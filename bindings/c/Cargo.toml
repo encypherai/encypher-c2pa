@@ -1,0 +1,18 @@
+[package]
+name = "encypher-c2pa-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+description = "Stable C ABI for the Encypher C2PA verifier"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+encypher-c2pa = { version = "=1.0.0-rc.1", path = "../../crates/encypher-c2pa" }
+serde_json = { workspace = true }

@@ -1,0 +1,19 @@
+{
+    "@context": "https://www.w3.org/ns/did/v1",
+    "id": "did:web:cawg-test-data.github.io:test-case:no-assertion-method",
+    "assertionMethod_NOPE": [
+        {
+            "id": "did:web:cawg-test-data.github.io:test-case:no-assertion-method#key-0",
+            "controller": "did:web:cawg-test-data.github.io:test-case:no-assertion-method",
+            "publicKeyJwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "704e3f33c84144f09238c413731907b4gcyqsHPBmis",
+                "kid": "did:web:cawg-test-data.github.io:test-case:no-assertion-method#key-0",
+                "alg": "EdDSA"
+            },
+            "type": "JsonWebKey"
+        }
+    ],
+    "services": []
+}

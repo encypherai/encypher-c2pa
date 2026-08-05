@@ -1,0 +1,20 @@
+[package]
+name = "encypher-c2pa-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+description = "C2PA data structures used by the Encypher verifier"
+
+[lib]
+name = "c2pa_core"
+
+[dependencies]
+c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.1", path = "../c2pa-cbor" }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }

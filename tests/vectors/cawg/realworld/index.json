@@ -1,0 +1,309 @@
+{
+  "accessed": "2026-08-05",
+  "description": "Pinned real-world news-content vectors from IPTC's published Media Provenance sample content; not an official conformance corpus.",
+  "network_policy": "offline",
+  "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+  "schema_version": 1,
+  "source": "https://iptc.org/std/MediaProvenance/SampleContent/",
+  "trust": {
+    "c2pa_conformance_trust_list": {
+      "accessed": "2026-08-05",
+      "notes": "C2PA conformance program trust list (claim-signing anchors). Ages; refresh with manage_realworld.py fetch --refresh-trust.",
+      "path": "trust/c2pa-conformance-trust.pem",
+      "sha256": "5fc0f1571f9eb4dff7a242291e1b198d347a768709bd6915022e9b59d6d7769c",
+      "size": 36772,
+      "source_url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/refs/heads/main/trust-list/C2PA-TRUST-LIST.pem"
+    },
+    "c2pa_conformance_tsa_trust_list": {
+      "accessed": "2026-08-05",
+      "notes": "C2PA conformance program timestamp-authority trust list (RFC 3161 TSA anchors). Ages; refresh with manage_realworld.py fetch --refresh-trust. Note: widely used public TSAs (e.g. DigiCert's public responder, used by IPTC's live production signer) are NOT on this list - a timeStamp.untrusted verdict against it is correct and matches the reference c2patool.",
+      "path": "trust/c2pa-tsa-trust.pem",
+      "sha256": "76788c4c36644ee24674f6d63e9ee6f0186c3e25e39ea80da67d1b6f35dbea62",
+      "size": 27725,
+      "source_url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/refs/heads/main/trust-list/C2PA-TSA-TRUST-LIST.pem"
+    },
+    "iptc_vnpl_end_entity_list": {
+      "accessed": "2026-08-05",
+      "notes": "IPTC Verified News Publishers List end-entity certificates (allow-list). The companion anchor list at https://trust.iptc.org was empty on the accessed date, which is legitimate. Ages; refresh with manage_realworld.py fetch --refresh-trust.",
+      "path": "trust/vnpl-end-entity.pem",
+      "sha256": "364a6d6bee6f1ce20c5c710976e57815c5538736c1bbc621733d92e22822303f",
+      "size": 40506,
+      "source_url": "https://trust.iptc.org/end-entity-list.pem"
+    }
+  },
+  "vector_count": 8,
+  "vectors": [
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "post-fix contract, verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.invalid",
+          "claimSignature.mismatch",
+          "cawg."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated"
+        ],
+        "required_failure_codes": [
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Valid"
+      },
+      "fixed_validation_time": "2026-06-01T00:00:00Z",
+      "id": "iptc-christmas-market",
+      "mime_type": "image/jpeg",
+      "notes": "IPTC Signer via c2patool 0.26.5, GlobalSign PS256 organization certificate (emailProtection EKU). Carries a cawg.metadata assertion but NO cawg.identity assertion. Signer cert window 2025-11-19..2026-11-20; validation time pinned inside it. Reference c2patool agrees: state Valid, failures exactly {signingCredential.untrusted} (c2patool additionally reports timeStamp.validated/trusted via its bundled TSA config, which this lane does not pass).",
+      "path": "assets/christmas-market-iptc-signed.jpg",
+      "publisher": "IPTC",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "5e48d2c24b4c0fb9a7bce249c03ab52494197b51c7225f610f35cd11fe842c5b",
+      "size": 691804,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/IPTC/christmas-market-iptc-signed.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "post-fix contract, verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.expired",
+          "signingCredential.outsideValidity",
+          "cawg."
+        ],
+        "required_codes": [
+          "claimSignature.insideValidity"
+        ],
+        "required_failure_codes": [
+          "claimSignature.mismatch",
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Invalid"
+      },
+      "fixed_validation_time": "2025-06-01T00:00:00Z",
+      "id": "iptc-board-legacy-broken",
+      "mime_type": "image/jpeg",
+      "notes": "Older sample signed with iptc_c2pa_signing_tool/0.1.0 (c2pa_rs 0.38.0). The claim signature is genuinely broken; the reference c2patool agrees (claimSignature.mismatch, state Invalid). Signer cert window 2024-10-31..2025-11-01; validation time pinned inside it so validity-window codes stay out of the expected set.",
+      "path": "assets/iptc-board-signed.jpg",
+      "publisher": "IPTC",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "d2f16f8f3c2ad53b0ab2d22623505b4418cd15b62f538909dbb1c53e7241621d",
+      "size": 816559,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/IPTC/iptc-board-signed.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "observed on pre-fix and post-fix binaries (2026-08-05); stable across the EKU fix",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.invalid",
+          "claimSignature.mismatch",
+          "cawg."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated"
+        ],
+        "required_failure_codes": [
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Valid"
+      },
+      "fixed_validation_time": "2025-06-01T00:00:00Z",
+      "id": "dw-natibindini-statue",
+      "mime_type": "image/jpeg",
+      "notes": "Truepic Lens CLI in Deutsche Welle (documentSigning + emailProtection EKUs); cert window 2024-12-23..2025-12-23. Observed identically on the pre-fix binary (documentSigning EKU already accepted). Reference c2patool agrees: state Valid, failures exactly {signingCredential.untrusted}.",
+      "path": "assets/Natibindini_statue_c2pa.jpg",
+      "publisher": "DW",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "7bcf5d0105553adfd8d3c8911d287e4c25d41787ed72f31f328749000bebd475",
+      "size": 1796423,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/DW/Natibindini_statue_c2pa.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "post-fix contract, verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.invalid",
+          "claimSignature.mismatch",
+          "cawg."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated"
+        ],
+        "required_failure_codes": [
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Valid"
+      },
+      "fixed_validation_time": "2026-01-01T00:00:00Z",
+      "id": "wdr-may-2025-still",
+      "mime_type": "image/jpeg",
+      "notes": "Westdeutscher Rundfunk organization certificate (emailProtection EKU), c2pa-rs/0.48.2; cert window 2025-05-08..2026-05-09. Reference c2patool agrees: state Valid, failures exactly {signingCredential.untrusted}.",
+      "path": "assets/WDR_202505_image_signed.jpg",
+      "publisher": "WDR",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "661e17e2567b4df8215d041c25e207bbc936fc71ea9ed1d39aba3afedc53d7a8",
+      "size": 188701,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/WDR/WDR_202505_image_signed.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "post-fix contract, verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.invalid",
+          "claimSignature.mismatch",
+          "cawg."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated"
+        ],
+        "required_failure_codes": [
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Valid"
+      },
+      "fixed_validation_time": "2026-01-01T00:00:00Z",
+      "id": "rnz-kiwi",
+      "mime_type": "image/jpeg",
+      "notes": "Radio New Zealand personal/org certificate (emailProtection EKU); cert window 2025-05-12..2026-05-13; validation time pinned inside it. Reference c2patool run at 2026-08-05 wall-clock reports state Invalid with an extra signingCredential.expired because the cert had lapsed by then and it evaluates at the current time - a time-context difference, not a semantic divergence; its signature verdicts (claimSignature.validated, dataHash/hashedURI match, signingCredential.untrusted) agree.",
+      "path": "assets/rnz-kiwi-signed.jpg",
+      "publisher": "RNZ",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "98a3b2f8e60721cde5639d5b88dc722b2b8e2dc90242dd56b685e4e7d1a3c01f",
+      "size": 380082,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/RNZ/rnz-kiwi-signed.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "post-fix contract, verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.invalid",
+          "claimSignature.mismatch",
+          "cawg."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated"
+        ],
+        "required_failure_codes": [
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Valid"
+      },
+      "fixed_validation_time": "2026-01-01T00:00:00Z",
+      "id": "rte-signed-still",
+      "mime_type": "image/jpeg",
+      "notes": "Raidio Teilifis Eireann organization certificate (emailProtection EKU), c2pa-rs/0.56.2; cert window 2025-07-07..2026-07-08. Reference c2patool agrees: state Valid, failures exactly {signingCredential.untrusted}.",
+      "path": "assets/rte_signed_image.jpg",
+      "publisher": "RT\u00c9",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "e60b71713e5d1f7b313faf22cad8b830bbb77cd0c2fca4e155a5aead3898c77f",
+      "size": 129194,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/RT%C3%89/rte_signed_image.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "post-fix contract, verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.invalid",
+          "claimSignature.mismatch",
+          "cawg."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated"
+        ],
+        "required_failure_codes": [
+          "signingCredential.untrusted"
+        ],
+        "validation_state": "Valid"
+      },
+      "fixed_validation_time": "2025-01-01T00:00:00Z",
+      "id": "cbc-untrusted-certificate-negative",
+      "mime_type": "image/jpeg",
+      "notes": "IPTC's designated invalid-content negative: Truepic libc2pa signed with a certificate that chains to no conformance-list anchor. The invalidity is trust-scoped - the signature itself verifies, so validation_state stays Valid while signingCredential.untrusted is present; the exact-failure-set assertion is what makes this a negative vector. Reference c2patool run at 2026-08-05 wall-clock additionally reports signingCredential.expired (cert window 2024-04-30..2025-04-30 had lapsed) and state Invalid - time-context difference; at the pinned time inside the window its remaining verdicts agree (untrusted, signature validates).",
+      "path": "assets/cbc-india-nationalists-untrusted-certificate.jpg",
+      "publisher": "CBC/Radio-Canada",
+      "rights": "published by IPTC as validation sample content; redistribution in this corpus pending confirmation",
+      "sha256": "f47dae50139d70143759658a8241e29eba8fe9fbc6937b603e328c83e0c22dcd",
+      "size": 5428471,
+      "source_url": "https://iptc.org/std/MediaProvenance/SampleContent/invalid-content/cbc-india-nationalists-untrusted-certificate.jpg",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem"
+      }
+    },
+    {
+      "accessed": "2026-08-05",
+      "expectation_basis": "verified empirically against the fixed binary on 2026-08-05",
+      "expected": {
+        "forbidden_failure_prefixes": [
+          "signingCredential.",
+          "claimSignature.",
+          "cawg.",
+          "assertion."
+        ],
+        "required_codes": [
+          "assertion.dataHash.match",
+          "assertion.hashedURI.match",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "signingCredential.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "fixed_validation_time": "2026-08-01T00:00:00Z",
+      "id": "iptc-live-production-odrl-workshop",
+      "mime_type": "image/png",
+      "notes": "LIVE production content from iptc.org/news (not the sample tree): full-size article image signed by 'IPTC Signer for C2PA' 2.0.1 (c2pa-rs 0.78.7), the conformant WordPress plugin, claim certificate issued by Trufo Inc. chaining to the C2PA conformance trust list - the only vector in this lane reaching signingCredential.trusted/state Trusted against the real conformance stack. Assertion set is the IPTC guide's recommended shape (c2pa.ingredient.v3, cawg.metadata, cawg.training-mining, c2pa.actions.v2, c2pa.hash.data) but still carries NO cawg.identity: even IPTC's current production signer does not yet deploy the two-signature architecture. The 300x143 WordPress rendition of the same upload is also signed (sign-every-rendition practiced). RFC 3161 timestamp present; timeStamp.untrusted informational is CORRECT even against the pinned C2PA conformance TSA trust list: the asset's timestamp comes from DigiCert's public responder (DigiCert SHA256 RSA4096 Timestamp Responder 2025 1), which is not a conformance-program TSA; the reference c2patool reports the same trust verdict. Known verifier granularity gap recorded: c2patool additionally emits timeStamp.validated (digest integrity) alongside untrusted, and the older sigTst (v1) headers on the legacy IPTC samples are not yet parsed by this verifier - both tracked as follow-ups.",
+      "path": "assets/iptc-live-odrl-workshop.png",
+      "publisher": "IPTC",
+      "rights": "published on iptc.org; retained here as an interoperability test artifact, redistribution pending confirmation",
+      "sha256": "651e8e03829af453d6d9e769886648c595a333067fb792ec3ea6f7a781d9d819",
+      "size": 1553058,
+      "source_page": "https://iptc.org/news/iptc-at-w3c-odrl-workshop-2026/",
+      "source_url": "https://iptc.org/wp-content/uploads/2026/07/Screenshot-2026-07-20-at-16.00.27.png",
+      "trust": {
+        "claim_trust_list": "trust/c2pa-conformance-trust.pem",
+        "tsa_trust_list": "trust/c2pa-tsa-trust.pem"
+      }
+    }
+  ]
+}
