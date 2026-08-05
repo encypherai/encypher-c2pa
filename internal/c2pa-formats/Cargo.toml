@@ -20,7 +20,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 c2pa-text = { workspace = true }
 unicode-normalization = "0.1"
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 
 [dev-dependencies]
 serde_json = { workspace = true }

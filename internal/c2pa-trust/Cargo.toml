@@ -33,4 +33,4 @@ ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
-rcgen = "0.13"
+rcgen = "0.14"

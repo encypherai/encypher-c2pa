@@ -32,4 +32,4 @@ x509-cert = { workspace = true }
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
