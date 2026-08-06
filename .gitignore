@@ -1,0 +1,22 @@
+/target/
+/dist/
+/.cargo-cache/
+/.cargo-sdk/
+/.rustup-sdk/
+/.tools/
+/.uv-bin/
+/.uv-cache/
+/.uv-python/
+/.uv-tools/
+/.venv-test/
+/.wasm-pack-cache/
+/.npm-cache/
+/.go-cache/
+/bindings/wasm/pkg/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Real-world news assets are redistribution-pending; fetch them on demand:
+#   python3 tests/vectors/cawg/realworld/manage_realworld.py fetch
+tests/vectors/cawg/realworld/assets/

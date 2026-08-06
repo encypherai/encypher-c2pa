@@ -1,0 +1,578 @@
+{
+  "description": "Frozen Encypher-generated CAWG Identity 1.2 positive and negative vectors.",
+  "network_policy": "offline",
+  "schema_version": 1,
+  "vector_count": 12,
+  "vectors": [
+    {
+      "actor_certificate": "generated/identity-1.2/certs/eddsa.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-eddsa-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-eddsa-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "971b97e782c7886d2e9441bf47c76af5670d3ef6c2ce540a43009f35ac33b809",
+      "signature_algorithm": "eddsa",
+      "size": 3904,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "426de9b730ea139c836c0557eceb5d5cec212fae3c3033f875a1b5e44dc2e725",
+      "signature_algorithm": "es256",
+      "size": 3968,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/ps256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-ps256-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-ps256-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "e248d7b14bf5e62c699d0b22d06a13b32ccccd93f62e4388af8f62d8765d487f",
+      "signature_algorithm": "ps256",
+      "size": 4558,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-png",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/png",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-png.png",
+      "polarity": "positive",
+      "sha256": "b4e9ac6114bb315d2baf3b2fb51a71ecfaf368b666e945a32bf33b1e757ad2e8",
+      "signature_algorithm": "es256",
+      "size": 3256,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.png",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.bmff.v3",
+      "id": "x509-es256-mp4",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.bmff.v3"
+      ],
+      "mime_type": "video/mp4",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-mp4.mp4",
+      "polarity": "positive",
+      "sha256": "895398689ab7f49b32010b6dd625301da3a38391dcec1046c73ce10282ceddc7",
+      "signature_algorithm": "es256",
+      "size": 11255,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.mp4",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-wav",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "audio/wav",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-wav.wav",
+      "polarity": "positive",
+      "sha256": "a226e9c7451cc801f8ffd5d6322deb5abed2408cab0296c91be253a996f3e884",
+      "signature_algorithm": "es256",
+      "size": 90906,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.wav",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-pdf",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "application/pdf",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-pdf.pdf",
+      "polarity": "positive",
+      "sha256": "5f5ea106471bd8fa7dd5e20ca115ec02fbf3028a52e224199e2451f8ba5823e2",
+      "signature_algorithm": "es256",
+      "size": 3674,
+      "source_asset": "enterprise_api/tests/parity/v22_fixtures/test.pdf",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256-wrong-eku.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-wrong-eku-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": "identity_trust",
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature."
+        ],
+        "forbidden_success_codes": [
+          "cawg.identity.trusted"
+        ],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.well-formed"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-wrong-eku-jpeg.jpg",
+      "polarity": "negative",
+      "sha256": "4f59ccbe75b0aab6b328ac3cbbc3fff08c72cb7093b9f2506e55965cf7513625",
+      "signature_algorithm": "es256",
+      "size": 4001,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256-smime.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "smime",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-smime-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted",
+          "timeStamp.validated",
+          "timeStamp.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-smime-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "fe523572fff0e22118ae834a1c20682f111a3a25bdfc20811a1631839a8d571d",
+      "signature_algorithm": "es256",
+      "size": 7088,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem",
+        "tsa_trust_list": "generated/identity-1.2/trust/tsa-trust.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 512,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-pad1-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-pad1-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "4bb0702969c7ee8a1d5affc1738217aa6bf59bdca595b346474aab805d8596ca",
+      "signature_algorithm": "es256",
+      "size": 4487,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": true,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-composed-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-composed-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "8a4398afd947b8d9643202bdcb95ff188970190785f7adfabc08475c4249ef96",
+      "signature_algorithm": "es256",
+      "size": 8606,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    },
+    {
+      "actor_certificate": "generated/identity-1.2/certs/es256.cert.pem",
+      "audit_evidence": [
+        "encypher_c2pa Rust verifier",
+        "enterprise_api Python cose_signer verifier"
+      ],
+      "audit_state": "independently-audited",
+      "cawg_pad1": 0,
+      "composition": false,
+      "credential_lane": "document_signing",
+      "credential_type": "x509",
+      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "hard_binding": "c2pa.hash.data",
+      "id": "x509-es256-bestpractice-jpeg",
+      "identity_references": [
+        "self#jumbf=c2pa.assertions/c2pa.hash.data",
+        "self#jumbf=c2pa.assertions/cawg.metadata",
+        "self#jumbf=c2pa.assertions/cawg.training-mining"
+      ],
+      "mime_type": "image/jpeg",
+      "negative_dimension": null,
+      "normative_expected": {
+        "forbidden_failure_prefixes": [
+          "claimSignature.",
+          "cawg."
+        ],
+        "forbidden_success_codes": [],
+        "required_codes": [
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.dataHash.match",
+          "signingCredential.trusted",
+          "cawg.identity.trusted"
+        ],
+        "required_failure_codes": [],
+        "validation_state": "Trusted"
+      },
+      "path": "generated/identity-1.2/assets/x509-es256-bestpractice-jpeg.jpg",
+      "polarity": "positive",
+      "sha256": "51f62e93bd807daa08bfb98fab4f42865f2536c6f8a4a329936b03d997577ebf",
+      "signature_algorithm": "es256",
+      "size": 4802,
+      "source_asset": "enterprise_api/tests/c2pa_test_certs/samples/test.jpg",
+      "spec_profile": "CAWG Identity 1.2",
+      "trust": {
+        "cawg_allowed_list": "generated/identity-1.2/trust/cawg-allowed.pem",
+        "claim_allowed_list": "generated/identity-1.2/trust/claim-allowed.pem"
+      }
+    }
+  ]
+}

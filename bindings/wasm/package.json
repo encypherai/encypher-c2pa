@@ -1,0 +1,9 @@
+{
+  "name": "@encypher/c2pa-source",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasm-pack build . --target web --release --out-dir pkg && node ../../scripts/package-wasm.mjs",
+    "test": "node ../../scripts/test-wasm.mjs"
+  }
+}

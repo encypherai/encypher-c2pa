@@ -1,0 +1,17 @@
+Encypher C2PA
+Copyright 2026 Encypher Corporation (https://encypher.com)
+
+This product includes software developed by Encypher Corporation
+Redistributions of this software or derivative works must retain this
+NOTICE file, as required by the Apache License, Version 2.0, Section 4(d).
+
+This product implements parts of the C2PA Technical Specification. C2PA,
+Content Credentials, and related marks belong to their respective owners. Use
+of the specification or marks does not state or imply certification.
+
+Structured-text carrier support uses the c2pa-text crate, distributed under
+Apache-2.0, from the Content Authenticity Initiative contributors.
+
+The repository includes cryptographic and serialization dependencies under
+their respective open-source licenses. Package distributions carry the
+applicable license metadata.

@@ -1,0 +1,1302 @@
+{
+  "description": "Pinned external CAWG interoperability vectors; not an official conformance corpus.",
+  "network_policy": "offline",
+  "schema_version": 1,
+  "sources": [
+    {
+      "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+      "license": "Apache-2.0 OR MIT",
+      "license_files": [
+        "external/contentauth-c2pa-rs/d7f13829/LICENSE-APACHE",
+        "external/contentauth-c2pa-rs/d7f13829/LICENSE-MIT"
+      ],
+      "repository": "contentauth/c2pa-rs"
+    },
+    {
+      "commit": "357f0fc5deb07ad629856728699804d67bf4f1c0",
+      "license": "Apache-2.0",
+      "license_files": [
+        "external/contentauth-c2pa-cpp/357f0fc5/LICENSE"
+      ],
+      "repository": "contentauth/c2pa-cpp"
+    }
+  ],
+  "vector_count": 34,
+  "vectors": [
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "id": "c2pa-cpp-cawg-data",
+      "license": "Apache-2.0",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "notes": "Legacy did:web sample issued by Adobe's production connected-identities aggregator; validates offline against the pinned did:web document fetched from the public .well-known endpoint (2026-08-04). Validated at the late clock because the VC validFrom (2025-05-30) postdates the default corpus clock.",
+      "path": "external/contentauth-c2pa-cpp/357f0fc5/assets/C_with_CAWG_data.jpg",
+      "sha256": "c7033c5d63e86e5870a6ade3b51e810a7dfd312e925124e7826e2a9b46263fe5",
+      "size": 194414,
+      "source": {
+        "commit": "357f0fc5deb07ad629856728699804d67bf4f1c0",
+        "path": "tests/fixtures/C_with_CAWG_data.jpg",
+        "repository": "contentauth/c2pa-cpp",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-cpp/357f0fc5deb07ad629856728699804d67bf4f1c0/tests/fixtures/C_with_CAWG_data.jpg"
+      },
+      "spec_profile": "legacy Adobe connected-identities sample",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem",
+        "did_documents": [
+          "did/connected-identities.identity.adobe.com.json"
+        ]
+      },
+      "upstream_expected": {
+        "required_codes": []
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.well-formed"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-cli-cawg-data",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.well-formed"
+        ]
+      },
+      "notes": "COSE signature verifies over the stored (serde field-order) signer_payload encoding, which the validator accepts alongside canonical CBOR and surfaces via the informational com.encypher.cawg.legacyProfile status (refused under --cawg-strict-encoding). Well-formed rather than trusted: the identity leaf carries no trusted timestamp, so the CAWG 1.2 interim S/MIME policy withholds trust.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/cli__tests__fixtures__C_with_CAWG_data.jpg",
+      "sha256": "fa0b257c863cb5b367135a017813ce0c1fbfc690a03e94acdd047c25c2d1ed46",
+      "size": 139636,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "cli/tests/fixtures/C_with_CAWG_data.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/cli/tests/fixtures/C_with_CAWG_data.jpg"
+      },
+      "spec_profile": "legacy non-deterministic signer_payload encoding",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": []
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_did_document"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-did-doc-without-assertion-method",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_did_document"
+        ]
+      },
+      "notes": "did:web issuer resolved through the pinned DID document published at cawg-test-data.github.io; the document deliberately lacks an assertionMethod.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__did_doc_without_assertion_method.jpg",
+      "sha256": "62d02b5ba1348156b2b1c01ef47c5e346e66ba73828282c41535f35efc414756",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/did_doc_without_assertion_method.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/did_doc_without_assertion_method.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem",
+        "did_documents": [
+          "did/cawg-test-data.github.io_test-case_no-assertion-method.json"
+        ]
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_did_document"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-interop-adobe-connected-identities",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "notes": "Issued by Adobe's stage connected-identities aggregator; validates offline against the pinned did:web document fetched from the public .well-known endpoint (2026-08-04). Use the fixed validation clock so the enclosing C2PA claim is inside certificate validity.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__adobe_connected_identities.jpg",
+      "sha256": "d17c8bf620a2d1bff2395e2b7c597d17aaf7b823dc30f1521aa777813da43aa4",
+      "size": 249364,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/adobe_connected_identities.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/adobe_connected_identities.jpg"
+      },
+      "spec_profile": "legacy interoperability sample",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem",
+        "did_documents": [
+          "did/connected-identities.identity-stage.adobe.com.json"
+        ]
+      },
+      "upstream_expected": {
+        "required_codes": []
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-interop-ims-multiple-manifests",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "notes": "Issued by Adobe's stage connected-identities aggregator; validates offline against the pinned did:web document fetched from the public .well-known endpoint (2026-08-04). Use the fixed validation clock so the enclosing C2PA claim is inside certificate validity.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ims_multiple_manifests.jpg",
+      "sha256": "6d03e1dd6a941b352784731a03b580378c5d38738a7a7a2fab85041ebb643128",
+      "size": 194342,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ims_multiple_manifests.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ims_multiple_manifests.jpg"
+      },
+      "spec_profile": "legacy interoperability sample",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem",
+        "did_documents": [
+          "did/connected-identities.identity-stage.adobe.com.json"
+        ]
+      },
+      "upstream_expected": {
+        "required_codes": []
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-content-type",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_content_type.jpg",
+      "sha256": "86ccbecac9563b8868061367804bb87bc4f17d4ede1c48987852e5d4efaf176e",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_content_type.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_content_type.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-content-type-assigned",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_content_type_assigned.jpg",
+      "sha256": "0db4d9a958026a1099c9d24af53f20c49a1910e12b445c474318da1c87d8e1ec",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_content_type_assigned.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_content_type_assigned.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_alg"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-cose-sign-alg",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_alg"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_cose_sign_alg.jpg",
+      "sha256": "35e76a42b63371cceefc055b32ea7f5b6ad7076c2af00b0295d3c3f90fe55dca",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_cose_sign_alg.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_cose_sign_alg.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_alg"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_cose_sign1"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-cose-sign1",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_cose_sign1"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_cose_sign1.jpg",
+      "sha256": "7db45e41c19ef648372cb5c496b204d9d737199baa863df6ae45fdfcdecc0c89",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_cose_sign1.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_cose_sign1.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_cose_sign1"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_issuer"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-issuer-did",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_issuer"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_issuer_did.jpg",
+      "sha256": "ecabe580fff6f9d32e8042207134979f862cd5a48bddc71b60f5e47d316a734b",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_issuer_did.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_issuer_did.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_issuer"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.time_stamp.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-time-stamp",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.time_stamp.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_time_stamp.jpg",
+      "sha256": "98a0e8edb1e7b57fcddaae0ecb24ecccbaf65ae3e5ac7308ca5dc1b922e4d561",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_time_stamp.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_time_stamp.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.time_stamp.invalid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_verifiable_credential"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-invalid-vc",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_verifiable_credential"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_vc.jpg",
+      "sha256": "e9eddaa511064d133f592d5ba394e52040bdde95190fd04d3ad6a2661b765471",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_vc.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/invalid_vc.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_verifiable_credential"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-missing-content-type",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__missing_content_type.jpg",
+      "sha256": "2c987e06d1aab829d280a50b6aba0547e6b4989bf71f600d7d81b66699d199ab",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/missing_content_type.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/missing_content_type.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_content_type"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_alg"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-missing-cose-sign-alg",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_alg"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__missing_cose_sign_alg.jpg",
+      "sha256": "02cbb8ebfb56a11d566917cb43e077a0e3f66c63fc7dcccc5c46634d3dae194b",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/missing_cose_sign_alg.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/missing_cose_sign_alg.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_alg"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.invalid_verifiable_credential"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-missing-vc",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_verifiable_credential"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__missing_vc.jpg",
+      "sha256": "5f7c4ff0a1ade29f023c066b20f67a4e46a54a9286911874cabfa68f6b44c6af",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/missing_vc.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/missing_vc.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.invalid_verifiable_credential"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.signature_mismatch"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-signature-mismatch",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.signature_mismatch"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__signature_mismatch.jpg",
+      "sha256": "74d975b3b6b0a21498fddc8984cd4c56d5409fbf0059131d95d52564c45610a7",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/signature_mismatch.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/signature_mismatch.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.signature_mismatch"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.signer_payload.mismatch"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-signer-payload-mismatch",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.signer_payload.mismatch"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__signer_payload_mismatch.jpg",
+      "sha256": "43cb3adcce666f1ab09c04be48332bbfdca6acc33aaf011a7620923c1b413e82",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/signer_payload_mismatch.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/signer_payload_mismatch.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.signer_payload.mismatch"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-success",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "notes": "Legacy CAWG 1.1 context; c2paAsset hashes are JSON byte arrays of the base64 text rather than the base64 strings required by CAWG Identity 1.2; both encodings decode to the same digest. The validator surfaces both legacy aspects via the informational com.encypher.cawg.legacyProfile status (refused under --cawg-strict-encoding).",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__success.jpg",
+      "sha256": "2d82904a32ee77e887382a1170ad2682a1f3d6978a79f837a3eba9976ea3527d",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/success.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/success.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.did_unavailable"
+        ]
+      },
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "id": "c2pa-rs-ica-unresolvable-did",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.did_unavailable"
+        ]
+      },
+      "notes": "VC validFrom (2025-08-04) postdates the default corpus clock; validated at the late clock so only the DID-resolution failure is observed.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__unresolvable_did.jpg",
+      "sha256": "2d4bde7a1059673cc13d91d207dbd9966fa992baf4bc1b9fc7a3ae4e3c4c49f6",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/unresolvable_did.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/unresolvable_did.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.did_unavailable"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.did_unsupported_method"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-unsupported-did-method",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.did_unsupported_method"
+        ]
+      },
+      "notes": "Present in the pinned fixture tree but not consumed by the pinned upstream test module.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__unsupported_did_method.jpg",
+      "sha256": "cd24197ef3319ac7fc702dc92fdebcd475b9227b558d38583d5cf4d44a96f98d",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/unsupported_did_method.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/unsupported_did_method.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.did_unsupported_method"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.time_stamp.validated",
+          "cawg.ica.valid_from.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-valid-from-after-time-stamp",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.time_stamp.validated",
+          "cawg.ica.valid_from.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_from_after_time_stamp.jpg",
+      "sha256": "c043b0c42e2c6c6ff9ca185f5f4c923379ba0b7d7f390071ad59845ad4414a0b",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_from_after_time_stamp.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_from_after_time_stamp.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.time_stamp.validated",
+          "cawg.ica.valid_from.invalid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.valid_from.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-valid-from-in-future",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.valid_from.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_from_in_future.jpg",
+      "sha256": "453f15d7d3bb8d49b15ccc562af093145e7235aa5b25875ae39ef9f80e2e575d",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_from_in_future.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_from_in_future.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.valid_from.invalid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.valid_from.missing"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-valid-from-missing",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.valid_from.missing"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_from_missing.jpg",
+      "sha256": "705957f911f2d65e4bfde4b962a38b771bd8294ce5550b45579a3447ca889ceb",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_from_missing.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_from_missing.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.valid_from.missing"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.time_stamp.validated",
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-valid-time-stamp",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.time_stamp.validated",
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_time_stamp.jpg",
+      "sha256": "7b6eb4a2584318c682d3b320d3bbec4a8f80bd6316ba004b299cb5b25cfa6997",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_time_stamp.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_time_stamp.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.time_stamp.validated",
+          "cawg.ica.credential_valid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-valid-until-in-future",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_until_in_future.jpg",
+      "sha256": "ecf2fc7cad42ae82e55c902bc0045a68585c37ce9abc269aa5b202de86d4deae",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_until_in_future.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_until_in_future.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.credential_valid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "ica",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.ica.valid_until.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-ica-valid-until-in-past",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.ica.valid_until.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_until_in_past.jpg",
+      "sha256": "bc60a838a32dde0b8fdb46bd788a04f6ce41a8ce0d073a4b9a88792a0bbeb22c",
+      "size": 258982,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_until_in_past.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/valid_until_in_past.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.ica.valid_until.invalid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.assertion.duplicate"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-duplicate-assertion-reference",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.assertion.duplicate"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__duplicate_assertion_reference.jpg",
+      "sha256": "4618ccc60c20484ec5d9f06719128f8fe978a59e17e0ab1af730d12310e97a74",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/duplicate_assertion_reference.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/duplicate_assertion_reference.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.assertion.duplicate"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.assertion.mismatch"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-extra-assertion-claim-v1",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.assertion.mismatch"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__extra_assertion_claim_v1.jpg",
+      "sha256": "779373cab76f78f47de111e256553553873e5a5e5576254666a96b9d76ece49f",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/extra_assertion_claim_v1.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/extra_assertion_claim_v1.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.assertion.mismatch"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.well-formed"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-extra-field",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.well-formed"
+        ]
+      },
+      "notes": "Top-level extra field is tolerated per CAWG 1.2 \u00a75.2; the COSE signature verifies over the stored (serde field-order, definite-length) signer_payload bytes. No failure codes; well-formed rather than trusted because the emailProtection-EKU test leaf lacks the trusted timestamp required by the CAWG 1.2 interim S/MIME policy.",
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__extra_field.jpg",
+      "sha256": "e62265aa94dc71aaff10224356d868d6958208f47ddc73f271aaa1a01ecaf0a5",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/extra_field.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/extra_field.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": []
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.sig_type.unknown"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-invalid-sig-type",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.sig_type.unknown"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__invalid_sig_type.jpg",
+      "sha256": "bb80fe6433aef04513624e65b5edfdfa98171998cfa7930370dd2b1127129856",
+      "size": 242914,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/invalid_sig_type.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/invalid_sig_type.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.sig_type.unknown"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.cbor.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-malformed-cbor",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.cbor.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__malformed_cbor.jpg",
+      "sha256": "4627a6c6461b718ad2dc4d99e2a12051e44a79f5fd3e13c90e7206549f06289a",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/malformed_cbor.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/malformed_cbor.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.cbor.invalid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.hard_binding_missing"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-no-hard-binding",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.hard_binding_missing"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__no_hard_binding.jpg",
+      "sha256": "2e6b5fc080aac1054f4009bb5d600b5e022f996c54ff7bad5f40cc45223c100a",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/no_hard_binding.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/no_hard_binding.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.hard_binding_missing"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.pad.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-pad1-invalid",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.pad.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__pad1_invalid.jpg",
+      "sha256": "9f3cde5006a0096c51f64c153741b9c4802535e9f8d526267cbe8bb79fc1ede8",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/pad1_invalid.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/pad1_invalid.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.pad.invalid"
+        ]
+      }
+    },
+    {
+      "audit_state": "imported",
+      "credential_type": "x509",
+      "current_sdk_observation": {
+        "required_codes": [
+          "cawg.identity.pad.invalid"
+        ]
+      },
+      "fixed_validation_time": "2025-05-01T00:00:00Z",
+      "id": "c2pa-rs-x509-pad2-invalid",
+      "license": "Apache-2.0 OR MIT",
+      "mime_type": "image/jpeg",
+      "normative_expected": {
+        "required_codes": [
+          "cawg.identity.pad.invalid"
+        ]
+      },
+      "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__pad2_invalid.jpg",
+      "sha256": "f27884ffaaf1890a4c5649deb5035f5c3a7d16f53db40aa65e5a2ec6535b65d8",
+      "size": 252940,
+      "source": {
+        "commit": "d7f13829ff4416c9254534885aa6f2ffc71d98f1",
+        "path": "sdk/src/identity/tests/fixtures/validation_method/pad2_invalid.jpg",
+        "repository": "contentauth/c2pa-rs",
+        "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/sdk/src/identity/tests/fixtures/validation_method/pad2_invalid.jpg"
+      },
+      "spec_profile": "CAWG Identity 1.1 draft-derived",
+      "trust": {
+        "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
+        "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
+      },
+      "upstream_expected": {
+        "required_codes": [
+          "cawg.identity.pad.invalid"
+        ]
+      }
+    }
+  ]
+}

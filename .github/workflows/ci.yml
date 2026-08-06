@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust core and CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # A plain `cargo audit`, not rustsec/audit-check: that action requires a
+      # GITHUB_TOKEN plus checks/issues write scopes to publish its check run,
+      # and a reusable workflow can never hold more permission than its
+      # caller - release.yml grants only `contents: read`, so the action would
+      # fail on every tag run even once wired up here.
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+      - run: cargo test --workspace
+      - run: cargo run -q -p encypher-c2pa-cli -- verify tests/fixtures/signed_test.mp4
+
+  msrv:
+    name: Rust 1.88 minimum version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
+  python:
+    name: Python wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path bindings/python/Cargo.toml --out dist/python
+      - run: uv venv .venv
+      - run: uv pip install --python .venv/bin/python dist/python/*.whl
+      - run: |
+          .venv/bin/python - <<'PY'
+          import encypher_c2pa as c
+          report = c.verify("tests/fixtures/signed_test.jpg")
+          assert report["schema_version"] == "1.0"
+          assert report["integrity"] == "valid"
+          assert report["trust"]["status"] == "not_evaluated"
+          PY
+
+  wasm:
+    name: Browser WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
+      - run: node scripts/package-wasm.mjs
+      - run: node scripts/test-wasm.mjs
+
+  go:
+    name: Go binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: cargo build -p encypher-c2pa-ffi --release
+      - run: go test ./...
+        working-directory: bindings/go

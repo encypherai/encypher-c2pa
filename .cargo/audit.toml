@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2023-0071 concerns timing leakage during RSA private-key operations.
+# This verification-only workspace performs RSA public-key verification only.
+# No RSA private key is loaded, generated, decrypted, or used to sign.
+ignore = ["RUSTSEC-2023-0071"]
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"

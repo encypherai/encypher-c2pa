@@ -1,0 +1,16 @@
+//! COSE_Sign1 verification and header extraction for C2PA claims.
+//!
+//! The verifier reconstructs the detached RFC 9052 `Sig_structure`, validates
+//! the signature with the certificate public key, and exposes the certificate,
+//! timestamp, and OCSP headers needed by the C2PA trust layer.
+
+mod alg;
+mod cose;
+mod error;
+
+pub use alg::CoseAlg;
+pub use cose::{
+    extract_cose_alg, extract_ocsp_staple, extract_ocsp_staples, extract_protected_x5chain,
+    extract_tsa_token, extract_tsa_tokens, extract_x5chain, timestamp_input, verify_claim,
+};
+pub use error::CryptoError;
