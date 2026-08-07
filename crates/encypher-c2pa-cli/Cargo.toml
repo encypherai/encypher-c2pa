@@ -15,7 +15,7 @@ name = "encypher-c2pa"
 path = "src/main.rs"
 
 [dependencies]
-encypher-c2pa = { version = "=1.0.0-rc.8", path = "../encypher-c2pa" }
+encypher-c2pa = { version = "=1.0.0-rc.9", path = "../encypher-c2pa" }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

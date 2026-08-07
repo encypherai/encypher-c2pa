@@ -4,7 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "encypher-c2pa"
-version = "1.0.0rc6"
+# No version here: maturin takes it from the Rust workspace. A duplicated
+# PEP 440 string silently drifted to 1.0.0rc6 while the crates moved on.
+dynamic = ["version"]
 description = "Offline, verification-only C2PA SDK"
 readme = "../../README.md"
 requires-python = ">=3.9"
@@ -24,6 +26,7 @@ Documentation = "https://github.com/encypherai/encypher-c2pa#readme"
 Issues = "https://github.com/encypherai/encypher-c2pa/issues"
 
 [tool.maturin]
+include = [{ path = "LICENSE", format = "sdist" }, { path = "NOTICE", format = "sdist" }]
 manifest-path = "Cargo.toml"
 module-name = "encypher_c2pa._native"
 python-source = "python"

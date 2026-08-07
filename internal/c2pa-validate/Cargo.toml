@@ -14,11 +14,11 @@ description = "C2PA validation engine used by the Encypher verifier"
 name = "c2pa_validate"
 
 [dependencies]
-c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.8", path = "../c2pa-cbor" }
-c2pa-core = { package = "encypher-c2pa-core", version = "=1.0.0-rc.8", path = "../c2pa-core" }
-c2pa-crypto = { package = "encypher-c2pa-crypto", version = "=1.0.0-rc.8", path = "../c2pa-crypto" }
-c2pa-trust = { package = "encypher-c2pa-trust", version = "=1.0.0-rc.8", path = "../c2pa-trust" }
-c2pa-formats = { package = "encypher-c2pa-formats", version = "=1.0.0-rc.8", path = "../c2pa-formats" }
+c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.9", path = "../c2pa-cbor" }
+c2pa-core = { package = "encypher-c2pa-core", version = "=1.0.0-rc.9", path = "../c2pa-core" }
+c2pa-crypto = { package = "encypher-c2pa-crypto", version = "=1.0.0-rc.9", path = "../c2pa-crypto" }
+c2pa-trust = { package = "encypher-c2pa-trust", version = "=1.0.0-rc.9", path = "../c2pa-trust" }
+c2pa-formats = { package = "encypher-c2pa-formats", version = "=1.0.0-rc.9", path = "../c2pa-formats" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
