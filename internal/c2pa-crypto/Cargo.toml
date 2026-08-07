@@ -14,7 +14,7 @@ description = "Cryptographic primitives used by the Encypher C2PA verifier"
 name = "c2pa_crypto"
 
 [dependencies]
-c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.7", path = "../c2pa-cbor" }
+c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.8", path = "../c2pa-cbor" }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 signature = { workspace = true }

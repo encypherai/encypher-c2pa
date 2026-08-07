@@ -57,7 +57,11 @@ jobs:
             target: x86_64
           - os: ubuntu-latest
             target: aarch64
-          - os: macos-13
+          # macOS x86_64 cross-builds from the arm64 image. The macos-13
+          # Intel runner is retired: its job sat unassigned until the run
+          # timed out, and because `pypi` needs every wheel, that one
+          # missing runner blocked the whole Python release.
+          - os: macos-14
             target: x86_64
           - os: macos-14
             target: aarch64
@@ -72,9 +76,17 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --manifest-path bindings/python/Cargo.toml --out dist
           manylinux: auto
+        env:
+          # ring's C sources read __ARM_ARCH to select the ARM assembler
+          # profile. The aarch64 cross-gcc inside maturin's manylinux
+          # container does not define it, so ring's build aborts with
+          # `#error "ARM assembler must define __ARM_ARCH"` and the linux
+          # aarch64 wheel never builds. Native aarch64 compilers define it
+          # themselves, which is why only the cross build failed.
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
       - uses: actions/upload-artifact@v4
         with:
-          name: python-${{ matrix.os }}-${{ matrix.target }}
+          name: python-${{ matrix.os }}-${{ matrix.target }}-${{ strategy.job-index }}
           path: dist/*.whl
 
   python-sdist:
