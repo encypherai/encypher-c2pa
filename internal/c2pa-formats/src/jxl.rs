@@ -9,7 +9,7 @@
 
 use crate::util::walk_iso_boxes;
 use crate::{AssetFormat, DataHashExclusion, FormatError};
-use c2pa_core::jumbf::{parse_superbox, UUID_MANIFEST_STORE};
+use c2pa_core::jumbf::parse_manifest_store;
 
 const FMT: AssetFormat = AssetFormat::Jxl;
 const TYPE_JUMB: &[u8; 4] = b"jumb";
@@ -38,11 +38,9 @@ fn check_jxl(data: &[u8]) -> Result<(), FormatError> {
     }
 }
 
-/// Return true if a top-level `jumb` box is the C2PA manifest store.
+/// Return true if a top-level `jumb` box is a complete C2PA manifest store.
 fn is_manifest_store(box_bytes: &[u8]) -> bool {
-    parse_superbox(box_bytes)
-        .map(|sb| sb.type_uuid == UUID_MANIFEST_STORE)
-        .unwrap_or(false)
+    parse_manifest_store(box_bytes).is_ok_and(|store| !store.manifests.is_empty())
 }
 
 /// Extract the manifest store: the top-level `jumb` box whose superbox UUID is

@@ -4,7 +4,7 @@
 //! the manifest store. The stream is independent of the Vorbis audio stream and
 //! may span any number of Ogg pages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
@@ -22,19 +22,45 @@ struct Page {
     end: usize,
     header_type: u8,
     serial: u32,
-    laces: Vec<u8>,
-    body_start: usize,
 }
 
-fn parse_pages(data: &[u8]) -> Result<Vec<Page>, FormatError> {
+#[derive(Default)]
+struct StreamState {
+    last_sequence: Option<u32>,
+    packet_open: bool,
+    eos: bool,
+    packet_count: usize,
+    first_packet: Vec<u8>,
+    first_complete: bool,
+}
+
+struct ValidatedOgg {
+    pages: Vec<Page>,
+    manifest_serial: Option<u32>,
+    manifest: Option<Vec<u8>>,
+}
+
+fn invalid(detail: &'static str) -> FormatError {
+    FormatError::InvalidStructure {
+        format: FMT,
+        detail,
+    }
+}
+
+/// Parse and validate every page and logical stream in an Ogg asset.
+///
+/// This is the single authority used for full assets and detached carriers.
+/// In addition to page framing and CRC, it enforces the stream state machine:
+/// zero-based contiguous non-wrapping sequence numbers, legal flags, packet
+/// continuation, a real final lacing terminator, and exactly one logical C2PA
+/// packet across the asset.
+fn validate_ogg(data: &[u8]) -> Result<ValidatedOgg, FormatError> {
     if data.is_empty() {
-        return Err(FormatError::InvalidStructure {
-            format: FMT,
-            detail: "empty Ogg stream",
-        });
+        return Err(invalid("empty Ogg stream"));
     }
 
     let mut pages = Vec::new();
+    let mut streams: HashMap<u32, StreamState> = HashMap::new();
     let mut pos = 0usize;
     while pos < data.len() {
         let fixed_end = pos.checked_add(27).ok_or(FormatError::Truncated(FMT))?;
@@ -42,12 +68,18 @@ fn parse_pages(data: &[u8]) -> Result<Vec<Page>, FormatError> {
             .get(pos..fixed_end)
             .ok_or(FormatError::Truncated(FMT))?;
         if &fixed[..4] != CAPTURE || fixed[4] != 0 {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "invalid Ogg page header",
-            });
+            return Err(invalid("invalid Ogg page header"));
         }
+        let header_type = fixed[5];
+        if header_type & !(BOS | EOS | CONTINUED) != 0 {
+            return Err(invalid("invalid Ogg page flags"));
+        }
+        let serial = u32::from_le_bytes(fixed[14..18].try_into().unwrap());
+        let sequence = u32::from_le_bytes(fixed[18..22].try_into().unwrap());
         let segment_count = fixed[26] as usize;
+        if segment_count == 0 {
+            return Err(invalid("Ogg page has no lacing values"));
+        }
         let lace_end = fixed_end
             .checked_add(segment_count)
             .filter(|&end| end <= data.len())
@@ -58,109 +90,118 @@ fn parse_pages(data: &[u8]) -> Result<Vec<Page>, FormatError> {
             .checked_add(body_len)
             .filter(|&end| end <= data.len())
             .ok_or(FormatError::Truncated(FMT))?;
+        let expected_crc = u32::from_le_bytes(fixed[22..26].try_into().unwrap());
+        if ogg_crc_page(&data[pos..end]) != expected_crc {
+            return Err(invalid("Ogg page checksum mismatch"));
+        }
+
+        let state = streams.entry(serial).or_default();
+        match state.last_sequence {
+            None => {
+                if sequence != 0 || header_type & BOS == 0 || header_type & CONTINUED != 0 {
+                    return Err(invalid("invalid first page for Ogg logical stream"));
+                }
+            }
+            Some(previous) => {
+                let expected = previous
+                    .checked_add(1)
+                    .ok_or(invalid("Ogg page sequence number wrapped"))?;
+                if sequence != expected {
+                    return Err(invalid("non-contiguous Ogg page sequence"));
+                }
+                if state.eos {
+                    return Err(invalid("Ogg page follows end-of-stream"));
+                }
+                if header_type & BOS != 0 {
+                    return Err(invalid("later Ogg page has beginning-of-stream flag"));
+                }
+                if (header_type & CONTINUED != 0) != state.packet_open {
+                    return Err(invalid("Ogg packet continuation flag mismatch"));
+                }
+            }
+        }
+
+        let mut body = lace_end;
+        for &lace in &laces {
+            let next = body + lace as usize;
+            if !state.first_complete {
+                state.first_packet.extend_from_slice(&data[body..next]);
+            }
+            body = next;
+            if lace < 255 {
+                state.packet_count = state
+                    .packet_count
+                    .checked_add(1)
+                    .ok_or(invalid("too many Ogg packets"))?;
+                state.first_complete = true;
+                state.packet_open = false;
+            } else {
+                state.packet_open = true;
+            }
+        }
+        if header_type & EOS != 0 {
+            if state.packet_open {
+                return Err(invalid("Ogg stream ends without a packet terminator"));
+            }
+            state.eos = true;
+        }
+        state.last_sequence = Some(sequence);
         pages.push(Page {
             start: pos,
             end,
-            header_type: fixed[5],
-            serial: u32::from_le_bytes([fixed[14], fixed[15], fixed[16], fixed[17]]),
-            laces,
-            body_start: lace_end,
+            header_type,
+            serial,
         });
         pos = end;
     }
-    Ok(pages)
-}
 
-fn first_packet(data: &[u8], pages: &[Page], first: usize) -> Result<Vec<u8>, FormatError> {
-    let serial = pages[first].serial;
-    let mut packet = Vec::new();
-    let mut first_stream_page = true;
-
-    for page in pages
-        .iter()
-        .skip(first)
-        .filter(|page| page.serial == serial)
-    {
-        if first_stream_page {
-            if page.header_type & BOS == 0 || page.header_type & CONTINUED != 0 {
-                return Err(FormatError::InvalidStructure {
-                    format: FMT,
-                    detail: "invalid first page for Ogg logical stream",
-                });
-            }
-            first_stream_page = false;
-        } else if page.header_type & CONTINUED == 0 {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "continued Ogg packet missing continuation flag",
-            });
+    let mut manifest_serial = None;
+    let mut manifest = None;
+    for (serial, state) in streams {
+        if !state.eos {
+            return Err(invalid("Ogg logical stream has no end-of-stream page"));
         }
-
-        let mut body = page.body_start;
-        for &lace in &page.laces {
-            let next = body + lace as usize;
-            packet.extend_from_slice(&data[body..next]);
-            body = next;
-            if lace < 255 {
-                return Ok(packet);
+        if let Some(store) = state.first_packet.strip_prefix(C2PA_PACKET_ID) {
+            if manifest.is_some() {
+                return Err(invalid("multiple Ogg C2PA logical streams"));
             }
+            if state.packet_count != 1 {
+                return Err(invalid("material follows Ogg C2PA packet"));
+            }
+            manifest_serial = Some(serial);
+            manifest = Some(store.to_vec());
         }
     }
-
-    Err(FormatError::Truncated(FMT))
+    Ok(ValidatedOgg {
+        pages,
+        manifest_serial,
+        manifest,
+    })
 }
 
-fn manifest_serials(data: &[u8], pages: &[Page]) -> Result<HashSet<u32>, FormatError> {
-    let mut seen = HashSet::new();
-    let mut manifests = HashSet::new();
-    for (index, page) in pages.iter().enumerate() {
-        if !seen.insert(page.serial) {
-            continue;
-        }
-        if page.header_type & BOS == 0 {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "Ogg logical stream has no beginning-of-stream page",
-            });
-        }
-        let packet = first_packet(data, pages, index)?;
-        if packet.starts_with(C2PA_PACKET_ID) {
-            manifests.insert(page.serial);
-        }
-    }
-    Ok(manifests)
+pub(crate) fn extract_carrier(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    Ok(validate_ogg(data)?.manifest)
 }
 
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
-    let pages = parse_pages(data)?;
-    let mut seen = HashSet::new();
-    for (index, page) in pages.iter().enumerate() {
-        if !seen.insert(page.serial) {
-            continue;
-        }
-        let packet = first_packet(data, &pages, index)?;
-        if let Some(manifest) = packet.strip_prefix(C2PA_PACKET_ID) {
-            return Ok(Some(manifest.to_vec()));
-        }
-    }
-    Ok(None)
+    extract_carrier(data)
 }
 
 pub(crate) fn strip(data: &[u8]) -> Result<Vec<u8>, FormatError> {
-    let pages = parse_pages(data)?;
-    let manifests = manifest_serials(data, &pages)?;
-    if manifests.is_empty() {
+    let validated = validate_ogg(data)?;
+    let Some(manifest_serial) = validated.manifest_serial else {
         return Ok(data.to_vec());
-    }
+    };
 
-    let kept_len: usize = pages
+    let kept_len: usize = validated
+        .pages
         .iter()
-        .filter(|page| !manifests.contains(&page.serial))
+        .filter(|page| page.serial != manifest_serial)
         .map(|page| page.end - page.start)
         .sum();
     let mut out = Vec::with_capacity(kept_len);
-    for page in pages {
-        if !manifests.contains(&page.serial) {
+    for page in validated.pages {
+        if page.serial != manifest_serial {
             out.extend_from_slice(&data[page.start..page.end]);
         }
     }
@@ -170,6 +211,22 @@ pub(crate) fn strip(data: &[u8]) -> Result<Vec<u8>, FormatError> {
 fn ogg_crc(data: &[u8]) -> u32 {
     let mut crc = 0u32;
     for &byte in data {
+        crc ^= (byte as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ CRC_POLYNOMIAL
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn ogg_crc_page(page: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for (index, &actual) in page.iter().enumerate() {
+        let byte = if (22..26).contains(&index) { 0 } else { actual };
         crc ^= (byte as u32) << 24;
         for _ in 0..8 {
             crc = if crc & 0x8000_0000 != 0 {
@@ -216,15 +273,10 @@ fn packet_laces(packet_len: usize) -> Vec<u8> {
     laces
 }
 
-pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
-    let clean = strip(asset)?;
-    let pages = parse_pages(&clean)?;
-    let used: HashSet<u32> = pages.iter().map(|page| page.serial).collect();
-    let mut serial = u32::from_le_bytes(*b"c2pa");
-    while used.contains(&serial) {
-        serial = serial.wrapping_add(1);
-    }
-
+pub(crate) fn build_manifest_pages(
+    manifest_store: &[u8],
+    serial: u32,
+) -> Result<Vec<u8>, FormatError> {
     let packet_len = C2PA_PACKET_ID
         .len()
         .checked_add(manifest_store.len())
@@ -237,19 +289,8 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
     packet.extend_from_slice(C2PA_PACKET_ID);
     packet.extend_from_slice(manifest_store);
     let laces = packet_laces(packet.len());
-
-    // RFC 3533 requires every logical stream's BOS page to precede the first
-    // non-BOS page in a multiplexed physical stream. Insert the C2PA stream
-    // after the source's initial run of BOS pages, not after the audio EOS;
-    // appending it would form an unknown chained stream that common decoders
-    // such as FFmpeg reject.
-    let insert_at = pages
-        .iter()
-        .find(|page| page.header_type & BOS == 0)
-        .map(|page| page.start)
-        .unwrap_or(clean.len());
     let page_count = laces.len().div_ceil(255);
-    let mut manifest_pages = Vec::with_capacity(packet.len() + 27 * page_count + laces.len());
+    let mut pages = Vec::with_capacity(packet.len() + 27 * page_count + laces.len());
     let mut body_offset = 0usize;
     for (page_index, page_laces) in laces.chunks(255).enumerate() {
         let body_len: usize = page_laces.iter().map(|&n| n as usize).sum();
@@ -260,7 +301,7 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
         }
         let granule = if last { 0 } else { u64::MAX };
         let body_end = body_offset + body_len;
-        manifest_pages.extend_from_slice(&build_page(
+        pages.extend_from_slice(&build_page(
             header_type,
             granule,
             serial,
@@ -270,6 +311,24 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
         ));
         body_offset = body_end;
     }
+    Ok(pages)
+}
+
+pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let clean = strip(asset)?;
+    let pages = validate_ogg(&clean)?.pages;
+    let used: HashSet<u32> = pages.iter().map(|page| page.serial).collect();
+    let mut serial = u32::from_le_bytes(*b"c2pa");
+    while used.contains(&serial) {
+        serial = serial.wrapping_add(1);
+    }
+
+    let insert_at = pages
+        .iter()
+        .find(|page| page.header_type & BOS == 0)
+        .map(|page| page.start)
+        .unwrap_or(clean.len());
+    let manifest_pages = build_manifest_pages(manifest_store, serial)?;
 
     let mut out = Vec::with_capacity(clean.len() + manifest_pages.len());
     out.extend_from_slice(&clean[..insert_at]);
@@ -279,11 +338,14 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
 }
 
 pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatError> {
-    let pages = parse_pages(data)?;
-    let manifests = manifest_serials(data, &pages)?;
-    Ok(pages
+    let validated = validate_ogg(data)?;
+    let Some(manifest_serial) = validated.manifest_serial else {
+        return Ok(Vec::new());
+    };
+    Ok(validated
+        .pages
         .into_iter()
-        .filter(|page| manifests.contains(&page.serial))
+        .filter(|page| page.serial == manifest_serial)
         .map(|page| DataHashExclusion {
             start: page.start,
             length: page.end - page.start,
@@ -299,6 +361,32 @@ mod tests {
     fn bare_ogg() -> Vec<u8> {
         let packet = b"\x01vorbisfixture";
         build_page(BOS | EOS, 0, 7, 0, &[packet.len() as u8], packet)
+    }
+
+    fn update_page_crc(data: &mut [u8], start: usize) {
+        let lace_end = start + 27 + data[start + 26] as usize;
+        let body_len: usize = data[start + 27..lace_end]
+            .iter()
+            .map(|&lace| lace as usize)
+            .sum();
+        let end = lace_end + body_len;
+        let checksum = ogg_crc_page(&data[start..end]);
+        data[start + 22..start + 26].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn assert_full_rejected(data: &[u8]) {
+        assert!(extract(data).is_err());
+        assert!(exclusions(data).is_err());
+    }
+
+    fn manifest_pages(data: &[u8]) -> Vec<Page> {
+        let validated = validate_ogg(data).unwrap();
+        let serial = validated.manifest_serial.unwrap();
+        validated
+            .pages
+            .into_iter()
+            .filter(|page| page.serial == serial)
+            .collect()
     }
 
     #[test]
@@ -336,7 +424,7 @@ mod tests {
         asset.extend_from_slice(&build_page(EOS, 1, serial, 2, &[audio.len() as u8], audio));
 
         let embedded = embed(&asset, &dummy_manifest_store()).unwrap();
-        let pages = parse_pages(&embedded).unwrap();
+        let pages = validate_ogg(&embedded).unwrap().pages;
         assert_eq!(pages[0].serial, serial);
         assert_ne!(pages[1].serial, serial);
         assert_ne!(pages[1].header_type & BOS, 0);
@@ -368,5 +456,84 @@ mod tests {
         let mut asset = bare_ogg();
         asset.pop();
         assert!(extract(&asset).is_err());
+    }
+    #[test]
+    fn full_asset_rejects_flipped_manifest_crc() {
+        let mut asset = embed(&bare_ogg(), &dummy_manifest_store()).unwrap();
+        let page = manifest_pages(&asset).remove(0);
+        asset[page.end - 1] ^= 1;
+        assert_full_rejected(&asset);
+    }
+
+    #[test]
+    fn full_asset_rejects_reserved_flags() {
+        let mut asset = embed(&bare_ogg(), &dummy_manifest_store()).unwrap();
+        let page = manifest_pages(&asset).remove(0);
+        asset[page.start + 5] |= 0x08;
+        update_page_crc(&mut asset, page.start);
+        assert_full_rejected(&asset);
+    }
+
+    #[test]
+    fn full_asset_rejects_later_bos_and_sequence_gap() {
+        let asset = embed(&bare_ogg(), &vec![0x5a; 130_000]).unwrap();
+        let pages = manifest_pages(&asset);
+        assert!(pages.len() > 1);
+
+        let mut later_bos = asset.clone();
+        later_bos[pages[1].start + 5] |= BOS;
+        update_page_crc(&mut later_bos, pages[1].start);
+        assert_full_rejected(&later_bos);
+
+        let mut sequence_gap = asset;
+        sequence_gap[pages[1].start + 18..pages[1].start + 22].copy_from_slice(&2u32.to_le_bytes());
+        update_page_crc(&mut sequence_gap, pages[1].start);
+        assert_full_rejected(&sequence_gap);
+    }
+
+    #[test]
+    fn full_asset_rejects_empty_page() {
+        let empty = build_page(BOS | EOS, 0, 99, 0, &[], &[]);
+        assert_full_rejected(&empty);
+    }
+
+    #[test]
+    fn full_asset_rejects_missing_eos_and_packet_terminator() {
+        let mut missing_eos = embed(&bare_ogg(), &dummy_manifest_store()).unwrap();
+        let page = manifest_pages(&missing_eos).remove(0);
+        missing_eos[page.start + 5] &= !EOS;
+        update_page_crc(&mut missing_eos, page.start);
+        assert_full_rejected(&missing_eos);
+
+        let mut unterminated_body = C2PA_PACKET_ID.to_vec();
+        unterminated_body.resize(255, 0x5a);
+        let unterminated = build_page(BOS | EOS, 0, 99, 0, &[255], &unterminated_body);
+        assert_full_rejected(&unterminated);
+    }
+
+    #[test]
+    fn full_asset_rejects_packet_or_page_after_manifest() {
+        let store = b"x";
+        let mut packet = C2PA_PACKET_ID.to_vec();
+        packet.extend_from_slice(store);
+        let first_len = u8::try_from(packet.len()).unwrap();
+        packet.push(b'x');
+        let mut trailing_packet = build_page(BOS | EOS, 0, 99, 0, &[first_len, 1], &packet);
+        trailing_packet.extend_from_slice(&bare_ogg());
+        assert_full_rejected(&trailing_packet);
+
+        let mut trailing_page = build_manifest_pages(store, 99).unwrap();
+        trailing_page.extend_from_slice(&build_page(EOS, 0, 99, 1, &[1], b"x"));
+        trailing_page.extend_from_slice(&bare_ogg());
+        assert_full_rejected(&trailing_page);
+    }
+
+    #[test]
+    fn full_asset_rejects_duplicate_c2pa_streams() {
+        let store = dummy_manifest_store();
+        let mut asset = build_manifest_pages(&store, 98).unwrap();
+        asset.extend_from_slice(&build_manifest_pages(&store, 99).unwrap());
+        asset.extend_from_slice(&bare_ogg());
+        assert_full_rejected(&asset);
     }
 }

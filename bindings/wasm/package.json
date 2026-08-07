@@ -1,5 +1,5 @@
 {
-  "name": "@encypher/c2pa-source",
+  "name": "@encypherai/c2pa-source",
   "private": true,
   "type": "module",
   "scripts": {

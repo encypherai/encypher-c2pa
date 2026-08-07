@@ -161,6 +161,20 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     Ok(out)
 }
 
+pub(crate) fn build_application_extension(manifest_store: &[u8]) -> Vec<u8> {
+    let mut extension = Vec::with_capacity(manifest_store.len() + 32);
+    extension.push(EXTENSION_INTRODUCER);
+    extension.push(APP_EXTENSION_LABEL);
+    extension.push(APP_BLOCK_SIZE);
+    extension.extend_from_slice(APP_ID);
+    for chunk in manifest_store.chunks(255) {
+        extension.push(chunk.len() as u8);
+        extension.extend_from_slice(chunk);
+    }
+    extension.push(0);
+    extension
+}
+
 /// Insert a C2PA Application Extension after the global color table.
 ///
 /// Any existing C2PA extension(s) are stripped first: prior insertion always
@@ -171,16 +185,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let at = first_block_offset(&clean)?;
-    let mut ext = Vec::with_capacity(manifest_store.len() + 32);
-    ext.push(EXTENSION_INTRODUCER);
-    ext.push(APP_EXTENSION_LABEL);
-    ext.push(APP_BLOCK_SIZE);
-    ext.extend_from_slice(APP_ID);
-    for chunk in manifest_store.chunks(255) {
-        ext.push(chunk.len() as u8);
-        ext.extend_from_slice(chunk);
-    }
-    ext.push(0); // block terminator
+    let ext = build_application_extension(manifest_store);
 
     let mut out = Vec::with_capacity(clean.len() + ext.len());
     out.extend_from_slice(&clean[..at]);

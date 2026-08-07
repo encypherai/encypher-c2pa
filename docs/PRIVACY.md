@@ -19,6 +19,8 @@ Native clients place events on a 64-item in-memory queue. They drop events when 
 
 The receiving service necessarily sees the connection's source IP and uses it for a 240-request-per-hour abuse limit. The event and stored metric do not include the IP or user-agent. Reports use a fixed anonymous organization identity and cannot enter the privileged incident or paging path.
 
+The CLI `verify` command also offers a separate, explicit lookup against the Encypher API. It is off unless `--encypher-api` is passed on that invocation. When passed, the SDK computes a SHA-256 digest of the exact asset bytes and posts only that digest, as `{"content_sha256": "<64 lowercase hex>"}`, to the lookup endpoint with a five-second timeout and a descriptive User-Agent. No asset bytes, manifest data, filenames, or file paths leave the machine. The default endpoint is `https://api.encypher.com/api/v1/lookup`, overridable with the hidden `--encypher-api-endpoint` flag for self-hosting or tests, mirroring the telemetry endpoint override. The response renders as a separate section and never changes the local verdict or the process exit code; any network, status, or decode failure degrades to a small error note.
+
 The browser example loads its JavaScript and WebAssembly from the same server that serves the page. With telemetry disabled, selecting and verifying an asset does not make a verification request. Applications can self-host both files and enforce this with Content Security Policy.
 
 Package registries and source hosts may record ordinary download logs when a user installs the software. Those services are outside the runtime verifier.

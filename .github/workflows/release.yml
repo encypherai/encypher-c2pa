@@ -124,24 +124,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+      # Trusted publishing (OIDC): no registry-url here on purpose -
+      # setup-node's registry-url writes an .npmrc _authToken placeholder that
+      # errors when NODE_AUTH_TOKEN is unset. npm >= 11.5.1 is required for
+      # OIDC; Node 22 bundles npm 10, so upgrade the CLI explicitly.
+      - run: npm install -g npm@latest
       - uses: jetli/wasm-pack-action@v0.4.0
       - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
       - run: node scripts/package-wasm.mjs
       - run: node scripts/test-wasm.mjs
-      - name: Publish to npm
+      - name: Publish to npm (OIDC trusted publishing)
         working-directory: bindings/wasm/pkg
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
           # A prerelease must never take the `latest` dist-tag: npm publish
           # defaults to `latest`, which would hand every plain
-          # `npm i @encypher/c2pa` a release candidate.
+          # `npm i @encypherai/c2pa` a release candidate.
           case "$version" in
             *-*) dist_tag=next ;;
             *) dist_tag=latest ;;
           esac
           echo "publishing $version to dist-tag $dist_tag"
-          npm publish --provenance --access public --tag "$dist_tag"
+          # No token: authentication is the OIDC exchange against the trusted
+          # publisher configured on npmjs.com (org encypherai, this repo,
+          # release.yml, environment release). Provenance is attached by
+          # default under trusted publishing.
+          npm publish --access public --tag "$dist_tag"

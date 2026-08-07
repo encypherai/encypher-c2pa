@@ -7,7 +7,7 @@ const packagePath = resolve(pkgDir, "package.json");
 const pkg = JSON.parse(await readFile(packagePath, "utf8"));
 
 Object.assign(pkg, {
-  name: "@encypher/c2pa",
+  name: "@encypherai/c2pa",
   description: "Offline, verification-only C2PA + CAWG SDK for browsers",
   license: "Apache-2.0",
   repository: {

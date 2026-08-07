@@ -9,6 +9,8 @@ use encypher_c2pa::{
     TelemetryOptions, VerifyOptions,
 };
 
+mod encypher_api;
+
 #[derive(Debug, Parser)]
 #[command(name = "encypher-c2pa", version, about = "Local C2PA verification")]
 struct Cli {
@@ -77,6 +79,14 @@ enum Command {
         telemetry_endpoint: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Query the Encypher provenance API after local verification. Sends
+        /// only a SHA-256 digest of the asset bytes; the response renders as a
+        /// separate section and never changes the local verdict or exit code.
+        #[arg(long)]
+        encypher_api: bool,
+        /// Override the Encypher provenance lookup endpoint (self-hosting, tests).
+        #[arg(long, value_name = "URL", hide = true)]
+        encypher_api_endpoint: Option<String>,
     },
     /// Read or change the saved failure telemetry preference.
     Telemetry {
@@ -124,6 +134,8 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             no_telemetry,
             telemetry_endpoint,
             json,
+            encypher_api,
+            encypher_api_endpoint,
         } => {
             // Telemetry preference persistence is best-effort: verification
             // MUST run even when no user configuration directory can be
@@ -162,8 +174,30 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 },
             };
             let report = verify_file(&asset, mime.as_deref(), &options)?;
+            let encypher_api_result = if encypher_api {
+                let bytes = fs::read(&asset)?;
+                let digest = encypher_api::content_sha256(&bytes);
+                let endpoint = encypher_api_endpoint
+                    .unwrap_or_else(|| encypher_api::DEFAULT_ENDPOINT.to_string());
+                Some(encypher_api::lookup(&endpoint, &digest))
+            } else {
+                None
+            };
             if json {
-                println!("{}", report.to_pretty_json()?);
+                if let Some(lookup) = &encypher_api_result {
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&report.to_pretty_json()?)
+                            .map_err(Error::Serialize)?;
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("encypher_api".to_string(), lookup.clone());
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).map_err(Error::Serialize)?
+                    );
+                } else {
+                    println!("{}", report.to_pretty_json()?);
+                }
             } else {
                 println!("asset: {}", asset.display());
                 println!("profile: {}", report.profile);
@@ -180,6 +214,10 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     for status in &report.validation_results.failure {
                         println!("  {}: {}", status.code, status.explanation);
                     }
+                }
+                println!("docs: https://encypher.com/c2pa/codes");
+                if let Some(lookup) = &encypher_api_result {
+                    encypher_api::render_human(lookup);
                 }
             }
             Ok(if report.integrity == "valid" {
@@ -225,6 +263,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 Error::Verification(format!("unknown validation status code: {code}"))
             })?;
             println!("{code}: {explanation}");
+            println!("details: https://encypher.com/c2pa/codes/{code}");
             Ok(ExitCode::SUCCESS)
         }
     }

@@ -14,7 +14,7 @@ description = "C2PA data structures used by the Encypher verifier"
 name = "c2pa_core"
 
 [dependencies]
-c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.6", path = "../c2pa-cbor" }
+c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.7", path = "../c2pa-cbor" }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }

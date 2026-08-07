@@ -17,10 +17,10 @@ default = ["telemetry"]
 telemetry = ["dep:ureq"]
 
 [dependencies]
-c2pa-core = { package = "encypher-c2pa-core", version = "=1.0.0-rc.6", path = "../../internal/c2pa-core" }
-c2pa-formats = { package = "encypher-c2pa-formats", version = "=1.0.0-rc.6", path = "../../internal/c2pa-formats" }
-c2pa-trust = { package = "encypher-c2pa-trust", version = "=1.0.0-rc.6", path = "../../internal/c2pa-trust" }
-c2pa-validate = { package = "encypher-c2pa-validate", version = "=1.0.0-rc.6", path = "../../internal/c2pa-validate" }
+c2pa-core = { package = "encypher-c2pa-core", version = "=1.0.0-rc.7", path = "../../internal/c2pa-core" }
+c2pa-formats = { package = "encypher-c2pa-formats", version = "=1.0.0-rc.7", path = "../../internal/c2pa-formats" }
+c2pa-trust = { package = "encypher-c2pa-trust", version = "=1.0.0-rc.7", path = "../../internal/c2pa-trust" }
+c2pa-validate = { package = "encypher-c2pa-validate", version = "=1.0.0-rc.7", path = "../../internal/c2pa-validate" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
