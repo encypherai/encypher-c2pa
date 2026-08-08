@@ -96,107 +96,219 @@ function emitRustdocJson(pkg) {
   }
 }
 
-// Extract the crate's OWN public surface. Everything rustdoc placed in `index`
-// is already public and reachable; the work here is naming items canonically
-// and dropping what belongs to other crates.
+// Extract the crate's OWN public surface.
+//
+// This is EXHAUSTIVE by construction, and that property is the whole point.
+// Earlier revisions enumerated the item families someone had thought of -
+// named paths, impls, plain struct fields, variant names - and reviewers kept
+// finding a family that was never walked. Struct-like enum variant FIELDS were
+// the last: `AssetFormat::TextStructured` gained a writer field, the gate said
+// PASS, and a consumer called it. Patching families one at a time did not
+// converge across four review cycles.
+//
+// So the walk visits every crate-local item rustdoc emitted, and anything it
+// cannot name or cannot reach is a FAILURE rather than a silent omission. A
+// family nobody anticipated now breaks the build instead of opening a hole.
 function extract(doc, crateName) {
   const out = new Set();
-  const { index, paths } = doc;
+  const { index, root } = doc;
+  const visited = new Set();
 
-  // Named items with canonical paths: functions, types, traits, constants.
-  // Modules are containers, not surface, so their own entry is skipped - their
-  // contents appear under their own paths.
-  for (const [id, p] of Object.entries(paths)) {
-    if (p.crate_id !== 0 || p.kind === "module") continue;
-    if (!index[id]) continue; // present in paths but not documented => not public
-    out.add(`${crateName}::${p.path.slice(1).join("::")} (${p.kind})`);
-  }
-
-  // Name the type an impl block is written for.
-  //
-  // Receivers are not always a bare nominal path. `impl Trait for &Format` is
-  // legal because references are #[fundamental], and a caller reaches it with
-  // `(&fmt) | args`. Earlier revisions resolved only `resolved_path`, returned
-  // null for anything else, and then SKIPPED the impl - fail-open inside a
-  // control that promises the opposite. A reviewer demonstrated a writer
-  // hidden that way by adding a single `&` to a previously-caught probe.
-  //
-  // Returns null only when the shape is genuinely unnameable here; callers
-  // must treat null as a failure, never as "nothing to record".
+  // Name the type an impl block is written for. Receivers are not always a
+  // bare nominal path: `impl Trait for &Format` is legal because references
+  // are #[fundamental], and a reviewer hid a writer that way. Returns null
+  // only when genuinely unnameable; callers MUST treat null as failure.
   const typeName = (ty) => {
     if (!ty) return null;
     if (ty.resolved_path?.path) return ty.resolved_path.path;
-    // Fundamental wrappers: the impl is reachable through the inner type.
-    if (ty.borrowed_ref?.type) {
-      const inner = typeName(ty.borrowed_ref.type);
-      return inner ? `&${inner}` : null;
-    }
-    if (ty.raw_pointer?.type) {
-      const inner = typeName(ty.raw_pointer.type);
-      return inner ? `*${inner}` : null;
-    }
+    if (ty.borrowed_ref?.type) { const i = typeName(ty.borrowed_ref.type); return i ? `&${i}` : null; }
+    if (ty.raw_pointer?.type) { const i = typeName(ty.raw_pointer.type); return i ? `*${i}` : null; }
     if (ty.slice) { const i = typeName(ty.slice); return i ? `[${i}]` : null; }
     if (ty.array?.type) { const i = typeName(ty.array.type); return i ? `[${i}; N]` : null; }
-    if (ty.tuple) {
-      const parts = ty.tuple.map(typeName);
-      return parts.every(Boolean) ? `(${parts.join(", ")})` : null;
-    }
+    if (ty.tuple) { const p = ty.tuple.map(typeName); return p.every(Boolean) ? `(${p.join(", ")})` : null; }
     if (typeof ty.primitive === "string") return ty.primitive;
     if (typeof ty.generic === "string") return ty.generic;
     return null;
   };
 
-  for (const item of Object.values(index)) {
-    if (item.crate_id !== 0) continue;
+  const record = (path, kind) => out.add(`${crateName}::${path} (${kind})`);
+
+  // Visit one item, record it, and recurse into everything it contains.
+  // `path` is the qualified name of this item.
+  const visit = (id, path) => {
+    if (id === null || id === undefined) return; // private tuple field slot
+    const item = index[id];
+    if (!item) return;                            // belongs to another crate
+    if (item.crate_id !== 0) return;
+    if (visited.has(id)) return;
+    visited.add(id);
+
     const inner = item.inner ?? {};
+    const kind = Object.keys(inner)[0];
 
-    // Auto-trait and blanket impls are excluded: the compiler derives those
-    // from other crates' generic impls rather than this repo authoring them.
-    const im = inner.impl;
-    if (im && !im.is_synthetic && !im.blanket_impl) {
-      const owner = typeName(im.for);
-
-      // An impl written in this crate that cannot be named is exactly the case
-      // a bypass hides in. Refuse to pass rather than drop it.
-      if (!owner) {
-        fail(
-          "an impl block in this crate has a receiver type this script cannot name",
-          `${crateName}: impl ${im.trait?.path ?? "(inherent)"} for <unnameable>\n` +
-          `receiver JSON: ${JSON.stringify(im.for).slice(0, 300)}\n\n` +
-          "Teach typeName() this shape, then regenerate the inventory. Skipping\n" +
-          "it would let a public writer through, which is how a reviewer\n" +
-          "smuggled one past an earlier revision using `for &Type`.",
-        );
-      }
-
-      if (im.trait) {
-        // One line per (type, trait) pair: the trait already fixes the method
-        // set, and per-method entries would bury the pair in derive noise.
-        out.add(`${crateName}::${owner}: ${im.trait.path} (trait impl)`);
-      } else {
-        for (const mid of im.items ?? []) {
-          const m = index[mid];
-          if (m?.name) out.add(`${crateName}::${owner}::${m.name} (method)`);
+    switch (kind) {
+      case "module":
+        // Containers are not surface themselves; their contents are.
+        for (const cid of inner.module.items ?? []) {
+          const c = index[cid];
+          // A `pub use` item carries no `name`; its public name lives on the
+          // re-export record. Without this the re-exported item is walked
+          // under the parent's path and inventoried under the wrong name.
+          const childName = c?.name ?? c?.inner?.use?.name ?? null;
+          visit(cid, childName ? (path ? `${path}::${childName}` : childName) : path);
         }
+        return;
+
+      case "struct": {
+        record(path, "struct");
+        const k = inner.struct.kind;
+        const fieldIds = k?.plain?.fields ?? k?.tuple ?? [];
+        for (const [i, fid] of fieldIds.entries()) {
+          const f = fid === null ? null : index[fid];
+          if (f) visit(fid, `${path}::${f.name ?? i}`);
+        }
+        for (const iid of inner.struct.impls ?? []) visitImpl(iid);
+        return;
       }
+
+      case "enum":
+        record(path, "enum");
+        for (const vid of inner.enum.variants ?? []) {
+          const v = index[vid];
+          if (v) visit(vid, `${path}::${v.name}`);
+        }
+        for (const iid of inner.enum.impls ?? []) visitImpl(iid);
+        return;
+
+      case "variant": {
+        record(path, "variant");
+        const vk = inner.variant.kind;
+        // Struct-like and tuple variants carry FIELDS, which are public API.
+        // Missing these was the seventh evasion found against this gate.
+        const fieldIds = vk?.struct?.fields ?? vk?.tuple ?? [];
+        for (const [i, fid] of fieldIds.entries()) {
+          const f = fid === null ? null : index[fid];
+          if (f) visit(fid, `${path}::${f.name ?? i}`);
+        }
+        return;
+      }
+
+      case "union":
+        record(path, "union");
+        for (const fid of inner.union.fields ?? []) {
+          const f = index[fid];
+          if (f) visit(fid, `${path}::${f.name}`);
+        }
+        for (const iid of inner.union.impls ?? []) visitImpl(iid);
+        return;
+
+      case "trait":
+        record(path, "trait");
+        // A trait's own members are callable through any implementor, and a
+        // default-bodied method needs no impl at all. Inventory them.
+        for (const tid of inner.trait.items ?? []) {
+          const t = index[tid];
+          if (t?.name) visit(tid, `${path}::${t.name}`);
+        }
+        return;
+
+      case "use": {
+        // Re-export. `is_glob` means the names it introduces are not listed
+        // here, so the walk cannot enumerate them - refuse rather than guess.
+        if (inner.use.is_glob) {
+          fail(
+            "a glob re-export cannot be inventoried",
+            `${crateName}::${path} -> ${inner.use.source}::*\n\n` +
+            "Name the re-exported items explicitly so the surface is reviewable.",
+          );
+        }
+        record(path, "use");
+        const target = inner.use.id;
+        if (target !== null && target !== undefined && index[target]) visit(target, path);
+        return;
+      }
+
+      case "impl":
+        visitImpl(id);
+        return;
+
+      // Leaves. Each is surface in its own right.
+      case "function":       record(path, "function"); return;
+      case "struct_field":   record(path, "field"); return;
+      case "constant":       record(path, "constant"); return;
+      case "static":         record(path, "static"); return;
+      case "type_alias":     record(path, "type_alias"); return;
+      case "trait_alias":    record(path, "trait_alias"); return;
+      case "assoc_const":    record(path, "assoc_const"); return;
+      case "assoc_type":     record(path, "assoc_type"); return;
+      case "macro":          record(path, "macro"); return;
+      case "proc_macro":     record(path, "proc_macro"); return;
+      case "primitive":      record(path, "primitive"); return;
+      case "extern_crate":   return; // not surface
+
+      default:
+        fail(
+          `rustdoc emitted an item kind this script does not handle: ${kind}`,
+          `${crateName}::${path}\n\n` +
+          "Add a naming rule for it and regenerate the inventory. Ignoring an\n" +
+          "unknown kind is how a public writer slips through: four review\n" +
+          "cycles each found a family an earlier revision never walked.",
+        );
+    }
+  };
+
+  function visitImpl(id) {
+    const item = index[id];
+    if (!item || item.crate_id !== 0 || visited.has(id)) return;
+    visited.add(id);
+    const im = item.inner?.impl;
+    if (!im) return;
+
+    // Auto-trait and blanket impls come from other crates' generic impls.
+    if (im.is_synthetic || im.blanket_impl) return;
+
+    const owner = typeName(im.for);
+    if (!owner) {
+      fail(
+        "an impl block in this crate has a receiver type this script cannot name",
+        `${crateName}: impl ${im.trait?.path ?? "(inherent)"} for <unnameable>\n` +
+        `receiver JSON: ${JSON.stringify(im.for).slice(0, 300)}\n\n` +
+        "Teach typeName() this shape, then regenerate the inventory.",
+      );
     }
 
-    // Public fields of public structs.
-    const fields = inner.struct?.kind?.plain?.fields;
-    if (fields && item.name) {
-      for (const fid of fields) {
-        const f = index[fid];
-        if (f?.name) out.add(`${crateName}::${item.name}::${f.name} (field)`);
+    if (im.trait) {
+      // One line per (type, trait) pair. The trait's own member list is
+      // inventoried at the trait, so per-method entries here would only add
+      // derive noise without adding review signal.
+      out.add(`${crateName}::${owner}: ${im.trait.path} (trait impl)`);
+      for (const mid of im.items ?? []) visited.add(mid);
+    } else {
+      for (const mid of im.items ?? []) {
+        const m = index[mid];
+        visited.add(mid);
+        if (m?.name) out.add(`${crateName}::${owner}::${m.name} (method)`);
       }
     }
+  }
 
-    // Enum variants.
-    if (inner.enum?.variants && item.name) {
-      for (const vid of inner.enum.variants) {
-        const v = index[vid];
-        if (v?.name) out.add(`${crateName}::${item.name}::${v.name} (variant)`);
-      }
-    }
+  visit(root, "");
+
+  // Anything rustdoc emitted for this crate that the walk never reached is a
+  // containment shape we do not model. Refuse rather than assume it is private.
+  //
+  // `Object.entries` yields string keys while rustdoc ids (and therefore
+  // `visited`) are numbers, so both sides are normalised before comparison.
+  const unreached = Object.entries(index)
+    .filter(([id, it]) => it.crate_id === 0 && !visited.has(Number(id)))
+    .map(([id, it]) => `${Object.keys(it.inner ?? {})[0]} ${it.name ?? "<unnamed>"} (id ${id})`);
+  if (unreached.length) {
+    fail(
+      `${unreached.length} crate-local item(s) were emitted by rustdoc but never reached by the walk`,
+      unreached.slice(0, 10).join("\n") +
+      "\n\nThe walk must reach every item so none can hide. Model the missing\n" +
+      "containment and regenerate the inventory.",
+    );
   }
 
   return out;
