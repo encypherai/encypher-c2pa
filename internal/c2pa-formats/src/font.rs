@@ -54,6 +54,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 
 /// Compute an SFNT table checksum: the wrapping sum of the table's big-endian
 /// `u32` words, treating the table as zero-padded to a multiple of 4 bytes.
+#[cfg(feature = "test-support")]
 fn table_checksum(data: &[u8]) -> u32 {
     let mut sum = 0u32;
     let mut i = 0;
@@ -71,6 +72,7 @@ fn table_checksum(data: &[u8]) -> u32 {
 ///
 /// `searchRange = 16 * 2^floor(log2(n))`, `entrySelector = floor(log2(n))`,
 /// `rangeShift = n*16 - searchRange`.
+#[cfg(feature = "test-support")]
 fn search_params(n: usize) -> (u16, u16, u16) {
     let mut es = 0u16;
     let mut pow = 1usize;
@@ -92,6 +94,7 @@ fn search_params(n: usize) -> (u16, u16, u16) {
 /// ascending tag, the binary-search header fields and each table's checksum are
 /// recomputed, and — if a `head` table is present — its `checkSumAdjustment` is
 /// recomputed so the whole-font checksum equals `0xB1B0AFBA`.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     if asset.len() < 12 || !is_sfnt_version(&asset[0..4]) {
         return Err(FormatError::InvalidStructure {

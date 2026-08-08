@@ -8,7 +8,9 @@
 //! Only standard (non-ZIP64) archives are supported; ZIP64 archives return
 //! [`FormatError::UnsupportedVariant`].
 
-use crate::util::{crc32, le_u32};
+#[cfg(feature = "test-support")]
+use crate::util::crc32;
+use crate::util::le_u32;
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Zip;
@@ -26,6 +28,8 @@ fn le16(data: &[u8], off: usize) -> Option<u16> {
 /// Parsed end-of-central-directory record.
 struct Eocd {
     total_entries: u16,
+    /// Parsed for completeness; only the write path consumes it.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     cd_size: u32,
     cd_offset: u32,
     /// Offset of the EOCD record itself.
@@ -359,6 +363,7 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 /// Remove the `META-INF/content_credential.c2pa` entry (if present),
 /// rebuilding local entries, the central directory, and the EOCD record so
 /// all offsets stay consistent. A no-op when the asset has no manifest entry.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     let eocd = find_eocd(asset)?;
     if find_cd_entry(asset, &eocd, ENTRY_NAME)?.is_none() {
@@ -453,6 +458,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// already-signed ZIP-based document (EPUB/DOCX/ODT/OXPS) always leaves
 /// exactly one manifest entry (the fresh one) rather than a stale entry that
 /// silently outranks it on read-back.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let eocd = find_eocd(&clean)?;

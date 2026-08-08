@@ -10,11 +10,15 @@ use crate::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Id3;
 const GEOB_MIME: &[u8] = b"application/c2pa";
+#[cfg(feature = "test-support")]
 const GEOB_FILENAME: &[u8] = b"c2pa";
+#[cfg(feature = "test-support")]
 const GEOB_DESC: &[u8] = b"c2pa manifest store";
+#[cfg(feature = "test-support")]
 const MAX_SYNCHSAFE: usize = (1 << 28) - 1;
 
 /// Encode a 28-bit value as a 4-byte synchsafe integer.
+#[cfg(feature = "test-support")]
 fn synchsafe_encode(n: u32) -> [u8; 4] {
     [
         ((n >> 21) & 0x7F) as u8,
@@ -37,6 +41,7 @@ fn has_id3(data: &[u8]) -> bool {
 }
 
 /// Build a GEOB frame (header + payload) for the given ID3 major version.
+#[cfg(feature = "test-support")]
 fn build_geob_frame(manifest: &[u8], major: u8) -> Result<Vec<u8>, FormatError> {
     // payload: encoding(0) | mime\0 | filename\0 | description\0 | binary
     let mut payload = Vec::with_capacity(manifest.len() + GEOB_MIME.len() + GEOB_DESC.len() + 8);
@@ -153,6 +158,7 @@ fn parse_geob(body: &[u8]) -> Option<Vec<u8>> {
 
 /// Embed the manifest in a clean ID3v2.3 `GEOB` frame. Any existing ID3v2 tag is
 /// stripped (matches the certified Pipeline-B embedder).
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     // Byte-parity with the legacy Pipeline-B embedder: strip any existing ID3v2
     // tag and write a clean ID3v2.3 tag holding only the C2PA GEOB frame. The

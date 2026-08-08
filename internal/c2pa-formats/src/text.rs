@@ -71,6 +71,7 @@ pub(crate) fn extract(method: TextMethod, data: &[u8]) -> Result<Option<Vec<u8>>
 
 /// Embed a manifest store into a text asset using `method`, returning the new
 /// UTF-8 text bytes.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(
     method: TextMethod,
     asset: &[u8],
@@ -118,6 +119,7 @@ pub(crate) fn embed(
 /// armour block wrapped in the given host comment delimiters and appended at
 /// end-of-text ([`c2pa_text::structured::Placement::End`]). Empty delimiters
 /// produce a bare block.
+#[cfg(feature = "test-support")]
 fn structured_text(
     text: &str,
     manifest_store: &[u8],
@@ -140,6 +142,7 @@ fn structured_text(
 /// armour block in the host language's `comment_prefix`/`comment_suffix` so the
 /// signed asset stays syntactically valid (e.g. `<!--`/`-->` for XML, `/*`/`*/`
 /// for CSS). Both delimiters empty embeds a bare block.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed_structured(
     asset: &[u8],
     manifest_store: &[u8],

@@ -129,6 +129,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 /// Remove an ID3-hosted C2PA manifest and every legacy native `c2pa`
 /// APPLICATION block. A C2PA-bearing ID3 tag is removed as a whole, matching
 /// the certified ID3 writer's clean-tag replacement behavior.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     let start = flac_start(asset)?;
     let id3_has_manifest = start != 0 && crate::id3::extract(asset)?.is_some();
@@ -183,6 +184,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 
 /// Embed according to C2PA 2.4 A.3.4: prepend a clean ID3v2.3 tag containing
 /// one `GEOB` frame with MIME type `application/c2pa`.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     crate::id3::embed(&clean, manifest_store)

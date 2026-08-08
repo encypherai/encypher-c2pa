@@ -22,5 +22,11 @@ c2pa-text = { workspace = true }
 unicode-normalization = "0.1"
 miniz_oxide = "0.8"
 
+# Off by default. Exposes container writing for in-repo fixture generation;
+# the published surface reads containers and never writes them.
+[features]
+test-support = ["c2pa-core/test-support"]
+
 [dev-dependencies]
+encypher-c2pa-formats = { path = ".", features = ["test-support"] }
 serde_json = { workspace = true }

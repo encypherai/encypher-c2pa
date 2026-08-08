@@ -78,6 +78,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 /// Remove every existing `C2PA` chunk, leaving all other chunks and their
 /// order untouched, and recompute the `RIFF` size field. A no-op when the
 /// asset has no manifest.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     check_riff(asset)?;
     let mut out = Vec::with_capacity(asset.len());
@@ -96,6 +97,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 }
 
 /// Build the exact RIFF `C2PA` carrier bytes for a manifest store.
+#[cfg(feature = "test-support")]
 pub(crate) fn build_c2pa_chunk(manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     if manifest_store.len() > u32::MAX as usize {
         return Err(FormatError::ManifestTooLarge {
@@ -120,6 +122,7 @@ pub(crate) fn build_c2pa_chunk(manifest_store: &[u8]) -> Result<Vec<u8>, FormatE
 /// already-signed RIFF asset always leaves exactly one manifest in the
 /// container (the fresh one) rather than a stale chunk that silently
 /// outranks it on read-back.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let carrier = build_c2pa_chunk(manifest_store)?;
     let clean = strip(asset)?;

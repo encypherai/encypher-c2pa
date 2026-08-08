@@ -168,6 +168,7 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 /// subsequent IFDs are reached through the preserved next-IFD pointer (their
 /// bytes are untouched). A pre-existing manifest in the first IFD is replaced;
 /// one elsewhere in the chain is left in place.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let (endian, ifd_off) = parse_header(asset)?;
     let mut entries: Vec<[u8; 12]> = Vec::new();
@@ -239,6 +240,7 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
     Ok(out)
 }
 
+#[cfg(feature = "test-support")]
 fn write_u16(out: &mut Vec<u8>, endian: Endian, x: u16) {
     match endian {
         Endian::Little => out.extend_from_slice(&x.to_le_bytes()),
@@ -246,6 +248,7 @@ fn write_u16(out: &mut Vec<u8>, endian: Endian, x: u16) {
     }
 }
 
+#[cfg(feature = "test-support")]
 fn write_u32(out: &mut Vec<u8>, endian: Endian, x: u32) {
     match endian {
         Endian::Little => out.extend_from_slice(&x.to_le_bytes()),

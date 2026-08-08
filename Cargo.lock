@@ -425,6 +425,7 @@ name = "encypher-c2pa-core"
 version = "1.0.0-rc.11"
 dependencies = [
  "encypher-c2pa-cbor",
+ "encypher-c2pa-core",
  "hex",
  "sha2",
  "thiserror",
@@ -465,6 +466,7 @@ dependencies = [
  "c2pa-text",
  "encypher-c2pa-cbor",
  "encypher-c2pa-core",
+ "encypher-c2pa-formats",
  "miniz_oxide",
  "serde_json",
  "sha2",

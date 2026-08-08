@@ -52,6 +52,11 @@ impl Profile {
 }
 
 /// Encode a [`Value`] to CBOR bytes using the given profile.
+///
+/// A serialization primitive, not a C2PA producer. Verification depends on it:
+/// COSE signature checking rebuilds the `Sig_structure` and encodes it to
+/// recover the exact bytes the signature covers (see `c2pa-crypto::cose`), and
+/// [`canonical_sha256`] encodes canonically to hash CAWG substructures.
 pub fn encode(value: &Value, profile: Profile) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
     encode::encode_into(&mut out, value, profile)?;

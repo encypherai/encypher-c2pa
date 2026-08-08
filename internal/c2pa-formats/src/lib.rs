@@ -414,10 +414,9 @@ pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u
 /// generations verbatim by design; the text methods delegate to the external
 /// `c2pa-text` crate).
 ///
-/// [`embed_manifest`] calls the per-format `strip` internally before
-/// inserting, so callers never need this directly for a plain re-sign; it is
-/// exposed for API completeness and for callers that want a manifest-free
-/// asset without immediately re-embedding.
+/// Container writing is not part of the verification surface; this exists for
+/// in-repo fixture generation only, behind the crate's `test-support` feature.
+#[cfg(feature = "test-support")]
 pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     match format {
         AssetFormat::Jpeg => jpeg::strip(asset),
@@ -444,8 +443,8 @@ pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, Form
 /// Frame a raw C2PA manifest store as the exact carrier bytes accepted by
 /// [`embed_manifest`].
 ///
-/// Only the v1 hash-mode families are accepted. The returned bytes are
-/// byte-identical to the carrier emitted by [`embed_manifest`].
+/// Only the v1 hash-mode families are accepted. Fixture generation only.
+#[cfg(feature = "test-support")]
 pub fn build_manifest_carrier(
     format: AssetFormat,
     manifest_store: &[u8],
@@ -461,14 +460,10 @@ pub fn build_manifest_carrier(
 
 /// Insert `manifest_store` into `asset`, returning the new asset bytes.
 ///
-/// `manifest_store` must be a complete JUMBF manifest-store superbox (as built
-/// by [`c2pa_core::jumbf::build_manifest_store`]). Every format now leaves
-/// exactly one physical manifest present after embedding: formats that
-/// previously appended blindly (JPEG, PNG, BMFF, RIFF, GIF, SVG, ZIP, FLAC,
-/// JXL) now strip any prior occurrence first (see [`strip_manifest`]); TIFF,
-/// Font, and ID3 already replaced in place. PDF's incremental update still
-/// preserves prior generations verbatim by design, but read paths
-/// ([`extract_manifest`], hash exclusions) resolve to the most recent one.
+/// Container writing is not part of the verification surface. This SDK reads
+/// C2PA structures and never produces them; the writer exists only so in-repo
+/// tests can build inputs for the readers, behind the `test-support` feature.
+#[cfg(feature = "test-support")]
 pub fn embed_manifest(
     format: AssetFormat,
     asset: &[u8],

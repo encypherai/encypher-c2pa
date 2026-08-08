@@ -44,9 +44,11 @@ const TYPE_JUMB: &[u8; 4] = b"jumb";
 const TYPE_JUMD: &[u8; 4] = b"jumd";
 const TYPE_CBOR: &[u8; 4] = b"cbor";
 
-/// Description box toggle: label present + requestable.
+/// Description box toggle: label present + requestable. Write path only.
+#[cfg(feature = "test-support")]
 const TOGGLE_REQUESTABLE: u8 = 0x03;
-/// Description box toggle: private (salt sub-box present).
+/// Description box toggle: private (salt sub-box present). Write path only.
+#[cfg(feature = "test-support")]
 const TOGGLE_PRIVATE: u8 = 0x10;
 
 /// Error parsing a JUMBF structure.
@@ -71,7 +73,8 @@ pub enum JumbfError {
     UnexpectedUuid,
 }
 
-/// Wrap `payload` in an ISOBMFF box with a 4-byte type code.
+/// Wrap `payload` in an ISOBMFF box with a 4-byte type code. Write path only.
+#[cfg(feature = "test-support")]
 fn box_bytes(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let total = 8 + payload.len();
     let mut out = Vec::with_capacity(total + 8);
@@ -88,7 +91,8 @@ fn box_bytes(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Build a JUMBF description box (`jumd`).
+/// Build a JUMBF description box (`jumd`). Write path only.
+#[cfg(feature = "test-support")]
 fn description_box(type_uuid: &[u8; 16], label: &str, salt: Option<&[u8]>) -> Vec<u8> {
     let mut toggles = TOGGLE_REQUESTABLE;
     if salt.is_some() {
@@ -106,6 +110,11 @@ fn description_box(type_uuid: &[u8; 16], label: &str, salt: Option<&[u8]>) -> Ve
 }
 
 /// Build a JUMBF superbox (`jumb`): a description box followed by content boxes.
+///
+/// JUMBF assembly is not part of the verification surface. The reader parses
+/// these structures; only in-repo fixture generation writes them, behind the
+/// crate's `test-support` feature.
+#[cfg(feature = "test-support")]
 pub fn superbox(
     type_uuid: &[u8; 16],
     label: &str,
@@ -119,12 +128,15 @@ pub fn superbox(
     box_bytes(TYPE_JUMB, &inner)
 }
 
-/// Wrap CBOR bytes in a CBOR content box (`cbor`).
+/// Wrap CBOR bytes in a CBOR content box (`cbor`). Fixture generation only.
+#[cfg(feature = "test-support")]
 pub fn cbor_box(cbor: &[u8]) -> Vec<u8> {
     box_bytes(TYPE_CBOR, cbor)
 }
 
 /// Build an assertion superbox containing a single CBOR content box.
+/// Fixture generation only.
+#[cfg(feature = "test-support")]
 pub fn assertion_box(label: &str, cbor: &[u8], salt: Option<&[u8]>) -> Vec<u8> {
     superbox(&UUID_CBOR_CONTENT, label, &[cbor_box(cbor)], salt)
 }
@@ -142,7 +154,8 @@ pub fn superbox_content(superbox_bytes: &[u8]) -> &[u8] {
 }
 
 /// Build a single C2PA manifest (assertion store + claim + signature) with a
-/// v2 claim box (`c2pa.claim.v2`).
+/// v2 claim box (`c2pa.claim.v2`). Fixture generation only.
+#[cfg(feature = "test-support")]
 pub fn build_manifest(
     manifest_label: &str,
     assertion_boxes: &[Vec<u8>],
@@ -162,6 +175,8 @@ pub fn build_manifest(
 ///
 /// `claim_label` is `"c2pa.claim.v2"` for 2.x claims and `"c2pa.claim"` for
 /// the legacy 1.x claim-v1 generation used by backward-compatibility fixtures.
+/// Fixture generation only.
+#[cfg(feature = "test-support")]
 pub fn build_manifest_with_claim_label(
     manifest_label: &str,
     assertion_boxes: &[Vec<u8>],
@@ -191,6 +206,8 @@ pub fn build_manifest_with_claim_label(
 }
 
 /// Build a complete C2PA manifest store from manifest superboxes (active last).
+/// Fixture generation only.
+#[cfg(feature = "test-support")]
 pub fn build_manifest_store(manifests: &[Vec<u8>]) -> Vec<u8> {
     superbox(&UUID_MANIFEST_STORE, "c2pa", manifests, None)
 }

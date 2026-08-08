@@ -13,6 +13,7 @@ use c2pa_core::jumbf::parse_manifest_store;
 
 const FMT: AssetFormat = AssetFormat::Jxl;
 const TYPE_JUMB: &[u8; 4] = b"jumb";
+#[cfg(feature = "test-support")]
 const TYPE_FTYP: &[u8; 4] = b"ftyp";
 const CONTAINER_SIG: [u8; 12] = [
     0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
@@ -62,6 +63,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 /// Remove every existing manifest-store `jumb` box, leaving all other
 /// top-level boxes and their order untouched. A no-op when the asset has no
 /// manifest.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     check_jxl(asset)?;
     let mut out = Vec::with_capacity(asset.len());
@@ -83,6 +85,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// reader happened to pick up the fresh manifest, but the stale box was
 /// never actually removed (permanent orphan bytes, and one insertion-point
 /// change away from silently flipping to a stale-wins bug).
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     // The manifest store must already be a `jumb` box.
     if manifest_store.len() < 8 || &manifest_store[4..8] != TYPE_JUMB {

@@ -11,7 +11,10 @@
 //! JUMBF content (description + content boxes), excluding the superbox
 //! `LBox+TBox` header.
 
-use c2pa_cbor::{encode, map_from_pairs, Profile, Value};
+#[cfg(feature = "test-support")]
+use c2pa_cbor::encode;
+use c2pa_cbor::{map_from_pairs, Profile, Value};
+#[cfg(feature = "test-support")]
 use sha2::{Digest, Sha256};
 
 /// Hash algorithm identifier strings per C2PA spec.
@@ -60,14 +63,16 @@ pub struct AssertionRef<'a> {
     pub jumbf_content: &'a [u8],
 }
 
-/// Compute the SHA-256 of an assertion's JUMBF content.
+/// Compute the SHA-256 of an assertion's JUMBF content. Write path only.
+#[cfg(feature = "test-support")]
 fn hash_assertion(content: &[u8]) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(content);
     h.finalize().to_vec()
 }
 
-/// Build a hashed-URI reference value for one assertion.
+/// Build a hashed-URI reference value for one assertion. Write path only.
+#[cfg(feature = "test-support")]
 fn assertion_ref_value(label: &str, content: &[u8]) -> Value {
     map_from_pairs([
         (
@@ -98,6 +103,10 @@ pub struct ClaimOptions<'a> {
 /// Build the claim as a CBOR [`Value`] (before encoding).
 ///
 /// The `created_assertions` array holds hashed references to each assertion.
+///
+/// Claim construction is not part of the verification surface; it exists for
+/// in-repo fixture generation only. See the crate's `test-support` feature.
+#[cfg(feature = "test-support")]
 pub fn build_claim_value(opts: &ClaimOptions, assertions: &[AssertionRef]) -> Value {
     let refs: Vec<Value> = assertions
         .iter()
@@ -127,6 +136,9 @@ pub fn build_claim_value(opts: &ClaimOptions, assertions: &[AssertionRef]) -> Va
 }
 
 /// Build the CBOR-encoded claim bytes using the options' profile.
+///
+/// Fixture generation only; see [`build_claim_value`].
+#[cfg(feature = "test-support")]
 pub fn build_claim_cbor(
     opts: &ClaimOptions,
     assertions: &[AssertionRef],

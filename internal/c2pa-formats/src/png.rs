@@ -5,7 +5,9 @@
 //! the `data` of a single `caBX` chunk, inserted before `IEND`. The CRC covers
 //! the type and data fields (ISO 3309 / zlib CRC-32).
 
-use crate::util::{be_u32, Crc32};
+use crate::util::be_u32;
+#[cfg(feature = "test-support")]
+use crate::util::Crc32;
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Png;
@@ -118,6 +120,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 
 /// Remove every existing `caBX` chunk, leaving all other chunks and their
 /// order untouched. A no-op when the asset has no manifest.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     check_signature(asset)?;
     let mut out = Vec::with_capacity(asset.len());
@@ -139,6 +142,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// already-signed PNG always leaves exactly one manifest in the container
 /// (the fresh one) rather than a stale chunk that silently outranks it on
 /// read-back.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let mut iend_start = None;
@@ -175,10 +179,12 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 }
 
 /// Build a PNG chunk: `length | type | data | crc`.
+#[cfg(feature = "test-support")]
 pub(crate) fn build_cabx_chunk(data: &[u8]) -> Vec<u8> {
     build_chunk(TYPE_CABX, data)
 }
 
+#[cfg(feature = "test-support")]
 fn build_chunk(type_code: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + data.len());
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());

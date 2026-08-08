@@ -33,3 +33,8 @@ x509-cert = { workspace = true }
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Tests construct manifests and embed them to build inputs for the readers.
+# Those constructors are not in the published surface, so the test build opts
+# into them explicitly rather than relying on workspace feature unification.
+c2pa-core = { package = "encypher-c2pa-core", path = "../c2pa-core", features = ["test-support"] }
+c2pa-formats = { package = "encypher-c2pa-formats", path = "../c2pa-formats", features = ["test-support"] }

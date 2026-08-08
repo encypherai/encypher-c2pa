@@ -11,7 +11,9 @@
 //! robustness when reading third-party SVGs, extraction also falls back to the
 //! older `<?c2pa-manifest BASE64?>` processing-instruction convention.
 
-use crate::util::{base64_decode, base64_encode};
+use crate::util::base64_decode;
+#[cfg(feature = "test-support")]
+use crate::util::base64_encode;
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Svg;
@@ -73,6 +75,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 /// Remove the existing manifest element (or `<?c2pa-manifest ?>` PI
 /// fallback), reusing the same span [`exclusions`] computes. A no-op when
 /// the asset has no manifest.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     let ex = exclusions(asset)?;
     let Some(span) = ex.first() else {
@@ -91,6 +94,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// happened to pick up the fresh manifest, but the stale element was never
 /// actually removed (permanent orphan markup, and one insertion-point change
 /// away from silently flipping to a stale-wins bug).
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let text = as_str(&clean)?;

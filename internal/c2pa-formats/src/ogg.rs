@@ -4,7 +4,9 @@
 //! the manifest store. The stream is independent of the Vorbis audio stream and
 //! may span any number of Ogg pages.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "test-support")]
+use std::collections::HashSet;
 
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
@@ -20,6 +22,8 @@ const CONTINUED: u8 = 0x01;
 struct Page {
     start: usize,
     end: usize,
+    /// Parsed for completeness; only the write path consumes it.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     header_type: u8,
     serial: u32,
 }
@@ -187,6 +191,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     extract_carrier(data)
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(data: &[u8]) -> Result<Vec<u8>, FormatError> {
     let validated = validate_ogg(data)?;
     let Some(manifest_serial) = validated.manifest_serial else {
@@ -208,6 +213,7 @@ pub(crate) fn strip(data: &[u8]) -> Result<Vec<u8>, FormatError> {
     Ok(out)
 }
 
+#[cfg(feature = "test-support")]
 fn ogg_crc(data: &[u8]) -> u32 {
     let mut crc = 0u32;
     for &byte in data {
@@ -239,6 +245,7 @@ fn ogg_crc_page(page: &[u8]) -> u32 {
     crc
 }
 
+#[cfg(feature = "test-support")]
 fn build_page(
     header_type: u8,
     granule_position: u64,
@@ -264,6 +271,7 @@ fn build_page(
     page
 }
 
+#[cfg(feature = "test-support")]
 fn packet_laces(packet_len: usize) -> Vec<u8> {
     let full = packet_len / 255;
     let remainder = packet_len % 255;
@@ -273,6 +281,7 @@ fn packet_laces(packet_len: usize) -> Vec<u8> {
     laces
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn build_manifest_pages(
     manifest_store: &[u8],
     serial: u32,
@@ -314,6 +323,7 @@ pub(crate) fn build_manifest_pages(
     Ok(pages)
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let pages = validate_ogg(&clean)?.pages;

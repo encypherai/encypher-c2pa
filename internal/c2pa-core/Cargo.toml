@@ -18,3 +18,11 @@ c2pa-cbor = { package = "encypher-c2pa-cbor", version = "=1.0.0-rc.11", path = "
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+
+# Off by default. Exposes claim/JUMBF construction for in-repo fixture
+# generation; the published verification surface only parses these structures.
+[features]
+test-support = []
+
+[dev-dependencies]
+encypher-c2pa-core = { path = ".", features = ["test-support"] }

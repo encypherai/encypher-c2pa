@@ -5,11 +5,16 @@
 //! immediately following the 16-byte UUID. Box headers are walked without
 //! copying payloads; only the manifest bytes are materialized.
 
-use crate::util::{be_u16, be_u24, be_u32, be_u64, iso_box_header, walk_iso_boxes, IsoBox};
+#[cfg(feature = "test-support")]
+use crate::util::iso_box_header;
+#[cfg(feature = "test-support")]
+use crate::util::{be_u16, be_u24, be_u32, be_u64};
+use crate::util::{walk_iso_boxes, IsoBox};
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Bmff;
 const TYPE_UUID: &[u8; 4] = b"uuid";
+#[cfg(feature = "test-support")]
 const TYPE_FTYP: &[u8; 4] = b"ftyp";
 
 /// Sanity-check that `data` looks like ISOBMFF: a parseable first box, and the
@@ -465,6 +470,7 @@ pub fn bmff_hash_reader<R: std::io::Read + std::io::Seek>(
 /// Removing bytes shifts everything after the removed box, so the absolute
 /// file offsets in `stco`/`co64`/`iloc`/`tfhd` tables are re-based by the net
 /// removed length (see [`patch_absolute_offsets`]).
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     check_bmff(asset)?;
     let mut out = Vec::with_capacity(asset.len());
@@ -484,6 +490,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 }
 
 /// Build the exact top-level C2PA UUID carrier for a manifest store.
+#[cfg(feature = "test-support")]
 pub(crate) fn build_c2pa_uuid_box(manifest_store: &[u8]) -> Vec<u8> {
     // Box payload (c2pa-rs BMFF layout): C2PA UUID (16) + version+flags (4) +
     // null-terminated purpose label "manifest" (9) + 8 reserved/merkle-offset
@@ -517,6 +524,7 @@ pub(crate) fn build_c2pa_uuid_box(manifest_store: &[u8]) -> Vec<u8> {
 /// manifest bytes as media payload (blank AVIF images with valid manifests).
 /// [`patch_absolute_offsets`] applies the same adjustment set as c2pa-rs's
 /// `adjust_known_offsets`.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let mut insert_at = 0usize;
@@ -557,15 +565,18 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 /// Container boxes descended into when hunting offset tables. Plain
 /// containers: children start at the payload. (`meta` is a FullBox and is
 /// special-cased: children start 4 bytes in, after version+flags.)
+#[cfg(feature = "test-support")]
 const OFFSET_CONTAINERS: [&[u8; 4]; 8] = [
     b"moov", b"trak", b"mdia", b"minf", b"stbl", b"moof", b"traf", b"mfra",
 ];
 
 /// Defensive recursion bound; real BMFF trees are < 8 deep on these paths.
+#[cfg(feature = "test-support")]
 const MAX_BOX_DEPTH: usize = 16;
 
 /// An offset-bearing box found by [`collect_offset_boxes`]: its kind plus the
 /// `(payload_start, end)` span of its payload within the file.
+#[cfg(feature = "test-support")]
 enum OffsetBoxKind {
     Stco,
     Co64,
@@ -575,6 +586,7 @@ enum OffsetBoxKind {
 
 /// Walk boxes within `data[lo..hi)` (same header rules as `walk_iso_boxes`:
 /// 32-bit sizes, the 64-bit `largesize` escape, and size 0 = to-end-of-range).
+#[cfg(feature = "test-support")]
 fn walk_boxes_range(
     data: &[u8],
     lo: usize,
@@ -618,6 +630,7 @@ fn walk_boxes_range(
 
 /// Recursively collect every `stco`/`co64`/`iloc`/`tfhd` payload span under
 /// `data[lo..hi)`, descending into the known container boxes.
+#[cfg(feature = "test-support")]
 fn collect_offset_boxes(
     data: &[u8],
     lo: usize,
@@ -657,6 +670,7 @@ fn collect_offset_boxes(
 }
 
 /// Apply `delta` to the big-endian u32 at `off`, failing on wrap.
+#[cfg(feature = "test-support")]
 fn apply_delta_u32(data: &mut [u8], off: usize, delta: i64) -> Result<(), FormatError> {
     let cur = be_u32(data, off).ok_or(FormatError::Truncated(FMT))? as i64;
     let new = cur
@@ -671,6 +685,7 @@ fn apply_delta_u32(data: &mut [u8], off: usize, delta: i64) -> Result<(), Format
 }
 
 /// Apply `delta` to the big-endian u64 at `off`, failing on wrap.
+#[cfg(feature = "test-support")]
 fn apply_delta_u64(data: &mut [u8], off: usize, delta: i64) -> Result<(), FormatError> {
     let cur = be_u64(data, off).ok_or(FormatError::Truncated(FMT))?;
     let new = if delta < 0 {
@@ -687,6 +702,7 @@ fn apply_delta_u64(data: &mut [u8], off: usize, delta: i64) -> Result<(), Format
 }
 
 /// Re-base a `stco` (u32) or `co64` (u64) chunk-offset table by `delta`.
+#[cfg(feature = "test-support")]
 fn patch_chunk_offsets(
     data: &mut [u8],
     payload_start: usize,
@@ -718,6 +734,7 @@ fn patch_chunk_offsets(
 
 /// Re-base a `tfhd` fragment header's `base_data_offset` (present only when
 /// flag bit 0 is set) by `delta`.
+#[cfg(feature = "test-support")]
 fn patch_tfhd(
     data: &mut [u8],
     payload_start: usize,
@@ -743,6 +760,7 @@ fn patch_tfhd(
 /// `extent_offset` (extent offsets are base-relative when a base exists).
 /// `idat`-relative (method 1) and item-relative (method 2) locations do not
 /// move when file bytes shift.
+#[cfg(feature = "test-support")]
 fn patch_iloc(
     data: &mut [u8],
     payload_start: usize,
@@ -857,6 +875,7 @@ fn patch_iloc(
 ///
 /// Offsets are adjusted unconditionally (parity with c2pa-rs): media payload
 /// always sits after `ftyp`, which is the only insertion point used.
+#[cfg(feature = "test-support")]
 fn patch_absolute_offsets(data: &mut [u8], delta: i64) -> Result<(), FormatError> {
     if delta == 0 {
         return Ok(());

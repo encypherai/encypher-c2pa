@@ -17,14 +17,17 @@ use crate::util::be_u16;
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Jpeg;
+#[cfg(feature = "test-support")]
 const MARKER_APP0: u8 = 0xE0;
 const MARKER_APP11: u8 = 0xEB;
 const MARKER_SOS: u8 = 0xDA;
 const MARKER_EOI: u8 = 0xD9;
 const CI_JP: [u8; 2] = [0x4A, 0x50];
 /// Box instance number we write; readers group fragments by this value.
+#[cfg(feature = "test-support")]
 const BOX_INSTANCE: u16 = 1;
 /// Maximum `Le` field value (including the 2 length bytes).
+#[cfg(feature = "test-support")]
 const MAX_SEGMENT_LEN: usize = 0xFFFF;
 
 fn check_soi(data: &[u8]) -> Result<(), FormatError> {
@@ -360,6 +363,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 }
 
 /// Build the `APP11` segment bytes carrying `manifest_store`.
+#[cfg(feature = "test-support")]
 pub(crate) fn build_app11_segments(manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     if manifest_store.len() < 8 {
         return Err(FormatError::InvalidStructure {
@@ -407,6 +411,7 @@ pub(crate) fn build_app11_segments(manifest_store: &[u8]) -> Result<Vec<u8>, For
 
 /// Find the byte offset at which to insert `APP11` segments: after SOI and any
 /// leading `APP0` (JFIF) segment.
+#[cfg(feature = "test-support")]
 fn insertion_offset(data: &[u8]) -> Result<usize, FormatError> {
     check_soi(data)?;
     let mut insert_at = 2;
@@ -427,6 +432,7 @@ fn insertion_offset(data: &[u8]) -> Result<usize, FormatError> {
 /// unstripped asset would interleave two unrelated manifests' fragments under
 /// the same `(instance, sequence)` keys -- corrupting the JUMBF beyond repair
 /// rather than merely leaving a stale one.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     check_soi(asset)?;
     let spans = valid_app11_spans(asset)?;
@@ -443,6 +449,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// Insert a manifest store as `APP11` segments after SOI/APP0.
 ///
 /// Any existing C2PA `APP11` segments are stripped first (see [`strip`]).
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let at = insertion_offset(&clean)?;

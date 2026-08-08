@@ -103,6 +103,7 @@ pub(crate) fn walk_iso_boxes(
 /// Build a 32/64-bit ISOBMFF box header for `box_type` wrapping a payload of
 /// `payload_len` bytes (plus an optional fixed prefix already counted in
 /// `payload_len`). Returns the header bytes; the caller appends the payload.
+#[cfg(feature = "test-support")]
 pub(crate) fn iso_box_header(box_type: &[u8; 4], payload_len: usize) -> Vec<u8> {
     let total = 8 + payload_len;
     if (total as u64) < (1u64 << 32) {
@@ -120,10 +121,12 @@ pub(crate) fn iso_box_header(box_type: &[u8; 4], payload_len: usize) -> Vec<u8> 
 }
 
 /// Streaming CRC-32 (ISO 3309 / zlib polynomial `0xEDB88320`), table-free.
+#[cfg(feature = "test-support")]
 pub(crate) struct Crc32 {
     value: u32,
 }
 
+#[cfg(feature = "test-support")]
 impl Crc32 {
     /// Create a fresh CRC-32 accumulator.
     pub(crate) fn new() -> Self {
@@ -148,15 +151,18 @@ impl Crc32 {
 }
 
 /// CRC-32 of a single byte slice.
+#[cfg(feature = "test-support")]
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut c = Crc32::new();
     c.update(bytes);
     c.finalize()
 }
 
+#[cfg(feature = "test-support")]
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 (RFC 4648) encode with padding.
+#[cfg(feature = "test-support")]
 pub(crate) fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

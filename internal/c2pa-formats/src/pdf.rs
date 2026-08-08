@@ -315,6 +315,7 @@ fn find_obj_last(data: &[u8], num: u64, gen: u64) -> Option<usize> {
 }
 
 /// Find the last occurrence of `needle` in `data`.
+#[cfg(feature = "test-support")]
 fn rfind(data: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || data.len() < needle.len() {
         return None;
@@ -389,6 +390,7 @@ fn dict_span(data: &[u8], from: usize) -> Option<(usize, usize)> {
 
 /// The document `/Root` reference, `/Size`, previous `startxref`, and the raw
 /// `/ID` value from the most recent classic `trailer` dictionary.
+#[cfg(feature = "test-support")]
 struct TrailerInfo {
     root_num: u64,
     root_gen: u64,
@@ -402,6 +404,7 @@ struct TrailerInfo {
 
 /// Parse the classic cross-reference trailer(s). Errors if the PDF has no
 /// `trailer` keyword (cross-reference stream) or lacks `/Root`//`/Size`.
+#[cfg(feature = "test-support")]
 fn parse_trailer(asset: &[u8]) -> Result<TrailerInfo, FormatError> {
     if rfind(asset, b"trailer").is_none() {
         return Err(FormatError::UnsupportedVariant {
@@ -475,6 +478,7 @@ fn parse_trailer(asset: &[u8]) -> Result<TrailerInfo, FormatError> {
 /// re-emitted catalog carries exactly one `/AF` (the new one). Duplicate keys
 /// in a PDF dictionary are undefined behavior most readers resolve as
 /// "last wins" -- never rely on that.
+#[cfg(feature = "test-support")]
 fn strip_af_entries(body: &[u8]) -> Vec<u8> {
     let mut out = body.to_vec();
     while let Some(af) = find_name_last(&out, b"/AF") {
@@ -504,6 +508,7 @@ fn strip_af_entries(body: &[u8]) -> Vec<u8> {
 /// (original catalog with its `/AF` replaced), a classic `xref` section, and a
 /// `trailer`/`startxref`/`%%EOF` chained to the prior cross-reference section.
 /// The manifest store is stored uncompressed so [`extract`] round-trips it.
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     if !asset.starts_with(b"%PDF-") {
         return Err(FormatError::InvalidStructure {

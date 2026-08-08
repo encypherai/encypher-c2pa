@@ -146,6 +146,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 
 /// Remove every existing C2PA Application Extension block, leaving all other
 /// blocks and their order untouched. A no-op when the asset has no manifest.
+#[cfg(feature = "test-support")]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     let spans = find_c2pa_extensions(asset)?;
     if spans.is_empty() {
@@ -161,6 +162,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     Ok(out)
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn build_application_extension(manifest_store: &[u8]) -> Vec<u8> {
     let mut extension = Vec::with_capacity(manifest_store.len() + 32);
     extension.push(EXTENSION_INTRODUCER);
@@ -182,6 +184,7 @@ pub(crate) fn build_application_extension(manifest_store: &[u8]) -> Vec<u8> {
 /// reader happened to pick up the fresh manifest, but the stale extension was
 /// never actually removed (permanent orphan bytes, and one insertion-point
 /// change away from silently flipping to a stale-wins bug).
+#[cfg(feature = "test-support")]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let at = first_block_offset(&clean)?;

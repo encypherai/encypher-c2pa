@@ -35,7 +35,7 @@ The verifier reads local bytes. It does not upload the asset, fetch a trust list
 - Runs through one Rust core in the CLI, Python wheel, Go binding, and browser WASM package.
 - Optionally reports bounded validation failure codes, without sending customer content.
 
-It does not sign media. The repository contains no signing keys, no COSE signing paths, and no manifest embedding. For managed signing, policy, durable receipts, or hosted trust decisions, use the [Encypher API](https://api.encypher.com/docs).
+It does not sign media. The published API contains no signing keys, no COSE signing paths, and nothing that constructs a C2PA manifest or writes one into an asset. That boundary is enforced mechanically: every publicly reachable item is checked against a reviewed inventory (`public-surface.txt`) by `scripts/check-public-surface.mjs`, which CI runs on every push and before every release. For managed signing, policy, durable receipts, or hosted trust decisions, use the [Encypher API](https://api.encypher.com/docs).
 
 **Scope: open standards only.** The SDK verifies C2PA manifests and CAWG identity assertions. It does not detect or read Encypher's proprietary provenance markers (invisible text provenance, durable soft bindings, marker registries); content carrying those markers verifies here as ordinary C2PA content. For proprietary-marker detection and the full provenance record, use the [Encypher API](https://api.encypher.com/docs).
 
@@ -292,6 +292,8 @@ node ../../scripts/test-wasm.mjs
 ## Security boundary
 
 The public repository contains verification, parsing, format handling, signature checks, static caller-supplied trust evaluation, and the opt-in failure telemetry client. It excludes signing keys, managed trust policy, registry lookups, proprietary watermarking and fingerprinting, customer workflows, service credentials, and telemetry backends.
+
+Manifest construction and container writing are not part of the published API. The code exists in-tree, gated behind a `test-support` Cargo feature that no published dependency enables, because the format readers need inputs to test against. A consumer building these crates normally cannot reach it, and `scripts/check-public-surface.mjs` fails the build if anything crosses into the public surface without review.
 
 Default verification makes no network request. Opt-in failure telemetry follows the fixed privacy boundary described in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
 
