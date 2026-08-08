@@ -417,35 +417,74 @@ function checkObservableCfgs() {
   const files = spawnSync("find", [srcRoot, "-name", "*.rs"], { encoding: "utf8" })
     .stdout.split("\n").filter(Boolean);
 
-  // Targets the matrix documents. `unknown` covers wasm32-unknown-unknown.
-  const MATRIX_OS = new Set(["unknown"]);
-  const PUB_ITEM = /^\s*pub(\s*\(|\s+)(?!crate\b)/;
-  const ATTR_OR_DOC = /^\s*(#\[|#!\[|\/\/)/;
+  // Target values the matrix documents. `unknown` covers wasm32-unknown-unknown.
+  const MATRIX_VALUES = new Set(["unknown", "wasm32"]);
   const offenders = [];
 
   for (const file of files) {
-    const lines = readFileSync(file, "utf8").split("\n");
-    lines.forEach((line, i) => {
-      const m = line.match(/#\s*\[\s*cfg(?:_attr)?\s*\((.*)\)\s*\]/);
-      if (!m) return;
+    const src = readFileSync(file, "utf8");
+    const lines = src.split("\n");
 
-      // Only a cfg that gates a PUBLIC ITEM can change the public surface.
-      // Statement-level predicates inside a function body, and anything on a
-      // private item, cannot - flagging those made the guard fire on ordinary
-      // platform branches in private code.
-      let j = i + 1;
-      while (j < lines.length && (ATTR_OR_DOC.test(lines[j]) || lines[j].trim() === "")) j++;
-      if (j >= lines.length || !PUB_ITEM.test(lines[j])) return;
+    for (let i = 0; i < lines.length; i++) {
+      if (!/#\s*!?\s*\[\s*cfg(_attr)?\s*\(/.test(lines[i])) continue;
 
-      const pred = m[1];
-      if (/\bdoc\b/.test(pred) && !/\bdoc\s*=/.test(pred)) {
-        offenders.push(`${file}:${i + 1}  ${line.trim()}\n     gates: ${lines[j].trim().slice(0, 70)}\n     rustdoc DEFINES 'doc', so this item appears in no JSON on any target`);
+      // Consume the WHOLE attribute by balancing brackets. The first version
+      // matched a complete attribute on one line, and a reviewer walked past it
+      // by splitting `#[cfg_attr(\n doc,\n cfg(any())\n)]` across four lines.
+      let depth = 0, end = i, attr = "";
+      scan: for (let j = i; j < lines.length; j++) {
+        for (const ch of lines[j]) {
+          if (ch === "[" || ch === "(") depth++;
+          else if (ch === "]" || ch === ")") depth--;
+        }
+        attr += (j > i ? " " : "") + lines[j].trim();
+        end = j;
+        if (depth <= 0) break scan;
       }
-      const os = pred.match(/target_os\s*=\s*"([^"]+)"/);
-      if (os && !MATRIX_OS.has(os[1])) {
-        offenders.push(`${file}:${i + 1}  ${line.trim()}\n     gates: ${lines[j].trim().slice(0, 70)}\n     target_os '${os[1]}' is outside SURFACE_MATRIX`);
+
+      // Find the item the attribute applies to: skip further attributes,
+      // doc comments and blanks. `pub` and the item keyword may sit on
+      // separate lines, so inspect a small window rather than one line.
+      let k = end + 1;
+      while (k < lines.length &&
+             (/^\s*(#\s*!?\s*\[|\/\/)/.test(lines[k]) || lines[k].trim() === "")) {
+        if (/#\s*!?\s*\[\s*cfg(_attr)?\s*\(/.test(lines[k])) {
+          let d = 0;
+          for (let j = k; j < lines.length; j++) {
+            for (const ch of lines[j]) {
+              if (ch === "[" || ch === "(") d++;
+              else if (ch === "]" || ch === ")") d--;
+            }
+            k = j;
+            if (d <= 0) break;
+          }
+        }
+        k++;
       }
-    });
+      const window = lines.slice(k, k + 3).join(" ");
+      const gatesPublic = /(^|\s)pub(\s*\(\s*(?!crate\b)[^)]*\))?\s+(fn|struct|enum|trait|type|const|static|union|mod|use)\b/.test(window);
+      if (!gatesPublic) continue;
+
+      const gated = (lines[k] ?? "").trim().slice(0, 70);
+      const at = `${file}:${i + 1}`;
+
+      // `doc` in any position, including inside `cfg_attr` and nested
+      // predicates: rustdoc DEFINES it, so such an item is in no JSON it
+      // produces, on any target, under any feature set.
+      if (/\bdoc\b/.test(attr) && !/\bdoc\s*=/.test(attr)) {
+        offenders.push(`${at}\n     attr:  ${attr.slice(0, 90)}\n     gates: ${gated}\n     rustdoc defines 'doc'; this item appears in no rustdoc output`);
+        continue;
+      }
+
+      // ALL target predicates, not just the first `target_os`. A second
+      // alternative or a `target_env`/`target_family`/`target_arch` value
+      // outside the matrix is equally invisible.
+      for (const m of attr.matchAll(/target_(os|arch|env|family|vendor)\s*=\s*r?#*"([^"]+)"/g)) {
+        if (!MATRIX_VALUES.has(m[2])) {
+          offenders.push(`${at}\n     attr:  ${attr.slice(0, 90)}\n     gates: ${gated}\n     target_${m[1]} '${m[2]}' is outside SURFACE_MATRIX`);
+        }
+      }
+    }
   }
 
   if (offenders.length) {
@@ -454,7 +493,10 @@ function checkObservableCfgs() {
       offenders.slice(0, 8).join("\n") +
       "\n\nEither drop the predicate, make the item non-public, or extend\n" +
       "SURFACE_MATRIX to cover it and regenerate. An item the extraction cannot\n" +
-      "see is an item the inventory cannot vouch for.",
+      "see is an item the inventory cannot vouch for.\n\n" +
+      "This is a source scan, which is crude next to rustdoc. It exists only\n" +
+      "because rustdoc cannot report on the conditions under which rustdoc\n" +
+      "itself runs.",
     );
   }
 }

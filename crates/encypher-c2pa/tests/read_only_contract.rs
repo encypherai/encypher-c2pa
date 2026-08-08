@@ -123,17 +123,12 @@ fn verify_file_does_not_touch_the_file_it_reads() {
     let _ = fs::remove_file(&path);
 }
 
-/// Every extension the SDK will infer a MIME type for.
+/// The extensions come from the crate's own table, not a copy.
 ///
-/// Covering only one was a real gap: a reviewer hid a writer in the `.png`
-/// branch of `mime_from_path` and every test here still passed, because they
-/// all used `.jpg`. Format dispatch is exactly where a per-extension side
-/// effect hides, so each branch gets exercised.
-const EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "tif", "tiff", "gif", "svg", "avif", "heic", "mp4", "mov", "m4a",
-    "wav", "mp3", "flac", "ogg", "pdf", "zip", "docx", "ttf", "otf", "txt", "csv", "json", "md",
-    "html", "xml",
-];
+/// A hand-maintained list drifted from `mime_from_path` and omitted `.dng`,
+/// and a reviewer hid a writer in exactly that branch: every test here passed.
+/// Reading `SUPPORTED_EXTENSIONS` makes that class of gap impossible - a new
+/// extension is covered the moment it is added to the mapping.
 
 #[test]
 fn verify_file_touches_nothing_for_any_supported_extension() {
@@ -142,7 +137,7 @@ fn verify_file_touches_nothing_for_any_supported_extension() {
     let data = fixture("signed_test.jpg");
     let before = digest(&data);
 
-    for ext in EXTENSIONS {
+    for (ext, _mime) in encypher_c2pa::SUPPORTED_EXTENSIONS {
         let path = scratch("extensions", &format!("asset.{ext}"), &data);
         let dir = path.parent().expect("scratch parent").to_path_buf();
         let listing_before = listing(&dir);

@@ -380,41 +380,65 @@ pub fn supported_mime_types() -> Vec<&'static str> {
     mimes
 }
 
-/// Infer a canonical MIME type from a local filename.
+/// Every filename extension the SDK maps to a MIME type, with its mapping.
+///
+/// This is the single source of truth for extension inference. It is public so
+/// that callers can discover it and so that the non-mutation contract tests
+/// iterate the real table rather than a hand-copied list: a reviewer hid a
+/// writer in the `.dng` branch precisely because the test's own copy had
+/// drifted and omitted it.
+pub const SUPPORTED_EXTENSIONS: &[(&str, &str)] = &[
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("png", "image/png"),
+    ("webp", "image/webp"),
+    ("gif", "image/gif"),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+    ("dng", "image/x-adobe-dng"),
+    ("heic", "image/heic"),
+    ("heif", "image/heif"),
+    ("avif", "image/avif"),
+    ("jxl", "image/jxl"),
+    ("svg", "image/svg+xml"),
+    ("mp4", "video/mp4"),
+    ("m4v", "video/mp4"),
+    ("mov", "video/quicktime"),
+    ("avi", "video/x-msvideo"),
+    ("wav", "audio/wav"),
+    ("mp3", "audio/mpeg"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("flac", "audio/flac"),
+    ("ogg", "audio/ogg"),
+    ("oga", "audio/ogg"),
+    ("pdf", "application/pdf"),
+    ("epub", "application/epub+zip"),
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    ("odt", "application/vnd.oasis.opendocument.text"),
+    ("ttf", "font/ttf"),
+    ("otf", "font/otf"),
+    ("txt", "text/plain"),
+];
+
+/// Infer a MIME type from a filename extension, case-insensitively.
 pub fn mime_from_path(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    Some(match extension.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "tif" | "tiff" => "image/tiff",
-        "dng" => "image/x-adobe-dng",
-        "heic" => "image/heic",
-        "heif" => "image/heif",
-        "avif" => "image/avif",
-        "jxl" => "image/jxl",
-        "svg" => "image/svg+xml",
-        "mp4" | "m4v" => "video/mp4",
-        "mov" => "video/quicktime",
-        "avi" => "video/x-msvideo",
-        "wav" => "audio/wav",
-        "mp3" => "audio/mpeg",
-        "m4a" => "audio/mp4",
-        "aac" => "audio/aac",
-        "flac" => "audio/flac",
-        "ogg" | "oga" => "audio/ogg",
-        "pdf" => "application/pdf",
-        "epub" => "application/epub+zip",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "odt" => "application/vnd.oasis.opendocument.text",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "txt" => "text/plain",
-        _ => return None,
-    })
+    SUPPORTED_EXTENSIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == extension)
+        .map(|(_, mime)| *mime)
 }
 
 fn parse_trust(value: Option<&str>) -> Result<Option<TrustList>, Error> {

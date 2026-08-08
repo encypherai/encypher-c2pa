@@ -295,11 +295,39 @@ The public repository contains verification, parsing, format handling, signature
 
 Manifest construction and container writing are not part of the published API. The verification kernel lives in private modules of the single published library, so that code is unreachable from outside the crate by construction rather than by configuration, and the writers are additionally `cfg(test)` so they are not compiled into the released artifact at all. No Cargo feature can expose them.
 
-Two CI controls defend this, and it is worth being precise about what each one proves.
+Two CI controls defend this. Both are useful and neither is a proof, so it is
+worth being exact about what each one checks.
 
-`scripts/check-public-surface.mjs` locks the SHAPE of the API. It takes the public surface from rustdoc's own output - so re-exports, macro expansion, impl methods, fields and variants are resolved by the compiler rather than inferred - unions it across every target and feature configuration a consumer can build, locks the Cargo feature map to an approved set derived from `cargo metadata`, and diffs the result against a reviewed inventory (`public-surface.txt`). Anything newly public fails the build. It fails closed: an item kind it cannot name, an impl receiver it cannot resolve, a `cfg` predicate it structurally cannot observe, or any item its walk fails to reach is a failure, never a pass.
+`scripts/check-public-surface.mjs` locks the SHAPE of the API. It takes the
+public surface from rustdoc's own output, so re-exports, macro expansion, impl
+methods, fields and variants are resolved by the compiler rather than inferred,
+and diffs it against a reviewed inventory (`public-surface.txt`). It reads four
+configurations and unions them: the host under no features, under `telemetry`
+alone, and under defaults, plus `wasm32-unknown-unknown` under no features,
+which is what the browser binding builds. The Cargo feature map is locked to an
+approved set derived from `cargo metadata`, so a feature added implicitly by an
+optional dependency, or an approved feature redefined to pull in more, fails.
+Within that scope the walk refuses rather than guesses: an item kind it cannot
+name, an impl receiver it cannot resolve, or any item it fails to reach is a
+failure. A source-level tripwire additionally rejects public items behind a
+`cfg` the extraction structurally cannot observe - `cfg(doc)`, or a target
+outside those four - because rustdoc cannot report on the conditions rustdoc
+itself runs under.
 
-What that control cannot see is conduct. An already-approved function whose body is rewritten to write bytes leaves the inventory byte-for-byte unchanged. `crates/encypher-c2pa/tests/read_only_contract.rs` covers that axis from the other side, asserting every public entry point leaves its input byte-identical and creates no files, across every extension and MIME type the SDK accepts and on both success and failure paths. That is a regression test, not a proof: it constrains the behaviour it exercises. Together the two controls make a boundary violation something that has to defeat both a compiler-derived surface lock and an observable behaviour test, rather than something that depends on a reviewer noticing.
+What that control cannot see is conduct. An already-approved function whose body
+is rewritten to write bytes leaves the inventory byte-for-byte unchanged.
+`crates/encypher-c2pa/tests/read_only_contract.rs` covers that from the other
+side: for `verify`, `verify_with_options` and `verify_file`, it asserts the
+input is byte-identical afterwards and that no file is created or removed in the
+directory being read, across every extension in `SUPPORTED_EXTENSIONS` and every
+MIME from `supported_mime_types()`, on success and failure paths alike. It reads
+those lists from the crate rather than copying them, so a newly supported format
+is covered the moment it is added. It does not observe writes elsewhere on the
+filesystem, and it constrains the behaviour it exercises rather than proving a
+general property.
+
+Between them a boundary violation has to defeat a compiler-derived surface lock
+and an observable behaviour test, instead of depending on a reviewer noticing.
 
 Default verification makes no network request. Opt-in failure telemetry follows the fixed privacy boundary described in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
 
