@@ -487,11 +487,12 @@ function checkNoWriteCapability() {
     fail(
       `${offenders.length} write-capable call(s) in verification code`,
       offenders.slice(0, 8).join("\n") +
-      "\n\nA verifier reads. Only these modules may hold a write capability:\n" +
+      "\n\nA verifier reads. Only these modules are expected to write:\n" +
       [...WRITE_ALLOWED].map(([m, why]) => `  ${m} - ${why}`).join("\n") +
-      "\n\nIf a new module genuinely needs one, add it here with a reason, and\n" +
-      "expect that decision to be read closely: this is the control that stops\n" +
-      "an approved function from quietly growing a writer.",
+      "\n\nIf a new module genuinely needs one, add it here with a reason and\n" +
+      "expect that decision to be read closely. Note that this scan is a\n" +
+      "tripwire for the careless case, not a boundary: a determined author can\n" +
+      "obtain a write through an alias or a dependency without matching it.",
     );
   }
 }
@@ -545,8 +546,19 @@ function checkObservableCfgs() {
         }
         k++;
       }
-      const window = lines.slice(k, k + 3).join(" ");
-      const gatesPublic = /(^|\s)pub(\s*\(\s*(?!crate\b)[^)]*\))?\s+(fn|struct|enum|trait|type|const|static|union|mod|use)\b/.test(window);
+      // Accumulate the item header until it is unambiguous, rather than
+      // reading a fixed number of lines. A reviewer defeated a three-line
+      // window with two blank lines between `pub` and `fn`, so no span is
+      // assumed: blanks and comments are skipped and content is gathered
+      // until the declaration resolves.
+      let header = "";
+      for (let j = k; j < lines.length && !/[{;=]/.test(header); j++) {
+        const t = lines[j].replace(/\/\/.*$/, "").trim();
+        if (t === "") continue;
+        header += (header ? " " : "") + t;
+        if (/\b(fn|struct|enum|trait|type|const|static|union|mod|use)\b/.test(header)) break;
+      }
+      const gatesPublic = /(^|\s)pub(\s*\(\s*(?!crate\b)[^)]*\))?\s+(fn|struct|enum|trait|type|const|static|union|mod|use)\b/.test(header);
       if (!gatesPublic) continue;
 
       const gated = (lines[k] ?? "").trim().slice(0, 70);
