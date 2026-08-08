@@ -144,4 +144,45 @@ bar: 9.5  max-cycles: 5  worktree: ../encypher-c2pa-worktrees/verification-only
 branch: feat/verification-only
 plan gate: n/a (implementation-first; entered the loop at Phase 5 per the
   skill's entry table — work claimed complete)
-completion gate: not yet run
+completion gate: cycle 2 in progress
+
+  cycle 1 (gpt55/opus per dimension):
+    correctness    8.0 / 9.6  -> not cleared
+    simplification 7.2 / 9.3  -> not cleared
+    security       8.0 / 9.4  -> not cleared
+
+  Both reviewers converged independently on one root cause: the gate was a
+  hand-rolled Rust source scanner, and it was the wrong tool. GPT-5.5
+  demonstrated a third evasion (a multiline `impl ... where` header puts the
+  opening brace on its own line, which the impl regex did not match, so public
+  methods went unrecorded - proven by compiling a consumer and calling the
+  smuggled writer). Opus independently identified macro-generated public items
+  as a blind spot no source scanner can close, and flagged that the inventory
+  locked shape rather than semantics. GPT-5.5 also found the inventory polluted
+  with private-module internals: `encode::encode_into` was listed as public
+  while a consumer calling it gets E0603.
+
+  Three reviewers had now each found a different hole in the same scanner. That
+  is not a defect to patch, it is evidence the approach does not converge.
+
+  cycle 2 changes:
+    - Replaced the ~600-line source scanner with rustdoc JSON extraction, which
+      is rustc's own view of the public API. Re-exports, macro-generated items,
+      impl methods, fields and variants are resolved by the compiler, so the
+      whole class of lexing and reachability holes cannot exist.
+    - Pinned nightly-2026-08-07 in CI and asserted rustdoc's `format_version`
+      (61) on every run, so an unstable-schema change fails loudly instead of
+      silently producing a wrong inventory.
+    - Inventory regenerated from the compiler view: 602 accurate entries,
+      replacing 648 that included private-module internals.
+    - Documented that `compute_data_hash_exclusions` is load-bearing for
+      verification despite its signing-flavoured name, so a later reviewer does
+      not gate it by mistake (Opus, low).
+    - Corrected SECURITY.md's alpha-era support statement (Opus, low).
+    - Corrected the README's "every publicly reachable item" claim to describe
+      the actual rustdoc-derived mechanism (Opus, low).
+
+  Evasion battery re-run against the new gate, all caught:
+    A un-gated writer, B evasively-named writer, C brace-in-string-literal,
+    D pub use smuggle, E multiline impl-where (old gate MISSED), F
+    macro-generated item (no source scanner could catch).

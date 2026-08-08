@@ -498,12 +498,16 @@ pub fn embed_manifest(
 }
 
 /// Compute the byte ranges to exclude from a `c2pa.hash.data` assertion for an
-/// asset that already contains an embedded (placeholder) manifest.
+/// asset that already contains an embedded manifest.
 ///
-/// This is the second pass of two-pass signing: after [`embed_manifest`] writes
-/// a placeholder, the signer hashes `asset_with_placeholder` while excluding the
-/// ranges returned here, so the resulting hash does not depend on the manifest's
-/// own (not-yet-final) bytes.
+/// Despite the signing-flavoured name, this is load-bearing for VERIFICATION
+/// and is deliberately public and un-gated: the verifier calls it to resolve
+/// the manifest carrier span while checking `c2pa.hash.data`
+/// (`c2pa-validate/src/lib.rs`). Do not mistake it for orphaned writer surface.
+///
+/// It is also the second pass of two-pass signing, where a signer hashes an
+/// asset containing a placeholder manifest while excluding the ranges returned
+/// here, so the hash does not depend on the manifest's own bytes.
 ///
 /// Returns an empty `Vec` if the asset contains no manifest.
 pub fn compute_data_hash_exclusions(

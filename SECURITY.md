@@ -16,7 +16,7 @@ We will acknowledge a complete report within three business days. We coordinate 
 
 ## Supported versions
 
-During the alpha period, only the latest tagged alpha receives security fixes. The first stable release will define a longer support window here.
+While the project is in release-candidate status, only the latest tagged release candidate receives security fixes. The first stable release will define a longer support window here.
 
 ## Security properties
 
