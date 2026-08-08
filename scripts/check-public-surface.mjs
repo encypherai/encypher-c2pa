@@ -82,6 +82,11 @@ function emitRustdocJson(pkg) {
     "cargo",
     [TOOLCHAIN, "rustdoc", "-q", "-p", pkg, "--lib", "--",
      "-Z", "unstable-options", "--output-format", "json",
+     // `#[doc(hidden)] pub` is still callable by a downstream crate. Without
+     // this flag rustdoc omits those items and the gate would read their
+     // absence as "not public" - a reviewer demonstrated a doc-hidden writer
+     // passing the gate while a consumer embedded a real PNG manifest chunk.
+     "--document-hidden-items",
      "-A", "rustdoc::broken_intra_doc_links"],
     { cwd: root, encoding: "utf8" },
   );
@@ -113,8 +118,7 @@ function extract(doc, crateName) {
     if (item.crate_id !== 0) continue;
     const inner = item.inner ?? {};
 
-    // Inherent impls only. Trait impls are governed by the trait's own contract
-    // and include blanket impls (Borrow, From, ...) that are not our surface.
+    // Inherent impls: every method is surface, recorded individually.
     if (inner.impl && !inner.impl.trait) {
       const owner = typeName(inner.impl);
       if (owner) {
@@ -122,6 +126,26 @@ function extract(doc, crateName) {
           const m = index[mid];
           if (m?.name) out.add(`${crateName}::${owner}::${m.name} (method)`);
         }
+      }
+    }
+
+    // Explicit trait impls on our own public types ARE downstream API: a trait
+    // impl can expose arbitrary behaviour without adding any named item. A
+    // reviewer proved this with `impl BitOr<(&[u8], &[u8])> for AssetFormat`
+    // that wrote a PNG manifest chunk, which the gate passed because it
+    // skipped trait impls entirely.
+    //
+    // Recorded one line per (type, trait) pair rather than per method: the
+    // trait already fixes the method set, so the pair is what needs review,
+    // and per-method entries would bury it in derive noise.
+    //
+    // Synthetic (auto-trait) and blanket impls are excluded - they are derived
+    // by the compiler from other crates' generic impls, not authored here.
+    if (inner.impl?.trait && !inner.impl.is_synthetic && !inner.impl.blanket_impl) {
+      const owner = typeName(inner.impl);
+      const traitPath = inner.impl.trait.path;
+      if (owner && traitPath) {
+        out.add(`${crateName}::${owner}: ${traitPath} (trait impl)`);
       }
     }
 

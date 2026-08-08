@@ -57,15 +57,25 @@ a C2PA producer. It was restored, and the invariant sharpened to: *no public
 item may construct a C2PA manifest structure or write one into an asset
 container.*
 
-**Gate design.** An inventory, not a denylist. `scripts/check-public-surface.mjs`
-walks each published crate from its `lib.rs` through file-backed `pub mod`
-declarations, inventories public `pub use` re-exports, descends into local
-modules behind those re-exports, records public fields, enum variants, inherent
-methods, and trait implementations, skips items behind `#[cfg(test)]` or
-`#[cfg(feature = "test-support")]`, and fails closed on inline public modules,
-`#[path]` public modules, wildcard re-exports, and module-level macro
-invocations. It diffs the result against the reviewed `public-surface.txt`. Any
-item added under that model fails the build until a human adds it deliberately.
+**Gate design.** An inventory, not a denylist, and derived from the compiler
+rather than from source text. `scripts/check-public-surface.mjs` runs
+`cargo rustdoc --output-format json` for each published lib and reads rustdoc's
+own view of the public API, so re-exports, macro expansion, impl methods,
+fields and variants are resolved by rustc instead of guessed. It records named
+items, inherent methods, public fields, enum variants, and explicit trait impls
+on local types (one line per type/trait pair), and passes
+`--document-hidden-items` because `#[doc(hidden)] pub` is still callable
+downstream. Auto-trait and blanket impls are excluded: the compiler derives
+those from other crates' generic impls rather than this repo authoring them.
+The result is diffed against the reviewed `public-surface.txt`, and any
+addition fails the build until a human adds it deliberately.
+
+rustdoc JSON is nightly-only with an unstable schema. CI pins
+`nightly-2026-08-07`, and the script asserts rustdoc's `format_version` on every
+run so a schema change fails loudly instead of silently emitting a wrong
+inventory. Every failure path exits non-zero with a named reason: the gate
+cannot tell "no public writers" from "could not look", so it treats the second
+as failure.
 
 ## WBS
 
@@ -85,7 +95,7 @@ item added under that model fails the build until a human adds it deliberately.
 ## Success Criteria
 
 - Default build of every published crate exposes zero manifest constructors and
-  zero container writers; `public-surface.txt` holds 648 reviewed items.
+  zero container writers; `public-surface.txt` holds 844 reviewed items.
 - `cargo test --workspace` passes with the same 302 tests as before the change.
 - Each of the 8 packages builds and tests independently (no reliance on
   workspace feature unification).
@@ -100,9 +110,10 @@ item added under that model fails the build until a human adds it deliberately.
 |---|---|
 | Gate catches un-gated `embed_manifest` | FAIL as designed, item named |
 | Gate catches renamed writer `materialise` | FAIL as designed; old 5-symbol sweep misses it |
-| Gate catches re-exported private-module writer | FAIL as designed, `security_probe_writer` named |
-| Gate catches public writer method/field/variant drift | FAIL as designed, inventory covers public type members |
-| Public surface inventory | 648 items, zero writers |
+| Gate catches re-exported private-module writer | FAIL as designed, `smug::writer` named |
+| Gate catches `#[doc(hidden)] pub` writer | FAIL as designed, `hidden_embed_png` named |
+| Gate catches explicit trait-impl writer | FAIL as designed, `AssetFormat: BitOr (trait impl)` named |
+| Public surface inventory | 844 items, zero writers |
 | Per-package tests (8 packages) | 0 errors, 302 passed |
 
 ## Completion Notes
@@ -144,7 +155,7 @@ bar: 9.5  max-cycles: 5  worktree: ../encypher-c2pa-worktrees/verification-only
 branch: feat/verification-only
 plan gate: n/a (implementation-first; entered the loop at Phase 5 per the
   skill's entry table — work claimed complete)
-completion gate: cycle 2 in progress
+completion gate: cycle 3 in progress
 
   cycle 1 (gpt55/opus per dimension):
     correctness    8.0 / 9.6  -> not cleared
@@ -174,7 +185,7 @@ completion gate: cycle 2 in progress
       (61) on every run, so an unstable-schema change fails loudly instead of
       silently producing a wrong inventory.
     - Inventory regenerated from the compiler view: 602 accurate entries,
-      replacing 648 that included private-module internals.
+      replacing 648 that had included private-module internals.
     - Documented that `compute_data_hash_exclusions` is load-bearing for
       verification despite its signing-flavoured name, so a later reviewer does
       not gate it by mistake (Opus, low).
@@ -182,7 +193,41 @@ completion gate: cycle 2 in progress
     - Corrected the README's "every publicly reachable item" claim to describe
       the actual rustdoc-derived mechanism (Opus, low).
 
-  Evasion battery re-run against the new gate, all caught:
-    A un-gated writer, B evasively-named writer, C brace-in-string-literal,
-    D pub use smuggle, E multiline impl-where (old gate MISSED), F
-    macro-generated item (no source scanner could catch).
+  cycle 2 (gpt55/opus per dimension):
+    correctness    7.0 / 9.7  -> not cleared
+    simplification 7.4 / 9.6  -> not cleared
+    security       -   / 9.5  -> not cleared
+
+  Opus cleared all three and confirmed the rustdoc rewrite resolved its
+  cycle-1 medium outright. GPT-5.5 found two further evasions in the NEW gate
+  and demonstrated both end to end with a default-feature consumer:
+    - `#[doc(hidden)] pub` items are callable downstream, but rustdoc omits
+      them by default, so the gate read their absence as "not public". Its
+      probe embedded a real PNG `caBX` chunk through one while the gate passed.
+    - Explicit trait impls on our own public types were skipped entirely. Its
+      probe added `impl BitOr<(&[u8], &[u8])> for AssetFormat` that wrote a PNG
+      manifest chunk; the gate passed and a consumer extracted 50 bytes.
+  Both were design errors in the extraction, not lexing bugs - the previous
+  gate had the same two holes and nobody had reached them yet.
+
+  cycle 3 changes:
+    - Pass `--document-hidden-items` to rustdoc so `#[doc(hidden)] pub` items
+      are inventoried. Verified the flag does not admit private items:
+      `encode_into` (E0603 for a consumer) is still absent.
+    - Inventory explicit trait impls on local types, one line per type/trait
+      pair rather than per method: the trait already fixes the method set, and
+      per-method entries would bury the pair in derive noise. Auto-trait and
+      blanket impls stay excluded - the compiler derives those from other
+      crates' generic impls rather than this repo authoring them.
+    - Inventory grew 602 -> 844, the 242 additions being real trait impls
+      (`Debug`, `Display`, `Error`, `PartialEq`, ...) that were public all
+      along and simply unrecorded.
+    - Corrected the PRD's gate-design section and inventory counts, which still
+      described the deleted source-walking design (GPT-5.5, medium).
+
+  Evasion battery, all seven classes caught by the current gate:
+    B evasively-named writer, C brace-in-string-literal, D pub use smuggle,
+    E multiline impl-where, F macro-generated item,
+    G #[doc(hidden)] pub writer, H explicit trait-impl writer.
+    E and F could never be caught by source scanning; G and H were live holes
+    in the rustdoc gate until cycle 3.
