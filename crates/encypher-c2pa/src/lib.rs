@@ -5,6 +5,50 @@
 //! or an explicit per-call override.
 
 #![forbid(unsafe_code)]
+// The six modules below are the verification kernel. They are a mirror of the
+// engine that runs in Encypher's production signing service, kept file-for-file
+// so the code published here is provably the same program, not a reduced
+// lookalike. A private drift gate compares them byte-for-byte against the
+// production copy on every release.
+//
+// They were separate published crates until this change. That made 22,890 lines
+// of implementation into semver-bound public API with no consumer - 81% of the
+// reviewed public surface - and it is why manifest construction needed a Cargo
+// feature to hide it. As private modules they are unreachable by construction,
+// so the writers are simply `cfg(test)` and no feature can expose them.
+//
+// Suppressing `dead_code`/`unused_imports` here is deliberate and narrow to
+// these mirrors.
+// The public verifier exercises a subset of the kernel: the rest is reached by
+// the production signer (`c2pa-sign`, `c2pa-cli` on the private side). Deleting
+// what this crate happens not to call would fork the shared source and destroy
+// the property the mirror exists for.
+//
+// `allow` rather than `expect`, which would be preferable: the dead set differs
+// between the two compilations of this crate. Under `cargo build` the writers
+// are absent and much of the kernel is unused; under `cargo test` the
+// `cfg(test)` code exercises them. A single `expect` cannot be fulfilled in
+// both, so it fails the `--all-targets` lint run. `allow` is scoped to these
+// six mirrors and to these two lints only; nothing else in the crate is
+// exempted, and the surface gate is what actually holds the boundary.
+#[path = "c2pa-cbor/lib.rs"]
+#[allow(dead_code, reason = "production kernel mirror")]
+mod c2pa_cbor;
+#[path = "c2pa-core/lib.rs"]
+#[allow(dead_code, unused_imports, reason = "production kernel mirror")]
+mod c2pa_core;
+#[path = "c2pa-crypto/lib.rs"]
+#[allow(dead_code, unused_imports, reason = "production kernel mirror")]
+mod c2pa_crypto;
+#[path = "c2pa-formats/lib.rs"]
+#[allow(dead_code, unused_imports, reason = "production kernel mirror")]
+mod c2pa_formats;
+#[path = "c2pa-trust/lib.rs"]
+#[allow(dead_code, unused_imports, reason = "production kernel mirror")]
+mod c2pa_trust;
+#[path = "c2pa-validate/lib.rs"]
+#[allow(dead_code, unused_imports, reason = "production kernel mirror")]
+mod c2pa_validate;
 mod telemetry;
 mod telemetry_consent;
 
@@ -21,12 +65,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use c2pa_core::{
+use crate::c2pa_core::{
     spec::{canonicalize_mime, mimes_for_version},
     EngineProfile, SpecVersion,
 };
-use c2pa_trust::TrustList;
-use c2pa_validate::{
+use crate::c2pa_trust::TrustList;
+use crate::c2pa_validate::{
     verify_with_cawg_trust_policy_did_documents_and_strict_encoding_safe as verify_safe,
     StatusCode as CoreStatus, ValidationResults as CoreResults, VerifyInput,
     ASSERTION_BMFF_HASH_MALFORMED, ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH,
@@ -227,7 +271,7 @@ fn verify_with_options_inner(
 ) -> Result<VerificationReport, Error> {
     let mime = canonicalize_mime(mime_type);
     if !mimes_for_version(SpecVersion::V2_4).contains(&mime.as_str())
-        || c2pa_formats::AssetFormat::from_mime(&mime).is_none()
+        || crate::c2pa_formats::AssetFormat::from_mime(&mime).is_none()
     {
         return Err(Error::UnsupportedMime(mime));
     }
@@ -259,7 +303,9 @@ fn verify_with_options_inner(
         options.cawg_strict_encoding,
     )
     .map_err(|error| match error {
-        c2pa_validate::ValidateError::UnsupportedMime(value) => Error::UnsupportedMime(value),
+        crate::c2pa_validate::ValidateError::UnsupportedMime(value) => {
+            Error::UnsupportedMime(value)
+        }
         other => Error::Verification(other.to_string()),
     })?;
 
@@ -322,7 +368,7 @@ pub fn verify_file(
 pub fn supported_mime_types() -> Vec<&'static str> {
     let mut mimes: Vec<_> = mimes_for_version(SpecVersion::V2_4)
         .into_iter()
-        .filter(|mime| c2pa_formats::AssetFormat::from_mime(mime).is_some())
+        .filter(|mime| crate::c2pa_formats::AssetFormat::from_mime(mime).is_some())
         .collect();
     mimes.sort_unstable();
     mimes.dedup();

@@ -48,18 +48,39 @@ const inventoryPath = resolve(root, "public-surface.txt");
 // changed under us: re-read the extraction below before trusting any output.
 const FORMAT_VERSION = 61;
 
-// Crates published to crates.io: package name, lib name, and manifest dir.
-// Keep in sync with release.yml. `encypher-c2pa-cli` is a binary: it ships no
-// API to link against, so it has no surface to lock.
-const PUBLISHED_LIBS = [
-  ["encypher-c2pa-cbor", "c2pa_cbor", "internal/c2pa-cbor"],
-  ["encypher-c2pa-core", "c2pa_core", "internal/c2pa-core"],
-  ["encypher-c2pa-crypto", "c2pa_crypto", "internal/c2pa-crypto"],
-  ["encypher-c2pa-formats", "c2pa_formats", "internal/c2pa-formats"],
-  ["encypher-c2pa-trust", "c2pa_trust", "internal/c2pa-trust"],
-  ["encypher-c2pa-validate", "c2pa_validate", "internal/c2pa-validate"],
-  ["encypher-c2pa", "encypher_c2pa", "crates/encypher-c2pa"],
+// The single published library. Consolidating the six former implementation
+// crates into private modules of this one removed 758 of 931 inventory entries
+// - 81% of the reviewed surface - none of which had a consumer. It also removed
+// the `test-support` feature: the writers are private-module `cfg(test)` items
+// now, so no Cargo feature can reach them.
+//
+// `encypher-c2pa-cli` is a binary. It ships no API to link against, so it has
+// no surface to lock.
+const PUBLISHED_LIB = ["encypher-c2pa", "encypher_c2pa"];
+
+// Every feature configuration a consumer can select, and the exact feature
+// definitions permitted. rustdoc only ever describes the configuration Cargo
+// was asked to build, so checking the default build alone is not enough: a
+// reviewer demonstrated a writer exposed under a non-default feature while the
+// gate stayed green, and a second demonstrated redefining an already-approved
+// feature to pull in writers. The surface is therefore the UNION across every
+// reachable configuration, and the definitions are locked too, not just the
+// names.
+const FEATURE_CONFIGS = [
+  ["no features", ["--no-default-features"]],
+  ["telemetry only", ["--no-default-features", "--features", "telemetry"]],
+  ["default", []],
 ];
+
+// Canonical feature map, as Cargo resolves it - not as a TOML file spells it.
+// An optional dependency implicitly creates a same-named feature that never
+// appears in `[features]`; a reviewer used exactly that to smuggle a writer
+// past a hand-written manifest parser. `dep:` syntax suppresses the implicit
+// feature, which is why `telemetry` is spelled the way it is.
+const APPROVED_FEATURES = {
+  default: ["telemetry"],
+  telemetry: ["dep:ureq"],
+};
 
 const TOOLCHAIN = process.env.SURFACE_TOOLCHAIN ?? "+nightly";
 
@@ -77,10 +98,10 @@ async function exists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
-function emitRustdocJson(pkg) {
+function emitRustdocJson(pkg, featureArgs) {
   const r = spawnSync(
     "cargo",
-    [TOOLCHAIN, "rustdoc", "-q", "-p", pkg, "--lib", "--",
+    [TOOLCHAIN, "rustdoc", "-q", "-p", pkg, "--lib", ...featureArgs, "--",
      "-Z", "unstable-options", "--output-format", "json",
      // `#[doc(hidden)] pub` is still callable by a downstream crate. Without
      // this flag rustdoc omits those items and the gate would read their
@@ -93,6 +114,53 @@ function emitRustdocJson(pkg) {
   if (r.status !== 0) {
     fail(`could not produce rustdoc JSON for ${pkg}`,
          (r.stderr || r.error?.message || "unknown error").trim().split("\n").slice(-8).join("\n"));
+  }
+}
+
+// Lock the feature map to what CARGO resolves, not what a TOML file spells.
+// This is the only way to see implicit features created by optional
+// dependencies, inline-table and dotted forms, target-specific optional deps,
+// and renamed dependencies - all of which a hand-written parser missed.
+function checkFeatures(pkg) {
+  const r = spawnSync("cargo", ["metadata", "--no-deps", "--format-version", "1"],
+                      { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) fail("cargo metadata failed", (r.stderr || "").trim().split("\n").slice(-5).join("\n"));
+
+  let meta;
+  try { meta = JSON.parse(r.stdout); } catch (e) { fail("cargo metadata output is unreadable", e.message); }
+
+  const p = meta.packages.find(x => x.name === pkg);
+  if (!p) fail(`cargo metadata has no package ${pkg}`);
+
+  const actual = p.features ?? {};
+  const norm = (m) => Object.fromEntries(
+    Object.entries(m).map(([k, v]) => [k, [...v].sort()]).sort(([a], [b]) => a.localeCompare(b)));
+  const a = JSON.stringify(norm(actual), null, 2);
+  const b = JSON.stringify(norm(APPROVED_FEATURES), null, 2);
+  if (a !== b) {
+    fail(
+      `the feature map of ${pkg} does not match the approved set`,
+      `cargo resolves:\n${a}\n\napproved:\n${b}\n\n` +
+      "Feature names AND definitions are locked. A new feature - including one\n" +
+      "Cargo creates implicitly from an optional dependency - can expose API the\n" +
+      "default build never shows, and redefining an approved feature can pull in\n" +
+      "code that was never reviewed. If this change is intended, update\n" +
+      "APPROVED_FEATURES and FEATURE_CONFIGS together and regenerate.",
+    );
+  }
+
+  // Every declared feature must be covered by a rustdoc configuration below,
+  // or its surface is never inspected.
+  const covered = new Set(FEATURE_CONFIGS.flatMap(([, args]) => {
+    const i = args.indexOf("--features");
+    return i === -1 ? [] : args[i + 1].split(",");
+  }));
+  covered.add("default");
+  for (const f of Object.keys(actual)) {
+    if (!covered.has(f)) {
+      fail(`feature '${f}' is declared but no rustdoc configuration inspects it`,
+           "Add a configuration to FEATURE_CONFIGS that enables it.");
+    }
   }
 }
 
@@ -314,52 +382,36 @@ function extract(doc, crateName) {
   return out;
 }
 
-// Cargo features a consumer can enable are part of the published surface, and
-// rustdoc only ever shows the configuration it was asked to build. A reviewer
-// proved the gap: adding a feature and hiding a PNG writer behind it left the
-// default surface identical, the gate green, and a downstream crate that
-// enabled the feature recovered an embedded manifest.
-//
-// Rather than build every feature combination, features themselves go into the
-// inventory. A new feature on a published crate is then a new line, reviewed
-// exactly like a new function - which is the same inversion the item walk uses.
-async function declaredFeatures(pkg, dir) {
-  const manifest = await readFile(resolve(root, dir, "Cargo.toml"), "utf8");
-  const section = manifest.split(/^\[/m).find(s => s.startsWith("features]"));
-  if (!section) return [];
-  return section
-    .split("\n").slice(1)
-    .map(l => l.split("#")[0].trim())
-    .filter(l => l.includes("="))
-    .map(l => l.split("=")[0].trim())
-    .filter(Boolean)
-    .map(f => `${pkg}::feature:${f}`);
-}
+const [PKG, LIB] = PUBLISHED_LIB;
 
+checkFeatures(PKG);
+
+// The published surface is the UNION over every reachable configuration.
+// Checking only the default build let a reviewer expose a writer behind a
+// non-default feature while the gate reported PASS.
 const surface = new Set();
-for (const [pkg, lib, dir] of PUBLISHED_LIBS) {
-  for (const f of await declaredFeatures(pkg, dir)) surface.add(f);
-  emitRustdocJson(pkg);
-  const jsonPath = resolve(root, "target/doc", `${lib}.json`);
-  if (!(await exists(jsonPath))) fail(`rustdoc produced no JSON for ${pkg} at ${jsonPath}`);
+for (const [label, featureArgs] of FEATURE_CONFIGS) {
+  emitRustdocJson(PKG, featureArgs);
+  const jsonPath = resolve(root, "target/doc", `${LIB}.json`);
+  if (!(await exists(jsonPath))) fail(`rustdoc produced no JSON for ${PKG} (${label}) at ${jsonPath}`);
 
   let doc;
   try {
     doc = JSON.parse(await readFile(jsonPath, "utf8"));
   } catch (err) {
-    fail(`rustdoc JSON for ${pkg} is unreadable`, err.message);
+    fail(`rustdoc JSON for ${PKG} (${label}) is unreadable`, err.message);
   }
 
   if (doc.format_version !== FORMAT_VERSION) {
     fail(
-      `rustdoc JSON schema changed for ${pkg}: expected format_version ${FORMAT_VERSION}, got ${doc.format_version}`,
+      `rustdoc JSON schema changed: expected format_version ${FORMAT_VERSION}, got ${doc.format_version}`,
       "The extraction in this script was written against the expected schema.\n" +
       "Re-read it against the new one, then update FORMAT_VERSION and regenerate\n" +
       "the inventory in the same commit.",
     );
   }
 
-  for (const entry of extract(doc, pkg)) surface.add(entry);
+  for (const entry of extract(doc, PKG)) surface.add(entry);
 }
 
 const current = [...surface].sort();

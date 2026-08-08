@@ -293,7 +293,9 @@ node ../../scripts/test-wasm.mjs
 
 The public repository contains verification, parsing, format handling, signature checks, static caller-supplied trust evaluation, and the opt-in failure telemetry client. It excludes signing keys, managed trust policy, registry lookups, proprietary watermarking and fingerprinting, customer workflows, service credentials, and telemetry backends.
 
-Manifest construction and container writing are not part of the published API. The code exists in-tree, gated behind a `test-support` Cargo feature that no published dependency enables, because the format readers need inputs to test against. A consumer building these crates normally cannot reach it, and `scripts/check-public-surface.mjs` fails the build if anything crosses into the public surface without review.
+Manifest construction and container writing are not part of the published API. The verification kernel lives in private modules of the single published library, so that code is unreachable from outside the crate by construction rather than by configuration, and the writers are additionally `cfg(test)` so they are not compiled into the released artifact at all. No Cargo feature can expose them.
+
+`scripts/check-public-surface.mjs` enforces this. It takes the public API from rustdoc's own output across every feature configuration a consumer can select, locks the Cargo feature map to an approved set derived from `cargo metadata`, and diffs the result against a reviewed inventory (`public-surface.txt`). Anything newly public fails the build.
 
 Default verification makes no network request. Opt-in failure telemetry follows the fixed privacy boundary described in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
 

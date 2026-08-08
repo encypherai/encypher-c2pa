@@ -388,24 +388,32 @@ dependencies = [
 name = "encypher-c2pa"
 version = "1.0.0-rc.11"
 dependencies = [
- "encypher-c2pa-core",
- "encypher-c2pa-formats",
- "encypher-c2pa-trust",
- "encypher-c2pa-validate",
+ "c2pa-text",
+ "cms",
+ "const-oid",
+ "der",
+ "ecdsa",
+ "ed25519-dalek",
+ "hex",
+ "miniz_oxide",
+ "p256",
+ "p384",
+ "p521",
+ "pkcs8",
+ "rand_core",
+ "rcgen",
+ "rsa",
  "serde",
  "serde_json",
+ "sha2",
+ "signature",
+ "spki",
  "thiserror",
  "time",
+ "unicode-normalization",
  "ureq",
-]
-
-[[package]]
-name = "encypher-c2pa-cbor"
-version = "1.0.0-rc.11"
-dependencies = [
- "hex",
- "sha2",
- "thiserror",
+ "x509-cert",
+ "x509-tsp",
 ]
 
 [[package]]
@@ -421,57 +429,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "encypher-c2pa-core"
-version = "1.0.0-rc.11"
-dependencies = [
- "encypher-c2pa-cbor",
- "encypher-c2pa-core",
- "hex",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "encypher-c2pa-crypto"
-version = "1.0.0-rc.11"
-dependencies = [
- "der",
- "ed25519-dalek",
- "encypher-c2pa-cbor",
- "p256",
- "p384",
- "p521",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "signature",
- "spki",
- "thiserror",
- "x509-cert",
-]
-
-[[package]]
 name = "encypher-c2pa-ffi"
 version = "1.0.0-rc.11"
 dependencies = [
  "encypher-c2pa",
  "serde_json",
-]
-
-[[package]]
-name = "encypher-c2pa-formats"
-version = "1.0.0-rc.11"
-dependencies = [
- "c2pa-text",
- "encypher-c2pa-cbor",
- "encypher-c2pa-core",
- "encypher-c2pa-formats",
- "miniz_oxide",
- "serde_json",
- "sha2",
- "thiserror",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -481,51 +443,6 @@ dependencies = [
  "encypher-c2pa",
  "pyo3",
  "serde_json",
-]
-
-[[package]]
-name = "encypher-c2pa-trust"
-version = "1.0.0-rc.11"
-dependencies = [
- "cms",
- "const-oid",
- "der",
- "ecdsa",
- "ed25519-dalek",
- "hex",
- "p256",
- "p384",
- "p521",
- "rcgen",
- "rsa",
- "sha2",
- "spki",
- "thiserror",
- "time",
- "x509-cert",
- "x509-tsp",
-]
-
-[[package]]
-name = "encypher-c2pa-validate"
-version = "1.0.0-rc.11"
-dependencies = [
- "cms",
- "const-oid",
- "der",
- "ed25519-dalek",
- "encypher-c2pa-cbor",
- "encypher-c2pa-core",
- "encypher-c2pa-crypto",
- "encypher-c2pa-formats",
- "encypher-c2pa-trust",
- "rcgen",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "time",
- "x509-cert",
 ]
 
 [[package]]

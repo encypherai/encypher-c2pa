@@ -19,18 +19,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
-      - name: Publish support crates and public packages
+      - name: Publish the library and CLI
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          # Two packages, not eight. The six implementation crates
+          # (encypher-c2pa-{cbor,core,crypto,formats,trust,validate}) were
+          # folded into private modules of the library: they had no consumer,
+          # they were 81% of the reviewed public API, and publishing them is
+          # what forced manifest construction to hide behind a Cargo feature.
+          #
+          # Their existing versions through 1.0.0-rc.11 stay on crates.io and
+          # are deliberately NOT yanked - older facade releases exact-pin them,
+          # and yanking would break fresh resolution of those versions.
           packages=(
-            encypher-c2pa-cbor
-            encypher-c2pa-core
-            encypher-c2pa-formats
-            encypher-c2pa-trust
-            encypher-c2pa-crypto
-            encypher-c2pa-validate
             encypher-c2pa
             encypher-c2pa-cli
           )

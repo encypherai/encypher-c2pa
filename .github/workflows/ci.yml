@@ -30,7 +30,7 @@ jobs:
       # Fails when anything becomes publicly reachable that is not in the
       # reviewed inventory. This repository publishes a verification-only SDK;
       # manifest construction and container writing live behind the
-      # `test-support` feature and must never appear here. The surface comes
+      # writers live in private modules and must never appear here. The surface comes
       # from rustdoc's own view, so re-exports, macro-generated items and impl
       # methods are resolved by rustc rather than guessed.
       - run: node scripts/check-public-surface.mjs

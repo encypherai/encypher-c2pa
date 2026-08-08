@@ -1,12 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "internal/c2pa-cbor",
-  "internal/c2pa-core",
-  "internal/c2pa-crypto",
-  "internal/c2pa-formats",
-  "internal/c2pa-trust",
-  "internal/c2pa-validate",
   "crates/encypher-c2pa",
   "crates/encypher-c2pa-cli",
   "bindings/c",

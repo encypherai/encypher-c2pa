@@ -17,12 +17,32 @@ default = ["telemetry"]
 telemetry = ["dep:ureq"]
 
 [dependencies]
-c2pa-core = { package = "encypher-c2pa-core", version = "=1.0.0-rc.11", path = "../../internal/c2pa-core" }
-c2pa-formats = { package = "encypher-c2pa-formats", version = "=1.0.0-rc.11", path = "../../internal/c2pa-formats" }
-c2pa-trust = { package = "encypher-c2pa-trust", version = "=1.0.0-rc.11", path = "../../internal/c2pa-trust" }
-c2pa-validate = { package = "encypher-c2pa-validate", version = "=1.0.0-rc.11", path = "../../internal/c2pa-validate" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true, features = ["oid"] }
+hex = { workspace = true }
 thiserror = { workspace = true }
+c2pa-text = { workspace = true }
+x509-cert = { workspace = true, features = ["pem"] }
+spki = { workspace = true }
+const-oid = { workspace = true }
+der = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing"] }
+p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+p384 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+p521 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+ecdsa = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+pkcs8 = { workspace = true }
+signature = { workspace = true }
+rand_core = { workspace = true }
+cms = { workspace = true }
+x509-tsp = { workspace = true }
+unicode-normalization = "0.1"
+miniz_oxide = "0.8"
 ureq = { version = "2.12.1", optional = true, default-features = false, features = ["json", "tls"] }
+
+[dev-dependencies]
+time = { workspace = true, features = ["macros"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
