@@ -155,7 +155,7 @@ bar: 9.5  max-cycles: 5  worktree: ../encypher-c2pa-worktrees/verification-only
 branch: feat/verification-only
 plan gate: n/a (implementation-first; entered the loop at Phase 5 per the
   skill's entry table — work claimed complete)
-completion gate: cycle 3 in progress
+completion gate: cycle 4 in progress
 
   cycle 1 (gpt55/opus per dimension):
     correctness    8.0 / 9.6  -> not cleared
@@ -231,3 +231,44 @@ completion gate: cycle 3 in progress
     G #[doc(hidden)] pub writer, H explicit trait-impl writer.
     E and F could never be caught by source scanning; G and H were live holes
     in the rustdoc gate until cycle 3.
+  cycle 3 (gpt55/opus per dimension):
+    correctness    -   / 9.6  -> not cleared
+    simplification -   / 9.3  -> not cleared
+    security       -   / 9.0  -> not cleared
+
+  Opus verified the cycle-3 fixes landed, then found a FOURTH reachability
+  miss and demonstrated it in a throwaway crate using the script's exact
+  rustdoc flags and extraction logic. `typeName` resolved an impl's owner only
+  through `resolved_path`, so any impl whose receiver was not a bare nominal
+  path returned null - and both impl branches then SILENTLY SKIPPED it. That is
+  fail-open inside a control whose header promises the opposite. Adding a
+  single `&` to the cycle-2 probe reopened it: references are `#[fundamental]`,
+  so `impl BitOr<...> for &AssetFormat` is legal and a caller reaches it with
+  `(&fmt) | args`, but the gate never saw it.
+
+  Four reachability misses in four cycles - doc-hidden, value trait impl,
+  reference trait impl, and the earlier lexing holes - say that enumerating
+  receiver shapes one at a time does not converge.
+
+  cycle 4 changes:
+    - `typeName` now resolves through fundamental wrappers (references, raw
+      pointers, slices, arrays, tuples, primitives, generics), so
+      `&AssetFormat` is inventoried as `&AssetFormat`.
+    - Structural fix, and the one that matters: an impl authored in this crate
+      whose receiver cannot be named is now a FAILURE, not a skip. The script
+      prints the offending impl and the raw receiver JSON and exits non-zero.
+      Unknown shapes can no longer pass silently, which closes the class rather
+      than the instance. Verified with `impl Smuggle for dyn Debug`, a shape
+      `typeName` deliberately does not handle: the gate fails and names it.
+
+  Evasion battery, nine classes, all fail closed:
+    B evasively-named, C brace-in-string, D pub use smuggle,
+    E multiline impl-where, F macro-generated, G #[doc(hidden)] pub,
+    H value-receiver trait impl, I reference-receiver trait impl,
+    J unnameable receiver (fails closed by construction).
+
+  Standing recommendation from both reviewers, not actioned: if maintaining
+  this extraction keeps costing review cycles, replace it with
+  `cargo public-api`, which handles receiver shapes and schema churn as a
+  maintained concern. The fail-closed default above is what makes the current
+  implementation safe to keep in the meantime.

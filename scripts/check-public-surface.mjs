@@ -112,40 +112,72 @@ function extract(doc, crateName) {
     out.add(`${crateName}::${p.path.slice(1).join("::")} (${p.kind})`);
   }
 
-  const typeName = (im) => im.for?.resolved_path?.path ?? null;
+  // Name the type an impl block is written for.
+  //
+  // Receivers are not always a bare nominal path. `impl Trait for &Format` is
+  // legal because references are #[fundamental], and a caller reaches it with
+  // `(&fmt) | args`. Earlier revisions resolved only `resolved_path`, returned
+  // null for anything else, and then SKIPPED the impl - fail-open inside a
+  // control that promises the opposite. A reviewer demonstrated a writer
+  // hidden that way by adding a single `&` to a previously-caught probe.
+  //
+  // Returns null only when the shape is genuinely unnameable here; callers
+  // must treat null as a failure, never as "nothing to record".
+  const typeName = (ty) => {
+    if (!ty) return null;
+    if (ty.resolved_path?.path) return ty.resolved_path.path;
+    // Fundamental wrappers: the impl is reachable through the inner type.
+    if (ty.borrowed_ref?.type) {
+      const inner = typeName(ty.borrowed_ref.type);
+      return inner ? `&${inner}` : null;
+    }
+    if (ty.raw_pointer?.type) {
+      const inner = typeName(ty.raw_pointer.type);
+      return inner ? `*${inner}` : null;
+    }
+    if (ty.slice) { const i = typeName(ty.slice); return i ? `[${i}]` : null; }
+    if (ty.array?.type) { const i = typeName(ty.array.type); return i ? `[${i}; N]` : null; }
+    if (ty.tuple) {
+      const parts = ty.tuple.map(typeName);
+      return parts.every(Boolean) ? `(${parts.join(", ")})` : null;
+    }
+    if (typeof ty.primitive === "string") return ty.primitive;
+    if (typeof ty.generic === "string") return ty.generic;
+    return null;
+  };
 
   for (const item of Object.values(index)) {
     if (item.crate_id !== 0) continue;
     const inner = item.inner ?? {};
 
-    // Inherent impls: every method is surface, recorded individually.
-    if (inner.impl && !inner.impl.trait) {
-      const owner = typeName(inner.impl);
-      if (owner) {
-        for (const mid of inner.impl.items ?? []) {
+    // Auto-trait and blanket impls are excluded: the compiler derives those
+    // from other crates' generic impls rather than this repo authoring them.
+    const im = inner.impl;
+    if (im && !im.is_synthetic && !im.blanket_impl) {
+      const owner = typeName(im.for);
+
+      // An impl written in this crate that cannot be named is exactly the case
+      // a bypass hides in. Refuse to pass rather than drop it.
+      if (!owner) {
+        fail(
+          "an impl block in this crate has a receiver type this script cannot name",
+          `${crateName}: impl ${im.trait?.path ?? "(inherent)"} for <unnameable>\n` +
+          `receiver JSON: ${JSON.stringify(im.for).slice(0, 300)}\n\n` +
+          "Teach typeName() this shape, then regenerate the inventory. Skipping\n" +
+          "it would let a public writer through, which is how a reviewer\n" +
+          "smuggled one past an earlier revision using `for &Type`.",
+        );
+      }
+
+      if (im.trait) {
+        // One line per (type, trait) pair: the trait already fixes the method
+        // set, and per-method entries would bury the pair in derive noise.
+        out.add(`${crateName}::${owner}: ${im.trait.path} (trait impl)`);
+      } else {
+        for (const mid of im.items ?? []) {
           const m = index[mid];
           if (m?.name) out.add(`${crateName}::${owner}::${m.name} (method)`);
         }
-      }
-    }
-
-    // Explicit trait impls on our own public types ARE downstream API: a trait
-    // impl can expose arbitrary behaviour without adding any named item. A
-    // reviewer proved this with `impl BitOr<(&[u8], &[u8])> for AssetFormat`
-    // that wrote a PNG manifest chunk, which the gate passed because it
-    // skipped trait impls entirely.
-    //
-    // Recorded one line per (type, trait) pair rather than per method: the
-    // trait already fixes the method set, so the pair is what needs review,
-    // and per-method entries would bury it in derive noise.
-    //
-    // Synthetic (auto-trait) and blanket impls are excluded - they are derived
-    // by the compiler from other crates' generic impls, not authored here.
-    if (inner.impl?.trait && !inner.impl.is_synthetic && !inner.impl.blanket_impl) {
-      const owner = typeName(inner.impl);
-      const traitPath = inner.impl.trait.path;
-      if (owner && traitPath) {
-        out.add(`${crateName}::${owner}: ${traitPath} (trait impl)`);
       }
     }
 
