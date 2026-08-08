@@ -412,6 +412,90 @@ function extract(doc, crateName) {
 // it is a tripwire on the ONE thing rustdoc cannot report on itself. Finding
 // such a predicate is not proof of a writer, only proof that the inventory
 // cannot speak for that code - so the gate refuses rather than guessing.
+// Forbid the CAPABILITY to write, not just the appearance of a writer.
+//
+// Everything else here reasons about the SHAPE of the API: which items are
+// public, under which features and targets. Shape cannot see conduct. A
+// reviewer demonstrated that three times by leaving the signature of an
+// approved function alone and rewriting its body to splice a manifest carrier
+// into the caller's file - the inventory did not move, and only a test that
+// happened to exercise that exact path could notice.
+//
+// This closes the class instead of the instances. A verifier reads; it has no
+// business calling a filesystem mutator at all. Exactly one module legitimately
+// does - the opt-in telemetry consent file - so that is named, and any other
+// production reference to a write-capable API fails the build. A rewritten body
+// cannot then write anything without also tripping this, whatever its shape.
+//
+// `cfg(test)` code is skipped: fixture builders write freely and are not
+// compiled into the released artifact.
+const WRITE_CAPABLE = [
+  [/\bfs::write\b/, "fs::write"],
+  [/\bfs::remove_(file|dir|dir_all)\b/, "fs::remove_*"],
+  [/\bfs::rename\b/, "fs::rename"],
+  [/\bfs::create_dir(_all)?\b/, "fs::create_dir*"],
+  [/\bfs::copy\b/, "fs::copy"],
+  [/\bfs::set_permissions\b/, "fs::set_permissions"],
+  [/\bfs::(hard_link|soft_link)\b/, "fs::*link"],
+  [/\bFile::create(_new)?\b/, "File::create"],
+  [/\bOpenOptions\b/, "OpenOptions"],
+  [/\bprocess::Command\b/, "process::Command"],
+];
+
+// Modules permitted to hold a write capability, with the reason.
+const WRITE_ALLOWED = new Map([
+  ["telemetry_consent.rs", "persists the user's opt-in telemetry choice"],
+]);
+
+function checkNoWriteCapability() {
+  const srcRoot = resolve(root, "crates/encypher-c2pa/src");
+  const files = spawnSync("find", [srcRoot, "-name", "*.rs"], { encoding: "utf8" })
+    .stdout.split("\n").filter(Boolean);
+
+  const offenders = [];
+  for (const file of files) {
+    const base = file.split("/").pop();
+    if (WRITE_ALLOWED.has(base)) continue;
+
+    const lines = readFileSync(file, "utf8").split("\n");
+
+    // Skip `#[cfg(test)] mod ... { ... }` regions by brace balance.
+    const skip = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      if (!/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/.test(lines[i])) continue;
+      let depth = 0, started = false;
+      for (let j = i; j < lines.length; j++) {
+        for (const ch of lines[j]) {
+          if (ch === "{") { depth++; started = true; }
+          else if (ch === "}") depth--;
+        }
+        skip.add(j);
+        if (started && depth <= 0) break;
+      }
+    }
+
+    lines.forEach((line, i) => {
+      if (skip.has(i)) return;
+      const code = line.replace(/\/\/.*$/, "");
+      for (const [re, name] of WRITE_CAPABLE) {
+        if (re.test(code)) offenders.push(`${file}:${i + 1}  ${name}\n     ${line.trim().slice(0, 80)}`);
+      }
+    });
+  }
+
+  if (offenders.length) {
+    fail(
+      `${offenders.length} write-capable call(s) in verification code`,
+      offenders.slice(0, 8).join("\n") +
+      "\n\nA verifier reads. Only these modules may hold a write capability:\n" +
+      [...WRITE_ALLOWED].map(([m, why]) => `  ${m} - ${why}`).join("\n") +
+      "\n\nIf a new module genuinely needs one, add it here with a reason, and\n" +
+      "expect that decision to be read closely: this is the control that stops\n" +
+      "an approved function from quietly growing a writer.",
+    );
+  }
+}
+
 function checkObservableCfgs() {
   const srcRoot = resolve(root, "crates/encypher-c2pa/src");
   const files = spawnSync("find", [srcRoot, "-name", "*.rs"], { encoding: "utf8" })
@@ -505,6 +589,7 @@ const [PKG, LIB] = PUBLISHED_LIB;
 
 checkFeatures(PKG);
 checkObservableCfgs();
+checkNoWriteCapability();
 
 // The published surface is the UNION over the whole (target, features) matrix.
 // Inspecting a single point let reviewers hide a writer twice: once behind a
