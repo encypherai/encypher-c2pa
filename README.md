@@ -46,7 +46,7 @@ Tagged releases publish the packages below. For an unreleased checkout, use [Bui
 ### CLI
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.0-rc.10
+cargo install encypher-c2pa-cli --version 1.0.0-rc.11
 encypher-c2pa verify composition.mp4
 encypher-c2pa verify composition.mp4 --json
 encypher-c2pa formats
@@ -58,7 +58,7 @@ Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupport
 
 ```toml
 [dependencies]
-encypher-c2pa = "=1.0.0-rc.10"
+encypher-c2pa = "=1.0.0-rc.11"
 ```
 
 ```rust
@@ -89,7 +89,7 @@ The wheel supports Python 3.9 and later through the stable ABI.
 ### Browser JavaScript
 
 ```bash
-npm install @encypherai/c2pa@next
+npm install @encypherai/c2pa
 ```
 
 ```js

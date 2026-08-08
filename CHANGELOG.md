@@ -2,6 +2,10 @@
 
 All notable changes to this project are recorded here.
 
+## 1.0.0-rc.11 - 2026-08-08
+
+- Corrected the browser install command to use the package's active `latest` tag. The `next` tag intentionally trails while no stable release exists because npm OIDC publishing can assign only one tag per publish.
+
 ## 1.0.0-rc.10 - 2026-08-08
 
 - Removed the signing-specific `prehashed_binding` extractor and `PrehashedBinding` type from the published validator. The generic detached `verify_prehashed_manifest` verifier remains public.
