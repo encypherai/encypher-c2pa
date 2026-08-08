@@ -48,17 +48,17 @@ const inventoryPath = resolve(root, "public-surface.txt");
 // changed under us: re-read the extraction below before trusting any output.
 const FORMAT_VERSION = 61;
 
-// Crates published to crates.io, with their lib names. Keep in sync with
-// release.yml. `encypher-c2pa-cli` is a binary: it ships no API to link
-// against, so it has no surface to lock.
+// Crates published to crates.io: package name, lib name, and manifest dir.
+// Keep in sync with release.yml. `encypher-c2pa-cli` is a binary: it ships no
+// API to link against, so it has no surface to lock.
 const PUBLISHED_LIBS = [
-  ["encypher-c2pa-cbor", "c2pa_cbor"],
-  ["encypher-c2pa-core", "c2pa_core"],
-  ["encypher-c2pa-crypto", "c2pa_crypto"],
-  ["encypher-c2pa-formats", "c2pa_formats"],
-  ["encypher-c2pa-trust", "c2pa_trust"],
-  ["encypher-c2pa-validate", "c2pa_validate"],
-  ["encypher-c2pa", "encypher_c2pa"],
+  ["encypher-c2pa-cbor", "c2pa_cbor", "internal/c2pa-cbor"],
+  ["encypher-c2pa-core", "c2pa_core", "internal/c2pa-core"],
+  ["encypher-c2pa-crypto", "c2pa_crypto", "internal/c2pa-crypto"],
+  ["encypher-c2pa-formats", "c2pa_formats", "internal/c2pa-formats"],
+  ["encypher-c2pa-trust", "c2pa_trust", "internal/c2pa-trust"],
+  ["encypher-c2pa-validate", "c2pa_validate", "internal/c2pa-validate"],
+  ["encypher-c2pa", "encypher_c2pa", "crates/encypher-c2pa"],
 ];
 
 const TOOLCHAIN = process.env.SURFACE_TOOLCHAIN ?? "+nightly";
@@ -314,8 +314,31 @@ function extract(doc, crateName) {
   return out;
 }
 
+// Cargo features a consumer can enable are part of the published surface, and
+// rustdoc only ever shows the configuration it was asked to build. A reviewer
+// proved the gap: adding a feature and hiding a PNG writer behind it left the
+// default surface identical, the gate green, and a downstream crate that
+// enabled the feature recovered an embedded manifest.
+//
+// Rather than build every feature combination, features themselves go into the
+// inventory. A new feature on a published crate is then a new line, reviewed
+// exactly like a new function - which is the same inversion the item walk uses.
+async function declaredFeatures(pkg, dir) {
+  const manifest = await readFile(resolve(root, dir, "Cargo.toml"), "utf8");
+  const section = manifest.split(/^\[/m).find(s => s.startsWith("features]"));
+  if (!section) return [];
+  return section
+    .split("\n").slice(1)
+    .map(l => l.split("#")[0].trim())
+    .filter(l => l.includes("="))
+    .map(l => l.split("=")[0].trim())
+    .filter(Boolean)
+    .map(f => `${pkg}::feature:${f}`);
+}
+
 const surface = new Set();
-for (const [pkg, lib] of PUBLISHED_LIBS) {
+for (const [pkg, lib, dir] of PUBLISHED_LIBS) {
+  for (const f of await declaredFeatures(pkg, dir)) surface.add(f);
   emitRustdocJson(pkg);
   const jsonPath = resolve(root, "target/doc", `${lib}.json`);
   if (!(await exists(jsonPath))) fail(`rustdoc produced no JSON for ${pkg} at ${jsonPath}`);
