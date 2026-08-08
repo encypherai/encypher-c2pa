@@ -166,7 +166,7 @@ plan gate: n/a (implementation-first; entered at Phase 5 per the skill's entry t
 Reviewers: `reviewer-gpt55` and `reviewer-opus` for cycles 1-5, `reviewer-sol56`
 (GPT-5.6 Sol) from cycle 6 at operator request.
 
-completion gate: cycle 8 in progress
+completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
 
   cycle 1  gpt55/opus   correctness 8.0/9.6  simplification 7.2/9.3  security 8.0/9.4  -> not cleared
   cycle 2  gpt55/opus   correctness 7.0/9.7  simplification 7.4/9.6  security  - /9.5  -> not cleared
@@ -175,6 +175,45 @@ completion gate: cycle 8 in progress
   cycle 5  gpt55/opus   correctness 8.0/9.7  simplification 9.5/9.6  security 8.0/9.6  -> not cleared
   cycle 6  sol56        correctness 6.8      simplification 8.8      security 7.4      -> not cleared
   cycle 7  sol56        correctness 8.0      simplification 8.4      security 8.0      -> not cleared
+  cycle 8  sol56        correctness 6.8      simplification  -       security  -       -> not cleared
+  cycle 9  sol56        correctness 6.6      simplification  -       security  -       -> not cleared
+  cycle 10 sol56        correctness 6.0      simplification 8.2      security 6.0      -> STOPPED
+
+  Why the loop stopped, and it is not because the bar was met.
+
+  Correctness across the Sol cycles ran 6.8, 8.0, 6.8, 6.6, 6.0. Falling, while
+  fifteen distinct evasions were found and closed. The score fell because the
+  fixes for cycles 8-10 grew a hand-written Rust attribute parser and a
+  write-effect denylist, and each new line of scanner was new attack surface.
+  Sol walked past the denylist twice in one sitting with ordinary safe Rust
+  ('use std::fs as io_fs', then 'File::options().create(true)'), each time with
+  the gate printing PASS, all contract tests green, the CLI verifying a real
+  signed MP4, and its marker file on disk.
+
+  That is the skill's no-progress condition: the diff churns and the score does
+  not rise. It is also a substantive finding rather than reviewer fatigue. Sol
+  said the same thing at cycle 8 and again at cycle 10: a source-level control
+  cannot establish 'no public item writes'. The property is not decidable by
+  pattern matching over text.
+
+  So the last commit reverted the claim rather than the code. The write scan
+  stays, relabelled in its own header as a tripwire for the careless case with
+  both bypasses named, and the weight sits on the two controls that hold: the
+  compiler-derived shape lock, and the observable behaviour tests. Sol verified
+  the README is now accurate about exactly this.
+
+  What would actually close it, in order of cost:
+
+    - run the verification entry points under Landlock or seccomp in a test and
+      assert they still succeed with filesystem mutation denied. Sound against
+      aliases, macros, dependencies and unsafe alike. Kernel 6.8 here supports
+      it. New dev-dependency, contained work.
+    - resolved-call analysis over the full dependency graph. MIR-level. Real
+      tooling work.
+
+  Recommendation: ship on the current honest framing, build the Landlock test
+  before 1.0. The boundary claim in the README is already true as written; what
+  is missing is a stronger control, not a correction.
 
   ELEVEN distinct evasions were found in this gate and fixed, each demonstrated
   end to end with a working consumer rather than asserted:
