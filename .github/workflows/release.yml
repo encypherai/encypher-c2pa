@@ -150,11 +150,29 @@ jobs:
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
-          # A prerelease must never take the `latest` dist-tag: npm publish
+          name=$(node -p "require('./package.json').name")
+          # A prerelease must never DISPLACE a stable `latest`: npm publish
           # defaults to `latest`, which would hand every plain
           # `npm i @encypherai/c2pa` a release candidate.
+          #
+          # But the first-ever publish of a package takes `latest`
+          # regardless of --tag, and OIDC trusted publishing cannot run
+          # `npm dist-tag add` (npm/cli#8547 - only `npm publish` is
+          # supported), so rc.6 pinned `latest` and no later release could
+          # move it: plain installs kept getting the first RC ever cut.
+          #
+          # `npm publish --tag` is the only lever OIDC gives us, so a
+          # prerelease claims `latest` too while no stable release exists
+          # to protect. Once 1.0.0 ships it takes `latest` and every later
+          # prerelease goes to `next` alone, which is the original intent.
           case "$version" in
-            *-*) dist_tag=next ;;
+            *-*)
+              current=$(npm view "$name@latest" version 2>/dev/null || true)
+              case "$current" in
+                "" | *-*) dist_tag=latest ;;
+                *) dist_tag=next ;;
+              esac
+              ;;
             *) dist_tag=latest ;;
           esac
           echo "publishing $version to dist-tag $dist_tag"
