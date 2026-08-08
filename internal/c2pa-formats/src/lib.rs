@@ -107,7 +107,7 @@ pub const C2PA_BMFF_UUID: [u8; 16] = [
 /// separately.
 pub const BMFF_HASH_EXCLUSION_PATHS: &[&str] = &["/uuid", "/ftyp", "/mfra", "/free", "/skip"];
 
-/// Canonical MIME types accepted by prepared hash-mode signing.
+/// Canonical MIME types supported by caller-supplied hard-binding digests.
 ///
 /// This is the engine source of truth consumed by the CLI export, API
 /// artifact, and CMS clients. Aliases are canonicalized before membership is
@@ -441,8 +441,8 @@ pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, Form
     }
 }
 
-/// Frame a raw C2PA manifest store as the exact carrier bytes used by a
-/// prepared hash-mode splice.
+/// Frame a raw C2PA manifest store as the exact carrier bytes accepted by
+/// [`embed_manifest`].
 ///
 /// Only the v1 hash-mode families are accepted. The returned bytes are
 /// byte-identical to the carrier emitted by [`embed_manifest`].

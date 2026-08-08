@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## 1.0.0-rc.10 - 2026-08-08
+
+- Removed the signing-specific `prehashed_binding` extractor and `PrehashedBinding` type from the published validator. The generic detached `verify_prehashed_manifest` verifier remains public.
+- Renamed the validator's signing-workflow error variant to `ValidateError::HardBinding` and made its diagnostics describe the malformed C2PA hard binding.
+- Fixed npm trusted publishing so the active release candidate can reclaim `latest` while no stable release exists. Once a stable version holds `latest`, later prereleases publish to `next`.
+
 ## 1.0.0-rc.1 - 2026-08-05
 
 - Added CAWG Identity 1.2 validation: X.509 COSE identity assertions and identity-claims-aggregation (ICA) verifiable credentials, with countersigner topology checks and spec status codes (`cawg.identity.*`, `cawg.ica.*`).

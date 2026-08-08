@@ -233,9 +233,9 @@ pub enum ValidateError {
     /// The manifest store JUMBF structure could not be parsed.
     #[error("manifest store parse failed: {0}")]
     Jumbf(#[from] c2pa_core::jumbf::JumbfError),
-    /// A prepared manifest did not carry one canonical SHA-256 hard binding.
-    #[error("prepared hard binding invalid: {0}")]
-    PreparedBinding(String),
+    /// The active manifest's hard-binding assertion is malformed or unsupported.
+    #[error("hard binding invalid: {0}")]
+    HardBinding(String),
     /// Verification panicked internally; contained at the API boundary so it
     /// never crosses an FFI/gRPC edge as an abort.
     #[error("internal verification panic (contained)")]
@@ -442,13 +442,6 @@ pub struct VerifyOutput {
     pub version_verdict: Option<VersionVerdict>,
 }
 
-/// Signed hard-binding facts extracted from the active manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PrehashedBinding {
-    pub algorithm: String,
-    pub digest: Vec<u8>,
-    pub exclusions: Json,
-}
 /// Verify the C2PA manifest embedded in an asset.
 ///
 /// **Verification is generous by default**: any asset whose MIME type maps to a
@@ -701,7 +694,7 @@ fn verify_with_fragments(
         if let Some(exclusions) = regular_data_hash_exclusions(manifest)? {
             let spans = c2pa_formats::compute_data_hash_exclusions(format, input.data)?;
             let [carrier] = spans.as_slice() else {
-                return Err(ValidateError::PreparedBinding(format!(
+                return Err(ValidateError::HardBinding(format!(
                     "expected one resolved manifest carrier, found {}",
                     spans.len()
                 )));
@@ -1096,8 +1089,8 @@ pub fn verify_prehashed_manifest<'a>(
     Ok(out)
 }
 
-// Parse the active data-hash assertion without the prepared-signing
-// restriction that its exclusion list contain exactly one range.
+// Parse the active data-hash assertion without constraining its exclusion list
+// to a single range.
 fn regular_data_hash_exclusions(
     manifest: &ParsedManifest<'_>,
 ) -> Result<Option<Vec<(usize, usize)>>, ValidateError> {
@@ -1110,24 +1103,23 @@ fn regular_data_hash_exclusions(
         [] => return Ok(None),
         [binding] => binding.1,
         _ => {
-            return Err(ValidateError::PreparedBinding(
+            return Err(ValidateError::HardBinding(
                 "regular verification requires exactly one c2pa.hash.data binding".into(),
             ));
         }
     };
-    let assertion = decode(cbor).map_err(|_| {
-        ValidateError::PreparedBinding("hard-binding assertion CBOR is invalid".into())
-    })?;
+    let assertion = decode(cbor)
+        .map_err(|_| ValidateError::HardBinding("hard-binding assertion CBOR is invalid".into()))?;
     let exclusions = match assertion.get("exclusions") {
         Some(Value::Array(exclusions)) if !exclusions.is_empty() => exclusions,
         _ => {
-            return Err(ValidateError::PreparedBinding(
+            return Err(ValidateError::HardBinding(
                 "signed data-hash exclusion list must contain at least one range".into(),
             ));
         }
     };
     if exclusions.len() > MAX_DATA_HASH_EXCLUSIONS {
-        return Err(ValidateError::PreparedBinding(format!(
+        return Err(ValidateError::HardBinding(format!(
             "exclusion list exceeds the verifier cap ({} > {MAX_DATA_HASH_EXCLUSIONS})",
             exclusions.len()
         )));
@@ -1143,9 +1135,7 @@ fn regular_data_hash_exclusions(
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    ValidateError::PreparedBinding(
-                        "signed data-hash exclusion start is invalid".into(),
-                    )
+                    ValidateError::HardBinding("signed data-hash exclusion start is invalid".into())
                 })?;
             let length = exclusion
                 .get("length")
@@ -1155,7 +1145,7 @@ fn regular_data_hash_exclusions(
                 })
                 .filter(|length| *length > 0)
                 .ok_or_else(|| {
-                    ValidateError::PreparedBinding(
+                    ValidateError::HardBinding(
                         "signed data-hash exclusion length is invalid".into(),
                     )
                 })?;
@@ -1195,14 +1185,14 @@ fn validate_regular_exclusion_geometry(
     carrier_length: usize,
 ) -> Result<(), ValidateError> {
     let carrier_end = carrier_start.checked_add(carrier_length).ok_or_else(|| {
-        ValidateError::PreparedBinding("resolved carrier output span overflows".into())
+        ValidateError::HardBinding("resolved carrier output span overflows".into())
     })?;
     let mut sorted = exclusions.to_vec();
     sorted.sort_unstable_by_key(|(start, _)| *start);
     let mut previous_end = None;
     for (start, length) in sorted {
         let end = start.checked_add(length).ok_or_else(|| {
-            ValidateError::PreparedBinding(
+            ValidateError::HardBinding(
                 "signed exclusion does not fit within resolved carrier output span".into(),
             )
         })?;
@@ -1210,150 +1200,13 @@ fn validate_regular_exclusion_geometry(
             || start < carrier_start
             || end > carrier_end
         {
-            return Err(ValidateError::PreparedBinding(
+            return Err(ValidateError::HardBinding(
                 "signed exclusion does not fit within resolved carrier output span".into(),
             ));
         }
         previous_end = Some(end);
     }
     Ok(())
-}
-
-/// Extract and validate the active manifest's sole prepared hard binding.
-///
-/// This is the claim-only half of hash-mode verification. The caller still
-/// validates the submitted carrier and compares this signed digest with its
-/// locally computed digest before writing any bytes.
-pub fn prehashed_binding(manifest_store: &[u8]) -> Result<PrehashedBinding, ValidateError> {
-    let store = parse_manifest_store(manifest_store)?;
-    let manifest = store.manifests.last().ok_or_else(|| {
-        ValidateError::PreparedBinding("manifest store contained no manifests".into())
-    })?;
-    let bindings = manifest
-        .assertions
-        .iter()
-        .filter(|(label, _)| label == "c2pa.hash.data" || label.starts_with("c2pa.hash.bmff"))
-        .collect::<Vec<_>>();
-    let (label, cbor) = match bindings.as_slice() {
-        [binding] => (binding.0.as_str(), binding.1),
-        _ => {
-            return Err(ValidateError::PreparedBinding(
-                "exactly one c2pa.hash.data or c2pa.hash.bmff binding is required".into(),
-            ));
-        }
-    };
-    let assertion = decode(cbor).map_err(|_| {
-        ValidateError::PreparedBinding("hard-binding assertion CBOR is invalid".into())
-    })?;
-    if assertion
-        .get("alg")
-        .and_then(Value::as_text)
-        .unwrap_or("sha256")
-        != "sha256"
-        || assertion.get("merkle").is_some()
-    {
-        return Err(ValidateError::PreparedBinding(
-            "only a non-merkle SHA-256 hard binding is supported".into(),
-        ));
-    }
-    let digest = assertion
-        .get("hash")
-        .and_then(Value::as_bytes)
-        .filter(|value| value.len() == 32)
-        .ok_or_else(|| ValidateError::PreparedBinding("hard-binding hash must be 32 bytes".into()))?
-        .to_vec();
-    let exclusions = match assertion.get("exclusions") {
-        Some(Value::Array(values)) => values,
-        _ => {
-            return Err(ValidateError::PreparedBinding(
-                "hard-binding exclusions are missing".into(),
-            ));
-        }
-    };
-    let normalized_exclusions = if label == "c2pa.hash.data" {
-        let mut rows = Vec::with_capacity(exclusions.len());
-        for exclusion in exclusions {
-            let start = exclusion
-                .get("start")
-                .and_then(|value| match value {
-                    Value::Integer(value) => u64::try_from(*value).ok(),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    ValidateError::PreparedBinding("data-hash exclusion start is invalid".into())
-                })?;
-            let length = exclusion
-                .get("length")
-                .and_then(|value| match value {
-                    Value::Integer(value) => u64::try_from(*value).ok(),
-                    _ => None,
-                })
-                .filter(|value| *value > 0)
-                .ok_or_else(|| {
-                    ValidateError::PreparedBinding("data-hash exclusion length is invalid".into())
-                })?;
-            rows.push(json!([start, length]));
-        }
-        if rows.len() != 1 {
-            return Err(ValidateError::PreparedBinding(
-                "prepared data hash requires exactly one carrier exclusion".into(),
-            ));
-        }
-        Json::Array(rows)
-    } else {
-        if label != "c2pa.hash.bmff.v3" {
-            return Err(ValidateError::PreparedBinding(
-                "prepared BMFF binding must use c2pa.hash.bmff.v3".into(),
-            ));
-        }
-        let uuid_exclusion = exclusions.first().ok_or_else(|| {
-            ValidateError::PreparedBinding("BMFF C2PA UUID exclusion is missing".into())
-        })?;
-        let uuid_match = uuid_exclusion.get("data").and_then(|value| match value {
-            Value::Array(values) if values.len() == 1 => values.first(),
-            _ => None,
-        });
-        let uuid_offset = uuid_match
-            .and_then(|value| value.get("offset"))
-            .and_then(|value| match value {
-                Value::Integer(value) => u64::try_from(*value).ok(),
-                _ => None,
-            });
-        let uuid_value = uuid_match
-            .and_then(|value| value.get("value"))
-            .and_then(Value::as_bytes);
-        if uuid_offset != Some(8) || uuid_value != Some(c2pa_formats::C2PA_BMFF_UUID.as_slice()) {
-            return Err(ValidateError::PreparedBinding(
-                "BMFF /uuid exclusion must uniquely match the C2PA carrier".into(),
-            ));
-        }
-        let mut paths = Vec::with_capacity(exclusions.len());
-        for exclusion in exclusions {
-            let xpath = exclusion
-                .get("xpath")
-                .and_then(Value::as_text)
-                .ok_or_else(|| {
-                    ValidateError::PreparedBinding("BMFF exclusion xpath is invalid".into())
-                })?;
-            paths.push(xpath);
-        }
-        if paths.as_slice() != c2pa_formats::BMFF_HASH_EXCLUSION_PATHS {
-            return Err(ValidateError::PreparedBinding(
-                "prepared BMFF exclusions do not match the canonical v3 set".into(),
-            ));
-        }
-        Json::Array(
-            paths
-                .into_iter()
-                .map(|xpath| Json::String(xpath.to_string()))
-                .collect(),
-        )
-    };
-    Ok(PrehashedBinding {
-        algorithm: label.to_string(),
-        digest,
-        exclusions: normalized_exclusions,
-    })
 }
 
 /// Run the per-manifest verification steps and assemble the output.
@@ -2402,9 +2255,9 @@ fn verify_compound_content(
 }
 
 /// Confirm that a caller-computed digest is the active claim's sole supported
-/// hard binding. This path never accepts generalized box, collection,
-/// multi-asset, or merkle bindings because the prepared protocol does not
-/// expose enough source bytes to verify those forms independently.
+/// hard binding. Generalized box, collection, multi-asset, and merkle bindings
+/// require source bytes that this detached verification entry point does not
+/// accept, so it rejects those forms.
 fn verify_prehashed_hard_binding(
     manifest: &ParsedManifest,
     digest: &[u8],
@@ -2426,7 +2279,7 @@ fn verify_prehashed_hard_binding(
             results.push_failure(
                 ASSERTION_DATA_HASH_MISMATCH,
                 format!("self#jumbf=/c2pa/{label}/c2pa.assertions"),
-                "prepared verification requires exactly one supported hard binding".into(),
+                "detached verification requires exactly one supported hard binding".into(),
             );
             return;
         }
@@ -2459,7 +2312,7 @@ fn verify_prehashed_hard_binding(
         results.push_failure(
             mismatch_code,
             url,
-            "prepared verification supports one non-merkle SHA-256 hard binding".into(),
+            "detached verification supports one non-merkle SHA-256 hard binding".into(),
         );
         return;
     }
