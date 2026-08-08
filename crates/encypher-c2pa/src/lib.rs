@@ -5,11 +5,16 @@
 //! or an explicit per-call override.
 
 #![forbid(unsafe_code)]
-// The six modules below are the verification kernel. They are a mirror of the
-// engine that runs in Encypher's production signing service, kept file-for-file
-// so the code published here is provably the same program, not a reduced
-// lookalike. A private drift gate compares them byte-for-byte against the
-// production copy on every release.
+// The six modules below are the verification kernel: the same engine that runs
+// in Encypher's production signing service, kept as six crate-named directories
+// so the two copies stay comparable file-for-file.
+//
+// A private drift gate compares them against the production copy. It has NOT
+// yet been updated for this layout - it still expects the pre-consolidation
+// crate paths - so at the time of writing the two trees are not being
+// automatically compared. Landing that projection is a prerequisite for the
+// next release; until it does, treat the parity claim as an intention rather
+// than an enforced property.
 //
 // They were separate published crates until this change. That made 22,890 lines
 // of implementation into semver-bound public API with no consumer - 81% of the

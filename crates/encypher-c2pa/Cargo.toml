@@ -46,3 +46,16 @@ ureq = { version = "2.12.1", optional = true, default-features = false, features
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+# The elliptic-curve stack reaches `getrandom` transitively (ecdsa -> p256 ->
+# elliptic-curve -> crypto-bigint -> rand_core), and on wasm32 that crate
+# refuses to compile unless a backend is selected. Until now the browser
+# binding declared this itself, which meant the published library did not
+# actually build for a target the README says it supports: a consumer taking
+# `encypher-c2pa` into the browser hit a compile error in a transitive
+# dependency. Declaring it here makes the library standalone-correct on wasm32.
+#
+# Not optional, so it creates no implicit Cargo feature - the surface gate
+# locks the feature map and would reject one.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

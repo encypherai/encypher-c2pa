@@ -6,7 +6,13 @@
 # Adding a line here is a deliberate decision to publish that item. This
 # repository ships a verification-only SDK: nothing here may construct a
 # C2PA manifest or write one into an asset container. Construction lives
-# behind the `test-support` feature, which no published dependency enables.
+# in private modules under `cfg(test)`, so it is unreachable from outside
+# the crate and absent from the published artifact.
+#
+# This inventory locks the SHAPE of the API - names and kinds - not the
+# behaviour of the items in it. An approved item whose body is rewritten to
+# write bytes leaves this file unchanged. That axis is covered by the
+# non-mutation contract tests in crates/encypher-c2pa/tests, not here.
 encypher-c2pa::C2PA_PROFILE (constant)
 encypher-c2pa::DEFAULT_TELEMETRY_ENDPOINT (constant)
 encypher-c2pa::DEFAULT_TELEMETRY_ENDPOINT (use)

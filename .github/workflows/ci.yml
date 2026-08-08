@@ -23,16 +23,26 @@ jobs:
       # toolchain is pinned rather than floating. The script asserts the schema
       # version it was written against and fails loudly if that changes, which
       # is what makes a pinned nightly safe to bump deliberately.
+      #
+      # wasm32 is required, not incidental: rustdoc only emits items enabled for
+      # the target it documents, so a host-only run cannot see a
+      # `#[cfg(target_arch = "wasm32")]` item at all. A reviewer hid a working
+      # container writer that way. The gate documents every (target, feature)
+      # combination a consumer can build and unions the result.
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-08-07
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # Fails when anything becomes publicly reachable that is not in the
-      # reviewed inventory. This repository publishes a verification-only SDK;
-      # manifest construction and container writing live behind the
-      # writers live in private modules and must never appear here. The surface comes
-      # from rustdoc's own view, so re-exports, macro-generated items and impl
+      # reviewed inventory. This repository publishes a verification-only SDK:
+      # manifest construction and container writing live in private modules
+      # under `cfg(test)` and must never appear here. The surface comes from
+      # rustdoc's own view, so re-exports, macro-generated items and impl
       # methods are resolved by rustc rather than guessed.
+      #
+      # This locks the SHAPE of the API. The behaviour of the items in it is
+      # covered by the non-mutation contract tests in the `rust` job.
       - run: node scripts/check-public-surface.mjs
         env:
           SURFACE_TOOLCHAIN: "+nightly-2026-08-07"

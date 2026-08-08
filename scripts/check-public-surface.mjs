@@ -58,18 +58,24 @@ const FORMAT_VERSION = 61;
 // no surface to lock.
 const PUBLISHED_LIB = ["encypher-c2pa", "encypher_c2pa"];
 
-// Every feature configuration a consumer can select, and the exact feature
-// definitions permitted. rustdoc only ever describes the configuration Cargo
-// was asked to build, so checking the default build alone is not enough: a
-// reviewer demonstrated a writer exposed under a non-default feature while the
-// gate stayed green, and a second demonstrated redefining an already-approved
-// feature to pull in writers. The surface is therefore the UNION across every
-// reachable configuration, and the definitions are locked too, not just the
-// names.
-const FEATURE_CONFIGS = [
-  ["no features", ["--no-default-features"]],
-  ["telemetry only", ["--no-default-features", "--features", "telemetry"]],
-  ["default", []],
+// Every (target, feature configuration) a consumer can actually build, because
+// rustdoc only ever describes the one it was asked for. Two reviewers hid a
+// writer in the gaps: once behind a non-default feature, once behind
+// `#[cfg(target_arch = "wasm32")]`, which a host-only run never emits. The
+// published surface is the UNION over this whole matrix.
+//
+// It is not a full cross-product. `telemetry` pulls in `ureq`, which does not
+// build for wasm32, and the browser binding sets `default-features = false`
+// accordingly - so wasm consumers can only ever select the feature-less
+// configuration. Listing a combination nobody can build would just fail the
+// gate on a build error rather than telling anyone anything.
+//
+// An empty target string means the host.
+const SURFACE_MATRIX = [
+  ["", "no features", ["--no-default-features"]],
+  ["", "telemetry only", ["--no-default-features", "--features", "telemetry"]],
+  ["", "default", []],
+  ["wasm32-unknown-unknown", "no features", ["--no-default-features"]],
 ];
 
 // Canonical feature map, as Cargo resolves it - not as a TOML file spells it.
@@ -98,10 +104,11 @@ async function exists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
-function emitRustdocJson(pkg, featureArgs) {
+function emitRustdocJson(pkg, featureArgs, target) {
+  const targetArgs = target ? ["--target", target] : [];
   const r = spawnSync(
     "cargo",
-    [TOOLCHAIN, "rustdoc", "-q", "-p", pkg, "--lib", ...featureArgs, "--",
+    [TOOLCHAIN, "rustdoc", "-q", "-p", pkg, "--lib", ...featureArgs, ...targetArgs, "--",
      "-Z", "unstable-options", "--output-format", "json",
      // `#[doc(hidden)] pub` is still callable by a downstream crate. Without
      // this flag rustdoc omits those items and the gate would read their
@@ -112,9 +119,11 @@ function emitRustdocJson(pkg, featureArgs) {
     { cwd: root, encoding: "utf8" },
   );
   if (r.status !== 0) {
-    fail(`could not produce rustdoc JSON for ${pkg}`,
+    fail(`could not produce rustdoc JSON for ${pkg}${target ? ` (${target})` : ""}`,
          (r.stderr || r.error?.message || "unknown error").trim().split("\n").slice(-8).join("\n"));
   }
+  // Cross-target builds land under target/<triple>/doc.
+  return resolve(root, target ? `target/${target}/doc` : "target/doc", `${LIB}.json`);
 }
 
 // Lock the feature map to what CARGO resolves, not what a TOML file spells.
@@ -145,21 +154,21 @@ function checkFeatures(pkg) {
       "Cargo creates implicitly from an optional dependency - can expose API the\n" +
       "default build never shows, and redefining an approved feature can pull in\n" +
       "code that was never reviewed. If this change is intended, update\n" +
-      "APPROVED_FEATURES and FEATURE_CONFIGS together and regenerate.",
+      "APPROVED_FEATURES and SURFACE_MATRIX together and regenerate.",
     );
   }
 
-  // Every declared feature must be covered by a rustdoc configuration below,
-  // or its surface is never inspected.
-  const covered = new Set(FEATURE_CONFIGS.flatMap(([, args]) => {
+  // Every declared feature must be inspected by at least one matrix entry, or
+  // its surface is never looked at.
+  const covered = new Set(SURFACE_MATRIX.flatMap(([, , args]) => {
     const i = args.indexOf("--features");
     return i === -1 ? [] : args[i + 1].split(",");
   }));
   covered.add("default");
   for (const f of Object.keys(actual)) {
     if (!covered.has(f)) {
-      fail(`feature '${f}' is declared but no rustdoc configuration inspects it`,
-           "Add a configuration to FEATURE_CONFIGS that enables it.");
+      fail(`feature '${f}' is declared but no configuration in SURFACE_MATRIX inspects it`,
+           "Add an entry that enables it.");
     }
   }
 }
@@ -386,20 +395,21 @@ const [PKG, LIB] = PUBLISHED_LIB;
 
 checkFeatures(PKG);
 
-// The published surface is the UNION over every reachable configuration.
-// Checking only the default build let a reviewer expose a writer behind a
-// non-default feature while the gate reported PASS.
+// The published surface is the UNION over the whole (target, features) matrix.
+// Inspecting a single point let reviewers hide a writer twice: once behind a
+// non-default feature, once behind `#[cfg(target_arch = "wasm32")]`, which a
+// host-only rustdoc never emits.
 const surface = new Set();
-for (const [label, featureArgs] of FEATURE_CONFIGS) {
-  emitRustdocJson(PKG, featureArgs);
-  const jsonPath = resolve(root, "target/doc", `${LIB}.json`);
-  if (!(await exists(jsonPath))) fail(`rustdoc produced no JSON for ${PKG} (${label}) at ${jsonPath}`);
+for (const [target, label, featureArgs] of SURFACE_MATRIX) {
+  const where = `${label}${target ? ` on ${target}` : " on host"}`;
+  const jsonPath = emitRustdocJson(PKG, featureArgs, target);
+  if (!(await exists(jsonPath))) fail(`rustdoc produced no JSON for ${PKG} (${where}) at ${jsonPath}`);
 
   let doc;
   try {
     doc = JSON.parse(await readFile(jsonPath, "utf8"));
   } catch (err) {
-    fail(`rustdoc JSON for ${PKG} (${label}) is unreadable`, err.message);
+    fail(`rustdoc JSON for ${PKG} (${where}) is unreadable`, err.message);
   }
 
   if (doc.format_version !== FORMAT_VERSION) {
@@ -426,7 +436,13 @@ if (process.argv.includes("--write")) {
     "# Adding a line here is a deliberate decision to publish that item. This",
     "# repository ships a verification-only SDK: nothing here may construct a",
     "# C2PA manifest or write one into an asset container. Construction lives",
-    "# behind the `test-support` feature, which no published dependency enables.",
+    "# in private modules under `cfg(test)`, so it is unreachable from outside",
+    "# the crate and absent from the published artifact.",
+    "#",
+    "# This inventory locks the SHAPE of the API - names and kinds - not the",
+    "# behaviour of the items in it. An approved item whose body is rewritten to",
+    "# write bytes leaves this file unchanged. That axis is covered by the",
+    "# non-mutation contract tests in crates/encypher-c2pa/tests, not here.",
     "",
   ].join("\n");
   await writeFile(inventoryPath, `${header}${current.join("\n")}\n`);

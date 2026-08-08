@@ -394,6 +394,7 @@ dependencies = [
  "der",
  "ecdsa",
  "ed25519-dalek",
+ "getrandom",
  "hex",
  "miniz_oxide",
  "p256",
