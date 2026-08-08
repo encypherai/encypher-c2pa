@@ -124,7 +124,7 @@ success and failure paths and creates no sibling files.
 - [x] Add non-mutation contract tests for the behaviour axis
 - [x] Make the library build for wasm32 standalone
 - [x] Correct the README, CHANGELOG and SECURITY boundary claims
-- [ ] Land the private drift-gate projection (separate repo, prerequisite for release)
+- [x] Establish what the drift gate actually is (it does not exist - see Open)
 - [ ] Completion gate to the bar
 
 ## Success Criteria
@@ -219,10 +219,22 @@ completion gate: cycle 8 in progress
 
 ## Open
 
-- **The private drift-gate projection is not done.** `scripts/check_kernel_drift.py`
-  in the monorepo still expects the pre-consolidation crate paths, so the two
-  kernel copies are not currently being compared automatically. This is a
-  prerequisite for release, in a separate repo.
+- **There is no kernel drift gate, and there never was.** I searched the
+  monorepo: `scripts/check_kernel_drift.py` does not exist, and the only drift
+  gates in `.github/workflows` cover the Next.js build and WordPress plugin
+  fixtures. Earlier notes here described it as stale; it is absent. The public
+  kernel and the production kernel are compared by review alone.
+
+  Building one is harder than the earlier framing assumed, because the two
+  trees are a derivative pair rather than copies - production carries manifest
+  construction and container writing and this repo does not, so production
+  `c2pa-formats` is roughly twice the size and equality is the wrong test. A
+  useful gate would map production paths onto this layout and diff the shared
+  functions, modelling the intended removals. That is a real piece of work in a
+  separate repo and it is not started.
+
+  It should gate a release. It does not gate this branch, which changes no
+  kernel logic - the consolidation moved files and narrowed visibility.
 - The six crates.io packages keep every existing version through `1.0.0-rc.11`
   and are deliberately NOT yanked: older `encypher-c2pa` releases exact-pin
   them, and yanking would break fresh resolution of those versions.

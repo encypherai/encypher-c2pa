@@ -5,16 +5,23 @@
 //! or an explicit per-call override.
 
 #![forbid(unsafe_code)]
-// The six modules below are the verification kernel: the same engine that runs
-// in Encypher's production signing service, kept as six crate-named directories
-// so the two copies stay comparable file-for-file.
+// The six modules below are the verification kernel. They derive from the
+// engine that runs in Encypher's production signing service, and are kept as
+// six crate-named directories so the two trees stay readable side by side.
 //
-// A private drift gate compares them against the production copy. It has NOT
-// yet been updated for this layout - it still expects the pre-consolidation
-// crate paths - so at the time of writing the two trees are not being
-// automatically compared. Landing that projection is a prerequisite for the
-// next release; until it does, treat the parity claim as an intention rather
-// than an enforced property.
+// They are a derivative, not a copy, and the difference is the point of this
+// repository: the production tree carries manifest construction and container
+// writing, and this one does not. The line counts differ accordingly and by
+// design - production `c2pa-formats` is roughly twice this one.
+//
+// No automated comparison exists between the two trees. An earlier version of
+// this comment said a private drift gate compared them; there is no such gate
+// in the monorepo, and saying otherwise credited this code with a control
+// nobody had written. Divergence is currently caught by review alone. If that
+// is not good enough - and for a security boundary it probably is not - the
+// thing to build is a projection that maps production paths onto this layout
+// and diffs the shared functions, which would have to model the intended
+// removals rather than expect equality.
 //
 // They were separate published crates until this change. That made 22,890 lines
 // of implementation into semver-bound public API with no consumer - 81% of the
