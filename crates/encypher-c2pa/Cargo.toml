@@ -11,6 +11,12 @@ readme.workspace = true
 description = "Offline, verification-only C2PA SDK"
 keywords = ["c2pa", "content-credentials", "provenance", "verification"]
 categories = ["cryptography", "multimedia"]
+# The two integration suites load fixtures from the workspace `tests/fixtures`
+# directory, which is outside this package. Shipping the suites without their
+# fixtures makes `cargo test` inside the unpacked crate fail on missing files,
+# which a reviewer hit. The unit tests carry their own fixtures under `src/`
+# and still ship, so the published artifact stays auditable.
+exclude = ["tests/**"]
 
 [features]
 default = ["telemetry"]
@@ -57,5 +63,10 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 #
 # Not optional, so it creates no implicit Cargo feature - the surface gate
 # locks the feature map and would reject one.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Scoped to the browser target specifically, not all of wasm32. A reviewer
+# found that a bare `target_arch = "wasm32"` predicate also captured
+# wasm32-wasip1, where the pre-change tree resolved getrandom with `std` and
+# this would have forced `js`, `js-sys` and `wasm-bindgen` onto existing WASI
+# consumers.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

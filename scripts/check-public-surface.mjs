@@ -38,6 +38,7 @@
 //   node scripts/check-public-surface.mjs --write   # regenerate the inventory
 
 import { readFile, writeFile, access } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -391,9 +392,77 @@ function extract(doc, crateName) {
   return out;
 }
 
+// Refuse any `cfg` predicate the extraction structurally cannot observe.
+//
+// The whole gate rests on rustdoc showing what a consumer compiles. Two ways
+// that breaks, both demonstrated by reviewers:
+//
+//   `cfg(doc)` / `cfg(not(doc))` - rustdoc DEFINES `doc`, so a `not(doc)` item
+//   does not exist in any JSON it produces, on any target, under any features.
+//   A probe hid a working PNG carrier writer there: the gate passed at 171 and
+//   the contract tests passed, while a consumer called it and produced a valid
+//   manifest. No amount of matrix widening finds this, because the item is
+//   invisible to the tool by construction.
+//
+//   `target_os` / `target_env` / `target_family` predicates naming a platform
+//   outside SURFACE_MATRIX - the matrix is a small allowlist of targets, so a
+//   `cfg(target_os = "windows")` item is simply never documented.
+//
+// Scanning source for these is crude next to rustdoc, and that is the point:
+// it is a tripwire on the ONE thing rustdoc cannot report on itself. Finding
+// such a predicate is not proof of a writer, only proof that the inventory
+// cannot speak for that code - so the gate refuses rather than guessing.
+function checkObservableCfgs() {
+  const srcRoot = resolve(root, "crates/encypher-c2pa/src");
+  const files = spawnSync("find", [srcRoot, "-name", "*.rs"], { encoding: "utf8" })
+    .stdout.split("\n").filter(Boolean);
+
+  // Targets the matrix documents. `unknown` covers wasm32-unknown-unknown.
+  const MATRIX_OS = new Set(["unknown"]);
+  const PUB_ITEM = /^\s*pub(\s*\(|\s+)(?!crate\b)/;
+  const ATTR_OR_DOC = /^\s*(#\[|#!\[|\/\/)/;
+  const offenders = [];
+
+  for (const file of files) {
+    const lines = readFileSync(file, "utf8").split("\n");
+    lines.forEach((line, i) => {
+      const m = line.match(/#\s*\[\s*cfg(?:_attr)?\s*\((.*)\)\s*\]/);
+      if (!m) return;
+
+      // Only a cfg that gates a PUBLIC ITEM can change the public surface.
+      // Statement-level predicates inside a function body, and anything on a
+      // private item, cannot - flagging those made the guard fire on ordinary
+      // platform branches in private code.
+      let j = i + 1;
+      while (j < lines.length && (ATTR_OR_DOC.test(lines[j]) || lines[j].trim() === "")) j++;
+      if (j >= lines.length || !PUB_ITEM.test(lines[j])) return;
+
+      const pred = m[1];
+      if (/\bdoc\b/.test(pred) && !/\bdoc\s*=/.test(pred)) {
+        offenders.push(`${file}:${i + 1}  ${line.trim()}\n     gates: ${lines[j].trim().slice(0, 70)}\n     rustdoc DEFINES 'doc', so this item appears in no JSON on any target`);
+      }
+      const os = pred.match(/target_os\s*=\s*"([^"]+)"/);
+      if (os && !MATRIX_OS.has(os[1])) {
+        offenders.push(`${file}:${i + 1}  ${line.trim()}\n     gates: ${lines[j].trim().slice(0, 70)}\n     target_os '${os[1]}' is outside SURFACE_MATRIX`);
+      }
+    });
+  }
+
+  if (offenders.length) {
+    fail(
+      `${offenders.length} public item(s) behind a cfg the surface extraction cannot observe`,
+      offenders.slice(0, 8).join("\n") +
+      "\n\nEither drop the predicate, make the item non-public, or extend\n" +
+      "SURFACE_MATRIX to cover it and regenerate. An item the extraction cannot\n" +
+      "see is an item the inventory cannot vouch for.",
+    );
+  }
+}
+
 const [PKG, LIB] = PUBLISHED_LIB;
 
 checkFeatures(PKG);
+checkObservableCfgs();
 
 // The published surface is the UNION over the whole (target, features) matrix.
 // Inspecting a single point let reviewers hide a writer twice: once behind a

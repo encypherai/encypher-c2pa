@@ -19,6 +19,15 @@ use std::path::Path;
 use encypher_c2pa::{verify, verify_file, verify_with_options, VerifyOptions};
 use sha2::{Digest, Sha256};
 
+fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<_> = fs::read_dir(dir)
+        .expect("directory listing")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    v.sort();
+    v
+}
+
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(bytes);
@@ -112,6 +121,59 @@ fn verify_file_does_not_touch_the_file_it_reads() {
         "verify_file() changed the file size"
     );
     let _ = fs::remove_file(&path);
+}
+
+/// Every extension the SDK will infer a MIME type for.
+///
+/// Covering only one was a real gap: a reviewer hid a writer in the `.png`
+/// branch of `mime_from_path` and every test here still passed, because they
+/// all used `.jpg`. Format dispatch is exactly where a per-extension side
+/// effect hides, so each branch gets exercised.
+const EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "webp", "tif", "tiff", "gif", "svg", "avif", "heic", "mp4", "mov", "m4a",
+    "wav", "mp3", "flac", "ogg", "pdf", "zip", "docx", "ttf", "otf", "txt", "csv", "json", "md",
+    "html", "xml",
+];
+
+#[test]
+fn verify_file_touches_nothing_for_any_supported_extension() {
+    // Identical signed bytes under every extension, so MIME inference takes a
+    // different branch each time while the content stays constant.
+    let data = fixture("signed_test.jpg");
+    let before = digest(&data);
+
+    for ext in EXTENSIONS {
+        let path = scratch("extensions", &format!("asset.{ext}"), &data);
+        let dir = path.parent().expect("scratch parent").to_path_buf();
+        let listing_before = listing(&dir);
+
+        let _ = verify_file(&path, None, &VerifyOptions::default());
+
+        let after =
+            fs::read(&path).unwrap_or_else(|e| panic!(".{ext}: unreadable after verify: {e}"));
+        assert_eq!(
+            before,
+            digest(&after),
+            "verify_file() modified a .{ext} input"
+        );
+        assert_eq!(
+            listing_before,
+            listing(&dir),
+            "verify_file() created or removed a file while reading .{ext}",
+        );
+        let _ = fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn verify_touches_nothing_for_any_supported_mime() {
+    // The byte entry point, across every MIME the SDK advertises.
+    let data = fixture("signed_test.jpg");
+    let before = digest(&data);
+    for mime in encypher_c2pa::supported_mime_types() {
+        let _ = verify(&data, mime);
+        assert_eq!(before, digest(&data), "verify() mutated input for {mime}");
+    }
 }
 
 #[test]
