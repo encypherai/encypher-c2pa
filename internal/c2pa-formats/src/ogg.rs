@@ -5,8 +5,6 @@
 //! may span any number of Ogg pages.
 
 use std::collections::HashMap;
-#[cfg(feature = "test-support")]
-use std::collections::HashSet;
 
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
@@ -22,8 +20,7 @@ const CONTINUED: u8 = 0x01;
 struct Page {
     start: usize,
     end: usize,
-    /// Parsed for completeness; only the write path consumes it.
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+    #[cfg(feature = "test-support")]
     header_type: u8,
     serial: u32,
 }
@@ -153,6 +150,7 @@ fn validate_ogg(data: &[u8]) -> Result<ValidatedOgg, FormatError> {
         pages.push(Page {
             start: pos,
             end,
+            #[cfg(feature = "test-support")]
             header_type,
             serial,
         });
@@ -327,7 +325,7 @@ pub(crate) fn build_manifest_pages(
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
     let pages = validate_ogg(&clean)?.pages;
-    let used: HashSet<u32> = pages.iter().map(|page| page.serial).collect();
+    let used: std::collections::HashSet<u32> = pages.iter().map(|page| page.serial).collect();
     let mut serial = u32::from_le_bytes(*b"c2pa");
     while used.contains(&serial) {
         serial = serial.wrapping_add(1);

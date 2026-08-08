@@ -58,11 +58,14 @@ item may construct a C2PA manifest structure or write one into an asset
 container.*
 
 **Gate design.** An inventory, not a denylist. `scripts/check-public-surface.mjs`
-walks each published crate from its `lib.rs` through `pub mod` declarations only
-— mirroring how rustc computes reachability — skipping items behind
-`#[cfg(test)]` or `#[cfg(feature = "test-support")]`, and diffs the result
-against the reviewed `public-surface.txt`. Any item that becomes public fails the
-build until a human adds it deliberately.
+walks each published crate from its `lib.rs` through file-backed `pub mod`
+declarations, inventories public `pub use` re-exports, descends into local
+modules behind those re-exports, records public fields, enum variants, inherent
+methods, and trait implementations, skips items behind `#[cfg(test)]` or
+`#[cfg(feature = "test-support")]`, and fails closed on inline public modules,
+`#[path]` public modules, wildcard re-exports, and module-level macro
+invocations. It diffs the result against the reviewed `public-surface.txt`. Any
+item added under that model fails the build until a human adds it deliberately.
 
 ## WBS
 
@@ -82,8 +85,8 @@ build until a human adds it deliberately.
 ## Success Criteria
 
 - Default build of every published crate exposes zero manifest constructors and
-  zero container writers; `public-surface.txt` holds 167 reviewed items.
-- `cargo test --workspace` passes with the same 301 tests as before the change.
+  zero container writers; `public-surface.txt` holds 648 reviewed items.
+- `cargo test --workspace` passes with the same 302 tests as before the change.
 - Each of the 8 packages builds and tests independently (no reliance on
   workspace feature unification).
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean in the
@@ -97,8 +100,43 @@ build until a human adds it deliberately.
 |---|---|
 | Gate catches un-gated `embed_manifest` | FAIL as designed, item named |
 | Gate catches renamed writer `materialise` | FAIL as designed; old 5-symbol sweep misses it |
-| Public surface inventory | 167 items, zero writers |
-| Per-package tests (8 packages) | 0 errors, 301 passed |
+| Gate catches re-exported private-module writer | FAIL as designed, `security_probe_writer` named |
+| Gate catches public writer method/field/variant drift | FAIL as designed, inventory covers public type members |
+| Public surface inventory | 648 items, zero writers |
+| Per-package tests (8 packages) | 0 errors, 302 passed |
+
+## Completion Notes
+
+Shipped in commit `7b0a8db` on branch `feat/verification-only`.
+
+- Removed eleven public write items from the default build: six JUMBF and
+  manifest-store builders and two claim builders in `encypher-c2pa-core`, and
+  three container writers (`embed_manifest`, `strip_manifest`,
+  `build_manifest_carrier`) in `encypher-c2pa-formats`. All now compile only
+  under the `test-support` feature. The 71 orphaned private write helpers across
+  the format modules were gated alongside; they were already private, not public
+  API.
+- One deviation from plan: `encypher-c2pa-cbor::encode` was gated as a writer in
+  the initial audit, then restored. COSE verification re-encodes the
+  `Sig_structure` to recover the bytes a signature covers, so a CBOR encoder is a
+  verification dependency. The invariant was sharpened accordingly: no public
+  item may construct a manifest structure or write one into a container.
+- Source kept, not deleted. JUMBF nesting is C2PA spec boilerplate and the format
+  readers need generated inputs to test against; deleting would force importing a
+  per-format signed fixture corpus for no gain.
+- Added the inventory gate `scripts/check-public-surface.mjs` and the reviewed
+  `public-surface.txt` (169 items). Wired into `.github/workflows/ci.yml`;
+  `release.yml` runs the same CI as a required `verify` job before publishing.
+- Added explicit `test-support` dev-dependencies to `c2pa-core`, `c2pa-formats`,
+  and `c2pa-validate` so each package tests independently without relying on
+  workspace feature unification.
+- Corrected the README boundary claim in two places: the "It does not sign media"
+  paragraph and the "Security boundary" section.
+
+Files touched: 29 (see `git show --stat 7b0a8db`). No database migrations.
+Public API removals live in `internal/c2pa-core/src/{claim,jumbf}.rs` and
+`internal/c2pa-formats/src/lib.rs`; the remaining format modules carry only the
+mechanical `#[cfg(feature = "test-support")]` gates on already-private helpers.
 
 ## Review Loop State
 

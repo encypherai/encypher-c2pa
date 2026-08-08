@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+- Removed manifest construction and container writing from the published API. Eleven public items across `encypher-c2pa-core` (claim building in `claim`, JUMBF and manifest-store assembly in `jumbf`) and `encypher-c2pa-formats` (`embed_manifest`, `strip_manifest`, `build_manifest_carrier`) now compile only behind the non-default `test-support` Cargo feature, which no published dependency enables. The SDK reads and verifies C2PA manifests and no longer exposes any way to produce one.
+- Breaking change for callers of the removed constructors and writers. There are no known consumers, but the public API changed; code that called those items must move to the `test-support` build or drop them. `encypher-c2pa-cbor::encode` stays public: COSE signature verification re-encodes the `Sig_structure` to recover the exact bytes a signature covers, so the CBOR encoder is a verification dependency, not a producer.
+- Added `scripts/check-public-surface.mjs`, a CI gate that enumerates every publicly reachable item and diffs it against the reviewed `public-surface.txt`. Any newly public item fails the build until a reviewer adds it deliberately, so a renamed writer cannot slip through the way a name-based check would. The gate runs on every pull request and before every release.
+
 ## 1.0.0-rc.11 - 2026-08-08
 
 - Corrected the browser install command to use the package's active `latest` tag. The `next` tag intentionally trails while no stable release exists because npm OIDC publishing can assign only one tag per publish.

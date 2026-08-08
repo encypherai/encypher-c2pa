@@ -8,8 +8,6 @@
 //! Only standard (non-ZIP64) archives are supported; ZIP64 archives return
 //! [`FormatError::UnsupportedVariant`].
 
-#[cfg(feature = "test-support")]
-use crate::util::crc32;
 use crate::util::le_u32;
 use crate::{AssetFormat, DataHashExclusion, FormatError};
 
@@ -28,8 +26,7 @@ fn le16(data: &[u8], off: usize) -> Option<u16> {
 /// Parsed end-of-central-directory record.
 struct Eocd {
     total_entries: u16,
-    /// Parsed for completeness; only the write path consumes it.
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+    #[cfg(feature = "test-support")]
     cd_size: u32,
     cd_offset: u32,
     /// Offset of the EOCD record itself.
@@ -59,6 +56,7 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
             }
             return Ok(Eocd {
                 total_entries,
+                #[cfg(feature = "test-support")]
                 cd_size,
                 cd_offset,
                 eocd_offset: pos,
@@ -476,7 +474,7 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
     // real CRC after the manifest is complete without changing the collection
     // binding, while keeping the resulting package valid for ordinary ZIP
     // readers.
-    let crc = crc32(manifest_store);
+    let crc = crate::util::crc32(manifest_store);
     let cd_start = eocd.cd_offset as usize;
     let cd_size = eocd.cd_size as usize;
     if cd_start + cd_size > asset.len() {
