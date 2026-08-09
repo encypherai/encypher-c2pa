@@ -333,12 +333,23 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
 
 /// Unmap every shared file-backed mapping inherited from the parent.
 ///
-/// Read `/proc/self/maps` line by line. The format is
-/// `start-end perms offset dev inode pathname`, and the fourth character of
-/// `perms` is `s` for a shared mapping or `p` for a private one. A shared
-/// mapping with a real backing file is a write capability regardless of its
-/// current protection, because `mprotect` can restore `PROT_WRITE` and a store
-/// then reaches the file without a syscall.
+/// A shared mapping of a file is a write capability regardless of its current
+/// protection, because `mprotect` can restore `PROT_WRITE` and a store then
+/// reaches the file with no syscall at all. Closing the descriptor it was made
+/// through does not remove it.
+///
+/// `/proc/self/maps` lines are
+/// `start-end perms offset dev inode pathname`. Two fields decide:
+///
+/// - the fourth character of `perms` is `s` for shared, `p` for private;
+/// - `inode` is `0` exactly when the mapping is anonymous.
+///
+/// The decision deliberately uses the INODE rather than the pathname. A
+/// pathname may contain spaces, so splitting on whitespace cannot delimit it,
+/// and the first version of this got the field arithmetic wrong anyway - it
+/// read the inode while believing it was the path, which happened to behave
+/// because this host has no anonymous shared mappings. The inode answers the
+/// only question being asked, and answers it unambiguously.
 ///
 /// Anonymous shared mappings are left alone: they back no file, and unmapping
 /// the allocator's own memory would end the process rather than protect it.
@@ -346,17 +357,11 @@ fn unmap_inherited_shared_mappings() -> Result<(), ()> {
     let maps = std::fs::read_to_string("/proc/self/maps").map_err(|_| ())?;
 
     for line in maps.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+        let fields: Vec<&str> = line.split_whitespace().take(5).collect();
+        let [range, perms, _offset, _dev, inode] = fields[..] else {
             continue;
         };
-        if perms.as_bytes().get(3) != Some(&b's') {
-            continue;
-        }
-        // Field 5 is the pathname, absent for anonymous mappings and given in
-        // brackets for kernel ones like [vvar].
-        let path = fields.nth(2).unwrap_or("");
-        if path.is_empty() || path.starts_with('[') {
+        if perms.as_bytes().get(3) != Some(&b's') || inode == "0" {
             continue;
         }
 
