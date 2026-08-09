@@ -355,11 +355,13 @@ because an earlier version returned an error and a discarded
 `let _ = write(..)` sailed through: the write failed, the result was dropped,
 verification finished and the test reported success. Refusing the syscall shows
 verification does not depend on writing; killing shows it does not try. And the
-allowlist is split in two - the eight syscalls the scenario actually makes,
+allowlist is split in two - the six syscalls the scenario actually makes,
 each proved necessary on every CI run by removing it and requiring the run to
 die, and a declared headroom tier for portability across libc and kernel
 versions. None of the headroom entries can create or modify a file. Splitting
-it means a new permission cannot arrive unnoticed.
+it means a new permission cannot arrive unnoticed: a test interprets the
+assembled filter and asks it, for every syscall number, whether it is allowed -
+so an ALLOW that appears in no list fails the build, however it got there.
 
 Between them a boundary violation has to defeat a compiler-derived surface
 lock, an observable behaviour test, and a kernel that will not permit the

@@ -51,6 +51,7 @@ const VERIFY_FAILED: i32 = 20;
 const VERIFY_WITH_OPTIONS_FAILED: i32 = 21;
 const VERIFY_FILE_FAILED: i32 = 22;
 const SIGNED_INPUT_NOT_PARSED: i32 = 23;
+const INHERITED_MAPPING_SURVIVED: i32 = 24;
 
 /// Everything the sandboxed child needs, gathered before the fork so its own
 /// work is exactly the calls under test.
@@ -330,24 +331,81 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     p
 }
 
+/// Unmap every shared file-backed mapping inherited from the parent.
+///
+/// Read `/proc/self/maps` line by line. The format is
+/// `start-end perms offset dev inode pathname`, and the fourth character of
+/// `perms` is `s` for a shared mapping or `p` for a private one. A shared
+/// mapping with a real backing file is a write capability regardless of its
+/// current protection, because `mprotect` can restore `PROT_WRITE` and a store
+/// then reaches the file without a syscall.
+///
+/// Anonymous shared mappings are left alone: they back no file, and unmapping
+/// the allocator's own memory would end the process rather than protect it.
+fn unmap_inherited_shared_mappings() -> Result<(), ()> {
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|_| ())?;
+
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if perms.as_bytes().get(3) != Some(&b's') {
+            continue;
+        }
+        // Field 5 is the pathname, absent for anonymous mappings and given in
+        // brackets for kernel ones like [vvar].
+        let path = fields.nth(2).unwrap_or("");
+        if path.is_empty() || path.starts_with('[') {
+            continue;
+        }
+
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+
+        let rc = unsafe { libc::munmap(start as *mut libc::c_void, end - start) };
+        if rc != 0 {
+            return Err(());
+        }
+    }
+
+    Ok(())
+}
+
 /// Drop the ability to create or modify any file, irreversibly, for this
 /// process and everything it goes on to call.
 fn engage_sandbox(exclude: Option<u32>) -> Result<(), i32> {
-    // Close every inherited descriptor first.
+    // Two kinds of inherited capability have to go before the filter does
+    // anything, because a filter over syscall numbers cannot see either.
     //
-    // A filter over syscall numbers says nothing about descriptors that were
-    // already open when it was installed, and a reviewer used exactly that: it
-    // took an inherited `O_RDWR` descriptor, mapped it `MAP_SHARED`, and
-    // changed the file's bytes without issuing a single denied syscall. The
-    // same inheritance let `ioctl` on a read-only descriptor flip
-    // `FS_NODUMP_FL`. Neither needed a writer in the library; both needed a
-    // writable thing already lying around, which is what a test harness leaves
-    // behind.
-    //
-    // So the child starts with nothing open. It never prints - it reports by
-    // exit status - and it opens its fixtures by path afterwards, read-only.
-    // This runs BEFORE the filter, while closing is still permitted.
+    // First, descriptors. A reviewer took an inherited `O_RDWR` descriptor and
+    // used it; the same inheritance let `ioctl` flip `FS_NODUMP_FL` on a
+    // read-only one. The child starts with nothing open: it never prints, and
+    // it opens its fixtures by path afterwards, read-only.
     unsafe { libc::close_range(0, u32::MAX, 0) };
+
+    // Second, and less obvious: shared file-backed MAPPINGS. Closing a
+    // descriptor does not remove the mapping made through it. The same
+    // reviewer mapped a file `MAP_SHARED` before the fork, let the child close
+    // every descriptor and install the filter, then used the permitted
+    // `mprotect` to restore `PROT_WRITE` on the surviving VMA and changed the
+    // file with an ordinary memory store - no syscall for the filter to refuse.
+    //
+    // So unmap them. `/proc/self/maps` names every mapping; anything shared and
+    // file-backed is a write capability that predates the sandbox. This runs
+    // before the filter, while reading `/proc` and unmapping are permitted, and
+    // a mapping that cannot be unmapped is a hard failure rather than a
+    // warning - the point of the exercise is that none survives.
+    if unmap_inherited_shared_mappings().is_err() {
+        return Err(INHERITED_MAPPING_SURVIVED);
+    }
 
     // Required before an unprivileged process may install a filter.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -446,7 +504,7 @@ fn verify_child(cases: Cases, exclude: Option<u32>) -> ! {
         for path in [&jpg_path, &mp4_path] {
             let report = verify_file(path, None, &VerifyOptions::default())
                 .map_err(|_| VERIFY_FILE_FAILED)?;
-            if !report.present {
+            if !signed_ok(&report) {
                 return Err(SIGNED_INPUT_NOT_PARSED);
             }
         }
@@ -627,6 +685,68 @@ fn no_writable_descriptor_reaches_the_sandbox() {
 }
 
 #[test]
+fn an_inherited_shared_mapping_cannot_outlive_the_sandbox() {
+    // The reviewer's exact attack, kept as a test because it is the subtlest
+    // route found here and the only one that needed no syscall at all.
+    //
+    // Map a file MAP_SHARED before forking, with PROT_READ so it looks
+    // harmless. The child closes every descriptor and installs the filter -
+    // neither of which touches the mapping. Then `mprotect`, which is
+    // permitted, restores PROT_WRITE on the surviving VMA and a plain store
+    // changes the file. Nothing was denied because nothing was asked.
+    //
+    // The fix is that the mapping is gone by the time the filter goes on, so
+    // the mprotect has nothing to upgrade.
+    const MPROTECT_SUCCEEDED: i32 = 40;
+
+    let dir = std::env::temp_dir().join(format!("encypher-vma-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("target");
+    std::fs::write(&path, b"A").expect("seed");
+
+    let raw = std::ffi::CString::new(path.to_str().expect("path")).expect("cstring");
+    let fd = unsafe { libc::open(raw.as_ptr(), libc::O_RDWR) };
+    assert!(fd >= 0, "open target");
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    assert!(mapped != libc::MAP_FAILED, "map target");
+
+    let status = in_child(move || {
+        if let Err(code) = engage_sandbox(None) {
+            unsafe { libc::_exit(code) }
+        }
+        // If the mapping survived, this upgrade succeeds and the store lands.
+        if unsafe { libc::mprotect(mapped, 4096, libc::PROT_READ | libc::PROT_WRITE) } == 0 {
+            unsafe { std::ptr::write_volatile(mapped as *mut u8, b'Z') };
+            unsafe { libc::_exit(MPROTECT_SUCCEEDED) }
+        }
+        unsafe { libc::_exit(OK) }
+    });
+
+    unsafe { libc::munmap(mapped, 4096) };
+    unsafe { libc::close(fd) };
+    let after = std::fs::read(&path).expect("read back");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == MPROTECT_SUCCEEDED {
+        panic!(
+            "an inherited MAP_SHARED mapping survived into the sandbox: \
+             mprotect restored write access and the file now reads {after:?}. \
+             Closing descriptors does not remove mappings made through them.",
+        );
+    }
+    assert_eq!(after, b"A", "the sandboxed child changed the backing file");
+}
+
+#[test]
 fn the_demonstrated_bypasses_all_die() {
     let probes: &[(&str, fn())] = &[
         // Writing to stdout when the harness has redirected it into a file.
@@ -670,6 +790,84 @@ fn the_demonstrated_bypasses_all_die() {
              stay closed.",
         );
     }
+}
+
+/// Interpret the assembled filter, so its verdicts can be asked rather than
+/// assumed.
+///
+/// Only the four opcodes this program uses are implemented; anything else is a
+/// panic, because a silently-ignored instruction would make every answer here
+/// worthless.
+fn evaluate(program: &[libc::sock_filter], nr: u32, args: [u32; 6]) -> u32 {
+    let mut data = [0u32; 16];
+    data[0] = nr;
+    data[1] = 0xc000_003e; // AUDIT_ARCH_X86_64
+    for (i, arg) in args.iter().enumerate() {
+        data[4 + i * 2] = *arg;
+    }
+
+    let mut a: u32 = 0;
+    let mut pc = 0usize;
+    for _ in 0..4096 {
+        let i = program[pc];
+        match i.code {
+            0x20 => a = data[(i.k / 4) as usize],
+            0x54 => a &= i.k,
+            0x15 => {
+                pc += 1 + usize::from(if a == i.k { i.jt } else { i.jf });
+                continue;
+            }
+            0x06 => return i.k,
+            other => panic!("filter uses opcode {other:#x}, which this interpreter does not model"),
+        }
+        pc += 1;
+    }
+    panic!("filter did not terminate");
+}
+
+/// No syscall is permitted that is not written down.
+///
+/// The earlier check ran one way only - every listed number must appear
+/// somewhere in the program - which catches a list entry that was never wired
+/// up and misses a permission that was wired up and never listed. A reviewer
+/// demonstrated the gap by adding a bare permission for `renameat2` to the
+/// assembled filter: every test still passed, and a probe renamed a real file.
+///
+/// This asks the filter directly, for every syscall number the table can hold.
+/// A stray ALLOW anywhere has to correspond to a name in one of the three
+/// lists, so a permission cannot enter unnoticed however it got there.
+#[test]
+fn the_filter_permits_nothing_unlisted() {
+    const RET_ALLOW: u32 = 0x7fff_0000;
+
+    let program = filter(None);
+    let listed: Vec<u32> = allowed()
+        .into_iter()
+        .chain(ARGUMENT_GATED.iter().map(|(nr, _)| *nr))
+        .collect();
+
+    // Argument profiles chosen to reach both sides of every gate: all-zero
+    // makes `openat` look read-only, and the second sets the one `ioctl`
+    // request that is allowed. A gate that let something through on other
+    // arguments would show up as an ALLOW for an unlisted number.
+    let profiles = [[0u32; 6], [0, TCGETS, 0, 0, 0, 0], [u32::MAX; 6]];
+
+    let mut unlisted = Vec::new();
+    for nr in 0..600u32 {
+        for args in &profiles {
+            if evaluate(&program, nr, *args) == RET_ALLOW && !listed.contains(&nr) {
+                unlisted.push(nr);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        unlisted.is_empty(),
+        "the filter permits syscalls that appear in no list: {unlisted:?}. \
+         Every permission must be written down, or the lists stop describing \
+         the program.",
+    );
 }
 
 /// Every entry in the exercised tier is load-bearing, and the two tiers agree.

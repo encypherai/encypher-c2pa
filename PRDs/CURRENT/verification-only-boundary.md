@@ -131,7 +131,7 @@ success and failure paths and creates no sibling files.
 
 - Default build of the published library exposes zero manifest constructors and
   zero container writers; `public-surface.txt` holds 171 reviewed items.
-- `cargo test --workspace` passes: 316 tests (302 pre-existing, unchanged by the
+- `cargo test --workspace` passes: 318 tests (302 pre-existing, unchanged by the
   consolidation, plus 6 non-mutation contract tests).
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - Exactly two publishable packages remain.
@@ -214,8 +214,24 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
         descriptor, so "the descriptor is read-only" is not a safety property.
         `ioctl` is now gated by request, not by descriptor.
 
-  Each of those four is pinned by a test that requires SIGSYS, so none can
-  return quietly.
+    20. an inherited `MAP_SHARED` file mapping outlived `close_range`. Closing
+        a descriptor does not remove the mapping made through it: the permitted
+        `mprotect` restored `PROT_WRITE` on the surviving VMA and an ordinary
+        store changed the file, with no syscall for the filter to refuse. The
+        child now parses `/proc/self/maps` and unmaps every shared file-backed
+        mapping before installing the filter.
+    21. the self-consistency check ran one way only - every listed syscall must
+        appear in the program - so a permission wired into the filter and never
+        listed was invisible. The reviewer demonstrated it by adding a bare
+        `renameat2` permission and renaming a real file while all tests passed.
+        A test now interprets the assembled BPF and asks its verdict for every
+        syscall number; an ALLOW appearing in no list fails the build.
+
+  Most of those are pinned by tests requiring SIGSYS. Two are not, because they
+  are closed by something other than the filter and asserting SIGSYS would prove
+  nothing: the inherited mapping is closed by unmapping, so its test reproduces
+  the attack and checks the backing file is unchanged, and the unlisted
+  permission is closed by interpreting the program rather than running it.
 
   ELEVEN distinct evasions were found in this gate and fixed, each demonstrated
   end to end with a working consumer rather than asserted:
