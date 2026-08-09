@@ -971,6 +971,15 @@ fn no_way_to_open_or_write_is_ungated() {
     // The io_uring trio is here whole rather than by halves: `setup` plus
     // `enter` is the write path, `register` alone is not, and a list naming one
     // of the three suggests the other two were considered and permitted.
+    //
+    // DO NOT grow this toward exhaustiveness. It is a tripwire for the openers
+    // someone might plausibly reach for while trying to turn CI green, not an
+    // inventory of every way the kernel can open a file. `open_tree`, `fsopen`
+    // and whatever arrives next are already denied for the ordinary reason -
+    // they are not on the allowlist - and `the_sandbox_kills_an_unlisted_syscall`
+    // proves that layer bites. Extending this list to cover them would be
+    // maintaining a copy of the syscall table by hand, which is the habit this
+    // file spent two review cycles shedding.
     const UNGATEABLE: &[(u32, &str)] = &[
         (85, "creat"),
         (437, "openat2"),
