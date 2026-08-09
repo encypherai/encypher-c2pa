@@ -295,7 +295,7 @@ The public repository contains verification, parsing, format handling, signature
 
 Manifest construction and container writing are not part of the published API. The verification kernel lives in private modules of the single published library, so that code is unreachable from outside the crate by construction rather than by configuration, and the writers are additionally `cfg(test)` so they are not compiled into the released artifact at all. No Cargo feature can expose them.
 
-Two CI controls defend this. Both are useful and neither is a proof, so it is
+Three CI controls defend this. Each is useful and none is a proof, so it is
 worth being exact about what each one checks.
 
 `scripts/check-public-surface.mjs` locks the SHAPE of the API. It takes the
@@ -347,8 +347,10 @@ Now anything outside a fixed list of readers, memory operations and clocks
 kills the process, and a test calls `io_uring_setup` inside the sandbox to
 prove the default really is deny. Aliases, re-export paths, generic
 `io::Write` indirection, macro expansion, `unsafe`, a dependency writing on the
-library's behalf and shelling out to a subprocess are all equally impossible;
-each was tried against it.
+library's behalf and shelling out to a subprocess are all equally impossible.
+Four of those routes are pinned by name in a regression test; the rest are
+refused by the default-deny allowlist rather than by any rule written for them,
+which is the point of a default-deny allowlist.
 
 Two details matter. It kills on the attempt rather than returning `EPERM`,
 because an earlier version returned an error and a discarded

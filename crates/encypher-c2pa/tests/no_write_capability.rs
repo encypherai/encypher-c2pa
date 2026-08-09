@@ -37,7 +37,7 @@
 //! success. Returning an error only proves verification does not DEPEND on
 //! writing. Killing proves it does not ATTEMPT it.
 //!
-//! Ten tests run here, and they fall into three groups.
+//! Nine tests run here, and they fall into three groups.
 //!
 //! Some assert the sandbox bites: a writer dies, an unlisted syscall dies, and
 //! each route a reviewer actually got through dies. Without these the rest
@@ -72,6 +72,7 @@ const VERIFY_WITH_OPTIONS_FAILED: i32 = 21;
 const VERIFY_FILE_FAILED: i32 = 22;
 const SIGNED_INPUT_NOT_PARSED: i32 = 23;
 const INHERITED_MAPPING_SURVIVED: i32 = 24;
+const DESCRIPTORS_NOT_CLOSED: i32 = 25;
 
 /// Everything the sandboxed child needs, gathered before the fork so its own
 /// work is exactly the calls under test.
@@ -426,7 +427,13 @@ fn engage_sandbox(exclude: Option<u32>) -> Result<(), i32> {
     // used it; the same inheritance let `ioctl` flip `FS_NODUMP_FL` on a
     // read-only one. The child starts with nothing open: it never prints, and
     // it opens its fixtures by path afterwards, read-only.
-    unsafe { libc::close_range(0, u32::MAX, 0) };
+    // Checked, not fired and forgotten. If `close_range` is unavailable or
+    // refused, the child would otherwise carry on with the parent's descriptors
+    // open while everything downstream assumed they were gone - which is the
+    // quiet version of the failure this function exists to prevent.
+    if unsafe { libc::close_range(0, u32::MAX, 0) } != 0 {
+        return Err(DESCRIPTORS_NOT_CLOSED);
+    }
 
     // Second, and less obvious: shared file-backed MAPPINGS. Closing a
     // descriptor does not remove the mapping made through it. The same
@@ -608,6 +615,7 @@ fn the_sandbox_kills_a_writer() {
             NO_NEW_PRIVS_REFUSED => "PR_SET_NO_NEW_PRIVS was refused",
             SECCOMP_REFUSED => "PR_SET_SECCOMP was refused; seccomp may be unavailable here",
             SANDBOX_NOT_ENGAGED => "a file was created with the filter installed",
+            DESCRIPTORS_NOT_CLOSED => "close_range or getrlimit failed",
             _ => "unexpected exit",
         };
         panic!("{why} (exit {code}) - the write-capability test cannot mean anything");
@@ -674,9 +682,23 @@ fn no_writable_descriptor_reaches_the_sandbox() {
     const MMAP_SHARED_SUCCEEDED: i32 = 31;
 
     let status = in_child(|| {
-        unsafe { libc::close_range(0, u32::MAX, 0) };
+        if unsafe { libc::close_range(0, u32::MAX, 0) } != 0 {
+            unsafe { libc::_exit(DESCRIPTORS_NOT_CLOSED) }
+        }
 
-        for fd in 0..256 {
+        // Scan to the process limit, not to an arbitrary 256. A writable
+        // descriptor above the old bound would have gone unnoticed, and the
+        // limit is what bounds the space that can hold one.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            unsafe { libc::_exit(DESCRIPTORS_NOT_CLOSED) }
+        }
+        let highest = limit.rlim_cur.min(1 << 20) as libc::c_int;
+
+        for fd in 0..=highest {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 {
                 continue; // not open, which is the expected case
@@ -1077,9 +1099,35 @@ fn the_filter_matches_the_declared_policy() {
         })
         .collect();
 
+    // Which syscall numbers to check.
+    //
+    // This was `0..600`, a bound with nothing behind it. A reviewer added a
+    // permission for syscall 600, watched all nine tests pass, then invoked 600
+    // in the sandbox and was not killed. Numbers above the bound were simply
+    // not a thing the check had an opinion about, and the x32 space was not
+    // either.
+    //
+    // A bound is the wrong shape of answer. This filter can only branch on
+    // constants it actually contains, so every syscall number NOT compared
+    // anywhere behaves identically to every other one. Take the constants the
+    // program compares, add one representative of everything else, and that
+    // covers the whole 32-bit space - exhaustively, and without a magic number
+    // to get wrong later.
+    let mut domain: Vec<u32> = program
+        .iter()
+        .filter(|i| i.code == 0x15)
+        .map(|i| i.k)
+        .collect();
+    domain.sort_unstable();
+    domain.dedup();
+    let representative = (0u32..)
+        .find(|n| !domain.contains(n))
+        .expect("some syscall number is not compared by the filter");
+    domain.push(representative);
+
     let mut wrong: Vec<String> = Vec::new();
 
-    for nr in 0..600u32 {
+    for nr in domain {
         let required = gated.iter().find(|(n, _)| *n == nr).map(|(_, c)| *c);
 
         for (verdict, conditions) in walk(&program, nr) {
@@ -1225,6 +1273,10 @@ fn verification_completes_with_the_write_capability_removed() {
     let explain = match code {
         OK => return,
         NO_NEW_PRIVS_REFUSED => "PR_SET_NO_NEW_PRIVS was refused, so no filter could be installed",
+        DESCRIPTORS_NOT_CLOSED => {
+            "close_range failed, so the child kept the parent's descriptors and \
+             the sandbox would have been a fiction"
+        }
         SECCOMP_REFUSED => "PR_SET_SECCOMP was refused; seccomp may be unavailable here",
         VERIFY_FAILED => "verify() failed with writes denied",
         VERIFY_WITH_OPTIONS_FAILED => "verify_with_options() failed with writes denied",
