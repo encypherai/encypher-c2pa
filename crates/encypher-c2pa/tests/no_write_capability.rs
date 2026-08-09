@@ -195,16 +195,46 @@ const HEADROOM: &[u32] = &[
     302, // prlimit64
 ];
 
-/// Permitted only for specific argument values, so they sit in neither tier
+/// The terminal-attribute query behind `isatty`, which the Rust runtime makes
+/// on startup. The only `ioctl` request permitted.
+const TCGETS: u32 = 0x5401;
+
+// Byte offsets into `struct seccomp_data`: nr, arch, instruction_pointer, then
+// args[6]. The argument offsets are named here because the gate table below
+// refers to them, and a wrong offset would silently inspect the wrong value.
+const OFF_NR: u32 = 0;
+const OFF_ARCH: u32 = 4;
+const OFF_ARG1: u32 = 24;
+const OFF_ARG2: u32 = 32;
+
+/// How a permitted syscall's arguments are constrained.
+enum Gate {
+    /// `openat`/`open`: the flags argument may carry no write flag.
+    NoWriteFlags { arg: u32 },
+    /// `ioctl`: the request argument must be exactly this value.
+    ArgEquals { arg: u32, value: u32 },
+}
+
+/// Permitted only for specific argument values, so these sit in neither tier
 /// above: the syscall number alone does not decide the verdict.
 ///
-/// `openat`/`open` must carry no write flag. `ioctl` must be the terminal
-/// query behind `isatty` - a reviewer used `FS_IOC_SETFLAGS` on a read-only
-/// descriptor, so the descriptor's mode is not a safety property.
-///
-/// They are named here so that every permitted syscall appears in exactly one
-/// of the three lists and `every_allowed_syscall_is_needed` can say so.
-const ARGUMENT_GATED: &[u32] = &[257, 2, 16];
+/// The filter is generated from this table, so a permission cannot exist in the
+/// program without appearing here.
+const ARGUMENT_GATED: &[(u32, Gate)] = &[
+    // openat(dirfd, path, flags, mode) - flags is args[2], at offset 32.
+    (257, Gate::NoWriteFlags { arg: OFF_ARG2 }),
+    // open(path, flags, mode) - flags is args[1], at offset 24.
+    (2, Gate::NoWriteFlags { arg: OFF_ARG1 }),
+    // ioctl(fd, request, ..) - request is args[1]. Only TCGETS, the terminal
+    // query the Rust runtime makes on startup.
+    (
+        16,
+        Gate::ArgEquals {
+            arg: OFF_ARG1,
+            value: TCGETS,
+        },
+    ),
+];
 
 /// The filter's allowlist: both tiers.
 fn allowed() -> Vec<u32> {
@@ -218,18 +248,9 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     const JMP_JEQ_K: u16 = 0x15;
     const RET_K: u16 = 0x06;
 
-    // `struct seccomp_data` offsets: nr, arch, instruction_pointer, args[6].
-    const OFF_NR: u32 = 0;
-    const OFF_ARCH: u32 = 4;
-    const OFF_ARG1: u32 = 24;
-    const OFF_ARG2: u32 = 32;
-
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     const RET_ALLOW: u32 = 0x7fff_0000;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
-
-    // The terminal-attribute query behind `isatty`.
-    const TCGETS: u32 = 0x5401;
 
     // Any of these in the open flags means the caller wants to modify a file.
     // `O_TMPFILE` includes `O_DIRECTORY` and is caught by `O_WRONLY`/`O_RDWR`,
@@ -253,39 +274,41 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
         ins(LD_W_ABS, 0, 0, OFF_NR),
     ];
 
-    // `openat` and `open` are the only syscalls whose verdict depends on an
-    // argument: the number selects the block, the flags decide. Each block is
-    // self-contained so no jump is long.
+    // The argument-gated syscalls, built FROM the table rather than alongside
+    // it. A reviewer asked whether a syscall could be permitted by the filter
+    // while appearing in none of the three lists - the direction the earlier
+    // check could not see. Generating every permission from the lists makes
+    // that unrepresentable rather than merely tested: there is nowhere else
+    // for a permission to come from.
     //
-    // `write` and `writev` are absent entirely, rather than permitted to
-    // stdout. An earlier version allowed fd 1 and 2 so the child could print,
-    // which left an obvious residue: a harness that redirected stdout into a
-    // file would hand a writer a live descriptor. The child reports by exit
-    // status and never prints, so it does not need them at all, and the
-    // question disappears instead of being argued about.
-    let read_only_open = |p: &mut Vec<libc::sock_filter>, nr: u32, off: u32| {
-        p.push(ins(JMP_JEQ_K, 0, 5, nr));
-        p.push(ins(LD_W_ABS, 0, 0, off));
-        p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
-        p.push(ins(JMP_JEQ_K, 1, 0, 0));
-        p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
-        p.push(ins(RET_K, 0, 0, RET_ALLOW));
+    // `write` and `writev` appear in no list, and so in no filter. An earlier
+    // version permitted them to fd 1-2 so the child could print, which handed a
+    // writer a live descriptor whenever the harness redirected stdout into a
+    // file. The child reports by exit status, so it does not need them.
+    for (nr, gate) in ARGUMENT_GATED {
+        match gate {
+            // openat/open: no write flag may be set.
+            Gate::NoWriteFlags { arg } => {
+                p.push(ins(JMP_JEQ_K, 0, 5, *nr));
+                p.push(ins(LD_W_ABS, 0, 0, *arg));
+                p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
+                p.push(ins(JMP_JEQ_K, 1, 0, 0));
+                p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+                p.push(ins(RET_K, 0, 0, RET_ALLOW));
+            }
+            // ioctl: one permitted request. `FS_IOC_SETFLAGS` on a READ-ONLY
+            // descriptor toggled `FS_NODUMP_FL`, so the descriptor's mode is
+            // not the safety property it appears to be - the request is.
+            Gate::ArgEquals { arg, value } => {
+                p.push(ins(JMP_JEQ_K, 0, 4, *nr));
+                p.push(ins(LD_W_ABS, 0, 0, *arg));
+                p.push(ins(JMP_JEQ_K, 1, 0, *value));
+                p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+                p.push(ins(RET_K, 0, 0, RET_ALLOW));
+            }
+        }
         p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
-    };
-    read_only_open(&mut p, 257, OFF_ARG2); // openat(dirfd, path, flags, ..)
-    read_only_open(&mut p, 2, OFF_ARG1); // open(path, flags, ..)
-
-    // `ioctl` needs an argument gate too, and for the same reason as `openat`.
-    // A reviewer used `FS_IOC_SETFLAGS` on a READ-ONLY descriptor to toggle
-    // `FS_NODUMP_FL`, so "the descriptor is read-only" is not the safety
-    // property it looks like. Only the terminal query the Rust runtime makes on
-    // startup is permitted; every other request kills.
-    p.push(ins(JMP_JEQ_K, 0, 4, 16));
-    p.push(ins(LD_W_ABS, 0, 0, OFF_ARG1));
-    p.push(ins(JMP_JEQ_K, 1, 0, TCGETS));
-    p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
-    p.push(ins(RET_K, 0, 0, RET_ALLOW));
-    p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
+    }
 
     // The allowlist proper. Each comparison jumps forward to the single ALLOW,
     // and falling off the end reaches KILL - so an unlisted syscall dies.
@@ -665,10 +688,11 @@ fn the_demonstrated_bypasses_all_die() {
 fn every_allowed_syscall_is_needed() {
     // Every permitted syscall appears in exactly one list. Without this the
     // argument-gated three sat outside both tiers, invisible to these checks.
+    let gated_numbers: Vec<u32> = ARGUMENT_GATED.iter().map(|(nr, _)| *nr).collect();
     let lists = [
         ("EXERCISED", EXERCISED),
         ("HEADROOM", HEADROOM),
-        ("ARGUMENT_GATED", ARGUMENT_GATED),
+        ("ARGUMENT_GATED", gated_numbers.as_slice()),
     ];
     for (i, (name_a, a)) in lists.iter().enumerate() {
         for (name_b, b) in lists.iter().skip(i + 1) {
@@ -683,7 +707,7 @@ fn every_allowed_syscall_is_needed() {
     // And the lists describe the filter that is actually built, rather than a
     // parallel document that can drift away from it.
     let program = filter(None);
-    for nr in EXERCISED.iter().chain(HEADROOM).chain(ARGUMENT_GATED) {
+    for nr in EXERCISED.iter().chain(HEADROOM).chain(&gated_numbers) {
         assert!(
             program.iter().any(|i| i.k == *nr),
             "syscall {nr} is listed as permitted but appears nowhere in the \
