@@ -957,6 +957,23 @@ fn the_interpreter_models_every_instruction() {
 
 #[test]
 fn the_filter_permits_nothing_unlisted() {
+    // A seccomp return value is an ACTION in the high 16 bits and DATA in the
+    // low 16. The kernel masks before deciding, so 0x7fff_0001 is every bit as
+    // permissive as 0x7fff_0000.
+    //
+    // The first version of this compared for equality with `RET_ALLOW`, and a
+    // reviewer walked past it twice over: `RET_ALLOW | 1` passed the test while
+    // the kernel renamed a real file, and so did `SECCOMP_RET_LOG`, which logs
+    // a syscall and then runs it.
+    //
+    // Enumerating the permissive actions would repeat the mistake this file has
+    // now made three times - allowlists are what it concluded, twice, and then
+    // it wrote a denylist over return codes anyway. So the test is inverted:
+    // for an unlisted syscall, every reachable verdict must be EXACTLY the kill
+    // this filter issues. Not "not allow" - exactly kill. Any other value,
+    // whatever a future kernel decides it means, is a failure.
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const ACTION: u32 = 0xffff_0000;
     const RET_ALLOW: u32 = 0x7fff_0000;
 
     let program = filter(None);
@@ -965,24 +982,32 @@ fn the_filter_permits_nothing_unlisted() {
         .chain(ARGUMENT_GATED.iter().map(|(nr, _)| *nr))
         .collect();
 
-    let unlisted: Vec<u32> = (0..600u32)
+    let permitted: Vec<(u32, Vec<u32>)> = (0..600u32)
         .filter(|nr| !listed.contains(nr))
-        .filter(|nr| reachable_verdicts(&program, *nr).contains(&RET_ALLOW))
+        .filter_map(|nr| {
+            let stray: Vec<u32> = reachable_verdicts(&program, nr)
+                .into_iter()
+                .filter(|v| *v != RET_KILL_PROCESS)
+                .collect();
+            (!stray.is_empty()).then_some((nr, stray))
+        })
         .collect();
 
     assert!(
-        unlisted.is_empty(),
-        "the filter can permit syscalls that appear in no list: {unlisted:?}. \
+        permitted.is_empty(),
+        "unlisted syscalls can reach a verdict other than kill: {permitted:x?}. \
          Every permission must be written down, or the lists stop describing \
          the program.",
     );
 
     // The walk is only worth anything if it reaches the ALLOW returns at all.
     // A filter it could not traverse would report an empty set for everything
-    // and pass silently.
+    // and pass in silence. Matched on the action, for the same reason as above.
     for nr in listed {
         assert!(
-            reachable_verdicts(&program, nr).contains(&RET_ALLOW),
+            reachable_verdicts(&program, nr)
+                .iter()
+                .any(|v| v & ACTION == RET_ALLOW),
             "syscall {nr} is listed as permitted, but no path through the \
              filter reaches ALLOW for it",
         );
