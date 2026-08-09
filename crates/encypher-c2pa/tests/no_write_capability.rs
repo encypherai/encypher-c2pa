@@ -202,13 +202,11 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     const LD_W_ABS: u16 = 0x20;
     const ALU_AND_K: u16 = 0x54;
     const JMP_JEQ_K: u16 = 0x15;
-    const JMP_JGT_K: u16 = 0x25;
     const RET_K: u16 = 0x06;
 
     // `struct seccomp_data` offsets: nr, arch, instruction_pointer, args[6].
     const OFF_NR: u32 = 0;
     const OFF_ARCH: u32 = 4;
-    const OFF_ARG0: u32 = 16;
     const OFF_ARG1: u32 = 24;
     const OFF_ARG2: u32 = 32;
 
@@ -238,29 +236,27 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
         ins(LD_W_ABS, 0, 0, OFF_NR),
     ];
 
-    // A syscall whose verdict depends on an argument: `nr` selects the block,
-    // the argument decides. Each block is self-contained so no jump is long.
-    let arg_gated = |p: &mut Vec<libc::sock_filter>, nr: u32, off: u32, write_flags: bool| {
-        p.push(ins(JMP_JEQ_K, 0, if write_flags { 5 } else { 4 }, nr));
+    // `openat` and `open` are the only syscalls whose verdict depends on an
+    // argument: the number selects the block, the flags decide. Each block is
+    // self-contained so no jump is long.
+    //
+    // `write` and `writev` are absent entirely, rather than permitted to
+    // stdout. An earlier version allowed fd 1 and 2 so the child could print,
+    // which left an obvious residue: a harness that redirected stdout into a
+    // file would hand a writer a live descriptor. The child reports by exit
+    // status and never prints, so it does not need them at all, and the
+    // question disappears instead of being argued about.
+    let read_only_open = |p: &mut Vec<libc::sock_filter>, nr: u32, off: u32| {
+        p.push(ins(JMP_JEQ_K, 0, 5, nr));
         p.push(ins(LD_W_ABS, 0, 0, off));
-        if write_flags {
-            // openat/open: allowed only with no write flag set.
-            p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
-            p.push(ins(JMP_JEQ_K, 1, 0, 0));
-            p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
-            p.push(ins(RET_K, 0, 0, RET_ALLOW));
-        } else {
-            // write/writev: allowed only to stdout and stderr.
-            p.push(ins(JMP_JGT_K, 1, 0, 2));
-            p.push(ins(RET_K, 0, 0, RET_ALLOW));
-            p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
-        }
+        p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
+        p.push(ins(JMP_JEQ_K, 1, 0, 0));
+        p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+        p.push(ins(RET_K, 0, 0, RET_ALLOW));
         p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
     };
-    arg_gated(&mut p, 257, OFF_ARG2, true); // openat(dirfd, path, flags, ..)
-    arg_gated(&mut p, 2, OFF_ARG1, true); // open(path, flags, ..)
-    arg_gated(&mut p, 1, OFF_ARG0, false); // write(fd, ..)
-    arg_gated(&mut p, 20, OFF_ARG0, false); // writev(fd, ..)
+    read_only_open(&mut p, 257, OFF_ARG2); // openat(dirfd, path, flags, ..)
+    read_only_open(&mut p, 2, OFF_ARG1); // open(path, flags, ..)
 
     // The allowlist proper. Each comparison jumps forward to the single ALLOW,
     // and falling off the end reaches KILL - so an unlisted syscall dies.
