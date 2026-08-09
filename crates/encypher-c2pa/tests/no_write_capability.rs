@@ -298,16 +298,10 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     ];
 
     // The argument-gated syscalls, built FROM the table rather than alongside
-    // it. A reviewer asked whether a syscall could be permitted by the filter
-    // while appearing in none of the three lists - the direction the earlier
-    // check could not see. Generating every permission from the lists makes
-    // that unrepresentable rather than merely tested: there is nowhere else
-    // for a permission to come from.
+    // it, so a permission cannot exist in the program without appearing in a
+    // list: there is nowhere else for one to come from.
     //
-    // `write` and `writev` appear in no list, and so in no filter. An earlier
-    // version permitted them to fd 1-2 so the child could print, which handed a
-    // writer a live descriptor whenever the harness redirected stdout into a
-    // file. The child reports by exit status, so it does not need them.
+    // `write` and `writev` appear in no list, and so in no filter. See History.
     for (nr, gate) in ARGUMENT_GATED {
         match gate {
             // openat/open: no write flag may be set.
@@ -319,9 +313,8 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
                 p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
                 p.push(ins(RET_K, 0, 0, RET_ALLOW));
             }
-            // ioctl: one permitted request. `FS_IOC_SETFLAGS` on a READ-ONLY
-            // descriptor toggled `FS_NODUMP_FL`, so the descriptor's mode is
-            // not the safety property it appears to be - the request is.
+            // ioctl: one permitted request. The gate is on the request and not
+            // the descriptor's mode - see History.
             Gate::ArgEquals { arg, value } => {
                 p.push(ins(JMP_JEQ_K, 0, 4, *nr));
                 p.push(ins(LD_W_ABS, 0, 0, *arg));
@@ -837,25 +830,13 @@ fn the_demonstrated_bypasses_all_die() {
 /// Each argument gate, tested against the kernel rather than against a model
 /// of it.
 ///
-/// There used to be four hundred lines here: a symbolic interpreter for the
-/// filter's four opcodes and a policy check that walked every syscall number
-/// over unknown arguments. It was deleted, and the reasoning is worth keeping
-/// because it was not obvious at the time.
+/// A symbolic interpreter used to check these boundaries statically. It was
+/// deleted; the History section says why, and it is the single most useful
+/// thing in this file to have read before changing it.
 ///
-/// Across four review cycles that interpreter never found a defect in the
-/// filter. It was itself the defect four times: it sampled three argument
-/// profiles and called that exhaustive, compared return values by whole word
-/// when the kernel masks off the data bits, skipped listed syscalls and so
-/// never examined the gates at all, and bounded the syscall space at 600. Every
-/// one of those is the same bug - the model disagreed with the kernel - and it
-/// is the bug a model can always have.
-///
-/// What it uniquely checked was the gate boundaries over all arguments. Three
-/// canaries check the same boundaries against the real kernel, which cannot
-/// have a faithfulness bug because there is nothing to be faithful to. The
-/// default-deny canary above already covers a mangled jump: an offset that let
-/// an unlisted syscall fall through to ALLOW would let `io_uring_setup` live,
-/// and that test would fail.
+/// The default-deny canary above covers what remains: a mangled jump offset
+/// that let an unlisted syscall fall through to ALLOW would let
+/// `io_uring_setup` live, and that test would fail.
 #[test]
 fn each_argument_gate_holds_against_the_kernel() {
     // Each write flag in isolation, on both open variants.
@@ -942,8 +923,11 @@ fn each_argument_gate_holds_against_the_kernel() {
         libc::syscall(2, c"/proc/self/maps".as_ptr(), 0, 0) >= 0
     });
     must_live("ioctl TCGETS", || unsafe {
-        // Fails with ENOTTY on a pipe, which is fine - what matters is that the
-        // process survives to report, rather than dying of SIGSYS.
+        // fd 0 was closed by `close_range`, so this returns EBADF. That is the
+        // point rather than a flaw: seccomp decides ALLOW or KILL from the
+        // request argument before the kernel ever looks up the descriptor, so
+        // surviving the call is exactly the gate contract being asserted. What
+        // would fail here is a blanket ioctl ban.
         let mut termios: libc::termios = std::mem::zeroed();
         libc::syscall(16, 0, TCGETS as u64, &mut termios);
         true

@@ -165,8 +165,9 @@ success and failure paths and creates no sibling files.
 | Sandbox vs. `write` to fd 1, `open` O_RDWR, `ioctl` FS_IOC_SETFLAGS, `io_uring_setup` | SIGSYS on all four |
 | Sandbox vs. inherited `O_RDWR` descriptor | none survives `close_range`; checked to RLIMIT_NOFILE |
 | Sandbox vs. inherited `MAP_SHARED` mapping | unmapped before the filter; backing file unchanged |
-| Gate canaries vs. `openat` O_CREAT, `open` O_WRONLY, `ioctl` non-TCGETS | SIGSYS on all three |
-| Gate canaries vs. read-only `openat` | succeeds, so the gates gate rather than ban |
+| Gate canaries, denied side | each of O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND isolated on both `openat` and `open`, plus `ioctl` FS_IOC_SETFLAGS: SIGSYS on all eleven |
+| Gate canaries vs. a mask losing one bit | each of the five removed in turn; each fails and names the flag |
+| Gate canaries, permitted side | read-only `openat` and `open` succeed, `ioctl` TCGETS survives, so the gates gate rather than ban |
 | Allowlist minimality | removing any EXERCISED entry breaks the run |
 
 ## Review Loop State
