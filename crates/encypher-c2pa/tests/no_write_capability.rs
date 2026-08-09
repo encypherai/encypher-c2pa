@@ -36,6 +36,7 @@
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use encypher_c2pa::{verify, verify_file, verify_with_options, VerifyOptions};
@@ -88,30 +89,36 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
-/// Assemble the seccomp program: allow a fixed set, kill everything else.
-///
-/// The first version of this was a denylist of mutating syscalls, and it had
-/// exactly the weakness the source scan had. A reviewer asked what it did about
-/// io_uring, and the answer was nothing: `io_uring_setup` succeeds on this
-/// kernel, and a ring can perform `openat` and `write` as submission entries
-/// without ever issuing the syscalls the list refused. `setxattr`, `utimensat`
-/// and `fallocate` were missing too. Enumerating ways to write is the same
-/// losing game one layer down.
-///
-/// So this is inverted. Verification needs a small, boring set of syscalls -
-/// read, map memory, look at the clock - and anything outside it kills the
-/// process. Soundness no longer depends on my imagination: it depends on the
-/// much easier claim that nothing in the list below can modify a file.
-///
-/// The two that could, given the wrong argument, are constrained by argument
-/// rather than excluded: `openat`/`open` must carry no write flag, and
-/// `write`/`writev` must target stdout or stderr. Everything else is either
-/// read-only or does not touch the filesystem at all.
-///
-/// It is deliberately not minimal. Trimming it further would buy nothing and
-/// would make the test brittle against an allocator change. What matters is
-/// that it is an allowlist, so a new way to write is denied by default instead
-/// of denied only if I thought of it.
+// How the permission lists below are meant to be read.
+//
+// The first version was a denylist of mutating syscalls, and it had exactly the
+// weakness the source scan had. A reviewer asked what it did about io_uring,
+// and the answer was nothing: `io_uring_setup` succeeds on this kernel, and a
+// ring performs `openat` and `write` as submission entries without ever issuing
+// the syscalls the list refused. `setxattr`, `utimensat` and `fallocate` were
+// missing too. Enumerating ways to write is the same losing game one layer
+// down.
+//
+// So it is inverted. Verification needs a small, boring set of syscalls - read,
+// map memory, look at the clock - and anything outside it kills the process.
+// Soundness no longer depends on my imagination: it depends on the much easier
+// claim that nothing in the lists below can modify a file.
+//
+// Three are constrained by argument rather than excluded: `openat` and `open`
+// must carry no write flag, and `ioctl` must be the one terminal query the
+// runtime makes on startup. Everything else is a read, a memory operation, a
+// thread or signal operation, or a clock.
+//
+// `write` and `writev` are not here at all. They were briefly permitted to
+// stdout so the child could print, until it became clear that a harness which
+// redirects stdout into a file hands a writer a live descriptor. The child
+// reports by exit status.
+//
+// The lists are deliberately not minimal. Trimming further would buy nothing
+// and would make the suite brittle against an allocator change. What matters is
+// that they are an allowlist, so a new way to write is denied by default rather
+// than denied only if someone thought of it.
+
 /// Syscalls the sandboxed scenario actually makes. Removing any one of these
 /// kills the run, which `every_allowed_syscall_is_needed` proves on every CI
 /// run - so this tier cannot quietly accumulate.
@@ -129,7 +136,7 @@ const EXERCISED: &[u32] = &[
 /// A reviewer asked how the allowlist could be shown minimal rather than merely
 /// sufficient. Measuring it was the easy part: the child is forked from a warm
 /// process, so it inherits its mappings and its allocator arena and ends up
-/// needing only the eight above. Trimming to exactly those would make this
+/// needing only the six above. Trimming to exactly those would make this
 /// suite fail on a machine with a different libc, allocator or kernel, and a
 /// test that fails on a contributor's laptop teaches people to delete the test.
 ///
@@ -200,6 +207,8 @@ const HEADROOM: &[u32] = &[
 /// on startup. The only `ioctl` request permitted.
 const TCGETS: u32 = 0x5401;
 
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
 // Byte offsets into `struct seccomp_data`: nr, arch, instruction_pointer, then
 // args[6]. The argument offsets are named here because the gate table below
 // refers to them, and a wrong offset would silently inspect the wrong value.
@@ -249,7 +258,6 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     const JMP_JEQ_K: u16 = 0x15;
     const RET_K: u16 = 0x06;
 
-    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     const RET_ALLOW: u32 = 0x7fff_0000;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
 
@@ -339,20 +347,25 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
 /// through does not remove it.
 ///
 /// `/proc/self/maps` lines are
-/// `start-end perms offset dev inode pathname`. Two fields decide:
+/// `start-end perms offset dev inode pathname`. The rule applied is:
 ///
-/// - the fourth character of `perms` is `s` for shared, `p` for private;
-/// - `inode` is `0` exactly when the mapping is anonymous.
+///   unmap it when the fourth character of `perms` is `s` and `inode` is not 0.
 ///
-/// The decision deliberately uses the INODE rather than the pathname. A
-/// pathname may contain spaces, so splitting on whitespace cannot delimit it,
-/// and the first version of this got the field arithmetic wrong anyway - it
-/// read the inode while believing it was the path, which happened to behave
-/// because this host has no anonymous shared mappings. The inode answers the
-/// only question being asked, and answers it unambiguously.
+/// That is deliberately conservative rather than exact, and the difference is
+/// worth stating because an earlier version of this comment claimed the exact
+/// version and was wrong. Inode 0 does mean anonymous, but the converse fails:
+/// a reviewer showed that `MAP_SHARED | MAP_ANONYMOUS` is reported as
+/// `/dev/zero` with a real inode, so the rule sweeps up some anonymous shared
+/// mappings too. That costs a little memory the child was not going to use and
+/// removes a class of mapping this code would otherwise have to reason about,
+/// so it is left as is - but it is not the rule "unmap file-backed mappings",
+/// and a maintainer should not be told that it is.
 ///
-/// Anonymous shared mappings are left alone: they back no file, and unmapping
-/// the allocator's own memory would end the process rather than protect it.
+/// The decision uses the inode rather than the pathname on purpose. A pathname
+/// may contain spaces, so splitting on whitespace cannot delimit it, and the
+/// first version got the field arithmetic wrong anyway: it read field 4 while
+/// believing that was the path. Field 4 is the inode. It behaved only because
+/// nothing here maps a file shared.
 fn unmap_inherited_shared_mappings() -> Result<(), ()> {
     let maps = std::fs::read_to_string("/proc/self/maps").map_err(|_| ())?;
 
@@ -797,50 +810,107 @@ fn the_demonstrated_bypasses_all_die() {
     }
 }
 
-/// Interpret the assembled filter, so its verdicts can be asked rather than
-/// assumed.
+/// A value the interpreter is tracking: a concrete number, or anything at all.
 ///
-/// Only the four opcodes this program uses are implemented; anything else is a
-/// panic, because a silently-ignored instruction would make every answer here
-/// worthless.
-fn evaluate(program: &[libc::sock_filter], nr: u32, args: [u32; 6]) -> u32 {
-    let mut data = [0u32; 16];
-    data[0] = nr;
-    data[1] = 0xc000_003e; // AUDIT_ARCH_X86_64
-    for (i, arg) in args.iter().enumerate() {
-        data[4 + i * 2] = *arg;
-    }
-
-    let mut a: u32 = 0;
-    let mut pc = 0usize;
-    for _ in 0..4096 {
-        let i = program[pc];
-        match i.code {
-            0x20 => a = data[(i.k / 4) as usize],
-            0x54 => a &= i.k,
-            0x15 => {
-                pc += 1 + usize::from(if a == i.k { i.jt } else { i.jf });
-                continue;
-            }
-            0x06 => return i.k,
-            other => panic!("filter uses opcode {other:#x}, which this interpreter does not model"),
-        }
-        pc += 1;
-    }
-    panic!("filter did not terminate");
+/// Syscall arguments are `Unknown`, because the point is to say something true
+/// for every argument a caller might pass, rather than for three that happened
+/// to be tried.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Val {
+    Known(u32),
+    Unknown,
 }
 
-/// No syscall is permitted that is not written down.
+/// Every verdict the filter can reach for a given syscall, over all arguments.
 ///
-/// The earlier check ran one way only - every listed number must appear
-/// somewhere in the program - which catches a list entry that was never wired
-/// up and misses a permission that was wired up and never listed. A reviewer
-/// demonstrated the gap by adding a bare permission for `renameat2` to the
-/// assembled filter: every test still passed, and a probe renamed a real file.
+/// The first version of this took three concrete argument profiles and ran
+/// them. It looked exhaustive and was not: a reviewer added a permission for
+/// `renameat2` guarded by `args[0] == 3`, which none of the three profiles hit,
+/// so the check stayed green while the sandboxed child opened directories until
+/// it held fd 3 and renamed a real file.
 ///
-/// This asks the filter directly, for every syscall number the table can hold.
-/// A stray ALLOW anywhere has to correspond to a name in one of the three
-/// lists, so a permission cannot enter unnoticed however it got there.
+/// So arguments are not sampled here, they are unknown. Where a comparison
+/// tests an unknown value both outcomes are explored, and what comes back is
+/// the set of verdicts reachable by ANY argument. A conditional ALLOW is then
+/// simply an ALLOW.
+///
+/// Only the four opcodes this program uses are modelled; anything else panics,
+/// because a silently-ignored instruction would make every answer worthless.
+/// The program has no backward jumps and each state is visited once, so the
+/// walk terminates.
+fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
+    // `seccomp_data` is addressed by byte offset. `nr` and `arch` are
+    // determined for a given syscall; every argument word is not.
+    let load = |k: u32| match k {
+        OFF_NR => Val::Known(nr),
+        OFF_ARCH => Val::Known(AUDIT_ARCH_X86_64),
+        _ => Val::Unknown,
+    };
+
+    let mut verdicts = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut work = vec![(0usize, Val::Known(0))];
+
+    while let Some((pc, a)) = work.pop() {
+        if !seen.insert((pc, a)) {
+            continue;
+        }
+        match program[pc].code {
+            // LD_W_ABS
+            0x20 => work.push((pc + 1, load(program[pc].k))),
+            // ALU_AND_K
+            0x54 => {
+                let next = match a {
+                    Val::Known(v) => Val::Known(v & program[pc].k),
+                    Val::Unknown => Val::Unknown,
+                };
+                work.push((pc + 1, next));
+            }
+            // JMP_JEQ_K
+            0x15 => {
+                let taken = pc + 1 + usize::from(program[pc].jt);
+                let missed = pc + 1 + usize::from(program[pc].jf);
+                match a {
+                    // A determined comparison goes one way, as the kernel would.
+                    Val::Known(v) => {
+                        work.push((if v == program[pc].k { taken } else { missed }, a))
+                    }
+                    // An undetermined one goes both ways, because some caller
+                    // can arrange either.
+                    Val::Unknown => {
+                        work.push((taken, Val::Known(program[pc].k)));
+                        work.push((missed, Val::Unknown));
+                    }
+                }
+            }
+            // RET_K
+            0x06 => {
+                verdicts.insert(program[pc].k);
+            }
+            other => panic!("filter uses opcode {other:#x}, which this interpreter does not model"),
+        }
+    }
+
+    verdicts
+}
+
+/// No syscall is permitted that is not written down, for any argument.
+///
+/// This invariant has been wrong twice, each time in a way that looked right.
+///
+/// First it ran one direction only - every listed number must appear somewhere
+/// in the program - which catches a list entry that was never wired up and
+/// misses a permission wired up and never listed. A reviewer added a bare
+/// `renameat2` permission and renamed a real file with every test green.
+///
+/// Then it asked the filter directly, but with three concrete argument
+/// profiles. The same reviewer guarded the same permission on `args[0] == 3`,
+/// which no profile happened to hit, opened directories in the sandboxed child
+/// until it held fd 3, and renamed a real file with every test green again.
+///
+/// Sampling arguments cannot establish a statement about all arguments. So the
+/// arguments are unknown and both sides of an undetermined comparison are
+/// explored: for an unlisted syscall, EVERY reachable path must end in KILL.
 #[test]
 fn the_filter_permits_nothing_unlisted() {
     const RET_ALLOW: u32 = 0x7fff_0000;
@@ -851,28 +921,28 @@ fn the_filter_permits_nothing_unlisted() {
         .chain(ARGUMENT_GATED.iter().map(|(nr, _)| *nr))
         .collect();
 
-    // Argument profiles chosen to reach both sides of every gate: all-zero
-    // makes `openat` look read-only, and the second sets the one `ioctl`
-    // request that is allowed. A gate that let something through on other
-    // arguments would show up as an ALLOW for an unlisted number.
-    let profiles = [[0u32; 6], [0, TCGETS, 0, 0, 0, 0], [u32::MAX; 6]];
-
-    let mut unlisted = Vec::new();
-    for nr in 0..600u32 {
-        for args in &profiles {
-            if evaluate(&program, nr, *args) == RET_ALLOW && !listed.contains(&nr) {
-                unlisted.push(nr);
-                break;
-            }
-        }
-    }
+    let unlisted: Vec<u32> = (0..600u32)
+        .filter(|nr| !listed.contains(nr))
+        .filter(|nr| reachable_verdicts(&program, *nr).contains(&RET_ALLOW))
+        .collect();
 
     assert!(
         unlisted.is_empty(),
-        "the filter permits syscalls that appear in no list: {unlisted:?}. \
+        "the filter can permit syscalls that appear in no list: {unlisted:?}. \
          Every permission must be written down, or the lists stop describing \
          the program.",
     );
+
+    // The walk is only worth anything if it reaches the ALLOW returns at all.
+    // A filter it could not traverse would report an empty set for everything
+    // and pass silently.
+    for nr in listed {
+        assert!(
+            reachable_verdicts(&program, nr).contains(&RET_ALLOW),
+            "syscall {nr} is listed as permitted, but no path through the \
+             filter reaches ALLOW for it",
+        );
+    }
 }
 
 /// Every entry in the exercised tier is load-bearing, and the two tiers agree.

@@ -1,6 +1,6 @@
 # Verification-Only Boundary
 
-**Status:** implementation complete, completion gate in progress (cycle 12)
+**Status:** implementation complete, completion gate in progress (cycle 14)
 **Current Goal:** the published SDK offers no way to produce a C2PA asset, and that property is enforced by CI rather than by reviewer attention.
 
 ## Overview
@@ -181,6 +181,8 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
 
   cycle 11 sol56        correctness 6.2      simplification 6.8      security  -       -> not cleared
   cycle 12 sol56        correctness 6.4      simplification 7.8      security  -       -> not cleared
+  cycle 13 sol56        correctness 7.3      simplification 8.6      security 7.6      -> not cleared
+  cycle 14 sol56        correctness 8.8      simplification 8.9      security 8.7      -> not cleared
 
   The loop was stopped after cycle 10 and then restarted, and the restart was
   the right call.
@@ -226,6 +228,20 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
         `renameat2` permission and renaming a real file while all tests passed.
         A test now interprets the assembled BPF and asks its verdict for every
         syscall number; an ALLOW appearing in no list fails the build.
+    22. that reverse check sampled three concrete argument profiles, so it did
+        not establish a statement about all arguments. The reviewer guarded an
+        unlisted `renameat2` permission on `args[0] == 3`, which no profile hit,
+        had the child open directories until it held fd 3, and renamed a real
+        file with every test green. Arguments are now symbolic: both sides of an
+        undetermined comparison are explored and every reachable path for an
+        unlisted syscall must end in KILL.
+    23. the maps parser read field 4 believing it was the pathname. Field 4 is
+        the inode. It behaved only because nothing on the host maps a file
+        shared; an anonymous shared mapping has inode 0, which is neither empty
+        nor bracketed, so the guard would have passed it and the allocator's own
+        memory would have been unmapped. The decision now uses the inode, which
+        also settles the pathname-with-spaces case that no amount of field
+        counting can.
 
   Most of those are pinned by tests requiring SIGSYS. Two are not, because they
   are closed by something other than the filter and asserting SIGSYS would prove
