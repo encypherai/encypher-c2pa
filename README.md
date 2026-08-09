@@ -329,10 +329,15 @@ general property.
 A third control asks the kernel instead of the source.
 `crates/encypher-c2pa/tests/no_write_capability.rs` forks a child, installs a
 seccomp filter, and runs `verify`, `verify_with_options` and `verify_file`
-inside it across every MIME in `supported_mime_types()` and every extension in
-`SUPPORTED_EXTENSIONS`, on signed, unsigned and truncated input. The signed
-cases must come back present with valid integrity and a matching hard binding,
-so a run that silently stopped parsing cannot pass for a clean one.
+inside it. Be precise about the coverage, because it is uneven: there are
+signed fixtures for JPEG and MP4 only, and those are the cases asserted to come
+back present, with valid integrity and a matching hard binding, so a run that
+quietly stopped parsing cannot pass for a clean one. Every other MIME in
+`supported_mime_types()` and every extension in `SUPPORTED_EXTENSIONS` is
+driven through the same entry points on unsigned, truncated and absent input,
+which exercises format dispatch and the error paths rather than a successful
+parse. Error paths are worth covering here: they are the easiest place for a
+side effect to hide.
 
 The filter is an allowlist, not a denylist, and that distinction is the whole
 control. The first version enumerated mutating syscalls; a reviewer asked what

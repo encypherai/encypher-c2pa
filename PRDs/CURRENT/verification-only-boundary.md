@@ -1,6 +1,6 @@
 # Verification-Only Boundary
 
-**Status:** implementation complete, completion gate in progress (cycle 8)
+**Status:** implementation complete, completion gate in progress (cycle 12)
 **Current Goal:** the published SDK offers no way to produce a C2PA asset, and that property is enforced by CI rather than by reviewer attention.
 
 ## Overview
@@ -131,7 +131,7 @@ success and failure paths and creates no sibling files.
 
 - Default build of the published library exposes zero manifest constructors and
   zero container writers; `public-surface.txt` holds 171 reviewed items.
-- `cargo test --workspace` passes: 308 tests (302 pre-existing, unchanged by the
+- `cargo test --workspace` passes: 316 tests (302 pre-existing, unchanged by the
   consolidation, plus 6 non-mutation contract tests).
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - Exactly two publishable packages remain.
@@ -145,7 +145,7 @@ success and failure paths and creates no sibling files.
 
 | Check | Result |
 |---|---|
-| Public surface inventory | 171 items, zero writers |
+| Public surface inventory | 172 items, zero writers |
 | Workspace tests | 308 passed, 0 failed |
 | clippy `-D warnings` | 0 errors |
 | CLI on a real signed MP4 | integrity valid, signature valid, hard binding match |
@@ -179,41 +179,43 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
   cycle 9  sol56        correctness 6.6      simplification  -       security  -       -> not cleared
   cycle 10 sol56        correctness 6.0      simplification 8.2      security 6.0      -> STOPPED
 
-  Why the loop stopped, and it is not because the bar was met.
+  cycle 11 sol56        correctness 6.2      simplification 6.8      security  -       -> not cleared
+  cycle 12 sol56        correctness 6.4      simplification 7.8      security  -       -> not cleared
 
-  Correctness across the Sol cycles ran 6.8, 8.0, 6.8, 6.6, 6.0. Falling, while
-  fifteen distinct evasions were found and closed. The score fell because the
-  fixes for cycles 8-10 grew a hand-written Rust attribute parser and a
-  write-effect denylist, and each new line of scanner was new attack surface.
-  Sol walked past the denylist twice in one sitting with ordinary safe Rust
-  ('use std::fs as io_fs', then 'File::options().create(true)'), each time with
-  the gate printing PASS, all contract tests green, the CLI verifying a real
-  signed MP4, and its marker file on disk.
+  The loop was stopped after cycle 10 and then restarted, and the restart was
+  the right call.
 
-  That is the skill's no-progress condition: the diff churns and the score does
-  not rise. It is also a substantive finding rather than reviewer fatigue. Sol
-  said the same thing at cycle 8 and again at cycle 10: a source-level control
-  cannot establish 'no public item writes'. The property is not decidable by
-  pattern matching over text.
+  At cycle 10 the scores had gone 6.8, 8.0, 6.8, 6.6, 6.0 - falling while
+  fifteen evasions were found and fixed. The cause was real: the fixes for
+  cycles 8-10 grew a hand-written Rust attribute parser and a write-effect
+  denylist over source text, and each addition was fresh attack surface. The
+  reviewer had said twice that no source-level control can establish "no public
+  item writes", and it was right.
 
-  So the last commit reverted the claim rather than the code. The write scan
-  stays, relabelled in its own header as a tripwire for the careless case with
-  both bypasses named, and the weight sits on the two controls that hold: the
-  compiler-derived shape lock, and the observable behaviour tests. Sol verified
-  the README is now accurate about exactly this.
+  So instead of a sixteenth patch, the control moved a layer down.
+  `tests/no_write_capability.rs` runs the public entry points under seccomp.
+  That reframed the loop: cycles 11 and 12 are no longer about whether a text
+  scanner can be made exhaustive, they are about whether a kernel-level
+  allowlist is sound. Both cycles found genuine defects in it, and both were
+  fixable rather than fundamental:
 
-  What would actually close it, in order of cost:
+    16. the filter was a syscall DENYLIST, so io_uring bypassed it entirely -
+        a ring performs openat and write as submission entries. Also missing:
+        setxattr, utimensat, mknod, fallocate, pwrite64. Inverted to
+        default-deny.
+    17. `write`/`writev` were permitted to fd 1-2 so the child could print. A
+        harness that redirects stdout into a file hands a writer a live
+        descriptor; the reviewer changed a file that way. They are now absent
+        entirely - the child reports by exit status.
+    18. an inherited `O_RDWR` descriptor plus `mmap(MAP_SHARED)` rewrote a file
+        without one denied syscall. No syscall filter can see that. The child
+        now closes every inherited descriptor before the filter goes on.
+    19. `ioctl` with `FS_IOC_SETFLAGS` toggled `FS_NODUMP_FL` on a READ-ONLY
+        descriptor, so "the descriptor is read-only" is not a safety property.
+        `ioctl` is now gated by request, not by descriptor.
 
-    - run the verification entry points under Landlock or seccomp in a test and
-      assert they still succeed with filesystem mutation denied. Sound against
-      aliases, macros, dependencies and unsafe alike. Kernel 6.8 here supports
-      it. New dev-dependency, contained work.
-    - resolved-call analysis over the full dependency graph. MIR-level. Real
-      tooling work.
-
-  Recommendation: ship on the current honest framing, build the Landlock test
-  before 1.0. The boundary claim in the README is already true as written; what
-  is missing is a stronger control, not a correction.
+  Each of those four is pinned by a test that requires SIGSYS, so none can
+  return quietly.
 
   ELEVEN distinct evasions were found in this gate and fixed, each demonstrated
   end to end with a working consumer rather than asserted:

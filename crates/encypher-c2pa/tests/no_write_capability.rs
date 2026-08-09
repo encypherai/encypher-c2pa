@@ -120,9 +120,7 @@ const EXERCISED: &[u32] = &[
     332, // statx
     10,  // mprotect
     28,  // madvise
-    16,  // ioctl - on a read-only descriptor
     318, // getrandom
-    231, // exit_group
 ];
 
 /// Permitted but not exercised here, and deliberately kept.
@@ -141,6 +139,11 @@ const EXERCISED: &[u32] = &[
 /// unnoticed: it either proves itself necessary, or it is written down here
 /// where a reviewer sees it.
 const HEADROOM: &[u32] = &[
+    // Harness, not verification. The child ends in `_exit`, so removing this
+    // always kills the run and it would pass the necessity test without that
+    // proving anything about the code under test. Declared here instead of
+    // taking undeserved credit there.
+    231, // exit_group
     17,  // pread64
     19,  // readv
     295, // preadv
@@ -192,6 +195,17 @@ const HEADROOM: &[u32] = &[
     302, // prlimit64
 ];
 
+/// Permitted only for specific argument values, so they sit in neither tier
+/// above: the syscall number alone does not decide the verdict.
+///
+/// `openat`/`open` must carry no write flag. `ioctl` must be the terminal
+/// query behind `isatty` - a reviewer used `FS_IOC_SETFLAGS` on a read-only
+/// descriptor, so the descriptor's mode is not a safety property.
+///
+/// They are named here so that every permitted syscall appears in exactly one
+/// of the three lists and `every_allowed_syscall_is_needed` can say so.
+const ARGUMENT_GATED: &[u32] = &[257, 2, 16];
+
 /// The filter's allowlist: both tiers.
 fn allowed() -> Vec<u32> {
     EXERCISED.iter().chain(HEADROOM).copied().collect()
@@ -213,6 +227,9 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     const RET_ALLOW: u32 = 0x7fff_0000;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+    // The terminal-attribute query behind `isatty`.
+    const TCGETS: u32 = 0x5401;
 
     // Any of these in the open flags means the caller wants to modify a file.
     // `O_TMPFILE` includes `O_DIRECTORY` and is caught by `O_WRONLY`/`O_RDWR`,
@@ -258,6 +275,18 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
     read_only_open(&mut p, 257, OFF_ARG2); // openat(dirfd, path, flags, ..)
     read_only_open(&mut p, 2, OFF_ARG1); // open(path, flags, ..)
 
+    // `ioctl` needs an argument gate too, and for the same reason as `openat`.
+    // A reviewer used `FS_IOC_SETFLAGS` on a READ-ONLY descriptor to toggle
+    // `FS_NODUMP_FL`, so "the descriptor is read-only" is not the safety
+    // property it looks like. Only the terminal query the Rust runtime makes on
+    // startup is permitted; every other request kills.
+    p.push(ins(JMP_JEQ_K, 0, 4, 16));
+    p.push(ins(LD_W_ABS, 0, 0, OFF_ARG1));
+    p.push(ins(JMP_JEQ_K, 1, 0, TCGETS));
+    p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+    p.push(ins(RET_K, 0, 0, RET_ALLOW));
+    p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
+
     // The allowlist proper. Each comparison jumps forward to the single ALLOW,
     // and falling off the end reaches KILL - so an unlisted syscall dies.
     // Minimality testing removes one entry and requires the scenario to die.
@@ -281,6 +310,22 @@ fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
 /// Drop the ability to create or modify any file, irreversibly, for this
 /// process and everything it goes on to call.
 fn engage_sandbox(exclude: Option<u32>) -> Result<(), i32> {
+    // Close every inherited descriptor first.
+    //
+    // A filter over syscall numbers says nothing about descriptors that were
+    // already open when it was installed, and a reviewer used exactly that: it
+    // took an inherited `O_RDWR` descriptor, mapped it `MAP_SHARED`, and
+    // changed the file's bytes without issuing a single denied syscall. The
+    // same inheritance let `ioctl` on a read-only descriptor flip
+    // `FS_NODUMP_FL`. Neither needed a writer in the library; both needed a
+    // writable thing already lying around, which is what a test harness leaves
+    // behind.
+    //
+    // So the child starts with nothing open. It never prints - it reports by
+    // exit status - and it opens its fixtures by path afterwards, read-only.
+    // This runs BEFORE the filter, while closing is still permitted.
+    unsafe { libc::close_range(0, u32::MAX, 0) };
+
     // Required before an unprivileged process may install a filter.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(NO_NEW_PRIVS_REFUSED);
@@ -355,18 +400,23 @@ fn verify_child(cases: Cases, exclude: Option<u32>) -> ! {
         engage_sandbox(exclude)?;
 
         // The signed fixtures must reach a real conclusion, not merely return.
-        // If verification silently degraded to "no provenance" the sandbox would
-        // look clean while proving nothing about the parsing path.
+        // One predicate for all three entry points: an earlier version checked
+        // a different pair of fields at each call, so a report could satisfy
+        // the suite while failing the property the README describes.
+        let signed_ok = |r: &encypher_c2pa::VerificationReport| {
+            r.present && r.integrity == "valid" && r.hard_binding == "match"
+        };
+
         for (bytes, mime) in [(&signed_jpg, "image/jpeg"), (&signed_mp4, "video/mp4")] {
             let report = verify(bytes, mime).map_err(|_| VERIFY_FAILED)?;
-            if !report.present || report.integrity != "valid" {
+            if !signed_ok(&report) {
                 return Err(SIGNED_INPUT_NOT_PARSED);
             }
         }
 
         let report = verify_with_options(&signed_mp4, "video/mp4", &VerifyOptions::default())
             .map_err(|_| VERIFY_WITH_OPTIONS_FAILED)?;
-        if !report.present || report.hard_binding != "match" {
+        if !signed_ok(&report) {
             return Err(SIGNED_INPUT_NOT_PARSED);
         }
 
@@ -487,6 +537,118 @@ fn the_sandbox_kills_an_unlisted_syscall() {
     );
 }
 
+/// Each capability a reviewer actually used, pinned so it cannot come back.
+///
+/// These are not hypothetical. Every one was demonstrated end to end against an
+/// earlier version of this filter, on a real file, while the whole suite
+/// reported success. They are listed by the route rather than the syscall
+/// because that is how they were found.
+#[test]
+fn no_writable_descriptor_reaches_the_sandbox() {
+    // The mmap route is closed by descriptor hygiene rather than by the filter,
+    // so it needs its own assertion. A reviewer took an inherited `O_RDWR`
+    // descriptor, mapped it `MAP_SHARED`, and rewrote a file's bytes without
+    // issuing one denied syscall. No filter over syscall numbers can see that;
+    // the only defence is that no such descriptor exists.
+    //
+    // Checked before the filter goes on, because `fcntl` is not permitted after.
+    const A_DESCRIPTOR_IS_WRITABLE: i32 = 30;
+    const MMAP_SHARED_SUCCEEDED: i32 = 31;
+
+    let status = in_child(|| {
+        unsafe { libc::close_range(0, u32::MAX, 0) };
+
+        for fd in 0..256 {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                continue; // not open, which is the expected case
+            }
+            let access = flags & libc::O_ACCMODE;
+            if access == libc::O_WRONLY || access == libc::O_RDWR {
+                unsafe { libc::_exit(A_DESCRIPTOR_IS_WRITABLE) }
+            }
+        }
+
+        // And with nothing writable open, the mapping the reviewer used cannot
+        // be built at all.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                3,
+                0,
+            )
+        };
+        if mapped != libc::MAP_FAILED {
+            unsafe { libc::_exit(MMAP_SHARED_SUCCEEDED) }
+        }
+
+        unsafe { libc::_exit(OK) }
+    });
+
+    assert!(
+        libc::WIFEXITED(status),
+        "descriptor check did not exit cleanly"
+    );
+    match libc::WEXITSTATUS(status) {
+        OK => {}
+        A_DESCRIPTOR_IS_WRITABLE => panic!(
+            "a writable descriptor survived into the sandbox - mmap MAP_SHARED \
+             over it rewrites a file without any denied syscall",
+        ),
+        MMAP_SHARED_SUCCEEDED => panic!("a writable shared mapping was still obtainable"),
+        code => panic!("unexpected exit {code}"),
+    }
+}
+
+#[test]
+fn the_demonstrated_bypasses_all_die() {
+    let probes: &[(&str, fn())] = &[
+        // Writing to stdout when the harness has redirected it into a file.
+        // The fix was to drop write/writev rather than permit them to fd 1-2.
+        ("write to fd 1", || unsafe {
+            libc::write(1, [120u8].as_ptr() as *const _, 1);
+        }),
+        // Opening anything for writing at all - the precondition for the
+        // MAP_SHARED mapping trick below.
+        ("open O_RDWR", || unsafe {
+            libc::open(c"/tmp".as_ptr(), libc::O_RDWR);
+        }),
+        // FS_IOC_SETFLAGS on a READ-ONLY descriptor toggled FS_NODUMP_FL, so
+        // read-only is not the safety property it appears to be. ioctl is now
+        // gated by request, not by descriptor.
+        ("ioctl FS_IOC_SETFLAGS", || unsafe {
+            let flags: libc::c_long = 0;
+            libc::ioctl(0, 0x4008_6602, &flags);
+        }),
+        // io_uring performs openat and write as ring operations, which is what
+        // made the original denylist unsound.
+        ("io_uring_setup", || unsafe {
+            let mut params = [0u8; 120];
+            libc::syscall(425, 8, params.as_mut_ptr());
+        }),
+    ];
+
+    for (name, probe) in probes {
+        let status = in_child(|| {
+            if let Err(code) = engage_sandbox(None) {
+                unsafe { libc::_exit(code) }
+            }
+            probe();
+            unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+        });
+
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "{name}: expected SIGSYS, but the capability survived the filter. \
+             This route was demonstrated against an earlier version and must \
+             stay closed.",
+        );
+    }
+}
+
 /// Every entry in the exercised tier is load-bearing, and the two tiers agree.
 ///
 /// An allowlist answers "is this sound?" far better than a denylist, but it
@@ -501,15 +663,33 @@ fn the_sandbox_kills_an_unlisted_syscall() {
 /// permission cannot be justified twice over.
 #[test]
 fn every_allowed_syscall_is_needed() {
-    let overlap: Vec<u32> = EXERCISED
-        .iter()
-        .copied()
-        .filter(|nr| HEADROOM.contains(nr))
-        .collect();
-    assert!(
-        overlap.is_empty(),
-        "listed in both EXERCISED and HEADROOM: {overlap:?}",
-    );
+    // Every permitted syscall appears in exactly one list. Without this the
+    // argument-gated three sat outside both tiers, invisible to these checks.
+    let lists = [
+        ("EXERCISED", EXERCISED),
+        ("HEADROOM", HEADROOM),
+        ("ARGUMENT_GATED", ARGUMENT_GATED),
+    ];
+    for (i, (name_a, a)) in lists.iter().enumerate() {
+        for (name_b, b) in lists.iter().skip(i + 1) {
+            let overlap: Vec<u32> = a.iter().copied().filter(|nr| b.contains(nr)).collect();
+            assert!(
+                overlap.is_empty(),
+                "listed in both {name_a} and {name_b}: {overlap:?}",
+            );
+        }
+    }
+
+    // And the lists describe the filter that is actually built, rather than a
+    // parallel document that can drift away from it.
+    let program = filter(None);
+    for nr in EXERCISED.iter().chain(HEADROOM).chain(ARGUMENT_GATED) {
+        assert!(
+            program.iter().any(|i| i.k == *nr),
+            "syscall {nr} is listed as permitted but appears nowhere in the \
+             assembled filter",
+        );
+    }
 
     let mut unnecessary = Vec::new();
     for nr in EXERCISED {
