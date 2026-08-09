@@ -834,8 +834,12 @@ enum Val {
 /// the set of verdicts reachable by ANY argument. A conditional ALLOW is then
 /// simply an ALLOW.
 ///
-/// Only the four opcodes this program uses are modelled; anything else panics,
-/// because a silently-ignored instruction would make every answer worthless.
+/// Only the four opcodes this program uses are modelled; anything else panics.
+/// A separate check requires EVERY instruction to be modelled, reachable or
+/// not, because an opcode encountered only on a path this walk considers dead
+/// would otherwise pass in silence - and "dead according to the model" is
+/// exactly the thing being taken on trust.
+///
 /// The program has no backward jumps and each state is visited once, so the
 /// walk terminates.
 fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
@@ -849,7 +853,14 @@ fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
 
     let mut verdicts = HashSet::new();
     let mut seen = HashSet::new();
-    let mut work = vec![(0usize, Val::Known(0))];
+
+    // The accumulator starts `Unknown` rather than `Known(0)`. The kernel zeroes
+    // it and this program loads before it compares, so the two agree here - but
+    // they fail differently if that stops being true. Over-approximating finds
+    // ALLOWs that are not really reachable, which is a loud false alarm;
+    // under-approximating misses one that is, which is the failure this whole
+    // test exists to prevent.
+    let mut work = vec![(0usize, Val::Unknown)];
 
     while let Some((pc, a)) = work.pop() {
         if !seen.insert((pc, a)) {
@@ -911,6 +922,39 @@ fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
 /// Sampling arguments cannot establish a statement about all arguments. So the
 /// arguments are unknown and both sides of an undetermined comparison are
 /// explored: for an unlisted syscall, EVERY reachable path must end in KILL.
+#[test]
+fn the_interpreter_models_every_instruction() {
+    // The walk panics on an opcode it does not model, which is the right
+    // behaviour but only fires on a path it decides is reachable. That is
+    // circular: the reachability decision is what the model is for. So check
+    // the whole program regardless of reachability.
+    //
+    // Classic BPF has more than these four - notably the X register, indexed
+    // loads and BPF_MISC. None appear here, and if one ever does, the honest
+    // outcome is a failure that says so rather than a walk quietly reasoning
+    // about an instruction set that is not the one being run.
+    const MODELLED: &[u16] = &[
+        0x20, // LD_W_ABS
+        0x54, // ALU_AND_K
+        0x15, // JMP_JEQ_K
+        0x06, // RET_K
+    ];
+
+    let unmodelled: Vec<(usize, u16)> = filter(None)
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| !MODELLED.contains(&i.code))
+        .map(|(pc, i)| (pc, i.code))
+        .collect();
+
+    assert!(
+        unmodelled.is_empty(),
+        "the filter contains instructions the interpreter does not model, at \
+         (index, opcode): {unmodelled:?}. Either model them or stop claiming \
+         the reverse invariant, because the walk cannot reason about them.",
+    );
+}
+
 #[test]
 fn the_filter_permits_nothing_unlisted() {
     const RET_ALLOW: u32 = 0x7fff_0000;
