@@ -1,6 +1,6 @@
 # Verification-Only Boundary
 
-**Status:** implementation complete, completion gate in progress (cycle 17)
+**Status:** implementation complete, completion gate in progress (cycle 18) - CLEARED
 **Current Goal:** the published SDK offers no way to produce a C2PA asset, and that property is enforced by CI rather than by reviewer attention.
 
 ## Overview
@@ -199,6 +199,29 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
   cycle 15 sol56        correctness 6.5      simplification 7.2      security 6.4      -> not cleared
   cycle 16 sol56        correctness 8.8      simplification 9.5      security 8.8      -> not cleared
   cycle 16 opus         correctness 9.2      simplification 6.8      security  -       -> not cleared
+  cycle 17 sol56        correctness 9.7      simplification 9.7      security 9.5      -> PASS
+  cycle 17 opus         correctness 9.3      simplification 9.5      security  -       -> not cleared
+  cycle 18 sol56        correctness 9.5      simplification 9.5      security 9.7      -> PASS, "ship"
+  cycle 18 opus         correctness 9.6      simplification 9.6      security  -       -> PASS
+
+  CLEARED at cycle 18. Both reviewers pass every dimension against the 9.5 bar.
+
+  What actually moved the scores was not the eighteen cycles of patching. It was
+  two structural inversions, each forced by a reviewer refusing to accept the
+  shape of the thing rather than its details.
+
+  The first was denylist to allowlist, twice over: the source scanner enumerating
+  ways to write could not be finished, and neither could the syscall denylist
+  that replaced it. Both had to become "everything is denied unless it is written
+  down".
+
+  The second was model to ground truth. A symbolic interpreter checked the filter
+  statically for four cycles, never found a defect in it, and was itself the
+  defect four times - always the same one, the model disagreeing with the kernel.
+  Deleting it and asking the kernel directly removed the entire bug class and 253
+  lines. Both reviewers had to change position to get there, and the deciding
+  evidence was a provenance fact neither had: what the component had actually
+  caught, which was nothing.
 
   The loop was stopped after cycle 10 and then restarted, and the restart was
   the right call.
@@ -324,6 +347,8 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
 
   cycle 8 changes (in review):
     - consolidated the six crates into private modules; surface 931 -> 171
+      (172 today: `SUPPORTED_EXTENSIONS` was made public at cycle 13 so the
+      contract tests could read the crate's own table instead of a copy)
     - deleted the `test-support` feature; writers are private `cfg(test)`
     - release publishes 2 packages, not 8
     - gate unions across the (target, feature) matrix - closes evasion 11
