@@ -53,6 +53,12 @@ ureq = { version = "2.12.1", optional = true, default-features = false, features
 time = { workspace = true, features = ["macros"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
+# For `tests/no_write_capability.rs`, which asks the kernel to enforce the
+# read-only promise rather than asking the source. Test-only: it is not a
+# dependency of the library and adds nothing to what a consumer compiles.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+libc = "0.2"
+
 # The elliptic-curve stack reaches `getrandom` transitively (ecdsa -> p256 ->
 # elliptic-curve -> crypto-bigint -> rand_core), and on wasm32 that crate
 # refuses to compile unless a backend is selected. Until now the browser

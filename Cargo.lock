@@ -396,6 +396,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom",
  "hex",
+ "libc",
  "miniz_oxide",
  "p256",
  "p384",

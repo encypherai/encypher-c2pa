@@ -326,8 +326,25 @@ is covered the moment it is added. It does not observe writes elsewhere on the
 filesystem, and it constrains the behaviour it exercises rather than proving a
 general property.
 
-Between them a boundary violation has to defeat a compiler-derived surface lock
-and an observable behaviour test, instead of depending on a reviewer noticing.
+A third control asks the kernel instead of the source.
+`crates/encypher-c2pa/tests/no_write_capability.rs` forks a child, installs a
+seccomp filter that kills the process on any syscall capable of creating,
+truncating, removing or executing, and runs `verify`, `verify_with_options` and
+`verify_file` inside it. They complete normally. This is the strongest of the
+three because it does not depend on recognising a writer: aliases, re-export
+paths, generic `io::Write` indirection, macro expansion, `unsafe`, a dependency
+writing on the library's behalf and shelling out to a subprocess are all
+equally impossible, and each of those routes was tried against it.
+
+Note that it kills on the attempt rather than returning an error. An earlier
+version returned `EPERM`, and a discarded `let _ = write(..)` sailed through
+it: the write failed, the result was dropped, verification finished and the
+test reported success. Refusing the syscall shows verification does not depend
+on writing. Killing shows it does not try.
+
+Between them a boundary violation has to defeat a compiler-derived surface
+lock, an observable behaviour test, and a kernel that will not permit the
+syscall - instead of depending on a reviewer noticing.
 
 Default verification makes no network request. Opt-in failure telemetry follows the fixed privacy boundary described in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
 
