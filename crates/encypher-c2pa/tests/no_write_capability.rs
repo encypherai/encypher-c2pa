@@ -18,9 +18,16 @@
 //! equally powerless against it, which is the whole point of moving the check
 //! down a layer.
 //!
-//! The filter is applied at `openat`/`open` by inspecting the flags argument,
-//! so reads pass and writes do not. `write(2)` itself stays permitted: the
-//! child needs stdout, and it cannot obtain a writable file descriptor anyway.
+//! The filter is an ALLOWLIST. Reads, memory operations, thread and signal
+//! operations and clocks pass; everything else kills the process. Three
+//! syscalls are permitted only on their arguments: `openat` and `open` must
+//! carry no write flag, and `ioctl` must be the one terminal query the runtime
+//! makes at startup.
+//!
+//! `write` and `writev` are permitted nowhere, not even to stdout. They were,
+//! briefly, because the child wanted to print - until it became clear that a
+//! harness redirecting stdout into a file hands a writer a live descriptor.
+//! The child reports by exit status instead.
 //!
 //! A denied syscall KILLS the child rather than returning `EPERM`, and that
 //! detail is the difference between a test and a decoration. The first version
@@ -30,9 +37,21 @@
 //! success. Returning an error only proves verification does not DEPEND on
 //! writing. Killing proves it does not ATTEMPT it.
 //!
-//! Two children run. The first tries to create a file and MUST die, because a
-//! filter that is not actually engaged would make everything after it vacuous.
-//! The second runs the entry points and must exit cleanly.
+//! Ten tests run here, and they fall into three groups.
+//!
+//! Some assert the sandbox bites: a writer dies, an unlisted syscall dies, and
+//! each route a reviewer actually got through dies. Without these the rest
+//! would pass just as happily with no filter installed at all.
+//!
+//! Some assert the sandbox is not a lie told about a different program: an
+//! interpreter for the four opcodes the filter uses reads the assembled
+//! program and checks it against the declared policy, so a permission cannot
+//! be added to the BPF without being written down, and a gated syscall cannot
+//! be reached by a route that skips its gate.
+//!
+//! And one asserts the point of the exercise: verification of every declared
+//! MIME and extension completes inside the sandbox, with the signed fixtures
+//! coming back present, valid and hard-binding matched.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -821,18 +840,17 @@ enum Val {
     Unknown,
 }
 
-/// Every verdict the filter can reach for a given syscall, over all arguments.
+/// Arguments are not sampled, they are unknown.
 ///
-/// The first version of this took three concrete argument profiles and ran
-/// them. It looked exhaustive and was not: a reviewer added a permission for
-/// `renameat2` guarded by `args[0] == 3`, which none of the three profiles hit,
-/// so the check stayed green while the sandboxed child opened directories until
-/// it held fd 3 and renamed a real file.
+/// An earlier version took three concrete argument profiles and ran them. It
+/// looked exhaustive and was not: a reviewer added a permission for `renameat2`
+/// guarded by `args[0] == 3`, which none of the three profiles hit, so the
+/// check stayed green while the sandboxed child opened directories until it
+/// held fd 3 and renamed a real file.
 ///
-/// So arguments are not sampled here, they are unknown. Where a comparison
-/// tests an unknown value both outcomes are explored, and what comes back is
-/// the set of verdicts reachable by ANY argument. A conditional ALLOW is then
-/// simply an ALLOW.
+/// Where a comparison tests an unknown value, both outcomes are explored, so
+/// what comes back covers every argument a caller could pass. A conditional
+/// ALLOW is then simply an ALLOW.
 ///
 /// Only the four opcodes this program uses are modelled; anything else panics.
 /// A separate check requires EVERY instruction to be modelled, reachable or
@@ -842,10 +860,7 @@ enum Val {
 ///
 /// The program has no backward jumps and each state is visited once, so the
 /// walk terminates.
-fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
-    walk(program, nr).into_iter().map(|(v, _)| v).collect()
-}
-
+///
 /// One thing the filter learned on the way to a verdict:
 /// `data[offset] & mask == value`.
 ///
@@ -1010,103 +1025,111 @@ fn the_interpreter_models_every_instruction() {
     );
 }
 
+/// The assembled filter agrees with the declared policy, everywhere, for every
+/// argument.
+///
+/// This started as two checks and they were each partly right, which is how
+/// both of them missed something.
+///
+/// One asked which syscalls could reach ALLOW and compared that to the lists,
+/// then skipped the listed ones as permitted by definition - so the argument
+/// gates, the entire reason `openat` is permitted at all, were examined by
+/// nothing. A reviewer planted a plain ALLOW for `openat` when `dirfd == 3`,
+/// and the sandboxed child opened four directories to get fd 3 and created a
+/// real file with `O_CREAT`.
+///
+/// The other compared verdicts for whole-word equality with `RET_ALLOW`, when a
+/// seccomp return is an action in the high 16 bits and data in the low 16.
+/// `RET_ALLOW | 1` is allow to the kernel and not-allow to that test, and
+/// `SECCOMP_RET_LOG` logs a syscall and then runs it. Both renamed a real file.
+///
+/// Two approximations standing next to the real policy is worse than one check
+/// that states it. So there is one, and it says: for every syscall number, on
+/// every path the filter can take, the verdict must be what the lists say it
+/// should be.
+///
+/// - unlisted syscalls reach exactly the kill this filter issues, and nothing
+///   else;
+/// - `EXERCISED` and `HEADROOM` may be allowed;
+/// - `ARGUMENT_GATED` may be allowed only on a path that established the
+///   gate's own constraint, and otherwise must kill.
+///
+/// The expected policy is derived from the same three lists the filter is
+/// generated from, so neither can drift from the other without this failing.
 #[test]
-fn every_argument_gate_is_actually_enforced() {
-    // Being on a list is permission to be reached, not permission to be reached
-    // on any terms.
-    //
-    // The reverse check skipped listed syscalls as permitted by definition, so
-    // nothing ever looked at the argument gates. A reviewer planted a plain
-    // RET_ALLOW for openat conditional on dirfd == 3 - openat is listed, so the
-    // check passed it - then opened four directories in the sandboxed child to
-    // obtain fd 3 and created a real file with O_CREAT. Eight tests green.
-    //
-    // So for each gated syscall, every path that reaches ALLOW must have learned
-    // the fact the gate exists to establish. A path that arrives by some other
-    // route has not been through the gate, whatever else it checked.
+fn the_filter_matches_the_declared_policy() {
     const ACTION: u32 = 0xffff_0000;
     const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
     const WRITE_FLAGS: u32 =
         (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
 
     let program = filter(None);
-
-    for (nr, gate) in ARGUMENT_GATED {
-        // The constraint the gate is supposed to impose, taken from the same
-        // table the filter is generated from.
-        let required: Constraint = match gate {
-            Gate::NoWriteFlags { arg } => (*arg, WRITE_FLAGS, 0),
-            Gate::ArgEquals { arg, value } => (*arg, u32::MAX, *value),
-        };
-
-        for (verdict, conditions) in walk(&program, *nr) {
-            if verdict & ACTION != RET_ALLOW {
-                continue;
-            }
-            assert!(
-                conditions.contains(&required),
-                "syscall {nr} can reach ALLOW without its gate: the path \
-                 established {conditions:x?}, which does not include \
-                 {required:x?}. A gated syscall that can be allowed by another \
-                 route is not gated.",
-            );
-        }
-    }
-}
-
-#[test]
-fn the_filter_permits_nothing_unlisted() {
-    // A seccomp return value is an ACTION in the high 16 bits and DATA in the
-    // low 16. The kernel masks before deciding, so 0x7fff_0001 is every bit as
-    // permissive as 0x7fff_0000.
-    //
-    // The first version of this compared for equality with `RET_ALLOW`, and a
-    // reviewer walked past it twice over: `RET_ALLOW | 1` passed the test while
-    // the kernel renamed a real file, and so did `SECCOMP_RET_LOG`, which logs
-    // a syscall and then runs it.
-    //
-    // Enumerating the permissive actions would repeat the mistake this file has
-    // now made three times - allowlists are what it concluded, twice, and then
-    // it wrote a denylist over return codes anyway. So the test is inverted:
-    // for an unlisted syscall, every reachable verdict must be EXACTLY the kill
-    // this filter issues. Not "not allow" - exactly kill. Any other value,
-    // whatever a future kernel decides it means, is a failure.
-    const RET_KILL_PROCESS: u32 = 0x8000_0000;
-    const ACTION: u32 = 0xffff_0000;
-    const RET_ALLOW: u32 = 0x7fff_0000;
-
-    let program = filter(None);
-    let listed: Vec<u32> = allowed()
-        .into_iter()
-        .chain(ARGUMENT_GATED.iter().map(|(nr, _)| *nr))
-        .collect();
-
-    let permitted: Vec<(u32, Vec<u32>)> = (0..600u32)
-        .filter(|nr| !listed.contains(nr))
-        .filter_map(|nr| {
-            let stray: Vec<u32> = reachable_verdicts(&program, nr)
-                .into_iter()
-                .filter(|v| *v != RET_KILL_PROCESS)
-                .collect();
-            (!stray.is_empty()).then_some((nr, stray))
+    let plain = allowed();
+    let gated: Vec<(u32, Constraint)> = ARGUMENT_GATED
+        .iter()
+        .map(|(nr, gate)| {
+            let required = match gate {
+                Gate::NoWriteFlags { arg } => (*arg, WRITE_FLAGS, 0),
+                Gate::ArgEquals { arg, value } => (*arg, u32::MAX, *value),
+            };
+            (*nr, required)
         })
         .collect();
 
+    let mut wrong: Vec<String> = Vec::new();
+
+    for nr in 0..600u32 {
+        let required = gated.iter().find(|(n, _)| *n == nr).map(|(_, c)| *c);
+
+        for (verdict, conditions) in walk(&program, nr) {
+            let allowed_here = verdict & ACTION == RET_ALLOW;
+
+            // Anything that is not an allow must be the one kill this filter
+            // issues. Enumerating which other actions happen to be permissive
+            // is the mistake that let RET_LOG through; demanding the exact kill
+            // covers encodings nobody here has thought of.
+            if !allowed_here && verdict != RET_KILL_PROCESS {
+                wrong.push(format!(
+                    "syscall {nr} can reach verdict {verdict:#x}, which is \
+                     neither allow nor the canonical kill"
+                ));
+                continue;
+            }
+            if !allowed_here {
+                continue;
+            }
+
+            match required {
+                // A gated syscall may be allowed only having passed its gate.
+                Some(c) if !conditions.contains(&c) => wrong.push(format!(
+                    "syscall {nr} reaches ALLOW without its gate: the path \
+                     established {conditions:x?}, which does not include {c:x?}"
+                )),
+                Some(_) => {}
+                // An ungated syscall may be allowed only if it is listed.
+                None if !plain.contains(&nr) => {
+                    wrong.push(format!("syscall {nr} reaches ALLOW but appears in no list"))
+                }
+                None => {}
+            }
+        }
+    }
+
     assert!(
-        permitted.is_empty(),
-        "unlisted syscalls can reach a verdict other than kill: {permitted:x?}. \
-         Every permission must be written down, or the lists stop describing \
-         the program.",
+        wrong.is_empty(),
+        "the filter disagrees with the declared policy:\n  {}",
+        wrong.join("\n  "),
     );
 
     // The walk is only worth anything if it reaches the ALLOW returns at all.
-    // A filter it could not traverse would report an empty set for everything
-    // and pass in silence. Matched on the action, for the same reason as above.
-    for nr in listed {
+    // A filter it could not traverse would report nothing for everything and
+    // pass in silence.
+    for nr in plain.iter().chain(gated.iter().map(|(nr, _)| nr)) {
         assert!(
-            reachable_verdicts(&program, nr)
+            walk(&program, *nr)
                 .iter()
-                .any(|v| v & ACTION == RET_ALLOW),
+                .any(|(v, _)| v & ACTION == RET_ALLOW),
             "syscall {nr} is listed as permitted, but no path through the \
              filter reaches ALLOW for it",
         );

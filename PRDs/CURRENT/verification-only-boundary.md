@@ -130,9 +130,8 @@ success and failure paths and creates no sibling files.
 ## Success Criteria
 
 - Default build of the published library exposes zero manifest constructors and
-  zero container writers; `public-surface.txt` holds 171 reviewed items.
-- `cargo test --workspace` passes: 318 tests (302 pre-existing, unchanged by the
-  consolidation, plus 6 non-mutation contract tests).
+  zero container writers; `public-surface.txt` holds 172 reviewed items.
+- `cargo test --workspace` passes: 319 tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - Exactly two publishable packages remain.
 - The gate fails on a writer becoming public through any of: a plain addition, a
@@ -140,13 +139,20 @@ success and failure paths and creates no sibling files.
   value or reference receiver, an enum variant field, a trait default method, an
   implicit or redefined Cargo feature, or a target-conditional `cfg`.
 - The contract tests fail if an approved item's body starts writing.
+- The sandboxed suite fails if verification attempts any filesystem mutation, if
+  the filter permits a syscall absent from the permission lists, or if a gated
+  syscall can reach ALLOW without passing its gate.
 
 ## Verification
 
 | Check | Result |
 |---|---|
 | Public surface inventory | 172 items, zero writers |
-| Workspace tests | 308 passed, 0 failed |
+| Workspace tests | 319 passed, 0 failed |
+| ...of which library unit tests | 277 |
+| ...seccomp capability suite | 9 |
+| ...non-mutation contract suite | 8 |
+| ...CLI, CAWG corpus, API, footers, FFI | 25 |
 | clippy `-D warnings` | 0 errors |
 | CLI on a real signed MP4 | integrity valid, signature valid, hard binding match |
 | `cargo package` | 67 files, 996.6 KiB |
@@ -156,6 +162,12 @@ success and failure paths and creates no sibling files.
 | Gate vs. target-gated writer | FAIL as designed, item named |
 | Gate vs. implicit/redefined feature | FAIL as designed, resolved-vs-approved diff |
 | Contract tests vs. mutated `verify_file` | FAIL as designed, while the surface gate passes |
+| Sandbox vs. writer via alias, `File::options`, `OpenOptions`, `remove_file`, subprocess, `set_times` | SIGSYS on all six |
+| Sandbox vs. inherited `O_RDWR` descriptor | none survives `close_range` |
+| Sandbox vs. inherited `MAP_SHARED` mapping | unmapped before the filter; backing file unchanged |
+| Policy check vs. unlisted `renameat2`, plain and conditional | FAIL as designed |
+| Policy check vs. `RET_ALLOW\|1`, `RET_LOG`, `RET_TRACE`, `RET_USER_NOTIF` | FAIL as designed |
+| Policy check vs. `openat`/`ioctl` allowed past their gates | FAIL as designed, missing constraint named |
 
 ## Review Loop State
 
