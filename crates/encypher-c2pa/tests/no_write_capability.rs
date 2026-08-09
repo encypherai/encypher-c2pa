@@ -55,22 +55,42 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
-/// Assemble the seccomp program.
+/// Assemble the seccomp program: allow a fixed set, kill everything else.
 ///
-/// Written out longhand rather than pulled from a crate: this repository has no
-/// network during CI and the filter is short enough that a reader can check it
-/// against the syscall table, which matters more here than brevity.
+/// The first version of this was a denylist of mutating syscalls, and it had
+/// exactly the weakness the source scan had. A reviewer asked what it did about
+/// io_uring, and the answer was nothing: `io_uring_setup` succeeds on this
+/// kernel, and a ring can perform `openat` and `write` as submission entries
+/// without ever issuing the syscalls the list refused. `setxattr`, `utimensat`
+/// and `fallocate` were missing too. Enumerating ways to write is the same
+/// losing game one layer down.
+///
+/// So this is inverted. Verification needs a small, boring set of syscalls -
+/// read, map memory, look at the clock - and anything outside it kills the
+/// process. Soundness no longer depends on my imagination: it depends on the
+/// much easier claim that nothing in the list below can modify a file.
+///
+/// The two that could, given the wrong argument, are constrained by argument
+/// rather than excluded: `openat`/`open` must carry no write flag, and
+/// `write`/`writev` must target stdout or stderr. Everything else is either
+/// read-only or does not touch the filesystem at all.
+///
+/// It is deliberately not minimal. Trimming it further would buy nothing and
+/// would make the test brittle against an allocator change. What matters is
+/// that it is an allowlist, so a new way to write is denied by default instead
+/// of denied only if I thought of it.
 fn filter() -> Vec<libc::sock_filter> {
     // Classic BPF opcodes.
     const LD_W_ABS: u16 = 0x20;
     const ALU_AND_K: u16 = 0x54;
     const JMP_JEQ_K: u16 = 0x15;
-    const JMP_JA: u16 = 0x05;
+    const JMP_JGT_K: u16 = 0x25;
     const RET_K: u16 = 0x06;
 
     // `struct seccomp_data` offsets: nr, arch, instruction_pointer, args[6].
     const OFF_NR: u32 = 0;
     const OFF_ARCH: u32 = 4;
+    const OFF_ARG0: u32 = 16;
     const OFF_ARG1: u32 = 24;
     const OFF_ARG2: u32 = 32;
 
@@ -79,42 +99,73 @@ fn filter() -> Vec<libc::sock_filter> {
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
 
     // Any of these in the open flags means the caller wants to modify a file.
+    // `O_TMPFILE` includes `O_DIRECTORY` and is caught by `O_WRONLY`/`O_RDWR`,
+    // which it must be combined with to be useful.
     const WRITE_FLAGS: u32 =
         (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
 
-    // x86_64 syscall numbers that mutate the filesystem without an open.
-    // `openat2` is here because its flags live behind a pointer, which classic
-    // BPF cannot follow - so it is refused outright rather than guessed at.
-    const UNCONDITIONAL_DENY: &[u32] = &[
-        437, // openat2
-        85,  // creat
-        87,  // unlink
-        263, // unlinkat
-        82,  // rename
-        264, // renameat
-        316, // renameat2
-        76,  // truncate
-        77,  // ftruncate
-        83,  // mkdir
-        258, // mkdirat
-        84,  // rmdir
-        86,  // link
-        265, // linkat
-        88,  // symlink
-        266, // symlinkat
-        90,  // chmod
-        268, // fchmodat
-        91,  // fchmod
-        // A verifier does not start programs either. Without these, a writer
-        // could shell out: the filter IS inherited across fork and exec, so the
-        // child dies and no write lands, but the verifier survives to return a
-        // clean report and the test would not notice the attempt.
-        57,  // fork
-        58,  // vfork
-        56,  // clone
-        435, // clone3
-        59,  // execve
-        322, // execveat
+    // x86_64 numbers for what verification legitimately does: read files and
+    // directories, manage its own memory and threads, ask the time, get
+    // randomness, and exit. None of these can create or modify a file.
+    const ALLOWED: &[u32] = &[
+        0,   // read
+        17,  // pread64
+        19,  // readv
+        295, // preadv
+        3,   // close
+        4,   // stat
+        5,   // fstat
+        6,   // lstat
+        262, // newfstatat
+        332, // statx
+        8,   // lseek
+        217, // getdents64
+        79,  // getcwd
+        89,  // readlink
+        267, // readlinkat
+        9,   // mmap
+        10,  // mprotect
+        11,  // munmap
+        12,  // brk
+        25,  // mremap
+        28,  // madvise
+        13,  // rt_sigaction
+        14,  // rt_sigprocmask
+        15,  // rt_sigreturn
+        131, // sigaltstack
+        202, // futex
+        24,  // sched_yield
+        204, // sched_getaffinity
+        39,  // getpid
+        186, // gettid
+        102, // getuid
+        107, // geteuid
+        104, // getgid
+        108, // getegid
+        60,  // exit
+        231, // exit_group
+        96,  // gettimeofday
+        228, // clock_gettime
+        229, // clock_getres
+        35,  // nanosleep
+        230, // clock_nanosleep
+        318, // getrandom
+        157, // prctl
+        158, // arch_prctl
+        218, // set_tid_address
+        273, // set_robust_list
+        334, // rseq
+        324, // membarrier
+        99,  // sysinfo
+        63,  // uname
+        16,  // ioctl - no writable descriptor exists for it to act on
+        7,   // poll
+        271, // ppoll
+        281, // epoll_pwait
+        291, // epoll_create1
+        233, // epoll_ctl
+        302, // prlimit64
+        302, // prlimit64 (duplicate is harmless)
     ];
 
     let ins = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
@@ -126,36 +177,41 @@ fn filter() -> Vec<libc::sock_filter> {
         ins(LD_W_ABS, 0, 0, OFF_ARCH),
         ins(JMP_JEQ_K, 1, 0, AUDIT_ARCH_X86_64),
         ins(RET_K, 0, 0, RET_KILL_PROCESS),
+        ins(LD_W_ABS, 0, 0, OFF_NR),
     ];
 
-    // openat(dirfd, path, flags, mode): allow when no write flag is set.
-    p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
-    p.push(ins(JMP_JEQ_K, 0, 5, 257));
-    p.push(ins(LD_W_ABS, 0, 0, OFF_ARG2));
-    p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
-    p.push(ins(JMP_JEQ_K, 1, 0, 0));
-    p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
-    p.push(ins(RET_K, 0, 0, RET_ALLOW));
+    // A syscall whose verdict depends on an argument: `nr` selects the block,
+    // the argument decides. Each block is self-contained so no jump is long.
+    let arg_gated = |p: &mut Vec<libc::sock_filter>, nr: u32, off: u32, write_flags: bool| {
+        p.push(ins(JMP_JEQ_K, 0, if write_flags { 5 } else { 4 }, nr));
+        p.push(ins(LD_W_ABS, 0, 0, off));
+        if write_flags {
+            // openat/open: allowed only with no write flag set.
+            p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
+            p.push(ins(JMP_JEQ_K, 1, 0, 0));
+            p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+            p.push(ins(RET_K, 0, 0, RET_ALLOW));
+        } else {
+            // write/writev: allowed only to stdout and stderr.
+            p.push(ins(JMP_JGT_K, 1, 0, 2));
+            p.push(ins(RET_K, 0, 0, RET_ALLOW));
+            p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+        }
+        p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
+    };
+    arg_gated(&mut p, 257, OFF_ARG2, true); // openat(dirfd, path, flags, ..)
+    arg_gated(&mut p, 2, OFF_ARG1, true); // open(path, flags, ..)
+    arg_gated(&mut p, 1, OFF_ARG0, false); // write(fd, ..)
+    arg_gated(&mut p, 20, OFF_ARG0, false); // writev(fd, ..)
 
-    // open(path, flags, mode): same test, flags one argument earlier.
-    p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
-    p.push(ins(JMP_JEQ_K, 0, 5, 2));
-    p.push(ins(LD_W_ABS, 0, 0, OFF_ARG1));
-    p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
-    p.push(ins(JMP_JEQ_K, 1, 0, 0));
-    p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
-    p.push(ins(RET_K, 0, 0, RET_ALLOW));
-
-    // Everything else that mutates. Each comparison jumps forward to the single
-    // shared deny return, so no offset exceeds the 255-instruction jump limit.
-    p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
-    let chain_start = p.len();
-    let deny_at = chain_start + UNCONDITIONAL_DENY.len() + 1;
-    for (i, nr) in UNCONDITIONAL_DENY.iter().enumerate() {
-        let jt = (deny_at - (chain_start + i) - 1) as u8;
+    // The allowlist proper. Each comparison jumps forward to the single ALLOW,
+    // and falling off the end reaches KILL - so an unlisted syscall dies.
+    let start = p.len();
+    let allow_at = start + ALLOWED.len() + 1;
+    for (i, nr) in ALLOWED.iter().enumerate() {
+        let jt = (allow_at - (start + i) - 1) as u8;
         p.push(ins(JMP_JEQ_K, jt, 0, *nr));
     }
-    p.push(ins(JMP_JA, 0, 0, 1));
     p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
     p.push(ins(RET_K, 0, 0, RET_ALLOW));
 
@@ -194,6 +250,22 @@ fn canary_child() -> ! {
     }
     let _ = std::fs::write("/tmp/encypher-seccomp-canary", b"x");
     // Reaching this line means the filter permitted a file creation.
+    unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+}
+
+/// Call a syscall that is simply not on the list. Must not survive.
+///
+/// `io_uring_setup` specifically, because it is what showed the previous
+/// denylist to be unsound: a ring performs `openat` and `write` as submission
+/// entries, so refusing those syscall numbers refuses nothing. It succeeds on
+/// this kernel outside the sandbox. Inside, it is not on the allowlist, and
+/// that is the whole difference between the two designs.
+fn unlisted_syscall_child() -> ! {
+    if let Err(code) = engage_sandbox() {
+        unsafe { libc::_exit(code) }
+    }
+    let mut params = [0u8; 120];
+    unsafe { libc::syscall(425, 8, params.as_mut_ptr()) };
     unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
 }
 
@@ -263,6 +335,37 @@ fn the_sandbox_kills_a_writer() {
         libc::WTERMSIG(status),
         libc::SIGSYS,
         "expected the write attempt to be killed by SIGSYS",
+    );
+}
+
+/// The allowlist is default-deny, and this is what makes that claim testable.
+#[test]
+fn the_sandbox_kills_an_unlisted_syscall() {
+    let status = in_child(|| unlisted_syscall_child());
+
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        let why = match code {
+            NO_NEW_PRIVS_REFUSED => "PR_SET_NO_NEW_PRIVS was refused",
+            SECCOMP_REFUSED => "PR_SET_SECCOMP was refused; seccomp may be unavailable here",
+            SANDBOX_NOT_ENGAGED => {
+                "io_uring_setup returned instead of being killed - the filter is \
+                 not default-deny, so every syscall absent from the allowlist is \
+                 permitted and this whole test file proves nothing"
+            }
+            _ => "unexpected exit",
+        };
+        panic!("{why} (exit {code})");
+    }
+
+    assert!(
+        libc::WIFSIGNALED(status),
+        "child neither exited nor signalled"
+    );
+    assert_eq!(
+        libc::WTERMSIG(status),
+        libc::SIGSYS,
+        "expected an unlisted syscall to be killed by SIGSYS",
     );
 }
 
