@@ -361,9 +361,14 @@ allowlist is split in two - the six syscalls the scenario actually makes,
 each proved necessary on every CI run by removing it and requiring the run to
 die, and a declared headroom tier for portability across libc and kernel
 versions. None of the headroom entries can create or modify a file. Splitting
-it means a new permission cannot arrive unnoticed: a test interprets the
-assembled filter and asks it, for every syscall number, whether it is allowed -
-so an ALLOW that appears in no list fails the build, however it got there.
+it means a permission cannot sit in the list unexplained: removing any entry
+from the exercised tier must break the run.
+
+Each gate is checked against the kernel too, not against a description of the
+filter. Three canaries confirm that `openat` with `O_CREAT` dies, `open` with
+`O_WRONLY` dies and `ioctl` with a request other than `TCGETS` dies, while a
+read-only `openat` still succeeds - so the gates are gating rather than
+banning, and there is no model of the kernel that could drift away from it.
 
 Between them a boundary violation has to defeat a compiler-derived surface
 lock, an observable behaviour test, and a kernel that will not permit the

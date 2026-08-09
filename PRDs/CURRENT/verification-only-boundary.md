@@ -1,6 +1,6 @@
 # Verification-Only Boundary
 
-**Status:** implementation complete, completion gate in progress (cycle 14)
+**Status:** implementation complete, completion gate in progress (cycle 16)
 **Current Goal:** the published SDK offers no way to produce a C2PA asset, and that property is enforced by CI rather than by reviewer attention.
 
 ## Overview
@@ -195,6 +195,9 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
   cycle 12 sol56        correctness 6.4      simplification 7.8      security  -       -> not cleared
   cycle 13 sol56        correctness 7.3      simplification 8.6      security 7.6      -> not cleared
   cycle 14 sol56        correctness 8.8      simplification 8.9      security 8.7      -> not cleared
+  cycle 15 sol56        correctness 6.5      simplification 7.2      security 6.4      -> not cleared
+  cycle 16 sol56        correctness 8.8      simplification 9.5      security 8.8      -> not cleared
+  cycle 16 opus         correctness 9.2      simplification 6.8      security  -       -> not cleared
 
   The loop was stopped after cycle 10 and then restarted, and the restart was
   the right call.
@@ -260,6 +263,32 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
   nothing: the inherited mapping is closed by unmapping, so its test reproduces
   the attack and checks the backing file is unchanged, and the unlisted
   permission is closed by interpreting the program rather than running it.
+
+  Cycle 16 ran two reviewers, and they split on whether the symbolic checker
+  belonged here at all. Sol scored it 9.5 and passed the dimension, calling the
+  file direct and proportionate. Opus scored 6.8 and called it disproportionate
+  machinery: the property it defends is broader than the SDK promises, and the
+  residual threat model is a contributor who can rewrite verify() but somehow
+  cannot edit the test.
+
+  Put to each other, they converged, and both changed position. The deciding
+  fact was one neither had: across four cycles the interpreter never found a
+  defect in the filter, and was itself the defect four times - sampled
+  arguments, whole-word return comparison, skipped gated syscalls, and a 600
+  bound. Every one of those is the same bug, the model disagreeing with the
+  kernel, and it is the bug a model can always have.
+
+  Sol withdrew its 9.5 as too generous given that record. Opus withdrew the
+  broader half of its finding, agreeing the property test catches something the
+  other two controls genuinely cannot: verify() takes a byte slice, so a
+  malicious body could construct a manifest and write it to an arbitrary path,
+  which the surface gate cannot see and the behaviour test does not watch for.
+
+  So the interpreter and its two meta-tests are deleted - 253 lines - and the
+  gate boundaries they uniquely covered are now three runtime canaries that ask
+  the kernel directly. The capability control stays. It is tested against
+  ground truth rather than against a model, which removes the only bug class it
+  has ever actually had.
 
   ELEVEN distinct evasions were found in this gate and fixed, each demonstrated
   end to end with a working consumer rather than asserted:

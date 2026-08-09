@@ -37,25 +37,29 @@
 //! success. Returning an error only proves verification does not DEPEND on
 //! writing. Killing proves it does not ATTEMPT it.
 //!
-//! Nine tests run here, and they fall into three groups.
+//! Eight tests run here, and every one of them asks the kernel rather than a
+//! model of it. That was not always true, and the history is the reason the
+//! file is the size it is - see `each_argument_gate_holds_against_the_kernel`.
 //!
-//! Some assert the sandbox bites: a writer dies, an unlisted syscall dies, and
-//! each route a reviewer actually got through dies. Without these the rest
-//! would pass just as happily with no filter installed at all.
+//! Most assert the sandbox bites: a writer dies, an unlisted syscall dies, each
+//! argument gate refuses the arguments it exists to refuse, and every route a
+//! reviewer actually got through dies. Without these the rest would pass just
+//! as happily with no filter installed at all.
 //!
-//! Some assert the sandbox is not a lie told about a different program: an
-//! interpreter for the four opcodes the filter uses reads the assembled
-//! program and checks it against the declared policy, so a permission cannot
-//! be added to the BPF without being written down, and a gated syscall cannot
-//! be reached by a route that skips its gate.
+//! Two assert that the setup leaves nothing behind: no inherited descriptor
+//! reaches the sandbox, and no inherited shared mapping outlives it. Both are
+//! there because a reviewer used exactly those to write a file without issuing
+//! a syscall the filter could refuse.
 //!
-//! And one asserts the point of the exercise: verification of every declared
-//! MIME and extension completes inside the sandbox, with the signed fixtures
-//! coming back present, valid and hard-binding matched.
+//! One keeps the allowlist honest: removing any syscall from the exercised tier
+//! must break the run, so a permission cannot sit there unexplained.
+//!
+//! And one is the point of the exercise: verification of every declared MIME
+//! and extension completes inside the sandbox, with the signed fixtures coming
+//! back present, valid and hard-binding matched.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use encypher_c2pa::{verify, verify_file, verify_with_options, VerifyOptions};
@@ -851,337 +855,85 @@ fn the_demonstrated_bypasses_all_die() {
     }
 }
 
-/// A value the interpreter is tracking: a concrete number, or anything at all.
+/// Each argument gate, tested against the kernel rather than against a model
+/// of it.
 ///
-/// Syscall arguments are `Unknown`, because the point is to say something true
-/// for every argument a caller might pass, rather than for three that happened
-/// to be tried.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Val {
-    Known(u32),
-    Unknown,
-}
-
-/// Arguments are not sampled, they are unknown.
+/// There used to be four hundred lines here: a symbolic interpreter for the
+/// filter's four opcodes and a policy check that walked every syscall number
+/// over unknown arguments. It was deleted, and the reasoning is worth keeping
+/// because it was not obvious at the time.
 ///
-/// An earlier version took three concrete argument profiles and ran them. It
-/// looked exhaustive and was not: a reviewer added a permission for `renameat2`
-/// guarded by `args[0] == 3`, which none of the three profiles hit, so the
-/// check stayed green while the sandboxed child opened directories until it
-/// held fd 3 and renamed a real file.
+/// Across four review cycles that interpreter never found a defect in the
+/// filter. It was itself the defect four times: it sampled three argument
+/// profiles and called that exhaustive, compared return values by whole word
+/// when the kernel masks off the data bits, skipped listed syscalls and so
+/// never examined the gates at all, and bounded the syscall space at 600. Every
+/// one of those is the same bug - the model disagreed with the kernel - and it
+/// is the bug a model can always have.
 ///
-/// Where a comparison tests an unknown value, both outcomes are explored, so
-/// what comes back covers every argument a caller could pass. A conditional
-/// ALLOW is then simply an ALLOW.
-///
-/// Only the four opcodes this program uses are modelled; anything else panics.
-/// A separate check requires EVERY instruction to be modelled, reachable or
-/// not, because an opcode encountered only on a path this walk considers dead
-/// would otherwise pass in silence - and "dead according to the model" is
-/// exactly the thing being taken on trust.
-///
-/// The program has no backward jumps and each state is visited once, so the
-/// walk terminates.
-///
-/// One thing the filter learned on the way to a verdict:
-/// `data[offset] & mask == value`.
-///
-/// Every test this program makes has that shape - load a word, optionally mask
-/// it, compare for equality - so a path condition is just a list of these.
-type Constraint = (u32, u32, u32);
-
-/// Walk the filter, returning every verdict it can reach together with what had
-/// to be true of the arguments to reach it.
-///
-/// Verdicts alone were not enough. The reverse check asked only WHICH syscalls
-/// could be allowed, then skipped the listed ones as permitted by definition -
-/// so the argument gates were never checked at all. A reviewer planted a plain
-/// `RET_ALLOW` for `openat` when `dirfd == 3`, which is listed, so nothing
-/// looked at it; the child opened four directories to get fd 3 and created a
-/// real file with `O_CREAT`.
-///
-/// Being listed is permission to be reached, not permission to be reached on
-/// any terms. Carrying the conditions along lets the terms be checked too.
-fn walk(program: &[libc::sock_filter], nr: u32) -> Vec<(u32, Vec<Constraint>)> {
-    // `seccomp_data` is addressed by byte offset. `nr` and `arch` are
-    // determined for a given syscall; every argument word is not.
-    let load = |k: u32| match k {
-        OFF_NR => Val::Known(nr),
-        OFF_ARCH => Val::Known(AUDIT_ARCH_X86_64),
-        _ => Val::Unknown,
-    };
-
-    // The accumulator, plus where it came from. The origin is what turns a
-    // comparison into a statement about an argument: after `A = data[off] & m`,
-    // learning `A == k` is learning `data[off] & m == k`.
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    struct State {
-        pc: usize,
-        val: Val,
-        origin: Option<(u32, u32)>,
-        conditions: Vec<Constraint>,
-    }
-
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    // The accumulator starts `Unknown` rather than `Known(0)`. The kernel zeroes
-    // it and this program loads before it compares, so the two agree here - but
-    // they fail differently if that stops being true. Over-approximating finds
-    // ALLOWs that are not really reachable, a loud false alarm;
-    // under-approximating misses one that is, the failure this exists to catch.
-    let mut work = vec![State {
-        pc: 0,
-        val: Val::Unknown,
-        origin: None,
-        conditions: Vec::new(),
-    }];
-
-    while let Some(s) = work.pop() {
-        if !seen.insert(s.clone()) {
-            continue;
-        }
-        let i = program[s.pc];
-        match i.code {
-            // LD_W_ABS
-            0x20 => work.push(State {
-                pc: s.pc + 1,
-                val: load(i.k),
-                origin: Some((i.k, u32::MAX)),
-                ..s
-            }),
-            // ALU_AND_K
-            0x54 => work.push(State {
-                pc: s.pc + 1,
-                val: match s.val {
-                    Val::Known(v) => Val::Known(v & i.k),
-                    Val::Unknown => Val::Unknown,
-                },
-                origin: s.origin.map(|(off, mask)| (off, mask & i.k)),
-                ..s
-            }),
-            // JMP_JEQ_K
-            0x15 => {
-                let taken = s.pc + 1 + usize::from(i.jt);
-                let missed = s.pc + 1 + usize::from(i.jf);
-                match s.val {
-                    // A determined comparison goes one way, as the kernel would.
-                    Val::Known(v) => work.push(State {
-                        pc: if v == i.k { taken } else { missed },
-                        ..s
-                    }),
-                    // An undetermined one goes both, because some caller can
-                    // arrange either. Taking the equal branch is where a fact
-                    // about an argument is learned.
-                    Val::Unknown => {
-                        let mut learned = s.conditions.clone();
-                        if let Some((off, mask)) = s.origin {
-                            learned.push((off, mask, i.k));
-                        }
-                        work.push(State {
-                            pc: taken,
-                            val: Val::Known(i.k),
-                            origin: s.origin,
-                            conditions: learned,
-                        });
-                        work.push(State { pc: missed, ..s });
-                    }
-                }
-            }
-            // RET_K
-            0x06 => out.push((i.k, s.conditions)),
-            other => panic!("filter uses opcode {other:#x}, which this interpreter does not model"),
-        }
-    }
-
-    out
-}
-
-/// No syscall is permitted that is not written down, for any argument.
-///
-/// This invariant has been wrong twice, each time in a way that looked right.
-///
-/// First it ran one direction only - every listed number must appear somewhere
-/// in the program - which catches a list entry that was never wired up and
-/// misses a permission wired up and never listed. A reviewer added a bare
-/// `renameat2` permission and renamed a real file with every test green.
-///
-/// Then it asked the filter directly, but with three concrete argument
-/// profiles. The same reviewer guarded the same permission on `args[0] == 3`,
-/// which no profile happened to hit, opened directories in the sandboxed child
-/// until it held fd 3, and renamed a real file with every test green again.
-///
-/// Sampling arguments cannot establish a statement about all arguments. So the
-/// arguments are unknown and both sides of an undetermined comparison are
-/// explored: for an unlisted syscall, EVERY reachable path must end in KILL.
+/// What it uniquely checked was the gate boundaries over all arguments. Three
+/// canaries check the same boundaries against the real kernel, which cannot
+/// have a faithfulness bug because there is nothing to be faithful to. The
+/// default-deny canary above already covers a mangled jump: an offset that let
+/// an unlisted syscall fall through to ALLOW would let `io_uring_setup` live,
+/// and that test would fail.
 #[test]
-fn the_interpreter_models_every_instruction() {
-    // The walk panics on an opcode it does not model, which is the right
-    // behaviour but only fires on a path it decides is reachable. That is
-    // circular: the reachability decision is what the model is for. So check
-    // the whole program regardless of reachability.
-    //
-    // Classic BPF has more than these four - notably the X register, indexed
-    // loads and BPF_MISC. None appear here, and if one ever does, the honest
-    // outcome is a failure that says so rather than a walk quietly reasoning
-    // about an instruction set that is not the one being run.
-    const MODELLED: &[u16] = &[
-        0x20, // LD_W_ABS
-        0x54, // ALU_AND_K
-        0x15, // JMP_JEQ_K
-        0x06, // RET_K
+fn each_argument_gate_holds_against_the_kernel() {
+    let probes: &[(&str, fn())] = &[
+        // openat may pass with no write flag, and only then.
+        ("openat O_CREAT", || unsafe {
+            libc::syscall(
+                257,
+                libc::AT_FDCWD,
+                c"/tmp/encypher-gate-canary".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT,
+                0o600,
+            );
+        }),
+        // open, the same gate on a different argument index.
+        ("open O_WRONLY", || unsafe {
+            libc::syscall(2, c"/tmp/encypher-gate-canary".as_ptr(), libc::O_WRONLY, 0);
+        }),
+        // ioctl may pass for TCGETS, and only that. FS_IOC_SETFLAGS is the
+        // request a reviewer used to flip an inode flag through a READ-ONLY
+        // descriptor, which is why the gate is on the request and not the
+        // descriptor.
+        ("ioctl FS_IOC_SETFLAGS", || unsafe {
+            let flags: libc::c_long = 0;
+            libc::syscall(16, 0, 0x4008_6602u64, &flags);
+        }),
     ];
 
-    let unmodelled: Vec<(usize, u16)> = filter(None)
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| !MODELLED.contains(&i.code))
-        .map(|(pc, i)| (pc, i.code))
-        .collect();
-
-    assert!(
-        unmodelled.is_empty(),
-        "the filter contains instructions the interpreter does not model, at \
-         (index, opcode): {unmodelled:?}. Either model them or stop claiming \
-         the reverse invariant, because the walk cannot reason about them.",
-    );
-}
-
-/// The assembled filter agrees with the declared policy, everywhere, for every
-/// argument.
-///
-/// This started as two checks and they were each partly right, which is how
-/// both of them missed something.
-///
-/// One asked which syscalls could reach ALLOW and compared that to the lists,
-/// then skipped the listed ones as permitted by definition - so the argument
-/// gates, the entire reason `openat` is permitted at all, were examined by
-/// nothing. A reviewer planted a plain ALLOW for `openat` when `dirfd == 3`,
-/// and the sandboxed child opened four directories to get fd 3 and created a
-/// real file with `O_CREAT`.
-///
-/// The other compared verdicts for whole-word equality with `RET_ALLOW`, when a
-/// seccomp return is an action in the high 16 bits and data in the low 16.
-/// `RET_ALLOW | 1` is allow to the kernel and not-allow to that test, and
-/// `SECCOMP_RET_LOG` logs a syscall and then runs it. Both renamed a real file.
-///
-/// Two approximations standing next to the real policy is worse than one check
-/// that states it. So there is one, and it says: for every syscall number, on
-/// every path the filter can take, the verdict must be what the lists say it
-/// should be.
-///
-/// - unlisted syscalls reach exactly the kill this filter issues, and nothing
-///   else;
-/// - `EXERCISED` and `HEADROOM` may be allowed;
-/// - `ARGUMENT_GATED` may be allowed only on a path that established the
-///   gate's own constraint, and otherwise must kill.
-///
-/// The expected policy is derived from the same three lists the filter is
-/// generated from, so neither can drift from the other without this failing.
-#[test]
-fn the_filter_matches_the_declared_policy() {
-    const ACTION: u32 = 0xffff_0000;
-    const RET_ALLOW: u32 = 0x7fff_0000;
-    const RET_KILL_PROCESS: u32 = 0x8000_0000;
-    const WRITE_FLAGS: u32 =
-        (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
-
-    let program = filter(None);
-    let plain = allowed();
-    let gated: Vec<(u32, Constraint)> = ARGUMENT_GATED
-        .iter()
-        .map(|(nr, gate)| {
-            let required = match gate {
-                Gate::NoWriteFlags { arg } => (*arg, WRITE_FLAGS, 0),
-                Gate::ArgEquals { arg, value } => (*arg, u32::MAX, *value),
-            };
-            (*nr, required)
-        })
-        .collect();
-
-    // Which syscall numbers to check.
-    //
-    // This was `0..600`, a bound with nothing behind it. A reviewer added a
-    // permission for syscall 600, watched all nine tests pass, then invoked 600
-    // in the sandbox and was not killed. Numbers above the bound were simply
-    // not a thing the check had an opinion about, and the x32 space was not
-    // either.
-    //
-    // A bound is the wrong shape of answer. This filter can only branch on
-    // constants it actually contains, so every syscall number NOT compared
-    // anywhere behaves identically to every other one. Take the constants the
-    // program compares, add one representative of everything else, and that
-    // covers the whole 32-bit space - exhaustively, and without a magic number
-    // to get wrong later.
-    let mut domain: Vec<u32> = program
-        .iter()
-        .filter(|i| i.code == 0x15)
-        .map(|i| i.k)
-        .collect();
-    domain.sort_unstable();
-    domain.dedup();
-    let representative = (0u32..)
-        .find(|n| !domain.contains(n))
-        .expect("some syscall number is not compared by the filter");
-    domain.push(representative);
-
-    let mut wrong: Vec<String> = Vec::new();
-
-    for nr in domain {
-        let required = gated.iter().find(|(n, _)| *n == nr).map(|(_, c)| *c);
-
-        for (verdict, conditions) in walk(&program, nr) {
-            let allowed_here = verdict & ACTION == RET_ALLOW;
-
-            // Anything that is not an allow must be the one kill this filter
-            // issues. Enumerating which other actions happen to be permissive
-            // is the mistake that let RET_LOG through; demanding the exact kill
-            // covers encodings nobody here has thought of.
-            if !allowed_here && verdict != RET_KILL_PROCESS {
-                wrong.push(format!(
-                    "syscall {nr} can reach verdict {verdict:#x}, which is \
-                     neither allow nor the canonical kill"
-                ));
-                continue;
+    for (name, probe) in probes {
+        let status = in_child(|| {
+            if let Err(code) = engage_sandbox(None) {
+                unsafe { libc::_exit(code) }
             }
-            if !allowed_here {
-                continue;
-            }
+            probe();
+            unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+        });
 
-            match required {
-                // A gated syscall may be allowed only having passed its gate.
-                Some(c) if !conditions.contains(&c) => wrong.push(format!(
-                    "syscall {nr} reaches ALLOW without its gate: the path \
-                     established {conditions:x?}, which does not include {c:x?}"
-                )),
-                Some(_) => {}
-                // An ungated syscall may be allowed only if it is listed.
-                None if !plain.contains(&nr) => {
-                    wrong.push(format!("syscall {nr} reaches ALLOW but appears in no list"))
-                }
-                None => {}
-            }
-        }
-    }
-
-    assert!(
-        wrong.is_empty(),
-        "the filter disagrees with the declared policy:\n  {}",
-        wrong.join("\n  "),
-    );
-
-    // The walk is only worth anything if it reaches the ALLOW returns at all.
-    // A filter it could not traverse would report nothing for everything and
-    // pass in silence.
-    for nr in plain.iter().chain(gated.iter().map(|(nr, _)| nr)) {
         assert!(
-            walk(&program, *nr)
-                .iter()
-                .any(|(v, _)| v & ACTION == RET_ALLOW),
-            "syscall {nr} is listed as permitted, but no path through the \
-             filter reaches ALLOW for it",
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "{name}: the gate let it through. A gated syscall reachable on the \
+             wrong arguments is not gated.",
         );
     }
+
+    // And the permitted side still works, or the gates would be indistinguishable
+    // from an outright ban and the verification test would be passing for the
+    // wrong reason.
+    let status = in_child(|| {
+        if let Err(code) = engage_sandbox(None) {
+            unsafe { libc::_exit(code) }
+        }
+        let fd = unsafe { libc::syscall(257, libc::AT_FDCWD, c"/proc/self/maps".as_ptr(), 0, 0) };
+        unsafe { libc::_exit(if fd >= 0 { OK } else { SANDBOX_NOT_ENGAGED }) }
+    });
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == OK,
+        "a read-only openat was refused, so the gate is banning rather than gating",
+    );
 }
 
 /// Every entry in the exercised tier is load-bearing, and the two tiers agree.
