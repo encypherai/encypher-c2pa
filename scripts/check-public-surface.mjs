@@ -412,20 +412,31 @@ function extract(doc, crateName) {
 // it is a tripwire on the ONE thing rustdoc cannot report on itself. Finding
 // such a predicate is not proof of a writer, only proof that the inventory
 // cannot speak for that code - so the gate refuses rather than guessing.
-// Forbid the CAPABILITY to write, not just the appearance of a writer.
+// A tripwire for accidental writers. NOT a capability boundary.
 //
 // Everything else here reasons about the SHAPE of the API: which items are
 // public, under which features and targets. Shape cannot see conduct. A
 // reviewer demonstrated that three times by leaving the signature of an
 // approved function alone and rewriting its body to splice a manifest carrier
-// into the caller's file - the inventory did not move, and only a test that
-// happened to exercise that exact path could notice.
+// into the caller's file - the inventory did not move.
 //
-// This closes the class instead of the instances. A verifier reads; it has no
-// business calling a filesystem mutator at all. Exactly one module legitimately
-// does - the opt-in telemetry consent file - so that is named, and any other
-// production reference to a write-capable API fails the build. A rewritten body
-// cannot then write anything without also tripping this, whatever its shape.
+// This scan was added to close that class and it does not. The same reviewer
+// walked past it twice in one sitting with ordinary safe Rust: `use std::fs as
+// io_fs` then `io_fs::write`, and `File::options().create(true)`. Both still
+// pass it today. Aliases, re-export paths, generic `io::Write` indirection,
+// macro expansion, `include!` and any dependency writing on the crate's behalf
+// defeat a pattern list, and extending the list per instance is the denylist
+// trap this script's own header warns against.
+//
+// It is kept for two narrow reasons: it costs nothing, and it names the
+// offending line, where a syscall filter can only report that something tried.
+// It catches the careless case - someone reaching for `fs::write` in a verifier
+// during ordinary work, which is the likely way this boundary really erodes.
+//
+// The control that actually decides is `tests/no_write_capability.rs`, which
+// runs the public entry points under a default-deny seccomp allowlist and kills
+// the process on anything outside it. That is route-independent by
+// construction, including the two bypasses above.
 //
 // `cfg(test)` code is skipped: fixture builders write freely and are not
 // compiled into the released artifact.
@@ -529,7 +540,8 @@ function checkObservableCfgs() {
 
       // Find the item the attribute applies to: skip further attributes,
       // doc comments and blanks. `pub` and the item keyword may sit on
-      // separate lines, so inspect a small window rather than one line.
+      // separate lines, so the header is accumulated below rather than read
+      // from a fixed number of lines.
       let k = end + 1;
       while (k < lines.length &&
              (/^\s*(#\s*!?\s*\[|\/\/)/.test(lines[k]) || lines[k].trim() === "")) {

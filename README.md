@@ -328,19 +328,33 @@ general property.
 
 A third control asks the kernel instead of the source.
 `crates/encypher-c2pa/tests/no_write_capability.rs` forks a child, installs a
-seccomp filter that kills the process on any syscall capable of creating,
-truncating, removing or executing, and runs `verify`, `verify_with_options` and
-`verify_file` inside it. They complete normally. This is the strongest of the
-three because it does not depend on recognising a writer: aliases, re-export
-paths, generic `io::Write` indirection, macro expansion, `unsafe`, a dependency
-writing on the library's behalf and shelling out to a subprocess are all
-equally impossible, and each of those routes was tried against it.
+seccomp filter, and runs `verify`, `verify_with_options` and `verify_file`
+inside it across every MIME in `supported_mime_types()` and every extension in
+`SUPPORTED_EXTENSIONS`, on signed, unsigned and truncated input. The signed
+cases must come back present with valid integrity and a matching hard binding,
+so a run that silently stopped parsing cannot pass for a clean one.
 
-Note that it kills on the attempt rather than returning an error. An earlier
-version returned `EPERM`, and a discarded `let _ = write(..)` sailed through
-it: the write failed, the result was dropped, verification finished and the
-test reported success. Refusing the syscall shows verification does not depend
-on writing. Killing shows it does not try.
+The filter is an allowlist, not a denylist, and that distinction is the whole
+control. The first version enumerated mutating syscalls; a reviewer asked what
+it did about io_uring, and the answer was nothing - a ring performs `openat`
+and `write` as submission entries, so refusing those numbers refuses nothing.
+Now anything outside a fixed list of readers, memory operations and clocks
+kills the process, and a test calls `io_uring_setup` inside the sandbox to
+prove the default really is deny. Aliases, re-export paths, generic
+`io::Write` indirection, macro expansion, `unsafe`, a dependency writing on the
+library's behalf and shelling out to a subprocess are all equally impossible;
+each was tried against it.
+
+Two details matter. It kills on the attempt rather than returning `EPERM`,
+because an earlier version returned an error and a discarded
+`let _ = write(..)` sailed through: the write failed, the result was dropped,
+verification finished and the test reported success. Refusing the syscall shows
+verification does not depend on writing; killing shows it does not try. And the
+allowlist is split in two - the eight syscalls the scenario actually makes,
+each proved necessary on every CI run by removing it and requiring the run to
+die, and a declared headroom tier for portability across libc and kernel
+versions. None of the headroom entries can create or modify a file. Splitting
+it means a new permission cannot arrive unnoticed.
 
 Between them a boundary violation has to defeat a compiler-derived surface
 lock, an observable behaviour test, and a kernel that will not permit the
