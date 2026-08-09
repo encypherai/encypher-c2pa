@@ -843,6 +843,29 @@ enum Val {
 /// The program has no backward jumps and each state is visited once, so the
 /// walk terminates.
 fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
+    walk(program, nr).into_iter().map(|(v, _)| v).collect()
+}
+
+/// One thing the filter learned on the way to a verdict:
+/// `data[offset] & mask == value`.
+///
+/// Every test this program makes has that shape - load a word, optionally mask
+/// it, compare for equality - so a path condition is just a list of these.
+type Constraint = (u32, u32, u32);
+
+/// Walk the filter, returning every verdict it can reach together with what had
+/// to be true of the arguments to reach it.
+///
+/// Verdicts alone were not enough. The reverse check asked only WHICH syscalls
+/// could be allowed, then skipped the listed ones as permitted by definition -
+/// so the argument gates were never checked at all. A reviewer planted a plain
+/// `RET_ALLOW` for `openat` when `dirfd == 3`, which is listed, so nothing
+/// looked at it; the child opened four directories to get fd 3 and created a
+/// real file with `O_CREAT`.
+///
+/// Being listed is permission to be reached, not permission to be reached on
+/// any terms. Carrying the conditions along lets the terms be checked too.
+fn walk(program: &[libc::sock_filter], nr: u32) -> Vec<(u32, Vec<Constraint>)> {
     // `seccomp_data` is addressed by byte offset. `nr` and `arch` are
     // determined for a given syscall; every argument word is not.
     let load = |k: u32| match k {
@@ -851,58 +874,90 @@ fn reachable_verdicts(program: &[libc::sock_filter], nr: u32) -> HashSet<u32> {
         _ => Val::Unknown,
     };
 
-    let mut verdicts = HashSet::new();
+    // The accumulator, plus where it came from. The origin is what turns a
+    // comparison into a statement about an argument: after `A = data[off] & m`,
+    // learning `A == k` is learning `data[off] & m == k`.
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct State {
+        pc: usize,
+        val: Val,
+        origin: Option<(u32, u32)>,
+        conditions: Vec<Constraint>,
+    }
+
+    let mut out = Vec::new();
     let mut seen = HashSet::new();
 
     // The accumulator starts `Unknown` rather than `Known(0)`. The kernel zeroes
     // it and this program loads before it compares, so the two agree here - but
     // they fail differently if that stops being true. Over-approximating finds
-    // ALLOWs that are not really reachable, which is a loud false alarm;
-    // under-approximating misses one that is, which is the failure this whole
-    // test exists to prevent.
-    let mut work = vec![(0usize, Val::Unknown)];
+    // ALLOWs that are not really reachable, a loud false alarm;
+    // under-approximating misses one that is, the failure this exists to catch.
+    let mut work = vec![State {
+        pc: 0,
+        val: Val::Unknown,
+        origin: None,
+        conditions: Vec::new(),
+    }];
 
-    while let Some((pc, a)) = work.pop() {
-        if !seen.insert((pc, a)) {
+    while let Some(s) = work.pop() {
+        if !seen.insert(s.clone()) {
             continue;
         }
-        match program[pc].code {
+        let i = program[s.pc];
+        match i.code {
             // LD_W_ABS
-            0x20 => work.push((pc + 1, load(program[pc].k))),
+            0x20 => work.push(State {
+                pc: s.pc + 1,
+                val: load(i.k),
+                origin: Some((i.k, u32::MAX)),
+                ..s
+            }),
             // ALU_AND_K
-            0x54 => {
-                let next = match a {
-                    Val::Known(v) => Val::Known(v & program[pc].k),
+            0x54 => work.push(State {
+                pc: s.pc + 1,
+                val: match s.val {
+                    Val::Known(v) => Val::Known(v & i.k),
                     Val::Unknown => Val::Unknown,
-                };
-                work.push((pc + 1, next));
-            }
+                },
+                origin: s.origin.map(|(off, mask)| (off, mask & i.k)),
+                ..s
+            }),
             // JMP_JEQ_K
             0x15 => {
-                let taken = pc + 1 + usize::from(program[pc].jt);
-                let missed = pc + 1 + usize::from(program[pc].jf);
-                match a {
+                let taken = s.pc + 1 + usize::from(i.jt);
+                let missed = s.pc + 1 + usize::from(i.jf);
+                match s.val {
                     // A determined comparison goes one way, as the kernel would.
-                    Val::Known(v) => {
-                        work.push((if v == program[pc].k { taken } else { missed }, a))
-                    }
-                    // An undetermined one goes both ways, because some caller
-                    // can arrange either.
+                    Val::Known(v) => work.push(State {
+                        pc: if v == i.k { taken } else { missed },
+                        ..s
+                    }),
+                    // An undetermined one goes both, because some caller can
+                    // arrange either. Taking the equal branch is where a fact
+                    // about an argument is learned.
                     Val::Unknown => {
-                        work.push((taken, Val::Known(program[pc].k)));
-                        work.push((missed, Val::Unknown));
+                        let mut learned = s.conditions.clone();
+                        if let Some((off, mask)) = s.origin {
+                            learned.push((off, mask, i.k));
+                        }
+                        work.push(State {
+                            pc: taken,
+                            val: Val::Known(i.k),
+                            origin: s.origin,
+                            conditions: learned,
+                        });
+                        work.push(State { pc: missed, ..s });
                     }
                 }
             }
             // RET_K
-            0x06 => {
-                verdicts.insert(program[pc].k);
-            }
+            0x06 => out.push((i.k, s.conditions)),
             other => panic!("filter uses opcode {other:#x}, which this interpreter does not model"),
         }
     }
 
-    verdicts
+    out
 }
 
 /// No syscall is permitted that is not written down, for any argument.
@@ -953,6 +1008,50 @@ fn the_interpreter_models_every_instruction() {
          (index, opcode): {unmodelled:?}. Either model them or stop claiming \
          the reverse invariant, because the walk cannot reason about them.",
     );
+}
+
+#[test]
+fn every_argument_gate_is_actually_enforced() {
+    // Being on a list is permission to be reached, not permission to be reached
+    // on any terms.
+    //
+    // The reverse check skipped listed syscalls as permitted by definition, so
+    // nothing ever looked at the argument gates. A reviewer planted a plain
+    // RET_ALLOW for openat conditional on dirfd == 3 - openat is listed, so the
+    // check passed it - then opened four directories in the sandboxed child to
+    // obtain fd 3 and created a real file with O_CREAT. Eight tests green.
+    //
+    // So for each gated syscall, every path that reaches ALLOW must have learned
+    // the fact the gate exists to establish. A path that arrives by some other
+    // route has not been through the gate, whatever else it checked.
+    const ACTION: u32 = 0xffff_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const WRITE_FLAGS: u32 =
+        (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
+
+    let program = filter(None);
+
+    for (nr, gate) in ARGUMENT_GATED {
+        // The constraint the gate is supposed to impose, taken from the same
+        // table the filter is generated from.
+        let required: Constraint = match gate {
+            Gate::NoWriteFlags { arg } => (*arg, WRITE_FLAGS, 0),
+            Gate::ArgEquals { arg, value } => (*arg, u32::MAX, *value),
+        };
+
+        for (verdict, conditions) in walk(&program, *nr) {
+            if verdict & ACTION != RET_ALLOW {
+                continue;
+            }
+            assert!(
+                conditions.contains(&required),
+                "syscall {nr} can reach ALLOW without its gate: the path \
+                 established {conditions:x?}, which does not include \
+                 {required:x?}. A gated syscall that can be allowed by another \
+                 route is not gated.",
+            );
+        }
+    }
 }
 
 #[test]
