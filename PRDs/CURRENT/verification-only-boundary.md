@@ -1,6 +1,6 @@
 # Verification-Only Boundary
 
-**Status:** implementation complete, completion gate in progress (cycle 16)
+**Status:** implementation complete, completion gate in progress (cycle 17)
 **Current Goal:** the published SDK offers no way to produce a C2PA asset, and that property is enforced by CI rather than by reviewer attention.
 
 ## Overview
@@ -131,7 +131,7 @@ success and failure paths and creates no sibling files.
 
 - Default build of the published library exposes zero manifest constructors and
   zero container writers; `public-surface.txt` holds 172 reviewed items.
-- `cargo test --workspace` passes: 319 tests.
+- `cargo test --workspace` passes: 318 tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - Exactly two publishable packages remain.
 - The gate fails on a writer becoming public through any of: a plain addition, a
@@ -148,26 +148,26 @@ success and failure paths and creates no sibling files.
 | Check | Result |
 |---|---|
 | Public surface inventory | 172 items, zero writers |
-| Workspace tests | 319 passed, 0 failed |
-| ...of which library unit tests | 277 |
-| ...seccomp capability suite | 9 |
+| Workspace tests | 318 passed, 0 failed |
+| ...library unit tests | 277 |
+| ...seccomp capability suite | 8 |
 | ...non-mutation contract suite | 8 |
-| ...CLI, CAWG corpus, API, footers, FFI | 25 |
+| ...verify contract, CAWG corpus, API, footers, FFI | 25 |
 | clippy `-D warnings` | 0 errors |
 | CLI on a real signed MP4 | integrity valid, signature valid, hard binding match |
-| `cargo package` | 67 files, 996.6 KiB |
+| `cargo package` | 65 files, 993.3 KiB |
 | wasm32 target | clean |
 | MSRV 1.88 | clean |
 | Publishable packages | `encypher-c2pa`, `encypher-c2pa-cli` |
 | Gate vs. target-gated writer | FAIL as designed, item named |
 | Gate vs. implicit/redefined feature | FAIL as designed, resolved-vs-approved diff |
 | Contract tests vs. mutated `verify_file` | FAIL as designed, while the surface gate passes |
-| Sandbox vs. writer via alias, `File::options`, `OpenOptions`, `remove_file`, subprocess, `set_times` | SIGSYS on all six |
-| Sandbox vs. inherited `O_RDWR` descriptor | none survives `close_range` |
+| Sandbox vs. `write` to fd 1, `open` O_RDWR, `ioctl` FS_IOC_SETFLAGS, `io_uring_setup` | SIGSYS on all four |
+| Sandbox vs. inherited `O_RDWR` descriptor | none survives `close_range`; checked to RLIMIT_NOFILE |
 | Sandbox vs. inherited `MAP_SHARED` mapping | unmapped before the filter; backing file unchanged |
-| Policy check vs. unlisted `renameat2`, plain and conditional | FAIL as designed |
-| Policy check vs. `RET_ALLOW\|1`, `RET_LOG`, `RET_TRACE`, `RET_USER_NOTIF` | FAIL as designed |
-| Policy check vs. `openat`/`ioctl` allowed past their gates | FAIL as designed, missing constraint named |
+| Gate canaries vs. `openat` O_CREAT, `open` O_WRONLY, `ioctl` non-TCGETS | SIGSYS on all three |
+| Gate canaries vs. read-only `openat` | succeeds, so the gates gate rather than ban |
+| Allowlist minimality | removing any EXERCISED entry breaks the run |
 
 ## Review Loop State
 
