@@ -169,6 +169,7 @@ success and failure paths and creates no sibling files.
 | Gate canaries vs. a mask losing one bit | each of the five removed in turn; each fails and names the flag |
 | Gate canaries, permitted side | read-only `openat` and `open` succeed, `ioctl` TCGETS survives, so the gates gate rather than ban |
 | Allowlist minimality | removing any EXERCISED entry breaks the run |
+| Open-family guard | `openat2` or `open_by_handle_at` added to an ungated tier fails the build, naming why |
 
 ## Review Loop State
 

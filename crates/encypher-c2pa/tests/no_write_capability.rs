@@ -934,6 +934,53 @@ fn each_argument_gate_holds_against_the_kernel() {
     });
 }
 
+/// No open-family syscall may sit in an ungated tier.
+///
+/// This is the one piece of advice in this file that could do real damage if
+/// followed carelessly, so it is a check rather than a sentence.
+///
+/// `EXERCISED` and `HEADROOM` are ungated: a number in either is permitted with
+/// any arguments whatsoever. That is fine for a reader like `statx`, and not
+/// fine for anything that opens, because opening is where the write mode
+/// lives. That is the entire reason `openat` and `open` sit in
+/// `ARGUMENT_GATED` instead.
+///
+/// The realistic way this goes wrong is not malice. A dependency bump routes
+/// opens through `openat2`, the completion test fails with SIGSYS, and someone
+/// reads "a read can go in HEADROOM", decides an open is basically a read, and
+/// adds 437. CI goes green and the gate is gone. `openat2` cannot even be gated
+/// the way `openat` is - its flags live in an `open_how` struct behind a
+/// pointer, and classic BPF cannot dereference one - so denied is the only
+/// honest answer for it.
+#[test]
+fn no_open_family_syscall_is_ungated() {
+    const OPEN_FAMILY: &[(u32, &str)] = &[
+        (2, "open"),
+        (257, "openat"),
+        (437, "openat2"),
+        (304, "open_by_handle_at"),
+        (85, "creat"),
+        (427, "io_uring_register"),
+    ];
+
+    let ungated = allowed();
+    let offenders: Vec<&str> = OPEN_FAMILY
+        .iter()
+        .filter(|(nr, _)| ungated.contains(nr))
+        .map(|(_, name)| *name)
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "{offenders:?} appear in EXERCISED or HEADROOM, which are ungated, so \
+         they are permitted with any arguments including a write mode. An \
+         opening syscall belongs in ARGUMENT_GATED behind a flags check, or \
+         nowhere. openat2 and open_by_handle_at cannot be gated by classic BPF \
+         at all - their arguments are behind a pointer - so for those the answer \
+         is nowhere.",
+    );
+}
+
 /// Every entry in the exercised tier is load-bearing, and the two tiers agree.
 ///
 /// An allowlist answers "is this sound?" far better than a denylist, but it
@@ -1013,14 +1060,25 @@ fn verification_completes_with_the_write_capability_removed() {
                  or remove a file - which is what this test exists to catch.\n\n\
                  But the filter is default-deny, so a perfectly innocent \
                  syscall that is simply not on the list dies exactly the same \
-                 way. A libc or dependency bump that starts routing reads \
-                 through openat2 or faccessat2, or a new format needing a \
-                 syscall nobody listed, both land here.\n\n\
-                 Find out which syscall it was before concluding there is a \
-                 writer: run the child under strace, or build the filter with \
-                 SECCOMP_RET_LOG in place of the kill and read the audit log. \
-                 If it turns out to be a read, add it to HEADROOM with a note \
-                 saying why it cannot modify a file.",
+                 way. A libc or dependency bump that starts routing metadata \
+                 lookups through faccessat2 or a newer statx, or a format \
+                 needing a syscall nobody listed, both land here.\n\n\
+                 Find out WHICH syscall before concluding there is a writer: \
+                 run the child under strace, or build the filter with \
+                 SECCOMP_RET_LOG in place of the kill and read the audit log.\n\n\
+                 Then, and this is the part that matters:\n\n\
+                 - A pure read with no open mode - faccessat2, a statx variant, \
+                 a readlink variant - can go in HEADROOM with a note saying why \
+                 it cannot modify a file.\n\n\
+                 - Anything in the OPEN family cannot. HEADROOM is ungated, so \
+                 putting openat2 or open_by_handle_at there permits it with any \
+                 flags at all, which reopens exactly the channel the openat and \
+                 open gates exist to close. openat2 also cannot be gated the way \
+                 they are: its flags live in an open_how struct behind a \
+                 pointer, and classic BPF cannot dereference one. So for the \
+                 open family the answer is that it stays denied. If a dependency \
+                 genuinely requires openat2, that is a dependency problem to \
+                 solve upstream or pin around, not a line to add here.",
             );
         }
         panic!("sandboxed child was killed by signal {sig}");
