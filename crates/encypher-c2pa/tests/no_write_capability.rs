@@ -934,7 +934,7 @@ fn each_argument_gate_holds_against_the_kernel() {
     });
 }
 
-/// No open-family syscall may sit in an ungated tier.
+/// No way to open or write may be permitted without a gate that means something.
 ///
 /// This is the one piece of advice in this file that could do real damage if
 /// followed carelessly, so it is a check rather than a sentence.
@@ -953,31 +953,62 @@ fn each_argument_gate_holds_against_the_kernel() {
 /// pointer, and classic BPF cannot dereference one - so denied is the only
 /// honest answer for it.
 #[test]
-fn no_open_family_syscall_is_ungated() {
-    const OPEN_FAMILY: &[(u32, &str)] = &[
-        (2, "open"),
-        (257, "openat"),
+fn no_way_to_open_or_write_is_ungated() {
+    // Two rules, because the syscalls divide into two cases and a single list
+    // would imply a coverage it does not hold.
+    //
+    // These may be permitted, but only behind an argument gate. Their flags are
+    // a plain register value, so a gate on them means something.
+    const GATEABLE: &[(u32, &str)] = &[(2, "open"), (257, "openat")];
+
+    // These may not be permitted at all, in any tier.
+    //
+    // `creat` always creates, so there is no argument worth inspecting.
+    // `openat2` and `open_by_handle_at` take their arguments through a pointer,
+    // and classic BPF cannot dereference one - a `NoWriteFlags` gate on either
+    // would compare a pointer value against a flag mask and mean nothing, which
+    // is a worse outcome than denial because it reads as protection.
+    // The io_uring trio is here whole rather than by halves: `setup` plus
+    // `enter` is the write path, `register` alone is not, and a list naming one
+    // of the three suggests the other two were considered and permitted.
+    const UNGATEABLE: &[(u32, &str)] = &[
+        (85, "creat"),
         (437, "openat2"),
         (304, "open_by_handle_at"),
-        (85, "creat"),
+        (425, "io_uring_setup"),
+        (426, "io_uring_enter"),
         (427, "io_uring_register"),
     ];
 
     let ungated = allowed();
-    let offenders: Vec<&str> = OPEN_FAMILY
+    let gated: Vec<u32> = ARGUMENT_GATED.iter().map(|(nr, _)| *nr).collect();
+
+    let wrongly_ungated: Vec<&str> = GATEABLE
         .iter()
         .filter(|(nr, _)| ungated.contains(nr))
         .map(|(_, name)| *name)
         .collect();
-
     assert!(
-        offenders.is_empty(),
-        "{offenders:?} appear in EXERCISED or HEADROOM, which are ungated, so \
-         they are permitted with any arguments including a write mode. An \
-         opening syscall belongs in ARGUMENT_GATED behind a flags check, or \
-         nowhere. openat2 and open_by_handle_at cannot be gated by classic BPF \
-         at all - their arguments are behind a pointer - so for those the answer \
-         is nowhere.",
+        wrongly_ungated.is_empty(),
+        "{wrongly_ungated:?} appear in EXERCISED or HEADROOM, which are \
+         ungated, so they are permitted with any arguments including a write \
+         mode. An opening syscall belongs in ARGUMENT_GATED behind a flags \
+         check, or nowhere.",
+    );
+
+    let wrongly_permitted: Vec<&str> = UNGATEABLE
+        .iter()
+        .filter(|(nr, _)| ungated.contains(nr) || gated.contains(nr))
+        .map(|(_, name)| *name)
+        .collect();
+    assert!(
+        wrongly_permitted.is_empty(),
+        "{wrongly_permitted:?} are permitted, and none of them can be. Either \
+         they always write, or their arguments live behind a pointer that \
+         classic BPF cannot dereference - so no gate on them would mean \
+         anything, and a gate that means nothing is worse than a denial \
+         because it reads as protection. If a dependency now requires one, \
+         that is a dependency to pin or replace, not a line to add here.",
     );
 }
 
