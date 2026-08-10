@@ -391,12 +391,30 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
   which is the same mistake this branch spent eighteen cycles removing from its
   own claims - trusting a source without establishing its provenance.
 
-  The right baseline is `c2patool` from `c2pa-rs`, on disk at
-  `/home/agentdesk/code/c2pa-rs-fork` at `bc3ca83d`. It cannot be built in this
-  environment: the workspace pulls in `c2pa_c_ffi`, which build-depends on
-  `cbindgen`, and crates.io returns 403 with no vendored copy present. So the
-  measurement is deferred, not done, and no conclusion about correctness should
-  be drawn from the withdrawn comparison in either direction.
+  The mechanism to close this already exists in this repository, in Rust, and
+  is ours: `tests/vectors/cawg/` plus the harness at
+  `crates/encypher-c2pa-cli/tests/cawg_corpus.rs`. Each vector pins a
+  third-party asset by upstream repo, commit and sha256, records its licence,
+  and carries three separate expectation sets - `normative_expected` (what the
+  spec requires), `upstream_expected` (what the upstream implementation
+  produces) and `current_sdk_observation` (what we produce). The harness
+  asserts against `normative_expected`, so it is a genuine external contract
+  rather than a recording of our own output, and `network_policy: offline` keeps
+  it hermetic.
+
+  That is the correct shape and it needs no third-party validator at runtime.
+  The gap is only in coverage: its 34 vectors are CAWG identity, pinned from
+  `contentauth-c2pa-rs` and `contentauth-c2pa-cpp`. Core C2PA manifest
+  validation - data hashes, BMFF hard bindings, ingredient chains - has no
+  equivalent corpus.
+
+  So the work is to extend this harness with core-C2PA vectors, importing
+  assets from `c2pa-rs` at a pinned commit with spec-derived
+  `normative_expected` sets. Two earlier attempts to shortcut that went to
+  outside implementations - the frozen Python suite, then `c2patool` - and both
+  were wrong: the Python suite is not current, and `c2patool` is contentauth's
+  tool, not an Encypher crate. Encypher validates with Encypher's Rust crates,
+  against pinned vectors and pinned expectations.
 
 - **README:383 overstates interoperability.** It says "Interoperability tests
   use C2PA-conformant fixtures and public validation status codes." The core
