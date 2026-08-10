@@ -63,14 +63,21 @@ fn xpath_box_types(xpaths: &[String]) -> Vec<[u8; 4]> {
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     check_bmff(data)?;
     let mut found = None;
+    let mut oversized = None;
     walk_iso_boxes(data, FMT, |b| {
-        if found.is_none() && is_c2pa_uuid(data, b) {
+        if found.is_none() && oversized.is_none() && is_c2pa_uuid(data, b) {
             let payload = &data[b.payload_start + 16..b.end];
             if let Some(store) = jumbf_from_uuid_payload(payload) {
-                found = Some(store.to_vec());
+                match super::ensure_manifest_store_size(FMT, store.len()) {
+                    Ok(()) => found = Some(store.to_vec()),
+                    Err(error) => oversized = Some(error),
+                }
             }
         }
     })?;
+    if let Some(error) = oversized {
+        return Err(error);
+    }
     Ok(found)
 }
 

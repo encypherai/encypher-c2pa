@@ -130,8 +130,8 @@ success and failure paths and creates no sibling files.
 ## Success Criteria
 
 - Default build of the published library exposes zero manifest constructors and
-  zero container writers; `public-surface.txt` holds 172 reviewed items.
-- `cargo test --workspace` passes: 451 tests across 15 suites.
+  zero container writers; `public-surface.txt` holds 171 reviewed items.
+- `cargo test --workspace` passes: 454 tests across 15 suites.
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - Exactly two publishable packages remain.
 - The gate fails on a writer becoming public through any of: a plain addition, a
@@ -147,16 +147,14 @@ success and failure paths and creates no sibling files.
 
 | Check | Result |
 |---|---|
-| Public surface inventory | 172 items, zero writers |
-| Workspace tests | 318 passed, 0 failed |
-| ...library unit tests | 277 |
-| ...seccomp capability suite | 8 |
-| ...non-mutation contract suite | 8 |
-| ...verify contract, CAWG corpus, API, footers, FFI | 25 |
+| Public surface inventory | 171 items, zero writers |
+| Workspace tests | 454 passed across 15 suites, 0 failed |
 | clippy `-D warnings` | 0 errors |
 | CLI on a real signed MP4 | integrity valid, signature valid, hard binding match |
-| `cargo package` | 65 files, 993.3 KiB |
-| wasm32 target | clean |
+| `cargo package` | 65 files, 1.3 MiB (291.9 KiB compressed); packaged source compiled |
+| Python wheel | `encypher-c2pa==1.0.0` installed in a clean venv; integrity valid, hard binding match |
+| Browser WASM | release build and verifier smoke clean; npm pack contains 7 intended files |
+| Go and C bindings | binding tests and compiled C consumer smoke clean |
 | MSRV 1.88 | clean |
 | Publishable packages | `encypher-c2pa`, `encypher-c2pa-cli` |
 | Gate vs. target-gated writer | FAIL as designed, item named |
@@ -183,12 +181,12 @@ Shipped (confirmed in this worktree):
   artifact. The `test-support` feature is gone.
 - Release graph collapsed to two publishable packages: `encypher-c2pa` and
   `encypher-c2pa-cli`. The three bindings (`bindings/c`, `bindings/python`,
-  `bindings/wasm`) carry `publish = false`. Workspace version is `1.0.0-rc.12`
-  (unreleased); all versions through `rc.11` of the facade, CLI, and retired
-  implementation crates were yanked on 2026-08-10.
+  `bindings/wasm`) carry `publish = false`. Workspace version is `1.0.0`
+  (unreleased); all versions through `1.0.0-rc.11` of the facade, CLI, and
+  retired implementation crates were yanked on 2026-08-10.
 - Compiler-derived, fail-closed surface gate at
   `scripts/check-public-surface.mjs`; reviewed inventory `public-surface.txt`
-  holds 172 items (comment-stripped count confirmed), zero writers, unioned
+  holds 171 items (comment-stripped count confirmed), zero writers, unioned
   over the feature and target (including wasm32) matrix.
 - Behaviour axis covered by `crates/encypher-c2pa/tests/read_only_contract.rs`;
   no-write capability enforced at the kernel by
@@ -210,15 +208,15 @@ Deviations from plan:
 
 Evidence status:
 
-- Directly confirmed on 2026-08-10: 172 reviewed public-surface items; two
-  publishable packages; 451 workspace tests across 15 suites; clippy with all
-  targets and features under `-D warnings`; Rust 1.88 MSRV; official C2PA core
-  corpus and read-only capability suites; Rust, CLI, Python wheel, browser WASM,
-  and Go FFI smoke tests.
+- Directly confirmed on 2026-08-10: 171 reviewed public-surface items; two
+  publishable packages; 454 workspace tests across 15 suites; clippy with all
+  targets under `-D warnings`; Rust 1.88 MSRV; official C2PA core corpus and
+  read-only capability suites; Rust, CLI, Python wheel, browser WASM, Go, and C
+  smoke tests.
 - `cargo package -p encypher-c2pa --locked --offline` produced and verified a
-  65-file, 1.2 MiB package. The CLI package file list contains only the intended
-  source, notices, README, and pinned test corpora.
-- The release-version contract passed for the `rc.12` tag, workspace metadata,
+  65-file, 1.3 MiB package. The CLI package file list contains only the intended
+  source, notices, and README.
+- The release-version contract passed for the `v1.0.0` tag, workspace metadata,
   CLI dependency requirement, and Python package version.
 - External interoperability is hermetic and pinned: 34 CAWG vectors from
   `contentauth/c2pa-rs@d7f13829`, six core C2PA vectors from
@@ -417,8 +415,6 @@ the finalized source after the last parser, CAWG, and BMFF remediations.
 
   cycle 8 changes (in review):
     - consolidated the six crates into private modules; surface 931 -> 171
-      (172 today: `SUPPORTED_EXTENSIONS` was made public at cycle 13 so the
-      contract tests could read the crate's own table instead of a copy)
     - deleted the `test-support` feature; writers are private `cfg(test)`
     - release publishes 2 packages, not 8
     - gate unions across the (target, feature) matrix - closes evasion 11

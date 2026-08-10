@@ -57,21 +57,15 @@ enum CawgTrustMode {
 /// Run the CLI on one corpus vector and return the READER report (the raw
 /// engine report the commercial CLI prints; this CLI nests it under
 /// `manifest_report` in its envelope).
-fn verify(vector: &Value, mode: CawgTrustMode, require_document_signing_anchor: bool) -> Value {
+fn verify(vector: &Value, mode: CawgTrustMode) -> Value {
     verify_at(
         vector,
         mode,
-        require_document_signing_anchor,
         vector["fixed_validation_time"].as_str().expect("time"),
     )
 }
 
-fn verify_at(
-    vector: &Value,
-    mode: CawgTrustMode,
-    require_document_signing_anchor: bool,
-    validation_time: &str,
-) -> Value {
+fn verify_at(vector: &Value, mode: CawgTrustMode, validation_time: &str) -> Value {
     let corpus = corpus_dir();
     let mut command = Command::new(env!("CARGO_BIN_EXE_encypher-c2pa"));
     command
@@ -93,9 +87,6 @@ fn verify_at(
             CawgTrustMode::None => &mut command,
         };
     }
-    if require_document_signing_anchor {
-        command.arg("--cawg-document-signing-require-anchor");
-    }
     if let Some(path) = trust["tsa_trust_list"].as_str() {
         command.arg("--tsa-trust").arg(corpus.join(path));
     }
@@ -115,6 +106,12 @@ fn verify_at(
         "{}: CLI exited {:?}: {}",
         vector["id"],
         code,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "{}: CLI emitted no JSON: {}",
+        vector["id"],
         String::from_utf8_lossy(&output.stderr)
     );
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("CLI JSON envelope");
@@ -213,7 +210,7 @@ fn corpus_integrity_is_offline() {
 #[test]
 fn external_corpus_observation_is_stable() {
     for vector in vectors(&external_index()) {
-        let report = verify(vector, CawgTrustMode::Allowed, false);
+        let report = verify(vector, CawgTrustMode::Allowed);
         assert_eq!(
             cawg_contract_codes(&report),
             required_codes(vector, "current_sdk_observation"),
@@ -230,7 +227,7 @@ fn external_corpus_observation_is_stable() {
 fn external_normative_expectations() {
     let mut mismatches = Vec::new();
     for vector in vectors(&external_index()) {
-        let observed = cawg_contract_codes(&verify(vector, CawgTrustMode::Allowed, false));
+        let observed = cawg_contract_codes(&verify(vector, CawgTrustMode::Allowed));
         let expected = required_codes(vector, "normative_expected");
         if observed != expected {
             mismatches.push(format!(
@@ -246,14 +243,14 @@ fn external_normative_expectations() {
     );
 }
 
-/// With `--cawg-document-signing-require-anchor`, a document-signing identity
-/// is only trusted when its chain reaches supplied CAWG trust material.
+/// Document-signing identities are trusted only when their chain reaches
+/// caller-supplied CAWG trust material.
 #[test]
 fn generated_document_signing_trust_root_is_enforced() {
     let index = generated_index();
     let vector = vector_by_id(&index, "x509-es256-jpeg");
 
-    let unanchored = verify(vector, CawgTrustMode::None, true);
+    let unanchored = verify(vector, CawgTrustMode::None);
     let well_formed = success_item(&unanchored, "cawg.identity.well-formed");
     assert_eq!(
         well_formed["details"]["trust_failure"],
@@ -261,7 +258,7 @@ fn generated_document_signing_trust_root_is_enforced() {
     );
     assert!(!codes(&unanchored).contains("cawg.identity.trusted"));
 
-    let anchored = verify(vector, CawgTrustMode::Trust, true);
+    let anchored = verify(vector, CawgTrustMode::Trust);
     let trusted = success_item(&anchored, "cawg.identity.trusted");
     assert_eq!(trusted["details"]["trust_source"], "document_signing");
 }
@@ -273,7 +270,7 @@ fn generated_network_policy_is_explicitly_offline() {
     let index = generated_index();
     assert_eq!(index["network_policy"], "offline");
     let vector = vector_by_id(&index, "x509-es256-jpeg");
-    let report = verify(vector, CawgTrustMode::Allowed, false);
+    let report = verify(vector, CawgTrustMode::Allowed);
     assert!(codes(&report).contains("signingCredential.ocsp.skipped"));
     let trusted = success_item(&report, "cawg.identity.trusted");
     assert_eq!(trusted["details"]["timestamp_trusted"], false);
@@ -296,7 +293,7 @@ fn generated_vector_hash_and_native_verdict() {
             vector["sha256"].as_str().expect("sha256")
         );
 
-        let report = verify(vector, CawgTrustMode::Allowed, false);
+        let report = verify(vector, CawgTrustMode::Allowed);
         let success = bucket_codes(&report, "success");
         let failures = bucket_codes(&report, "failure");
         let expected = &vector["normative_expected"];
@@ -382,7 +379,7 @@ fn generated_bestpractice_vector_covers_editorial_metadata() {
             "self#jumbf=c2pa.assertions/cawg.training-mining",
         ])
     );
-    let report = verify(vector, CawgTrustMode::Allowed, false);
+    let report = verify(vector, CawgTrustMode::Allowed);
     assert_eq!(report["validation_state"], "Trusted");
     assert!(codes(&report).contains("cawg.identity.trusted"));
 
@@ -424,7 +421,7 @@ fn generated_time_shift_outside_validity_is_never_trusted() {
     let index = generated_index();
     let vector = vector_by_id(&index, "x509-es256-jpeg");
     for shifted_time in ["2040-01-01T00:00:00Z", "2020-01-01T00:00:00Z"] {
-        let report = verify_at(vector, CawgTrustMode::Allowed, false, shifted_time);
+        let report = verify_at(vector, CawgTrustMode::Allowed, shifted_time);
         let failures = bucket_codes(&report, "failure");
         let expected: BTreeSet<String> = [
             "claimSignature.outsideValidity",
@@ -451,7 +448,7 @@ fn generated_time_shift_outside_validity_is_never_trusted() {
 fn generated_smime_lane_is_trusted_via_email_protection_eku() {
     let index = generated_index();
     let vector = vector_by_id(&index, "x509-es256-smime-jpeg");
-    let report = verify(vector, CawgTrustMode::Allowed, false);
+    let report = verify(vector, CawgTrustMode::Allowed);
     assert_eq!(report["validation_state"], "Trusted");
     let trusted = success_item(&report, "cawg.identity.trusted");
     let details = &trusted["details"];
@@ -470,7 +467,7 @@ fn generated_pad1_vector_reports_nonzero_padding() {
     let index = generated_index();
     let vector = vector_by_id(&index, "x509-es256-pad1-jpeg");
     assert_eq!(vector["cawg_pad1"], 512);
-    let report = verify(vector, CawgTrustMode::Allowed, false);
+    let report = verify(vector, CawgTrustMode::Allowed);
     let manifest = &report["manifests"][report["active_manifest"].as_str().expect("label")];
     let identity = assertion_data(manifest, "cawg.identity");
     let pad1 = identity["pad1"].as_str().expect("pad1");
@@ -481,7 +478,6 @@ fn generated_pad1_vector_reports_nonzero_padding() {
     let plain = verify(
         vector_by_id(&index, "x509-es256-jpeg"),
         CawgTrustMode::Allowed,
-        false,
     );
     let plain_manifest = &plain["manifests"][plain["active_manifest"].as_str().expect("label")];
     assert_eq!(assertion_data(plain_manifest, "cawg.identity")["pad1"], "");
@@ -494,7 +490,7 @@ fn generated_composed_vector_embeds_cawg_signed_ingredient() {
     let index = generated_index();
     let vector = vector_by_id(&index, "x509-es256-composed-jpeg");
     assert_eq!(vector["composition"], true);
-    let report = verify(vector, CawgTrustMode::Allowed, false);
+    let report = verify(vector, CawgTrustMode::Allowed);
     assert_eq!(report["validation_state"], "Trusted");
     assert!(codes(&report).contains("cawg.identity.trusted"));
 

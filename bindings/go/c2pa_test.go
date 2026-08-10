@@ -1,6 +1,7 @@
 package c2pa
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,6 +21,44 @@ func TestSignedJPEGReportsIntegrityWithoutTrust(t *testing.T) {
 	}
 	if report.Trust.Status != "not_evaluated" {
 		t.Fatalf("integrity must not imply trust: %+v", report.Trust)
+	}
+}
+
+func TestCAWGOptionsAndStatusDetailsRoundTrip(t *testing.T) {
+	optionsJSON, err := json.Marshal(Options{
+		CAWGTrustPEM:        "anchor",
+		CAWGAllowedCertsPEM: "leaf",
+		CAWGDIDDocuments:    map[string]json.RawMessage{"did:web:example.test": json.RawMessage(`{"id":"did:web:example.test"}`)},
+		CAWGStrictEncoding:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var options map[string]json.RawMessage
+	if err := json.Unmarshal(optionsJSON, &options); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"cawg_trust_pem",
+		"cawg_allowed_certs_pem",
+		"cawg_did_documents",
+		"cawg_strict_encoding",
+	} {
+		if _, ok := options[key]; !ok {
+			t.Fatalf("missing CAWG option %q in %s", key, optionsJSON)
+		}
+	}
+
+	var status Status
+	if err := json.Unmarshal([]byte(`{"code":"cawg.identity.trusted","url":"self#jumbf=c2pa.assertions/cawg.identity","explanation":"trusted","details":{"trust_source":"allowed_list"}}`), &status); err != nil {
+		t.Fatal(err)
+	}
+	var details map[string]string
+	if err := json.Unmarshal(status.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["trust_source"] != "allowed_list" {
+		t.Fatalf("unexpected status details: %s", status.Details)
 	}
 }
 

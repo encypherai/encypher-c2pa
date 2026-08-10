@@ -20,7 +20,7 @@ __all__ = [
     "telemetry_enabled",
     "verify",
 ]
-__version__ = "1.0.0rc6"
+__version__ = "1.0.0"
 
 Asset = Union[bytes, bytearray, memoryview, str, Path]
 
@@ -34,7 +34,6 @@ def verify(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
-    cawg_document_signing_require_anchor: bool = False,
     cawg_did_documents: Optional[Mapping[str, Any]] = None,
     cawg_strict_encoding: bool = False,
     validation_time: Optional[str] = None,
@@ -77,7 +76,6 @@ def verify(
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
-        "cawg_document_signing_require_anchor": bool(cawg_document_signing_require_anchor),
         "cawg_did_documents": dict(cawg_did_documents) if cawg_did_documents else None,
         "cawg_strict_encoding": bool(cawg_strict_encoding),
         "validation_time": validation_time,

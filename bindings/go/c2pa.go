@@ -30,17 +30,22 @@ type TelemetryOptions struct {
 }
 
 type Options struct {
-	TrustPEM        string            `json:"trust_pem,omitempty"`
-	TSATrustPEM     string            `json:"tsa_trust_pem,omitempty"`
-	AllowedCertsPEM string            `json:"allowed_list_pem,omitempty"`
-	ValidationTime  string            `json:"validation_time,omitempty"`
-	Telemetry       *TelemetryOptions `json:"telemetry,omitempty"`
+	TrustPEM            string                     `json:"trust_pem,omitempty"`
+	TSATrustPEM         string                     `json:"tsa_trust_pem,omitempty"`
+	AllowedCertsPEM     string                     `json:"allowed_list_pem,omitempty"`
+	CAWGTrustPEM        string                     `json:"cawg_trust_pem,omitempty"`
+	CAWGAllowedCertsPEM string                     `json:"cawg_allowed_certs_pem,omitempty"`
+	CAWGDIDDocuments    map[string]json.RawMessage `json:"cawg_did_documents,omitempty"`
+	CAWGStrictEncoding  bool                       `json:"cawg_strict_encoding,omitempty"`
+	ValidationTime      string                     `json:"validation_time,omitempty"`
+	Telemetry           *TelemetryOptions          `json:"telemetry,omitempty"`
 }
 
 type Status struct {
-	Code        string `json:"code"`
-	URL         string `json:"url"`
-	Explanation string `json:"explanation"`
+	Code        string          `json:"code"`
+	URL         string          `json:"url"`
+	Explanation string          `json:"explanation"`
+	Details     json.RawMessage `json:"details,omitempty"`
 }
 
 type ValidationResults struct {

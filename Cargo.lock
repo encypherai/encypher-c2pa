@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "c2pa-text",
  "cms",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-cli"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "clap",
  "encypher-c2pa",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-ffi"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "encypher-c2pa",
  "serde_json",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-python"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "encypher-c2pa",
  "pyo3",
@@ -449,10 +449,9 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-wasm"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "encypher-c2pa",
- "getrandom",
  "js-sys",
  "serde-wasm-bindgen",
  "wasm-bindgen",

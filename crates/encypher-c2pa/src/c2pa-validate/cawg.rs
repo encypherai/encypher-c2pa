@@ -212,6 +212,14 @@ fn verify_identity_assertion(
 ) {
     #[cfg(test)]
     record_identity_work(|counts| counts.identity_evaluations += 1);
+    if !map_keys_are_unique(assertion) {
+        invalid_cbor(
+            ctx.results,
+            url,
+            "identity assertion contains a duplicate CBOR map key",
+        );
+        return;
+    }
     let claim_binds_identity = claim_refs.references.iter().any(|reference| {
         reference
             .value
@@ -737,6 +745,23 @@ fn reference_targets_identity(reference_url: &str, identity_url: &str) -> bool {
     reference_url == format!("self#jumbf=c2pa.assertions/{identity_label}")
 }
 
+fn map_keys_are_unique(value: &Value) -> bool {
+    match value {
+        Value::Map(entries) => {
+            let mut keys = HashSet::with_capacity(entries.len());
+            entries.iter().all(|(key, value)| {
+                map_keys_are_unique(key)
+                    && map_keys_are_unique(value)
+                    && encode(key, Profile::CanonicalForHashedSubstructures)
+                        .is_ok_and(|encoded| keys.insert(encoded))
+            })
+        }
+        Value::Array(values) => values.iter().all(map_keys_are_unique),
+        Value::Tag(_, value) => map_keys_are_unique(value),
+        _ => true,
+    }
+}
+
 fn same_hashed_uri(left: &Value, right: &Value) -> bool {
     left.get("url").and_then(Value::as_text) == right.get("url").and_then(Value::as_text)
         && left.get("hash").and_then(Value::as_bytes) == right.get("hash").and_then(Value::as_bytes)
@@ -1204,6 +1229,90 @@ mod tests {
             Value::Text("created_assertions".into()),
             Value::Array(references),
         )])
+    }
+
+    #[test]
+    fn duplicate_signer_payload_keys_fail_before_semantic_or_signature_checks() {
+        let expected_binding =
+            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
+        let substituted_binding =
+            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x33);
+        let signer_payload = Value::Map(vec![
+            (
+                Value::Text("referenced_assertions".into()),
+                Value::Array(vec![substituted_binding]),
+            ),
+            (
+                Value::Text("referenced_assertions".into()),
+                Value::Array(vec![expected_binding.clone()]),
+            ),
+            (
+                Value::Text("sig_type".into()),
+                Value::Text(CAWG_X509_COSE.into()),
+            ),
+            (
+                Value::Text("role".into()),
+                Value::Array(vec![Value::Text("cawg.publisher:primary".into())]),
+            ),
+        ]);
+        let identity_bytes = encode(
+            &Value::Map(vec![
+                (Value::Text("signer_payload".into()), signer_payload),
+                (Value::Text("signature".into()), Value::Bytes(vec![1])),
+                (Value::Text("pad1".into()), Value::Bytes(Vec::new())),
+            ]),
+            Profile::LegacyPipelineBDefinite,
+        )
+        .expect("encode ambiguous identity");
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("cawg.identity".into(), identity_bytes.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 0x01),
+            expected_binding,
+        ]);
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let primary_binding = claim_refs
+            .references
+            .iter()
+            .find(|reference| reference.label == Some("c2pa.hash.data"));
+        let mut results = ValidationResults::default();
+        {
+            let mut ctx = IdentityContext {
+                manifest: &manifest,
+                claim: &claim,
+                validation_time: datetime!(2025-05-01 0:00 UTC),
+                claim_timestamp: None,
+                cawg_trust: None,
+                cawg_allowed_certs: None,
+                ocsp_verification_time: datetime!(2025-05-01 0:00 UTC),
+                document_signing_require_anchor: true,
+                tsa_trust: None,
+                did_documents: None,
+                strict_encoding: false,
+                results: &mut results,
+            };
+            verify_identity_assertions(&mut ctx, &claim_refs, primary_binding, &[]);
+        }
+        let failures: Vec<_> = results
+            .failure
+            .iter()
+            .filter(|status| status.code == CAWG_IDENTITY_CBOR_INVALID)
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].explanation.contains("duplicate CBOR map key"));
+        assert!(!results
+            .success
+            .iter()
+            .any(|status| status.code == CAWG_IDENTITY_TRUSTED));
     }
 
     #[test]

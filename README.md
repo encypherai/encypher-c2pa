@@ -22,7 +22,7 @@ Local-first, verification-only C2PA + CAWG SDK for Rust, Python, Go, and browser
 
 The verifier reads local bytes. It does not upload the asset, fetch a trust list, or require an account. Cryptographic integrity and trust are separate fields in every report. On first interactive use, the SDK asks whether it may send bounded, anonymous failure telemetry and saves the answer.
 
-> Release candidate: report schema `1.0`, engine profile `c2pa-2.4`, CAWG identity 1.2. Pin exact package versions until the stable 1.0.0 tag.
+> Stable report schema `1.0`, engine profile `c2pa-2.4`, CAWG identity 1.2.
 
 ## What it does
 
@@ -46,7 +46,7 @@ Tagged releases publish the packages below. For an unreleased checkout, use [Bui
 ### CLI
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.0-rc.12
+cargo install encypher-c2pa-cli --version 1.0.0
 encypher-c2pa verify composition.mp4
 encypher-c2pa verify composition.mp4 --json
 encypher-c2pa formats
@@ -58,7 +58,7 @@ Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupport
 
 ```toml
 [dependencies]
-encypher-c2pa = "=1.0.0-rc.12"
+encypher-c2pa = "1.0.0"
 ```
 
 ```rust
@@ -73,7 +73,7 @@ println!("integrity={} trust={}", report.integrity, report.trust.status);
 ### Python
 
 ```bash
-pip install --pre encypher-c2pa
+pip install encypher-c2pa
 ```
 
 ```python
@@ -175,7 +175,7 @@ Six inputs control trust. Each is optional; omitting one skips that check (the r
 | `--cawg-allowed` | `cawg_allowed_certs_pem` | CAWG allowed certificates: exact end-entity allow-list for identity signers. |
 | `--cawg-did-documents` | `cawg_did_documents` | Pinned offline DID-document store for `did:web` identity-claims-aggregation issuers: JSON files holding a DID document, an array of documents, or a `DID -> document` map. An issuer absent from the store fails closed with `cawg.ica.did_unavailable` (`did:jwk` issuers need no store; they resolve by pure local decoding). |
 
-Two switches tighten CAWG policy. `--cawg-document-signing-require-anchor` (`cawg_document_signing_require_anchor`) stops accepting a document-signing credential on its EKU alone; it must chain to a `--cawg-trust` anchor or appear on `--cawg-allowed`. `--cawg-strict-encoding` (`cawg_strict_encoding`) refuses CAWG 1.1-era legacy encodings; without it they verify and are surfaced through the informational `com.encypher.cawg.legacyProfile` status.
+CAWG document-signing credentials must chain to a `--cawg-trust` (`cawg_trust_pem`) anchor or appear on `--cawg-allowed` (`cawg_allowed_certs_pem`); certificate profile alone never establishes trust. `--cawg-strict-encoding` (`cawg_strict_encoding`) refuses CAWG 1.1-era legacy encodings; without it they verify and are surfaced through the informational `com.encypher.cawg.legacyProfile` status.
 
 CAWG identity outcomes are assertion-scoped: `cawg.*` codes report the identity assertion's own verdict and never flip the C2PA manifest's `validation_state` or integrity verdict. A tampered identity assertion still fails the manifest through the C2PA-level hashed-URI check.
 
@@ -266,7 +266,7 @@ The response is Encypher's own record, separate from the local verdict: a match 
 
 ## Format coverage
 
-`encypher-c2pa formats` prints the canonical MIME types covered by the current C2PA 2.4 engine profile. The current build reports 69 MIME types. Container readers cover JPEG, PNG, WebP, TIFF/DNG, GIF, SVG, JPEG XL, ISO BMFF media, RIFF media, FLAC, MP3, PDF, ZIP-derived documents, fonts, EPUB, and text.
+`encypher-c2pa formats` prints the canonical MIME types covered by the installed C2PA 2.4 engine profile. Container readers cover JPEG, PNG, WebP, TIFF/DNG, GIF, SVG, JPEG XL, ISO BMFF media, RIFF media, FLAC, MP3, PDF, ZIP-derived documents, fonts, EPUB, and text.
 
 Text coverage is every method C2PA 2.4 defines, through the published [`c2pa-text`](https://crates.io/crates/c2pa-text) crate: A.8 unstructured text (the invisible variation-selector wrapper on `text/plain`, CSV, JSON, and social-post content), A.9 structured text (the ASCII-armour comment block for Markdown, XML/XHTML, YAML, TOML, CSS, JavaScript, Python, and every comment syntax `c2pa-text` defines), and A.7 HTML (the inline `application/c2pa` script element). Encypher's proprietary text markers are not part of C2PA and are deliberately not read here; they are served by the [Encypher API](https://api.encypher.com/docs).
 

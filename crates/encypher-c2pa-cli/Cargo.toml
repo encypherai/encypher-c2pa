@@ -9,13 +9,14 @@ homepage.workspace = true
 authors.workspace = true
 readme.workspace = true
 description = "Offline C2PA verification command-line tool"
+exclude = ["tests/**"]
 
 [[bin]]
 name = "encypher-c2pa"
 path = "src/main.rs"
 
 [dependencies]
-encypher-c2pa = { version = "=1.0.0-rc.12", path = "../encypher-c2pa" }
+encypher-c2pa = { version = "=1.0.0", path = "../encypher-c2pa" }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

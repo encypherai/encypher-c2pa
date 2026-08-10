@@ -52,10 +52,6 @@ enum Command {
         /// Directly allowed CAWG end-entity certificates (PEM). Repeatable.
         #[arg(long, value_name = "PEM")]
         cawg_allowed: Vec<PathBuf>,
-        /// Require CAWG document-signing credentials to chain to a supplied
-        /// anchor (or match the allowed list).
-        #[arg(long)]
-        cawg_document_signing_require_anchor: bool,
         /// Pinned offline did:web DID documents for CAWG ICA issuers.
         /// Repeatable; each file is a DID document, an array of documents, or
         /// a DID -> document map. Without it did:web resolution fails closed.
@@ -126,7 +122,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             allowed,
             cawg_trust,
             cawg_allowed,
-            cawg_document_signing_require_anchor,
             cawg_did_documents,
             cawg_strict_encoding,
             time,
@@ -163,7 +158,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 allowed_list_pem: read_merged_pem(&allowed)?,
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
-                cawg_document_signing_require_anchor,
                 cawg_did_documents: read_did_documents(&cawg_did_documents)?,
                 cawg_strict_encoding,
                 validation_time: time,

@@ -15,8 +15,8 @@ jobs:
     name: Release version contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
       - name: Match tag, workspace, and published dependency versions
         run: |
           set -euo pipefail
@@ -39,32 +39,43 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
       - name: Publish the library and CLI
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          # Two packages, not eight. The six implementation crates
-          # (encypher-c2pa-{cbor,core,crypto,formats,trust,validate}) were
-          # folded into private modules of the library: they had no consumer,
-          # they were 81% of the reviewed public API, and publishing them is
-          # what forced manifest construction to hide behind a Cargo feature.
-          #
-          # Every version through 1.0.0-rc.11 of the facade, CLI, and retired
-          # implementation crates is yanked. Existing lockfiles still resolve;
-          # fresh resolution resumes with the stable verification-only release.
+          # Publish only the public library, then its exact-pinned CLI.
+          # Immutable versions already present are safe rerun checkpoints.
+          version=${GITHUB_REF_NAME#v}
           packages=(
             encypher-c2pa
             encypher-c2pa-cli
           )
+          crate_is_published() {
+            curl --user-agent "encypher-c2pa-release-workflow/1.0" \
+              --fail --silent --show-error --retry 3 --retry-all-errors \
+              "https://crates.io/api/v1/crates/$1/$version" >/dev/null
+          }
           for package in "${packages[@]}"; do
-            for attempt in 1 2 3 4 5; do
+            if crate_is_published "$package"; then
+              echo "$package $version is already published; skipping"
+              continue
+            fi
+            # The CLI exact-pins the library. Allow crates.io's sparse index
+            # time to expose the library after the first publish.
+            for attempt in {1..15}; do
               if cargo publish --locked -p "$package"; then
                 break
               fi
-              if [ "$attempt" = 5 ]; then
+              # A publish can reach crates.io even if the runner loses the
+              # response. Treat the immutable registry record as success.
+              if crate_is_published "$package"; then
+                echo "$package $version was published during this attempt"
+                break
+              fi
+              if [ "$attempt" = 15 ]; then
                 exit 1
               fi
               sleep 20
@@ -94,8 +105,8 @@ jobs:
             target: x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
           target: ${{ matrix.target }}
@@ -109,7 +120,7 @@ jobs:
           # aarch64 wheel never builds. Native aarch64 compilers define it
           # themselves, which is why only the cross build failed.
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-${{ matrix.os }}-${{ matrix.target }}-${{ strategy.job-index }}
           path: dist/*.whl
@@ -119,12 +130,12 @@ jobs:
     needs: [verify, release-version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
           args: --manifest-path bindings/python/Cargo.toml --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-sdist
           path: dist/*.tar.gz
@@ -137,14 +148,15 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: python-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
+          skip-existing: true
 
   npm:
     name: Publish browser WASM package
@@ -154,19 +166,19 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
         with:
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       # Trusted publishing (OIDC): no registry-url here on purpose -
       # setup-node's registry-url writes an .npmrc _authToken placeholder that
       # errors when NODE_AUTH_TOKEN is unset. npm >= 11.5.1 is required for
       # OIDC; Node 22 bundles npm 10, so upgrade the CLI explicitly.
-      - run: npm install -g npm@latest
-      - uses: jetli/wasm-pack-action@v0.4.0
+      - run: npm install -g npm@11.5.1
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
       - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
       - run: node scripts/package-wasm.mjs
       - run: node scripts/test-wasm.mjs
@@ -176,20 +188,13 @@ jobs:
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
           name=$(node -p "require('./package.json').name")
-          # A prerelease must never DISPLACE a stable `latest`: npm publish
-          # defaults to `latest`, which would hand every plain
-          # `npm i @encypherai/c2pa` a release candidate.
-          #
-          # But the first-ever publish of a package takes `latest`
-          # regardless of --tag, and OIDC trusted publishing cannot run
-          # `npm dist-tag add` (npm/cli#8547 - only `npm publish` is
-          # supported), so rc.6 pinned `latest` and no later release could
-          # move it: plain installs kept getting the first RC ever cut.
-          #
-          # `npm publish --tag` is the only lever OIDC gives us, so a
-          # prerelease claims `latest` too while no stable release exists
-          # to protect. Once 1.0.0 ships it takes `latest` and every later
-          # prerelease goes to `next` alone, which is the original intent.
+          published=$(npm view "$name@$version" version 2>/dev/null || true)
+          if [ "$published" = "$version" ]; then
+            echo "$name@$version is already published; skipping"
+            exit 0
+          fi
+          # Stable releases own `latest`. After stable exists, prereleases
+          # publish only to `next`.
           case "$version" in
             *-*)
               current=$(npm view "$name@latest" version 2>/dev/null || true)
@@ -206,3 +211,39 @@ jobs:
           # release.yml, environment release). Provenance is attached by
           # default under trusted publishing.
           npm publish --access public --tag "$dist_tag"
+
+  github-release:
+    name: Publish GitHub release
+    needs: [crates, pypi, npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Create release from the verified tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          title="Encypher C2PA $version"
+          is_prerelease=false
+          prerelease=()
+          case "$version" in
+            *-*)
+              is_prerelease=true
+              prerelease=(--prerelease)
+              ;;
+          esac
+          if existing=$(gh release view "$GITHUB_REF_NAME" \
+            --json tagName,name,isPrerelease 2>/dev/null); then
+            python3 -c 'import json,sys; expected={"tagName":sys.argv[1],"name":sys.argv[2],"isPrerelease":sys.argv[3]=="true"}; actual=json.load(sys.stdin); assert actual == expected, f"existing release mismatch: {actual!r} != {expected!r}"' \
+              "$GITHUB_REF_NAME" "$title" "$is_prerelease" <<<"$existing"
+            echo "$GITHUB_REF_NAME release already exists with expected metadata; skipping"
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$title" \
+            --generate-notes \
+            "${prerelease[@]}"

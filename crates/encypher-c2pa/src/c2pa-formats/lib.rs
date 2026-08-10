@@ -298,12 +298,12 @@ pub enum FormatError {
     #[error("unexpected end of data while parsing {0:?}")]
     Truncated(AssetFormat),
 
-    /// The manifest is too large for this format's container limits.
+    /// The manifest exceeds a container or verifier resource limit.
     #[error("manifest of {got} bytes exceeds the {max}-byte limit for {format:?}")]
     ManifestTooLarge {
-        /// The format whose limit was exceeded.
+        /// The format whose manifest was rejected.
         format: AssetFormat,
-        /// The container's maximum payload size.
+        /// The applicable container or verifier limit.
         max: usize,
         /// The manifest size that was rejected.
         got: usize,
@@ -381,7 +381,7 @@ pub(crate) use bmff::bmff_mdat_payloads;
 /// [`crate::c2pa_core::jumbf::parse_manifest_store`]), `Ok(None)` if the asset is valid
 /// but has no manifest, or `Err` if the container is malformed.
 pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
-    match format {
+    let manifest = match format {
         AssetFormat::Jpeg => jpeg::extract(data),
         AssetFormat::Png => png::extract(data),
         AssetFormat::Bmff => bmff::extract(data),
@@ -404,10 +404,26 @@ pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u
             if data.is_empty() {
                 Ok(None)
             } else {
+                ensure_manifest_store_size(format, data.len())?;
                 Ok(Some(data.to_vec()))
             }
         }
+    }?;
+    if let Some(store) = &manifest {
+        ensure_manifest_store_size(format, store.len())?;
     }
+    Ok(manifest)
+}
+
+fn ensure_manifest_store_size(format: AssetFormat, got: usize) -> Result<(), FormatError> {
+    if got > crate::MAX_MANIFEST_STORE_BYTES {
+        return Err(FormatError::ManifestTooLarge {
+            format,
+            max: crate::MAX_MANIFEST_STORE_BYTES,
+            got,
+        });
+    }
+    Ok(())
 }
 
 /// Remove any existing manifest from `asset`, returning a clean copy safe to
@@ -766,6 +782,20 @@ mod tests {
                 "{mime}: source must be outside exclusion"
             );
         }
+    }
+    #[test]
+    fn manifest_store_size_is_bounded_before_direct_copy() {
+        assert!(matches!(
+            ensure_manifest_store_size(
+                AssetFormat::C2paStore,
+                crate::MAX_MANIFEST_STORE_BYTES + 1
+            ),
+            Err(FormatError::ManifestTooLarge {
+                format: AssetFormat::C2paStore,
+                max: crate::MAX_MANIFEST_STORE_BYTES,
+                got
+            }) if got == crate::MAX_MANIFEST_STORE_BYTES + 1
+        ));
     }
 }
 

@@ -101,6 +101,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
 pub const C2PA_PROFILE: &str = "c2pa-2.4";
+const MAX_MANIFEST_STORE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -117,10 +118,6 @@ pub struct VerifyOptions {
     pub cawg_trust_pem: Option<String>,
     /// PEM bundle of directly allowed CAWG end-entity certificates.
     pub cawg_allowed_certs_pem: Option<String>,
-    /// Require a CAWG document-signing credential to chain to a supplied
-    /// anchor (or match the allowed list) instead of being accepted on its
-    /// certificate profile alone.
-    pub cawg_document_signing_require_anchor: bool,
     /// Pinned offline `did:web` DID-document store for CAWG ICA issuers,
     /// keyed by primary DID (no fragment). Resolution never touches the
     /// network: an issuer absent from the store fails closed with
@@ -310,7 +307,7 @@ fn verify_with_options_inner(
         },
         cawg_trust.as_ref(),
         cawg_allowed_certs.as_ref(),
-        options.cawg_document_signing_require_anchor,
+        true,
         options.cawg_did_documents.as_ref(),
         options.cawg_strict_encoding,
     )

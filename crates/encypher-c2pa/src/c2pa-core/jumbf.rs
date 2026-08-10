@@ -60,6 +60,7 @@ const MAX_ASSERTIONS_PER_MANIFEST: usize = 4_096;
 /// The same bound is conservative for manifest stores, manifests, and
 /// individual assertion superboxes while preventing unbounded child vectors.
 const MAX_CHILD_BOXES_PER_SUPERBOX: usize = MAX_ASSERTIONS_PER_MANIFEST;
+const MAX_LABEL_BYTES: usize = 1_024;
 
 /// Description box toggle: requestable.
 const TOGGLE_REQUESTABLE: u8 = 0x01;
@@ -416,6 +417,11 @@ fn parse_superbox_description(payload: &[u8]) -> Result<ParsedSuperboxDescriptio
         .ok_or(JumbfError::InvalidStructure(
             "JUMBF label is not null-terminated",
         ))?;
+    if null > MAX_LABEL_BYTES {
+        return Err(JumbfError::ResourceLimit(
+            "JUMBF label exceeds verifier bound",
+        ));
+    }
     let label = std::str::from_utf8(&label_bytes[..null])
         .map_err(|_| JumbfError::InvalidStructure("JUMBF label is not valid UTF-8"))?;
     if label.is_empty()
@@ -515,6 +521,11 @@ pub struct ParsedStore<'a> {
 
 /// Parse a C2PA manifest store from JUMBF bytes.
 pub fn parse_manifest_store(data: &[u8]) -> Result<ParsedStore<'_>, JumbfError> {
+    if data.len() > crate::MAX_MANIFEST_STORE_BYTES {
+        return Err(JumbfError::ResourceLimit(
+            "manifest store exceeds verifier byte bound",
+        ));
+    }
     let store = parse_superbox(data)?;
     if store.type_uuid != UUID_MANIFEST_STORE {
         return Err(JumbfError::UnexpectedUuid);
@@ -755,6 +766,19 @@ mod tests {
         let span_start = spans[0].as_ptr() as usize;
         let span_end = span_start + spans[0].len();
         assert!(span_start >= store_start && span_end <= store_end);
+    }
+
+    #[test]
+    fn superbox_parser_rejects_excessive_label() {
+        let label = "x".repeat(MAX_LABEL_BYTES + 1);
+        let store = superbox(&UUID_MANIFEST_STORE, &label, &[], None);
+
+        assert!(matches!(
+            parse_manifest_store(&store),
+            Err(JumbfError::ResourceLimit(
+                "JUMBF label exceeds verifier bound"
+            ))
+        ));
     }
 
     #[test]
