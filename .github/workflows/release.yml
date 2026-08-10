@@ -52,9 +52,9 @@ jobs:
           # they were 81% of the reviewed public API, and publishing them is
           # what forced manifest construction to hide behind a Cargo feature.
           #
-          # Their existing versions through 1.0.0-rc.11 stay on crates.io and
-          # are deliberately NOT yanked - older facade releases exact-pin them,
-          # and yanking would break fresh resolution of those versions.
+          # Every version through 1.0.0-rc.11 of the facade, CLI, and retired
+          # implementation crates is yanked. Existing lockfiles still resolve;
+          # fresh resolution resumes with the stable verification-only release.
           packages=(
             encypher-c2pa
             encypher-c2pa-cli

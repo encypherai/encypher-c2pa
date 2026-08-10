@@ -184,8 +184,8 @@ Shipped (confirmed in this worktree):
 - Release graph collapsed to two publishable packages: `encypher-c2pa` and
   `encypher-c2pa-cli`. The three bindings (`bindings/c`, `bindings/python`,
   `bindings/wasm`) carry `publish = false`. Workspace version is `1.0.0-rc.12`
-  (unreleased); `rc.1` through `rc.11` stay on crates.io, deliberately not
-  yanked.
+  (unreleased); all versions through `rc.11` of the facade, CLI, and retired
+  implementation crates were yanked on 2026-08-10.
 - Compiler-derived, fail-closed surface gate at
   `scripts/check-public-surface.mjs`; reviewed inventory `public-surface.txt`
   holds 172 items (comment-stripped count confirmed), zero writers, unioned
@@ -446,6 +446,6 @@ the finalized source after the last parser, CAWG, and BMFF remediations.
 
   It does not gate this standalone SDK release. It is required before these
   verifier changes are copied into the proprietary production signing kernel.
-- The six crates.io packages keep every existing version through `1.0.0-rc.11`
-  and are deliberately NOT yanked: older `encypher-c2pa` releases exact-pin
-  them, and yanking would break fresh resolution of those versions.
+- All versions through `1.0.0-rc.11` of the facade, CLI, and six retired
+  implementation crates are yanked. Existing lockfiles continue to resolve;
+  fresh dependency resolution waits for the stable verification-only release.
