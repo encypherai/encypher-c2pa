@@ -10,7 +10,7 @@ members = [
 default-members = ["crates/encypher-c2pa", "crates/encypher-c2pa-cli"]
 
 [workspace.package]
-version = "1.0.0-rc.11"
+version = "1.0.0-rc.12"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"

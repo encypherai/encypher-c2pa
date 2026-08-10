@@ -17,6 +17,12 @@ const COSE_SIGN1_TAG: u64 = 18;
 const COSE_HDR_ALG: i128 = 1;
 /// RFC 9052 integer label for an x5chain certificate chain.
 const COSE_HDR_X5CHAIN: i128 = 33;
+/// Maximum certificates accepted from a COSE x5chain.
+const MAX_X5CHAIN_CERTIFICATES: usize = 20;
+/// Maximum DER bytes accepted for one x5chain certificate.
+const MAX_X5CHAIN_CERTIFICATE_BYTES: usize = 64 * 1024;
+/// Maximum aggregate DER bytes accepted for one x5chain.
+const MAX_X5CHAIN_TOTAL_BYTES: usize = 512 * 1024;
 
 /// CBOR profile used for all COSE substructures (matches Python `cbor2.dumps`).
 const PROFILE: Profile = Profile::LegacyPipelineBDefinite;
@@ -278,7 +284,9 @@ pub(crate) fn verify_signature(
             EcCurve::P256 => {
                 let verifying_key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki)
                     .map_err(key_err("P-256"))?;
-                let signature = p256::ecdsa::Signature::from_slice(signature).map_err(bad)?;
+                let signature = p256::ecdsa::Signature::from_slice(signature)
+                    .or_else(|_| p256::ecdsa::Signature::from_der(signature))
+                    .map_err(bad)?;
                 verifying_key
                     .verify_prehash(&digest, &signature)
                     .map_err(bad)
@@ -286,7 +294,9 @@ pub(crate) fn verify_signature(
             EcCurve::P384 => {
                 let verifying_key = p384::ecdsa::VerifyingKey::from_public_key_der(&spki)
                     .map_err(key_err("P-384"))?;
-                let signature = p384::ecdsa::Signature::from_slice(signature).map_err(bad)?;
+                let signature = p384::ecdsa::Signature::from_slice(signature)
+                    .or_else(|_| p384::ecdsa::Signature::from_der(signature))
+                    .map_err(bad)?;
                 verifying_key
                     .verify_prehash(&digest, &signature)
                     .map_err(bad)
@@ -299,7 +309,9 @@ pub(crate) fn verify_signature(
                     &public_key.to_encoded_point(false),
                 )
                 .map_err(bad)?;
-                let signature = p521::ecdsa::Signature::from_slice(signature).map_err(bad)?;
+                let signature = p521::ecdsa::Signature::from_slice(signature)
+                    .or_else(|_| p521::ecdsa::Signature::from_der(signature))
+                    .map_err(bad)?;
                 verifying_key
                     .verify_prehash(&digest, &signature)
                     .map_err(bad)
@@ -338,116 +350,168 @@ pub(crate) fn verify_signature(
 
 /// Extract the DER certificate chain from a `COSE_Sign1`.
 ///
-/// The x5chain may live in either the protected or the unprotected header.
-/// Live c2pa-rs signatures place it in the protected header map, while legacy
-/// Encypher assets carry it in the unprotected map. Both the text
-/// `"x5chain"` and integer (33) labels are accepted, as are the
-/// single-certificate (byte string) and chain (array of byte strings) forms.
-/// The protected header is checked first; the first chain found is returned.
+/// C2PA 2.4 accepts integer label `33` or legacy text label `x5chain` from
+/// either header bucket. Integer `33` wins when both label forms are present.
+/// The signature is malformed only when the chosen label occurs in both
+/// buckets, or the same exact label is duplicated within one bucket.
 pub fn extract_x5chain(cose_sign1: &[u8]) -> Result<Vec<Vec<u8>>, CryptoError> {
     let decoded = decode(cose_sign1)?;
     let array = cose_array(&decoded)?;
 
-    // Protected header: a CBOR map serialized as a byte string.
-    let protected_x5 = match array[0].as_bytes() {
+    let protected = match array[0].as_bytes() {
         Some(bytes) => match decode(bytes)? {
-            Value::Map(m) => find_x5chain(&m),
-            _ => None,
+            Value::Map(map) => map,
+            _ => Vec::new(),
         },
-        None => None,
+        None => Vec::new(),
     };
-
-    let x5 = match protected_x5 {
-        Some(v) => v,
-        None => {
-            let unprotected = match &array[1] {
-                Value::Map(m) => m,
-                _ => {
-                    return Err(CryptoError::Malformed(
-                        "unprotected header is not a map".into(),
-                    ))
-                }
-            };
-            find_x5chain(unprotected).ok_or_else(|| {
-                CryptoError::Malformed("no x5chain in protected or unprotected header".into())
-            })?
-        }
-    };
-
-    x5chain_to_ders(&x5)
-}
-
-/// Extract the DER certificate chain only when `x5chain` is integrity
-/// protected by the COSE signature.
-///
-/// CAWG Identity 1.2 imports the C2PA signing-credential rule that the
-/// end-entity certificate be integrity protected. An unprotected-only chain is
-/// therefore not an acceptable named-actor credential.
-pub fn extract_protected_x5chain(cose_sign1: &[u8]) -> Result<Vec<Vec<u8>>, CryptoError> {
-    let decoded = decode(cose_sign1)?;
-    let array = cose_array(&decoded)?;
-    let protected = array[0]
-        .as_bytes()
-        .ok_or_else(|| CryptoError::Malformed("protected header is not bytes".into()))?;
-    let protected_map = match decode(protected)? {
+    let unprotected: &[(Value, Value)] = match &array[1] {
         Value::Map(map) => map,
-        _ => {
+        _ => &[],
+    };
+
+    let protected_integer = find_x5chain_label(&protected, true)?;
+    let unprotected_integer = find_x5chain_label(unprotected, true)?;
+    let selected = match (protected_integer, unprotected_integer) {
+        (Some(_), Some(_)) => {
             return Err(CryptoError::Malformed(
-                "protected header is not a map".into(),
+                "integer 33 x5chain appears in both protected and unprotected headers".into(),
             ))
         }
-    };
-    let x5chain = find_x5chain(&protected_map)
-        .ok_or_else(|| CryptoError::Malformed("no x5chain in protected header".into()))?;
-    x5chain_to_ders(&x5chain)
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => {
+            let protected_text = find_x5chain_label(&protected, false)?;
+            let unprotected_text = find_x5chain_label(unprotected, false)?;
+            match (protected_text, unprotected_text) {
+                (Some(_), Some(_)) => {
+                    return Err(CryptoError::Malformed(
+                        "text x5chain appears in both protected and unprotected headers".into(),
+                    ))
+                }
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            }
+        }
+    }
+    .ok_or_else(|| {
+        CryptoError::Malformed("no x5chain in protected or unprotected header".into())
+    })?;
+
+    x5chain_to_ders(selected)
 }
 
-/// Locate an x5chain entry in a header map under either the text `"x5chain"`
-/// or integer (33) label.
-fn find_x5chain(map: &[(Value, Value)]) -> Option<Value> {
-    map_get_text(map, "x5chain")
-        .or_else(|| map_get_int(map, COSE_HDR_X5CHAIN))
-        .cloned()
+/// Locate at most one x5chain entry with the exact selected label.
+fn find_x5chain_label(
+    map: &[(Value, Value)],
+    integer_label: bool,
+) -> Result<Option<&Value>, CryptoError> {
+    let mut matching = map.iter().filter(|(key, _)| {
+        if integer_label {
+            matches!(key, Value::Integer(value) if *value == COSE_HDR_X5CHAIN)
+        } else {
+            key.as_text() == Some("x5chain")
+        }
+    });
+    let found = matching.next().map(|(_, value)| value);
+    if matching.next().is_some() {
+        let label = if integer_label { "integer 33" } else { "text" };
+        return Err(CryptoError::Malformed(format!(
+            "duplicate {label} x5chain entries in one COSE header bucket"
+        )));
+    }
+    Ok(found)
 }
 
 /// Decode an x5chain value into its constituent DER certificates, accepting
 /// both single-certificate (byte string) and chain (array of byte strings).
 fn x5chain_to_ders(x5: &Value) -> Result<Vec<Vec<u8>>, CryptoError> {
-    match x5 {
-        Value::Array(items) => items
-            .iter()
-            .map(|item| {
-                item.as_bytes().map(|bytes| bytes.to_vec()).ok_or_else(|| {
-                    CryptoError::Malformed("x5chain entries must be byte strings".into())
+    let certificates = match x5 {
+        Value::Array(items) => {
+            if items.len() > MAX_X5CHAIN_CERTIFICATES {
+                return Err(CryptoError::Malformed(format!(
+                    "x5chain has too many certificates ({} > {MAX_X5CHAIN_CERTIFICATES})",
+                    items.len()
+                )));
+            }
+            items
+                .iter()
+                .map(|item| {
+                    item.as_bytes().ok_or_else(|| {
+                        CryptoError::Malformed("x5chain entries must be byte strings".into())
+                    })
                 })
-            })
-            .collect(),
-        Value::Bytes(b) => Ok(vec![b.clone()]),
-        _ => Err(CryptoError::Malformed(
-            "x5chain is neither a byte string nor an array".into(),
-        )),
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Value::Bytes(bytes) => vec![bytes.as_slice()],
+        _ => {
+            return Err(CryptoError::Malformed(
+                "x5chain is neither a byte string nor an array".into(),
+            ))
+        }
+    };
+
+    let mut total_bytes = 0usize;
+    for certificate in &certificates {
+        if certificate.len() > MAX_X5CHAIN_CERTIFICATE_BYTES {
+            return Err(CryptoError::Malformed(format!(
+                "x5chain certificate exceeds {MAX_X5CHAIN_CERTIFICATE_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.checked_add(certificate.len()).ok_or_else(|| {
+            CryptoError::Malformed("x5chain certificate byte count overflow".into())
+        })?;
+        if total_bytes > MAX_X5CHAIN_TOTAL_BYTES {
+            return Err(CryptoError::Malformed(format!(
+                "x5chain exceeds {MAX_X5CHAIN_TOTAL_BYTES} total certificate bytes"
+            )));
+        }
     }
+
+    Ok(certificates.into_iter().map(<[u8]>::to_vec).collect())
 }
 
-/// Extract the RFC 3161 timestamp token from the `sigTst2` unprotected header,
-/// if present.
-pub fn extract_tsa_token(cose_sign1: &[u8]) -> Option<Vec<u8>> {
+/// Timestamp header generation carried by a C2PA claim signature.
+#[derive(Clone, Copy)]
+pub enum ClaimTimestampVersion {
+    /// Legacy claim-v1 `sigTst`, whose imprint covers the claim payload.
+    V1,
+    /// Claim-v2 `sigTst2`, whose imprint covers the encoded COSE signature.
+    V2,
+}
+
+/// Extract the claim timestamp header and preserve malformed token entries.
+///
+/// `None` means no timestamp header. `Some((_, []))` means the header exists
+/// but its `tstTokens` member is malformed or empty.
+pub fn extract_claim_tsa_tokens(
+    cose_sign1: &[u8],
+) -> Option<(ClaimTimestampVersion, Vec<Option<Vec<u8>>>)> {
     let decoded = decode(cose_sign1).ok()?;
     let array = cose_array(&decoded).ok()?;
-    let unprotected = match &array[1] {
-        Value::Map(map) => map,
-        _ => return None,
+    let Value::Map(unprotected) = &array[1] else {
+        return None;
     };
-    let sig_tst2 = map_get_text(unprotected, "sigTst2")?;
-    let tokens = sig_tst2.get("tstTokens")?;
-    let first = match tokens {
-        Value::Array(items) => items.first()?,
-        _ => return None,
+    let (header, version) = if let Some(header) = map_get_text(unprotected, "sigTst2") {
+        (header, ClaimTimestampVersion::V2)
+    } else {
+        (
+            map_get_text(unprotected, "sigTst")?,
+            ClaimTimestampVersion::V1,
+        )
     };
-    first
-        .get("val")
-        .and_then(Value::as_bytes)
-        .map(<[u8]>::to_vec)
+    let tokens = match header.get("tstTokens") {
+        Some(Value::Array(tokens)) => tokens
+            .iter()
+            .map(|token| {
+                token
+                    .get("val")
+                    .and_then(Value::as_bytes)
+                    .map(<[u8]>::to_vec)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some((version, tokens))
 }
 
 /// Extract every RFC 3161 token entry from `sigTst2.tstTokens`.
@@ -494,61 +558,241 @@ pub fn timestamp_input(cose_sign1: &[u8]) -> Result<Vec<u8>, CryptoError> {
         .as_bytes()
         .ok_or_else(|| CryptoError::Malformed("signature is not a byte string".into()))?;
     let serialized_signature = encode(&Value::Bytes(signature.to_vec()), PROFILE)?;
+    counter_signature_input(protected, &serialized_signature)
+}
+
+/// Build the legacy C2PA claim-v1 `sigTst` CounterSignature input.
+pub fn timestamp_input_v1(cose_sign1: &[u8], claim_cbor: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let decoded = decode(cose_sign1)?;
+    let array = cose_array(&decoded)?;
+    let protected = array[0]
+        .as_bytes()
+        .ok_or_else(|| CryptoError::Malformed("protected header is not a byte string".into()))?;
+    counter_signature_input(protected, claim_cbor)
+}
+
+fn counter_signature_input(protected: &[u8], payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
     encode(
         &Value::Array(vec![
             Value::Text("CounterSignature".to_string()),
             Value::Bytes(protected.to_vec()),
             Value::Bytes(Vec::new()),
-            Value::Bytes(serialized_signature),
+            Value::Bytes(payload.to_vec()),
         ]),
         PROFILE,
     )
     .map_err(Into::into)
 }
 
-/// Extract the first stapled OCSP response (DER) from the COSE unprotected
-/// header, if present.
+/// Visit stapled OCSP responses from the COSE unprotected
+/// `rVals.ocspVals` array without cloning their DER bytes.
 ///
-/// Per the C2PA spec / c2pa-rs, revocation material is carried under the
-/// unprotected `rVals` map as `ocspVals`: an array of DER-encoded OCSP
-/// responses. Returns the first response, which covers the signing chain.
-pub fn extract_ocsp_staple(cose_sign1: &[u8]) -> Option<Vec<u8>> {
-    let decoded = decode(cose_sign1).ok()?;
-    let array = cose_array(&decoded).ok()?;
-    let unprotected = match &array[1] {
-        Value::Map(m) => m,
-        _ => return None,
-    };
-    let rvals = map_get_text(unprotected, "rVals")?;
-    let ocsp_vals = rvals.get("ocspVals")?;
-    match ocsp_vals {
-        Value::Array(items) => items.first().and_then(|v| v.as_bytes()).map(|b| b.to_vec()),
-        _ => None,
-    }
-}
-
-/// Extract **all** stapled OCSP responses (DER) from the COSE unprotected
-/// `rVals.ocspVals` array, in order. A C2PA signature may staple one OCSP
-/// response per certificate in the chain (leaf and each intermediate), so a
-/// verifier must inspect every entry to catch a revoked intermediate.
-pub fn extract_ocsp_staples(cose_sign1: &[u8]) -> Vec<Vec<u8>> {
+/// `max_values` is checked against the array length before any response is
+/// visited. The return value is `false` only when that entry limit is exceeded;
+/// absent or malformed revocation material produces no visits and returns
+/// `true`.
+pub fn visit_ocsp_staples(
+    cose_sign1: &[u8],
+    max_values: usize,
+    mut visit: impl FnMut(&[u8]),
+) -> bool {
     let Ok(decoded) = decode(cose_sign1) else {
-        return Vec::new();
+        return true;
     };
     let Ok(array) = cose_array(&decoded) else {
-        return Vec::new();
+        return true;
     };
     let Value::Map(unprotected) = &array[1] else {
-        return Vec::new();
+        return true;
     };
     let Some(rvals) = map_get_text(unprotected, "rVals") else {
-        return Vec::new();
+        return true;
     };
     let Some(Value::Array(items)) = rvals.get("ocspVals") else {
-        return Vec::new();
+        return true;
     };
-    items
-        .iter()
-        .filter_map(|v| v.as_bytes().map(|b| b.to_vec()))
-        .collect()
+    if items.len() > max_values {
+        return false;
+    }
+    for item in items {
+        if let Some(bytes) = item.as_bytes() {
+            visit(bytes);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cose_with_headers(
+        protected: Vec<(Value, Value)>,
+        unprotected: Vec<(Value, Value)>,
+    ) -> Vec<u8> {
+        let protected = encode(&Value::Map(protected), PROFILE).expect("encode protected");
+        encode(
+            &Value::Tag(
+                COSE_SIGN1_TAG,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(unprotected),
+                    Value::Bytes(b"payload".to_vec()),
+                    Value::Bytes(b"signature".to_vec()),
+                ])),
+            ),
+            PROFILE,
+        )
+        .expect("encode cose")
+    }
+
+    fn integer(value: u8) -> (Value, Value) {
+        (
+            Value::Integer(COSE_HDR_X5CHAIN),
+            Value::Bytes(vec![0x30, value, 0x00]),
+        )
+    }
+
+    fn text(value: u8) -> (Value, Value) {
+        (
+            Value::Text("x5chain".into()),
+            Value::Bytes(vec![0x30, value, 0x00]),
+        )
+    }
+
+    #[test]
+    fn accepts_x5chain_from_protected_or_unprotected_bucket() {
+        for cose in [
+            cose_with_headers(vec![integer(1)], Vec::new()),
+            cose_with_headers(Vec::new(), vec![integer(1)]),
+            cose_with_headers(vec![text(1)], Vec::new()),
+            cose_with_headers(Vec::new(), vec![text(1)]),
+        ] {
+            assert_eq!(
+                extract_x5chain(&cose).expect("compatible x5chain"),
+                vec![vec![0x30, 0x01, 0x00]]
+            );
+        }
+    }
+
+    #[test]
+    fn integer_label_wins_over_text_in_same_or_different_buckets() {
+        for cose in [
+            cose_with_headers(vec![text(2), integer(1)], Vec::new()),
+            cose_with_headers(Vec::new(), vec![text(2), integer(1)]),
+            cose_with_headers(vec![integer(1)], vec![text(2)]),
+            cose_with_headers(vec![text(2)], vec![integer(1)]),
+        ] {
+            assert_eq!(
+                extract_x5chain(&cose).expect("integer label"),
+                vec![vec![0x30, 0x01, 0x00]]
+            );
+        }
+    }
+
+    #[test]
+    fn chosen_label_in_both_buckets_is_rejected() {
+        let integer_duplicate = cose_with_headers(vec![integer(1)], vec![integer(2), text(3)]);
+        assert!(extract_x5chain(&integer_duplicate).is_err());
+
+        let text_duplicate = cose_with_headers(vec![text(1)], vec![text(2)]);
+        assert!(extract_x5chain(&text_duplicate).is_err());
+    }
+
+    #[test]
+    fn duplicate_exact_label_in_one_bucket_is_rejected() {
+        let integer_duplicate = cose_with_headers(vec![integer(1), integer(2)], Vec::new());
+        assert!(extract_x5chain(&integer_duplicate).is_err());
+
+        let text_duplicate = cose_with_headers(Vec::new(), vec![text(1), text(2)]);
+        assert!(extract_x5chain(&text_duplicate).is_err());
+    }
+
+    #[test]
+    fn malformed_integer_value_does_not_fall_back_to_text_label() {
+        let cose = cose_with_headers(
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), Value::Integer(7))],
+            vec![text(1)],
+        );
+        assert!(extract_x5chain(&cose).is_err());
+    }
+
+    #[test]
+    fn x5chain_certificate_limits_accept_boundaries_and_reject_excess() {
+        let at_count_limit = Value::Array(
+            (0..MAX_X5CHAIN_CERTIFICATES)
+                .map(|_| Value::Bytes(vec![0x30, 0x00]))
+                .collect(),
+        );
+        let cose = cose_with_headers(
+            Vec::new(),
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), at_count_limit)],
+        );
+        assert_eq!(
+            extract_x5chain(&cose).expect("chain at count limit").len(),
+            MAX_X5CHAIN_CERTIFICATES
+        );
+
+        let at_certificate_limit = Value::Bytes(vec![0; MAX_X5CHAIN_CERTIFICATE_BYTES]);
+        let cose = cose_with_headers(
+            Vec::new(),
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), at_certificate_limit)],
+        );
+        assert_eq!(
+            extract_x5chain(&cose)
+                .expect("certificate at byte limit")
+                .first()
+                .map(Vec::len),
+            Some(MAX_X5CHAIN_CERTIFICATE_BYTES)
+        );
+
+        assert_eq!(MAX_X5CHAIN_TOTAL_BYTES % MAX_X5CHAIN_CERTIFICATE_BYTES, 0);
+        let total_certificate_count = MAX_X5CHAIN_TOTAL_BYTES / MAX_X5CHAIN_CERTIFICATE_BYTES;
+        let at_total_limit = Value::Array(
+            (0..total_certificate_count)
+                .map(|_| Value::Bytes(vec![0; MAX_X5CHAIN_CERTIFICATE_BYTES]))
+                .collect(),
+        );
+        let cose = cose_with_headers(
+            Vec::new(),
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), at_total_limit)],
+        );
+        assert_eq!(
+            extract_x5chain(&cose)
+                .expect("chain at total byte limit")
+                .len(),
+            total_certificate_count
+        );
+
+        let over_count_limit = Value::Array(
+            (0..=MAX_X5CHAIN_CERTIFICATES)
+                .map(|_| Value::Bytes(vec![0x30, 0x00]))
+                .collect(),
+        );
+        let cose = cose_with_headers(
+            Vec::new(),
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), over_count_limit)],
+        );
+        assert!(extract_x5chain(&cose).is_err());
+
+        let oversized_certificate = Value::Bytes(vec![0; MAX_X5CHAIN_CERTIFICATE_BYTES + 1]);
+        let cose = cose_with_headers(
+            Vec::new(),
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), oversized_certificate)],
+        );
+        assert!(extract_x5chain(&cose).is_err());
+
+        let certificate_bytes = MAX_X5CHAIN_TOTAL_BYTES / 9 + 1;
+        assert!(certificate_bytes <= MAX_X5CHAIN_CERTIFICATE_BYTES);
+        let over_total_limit = Value::Array(
+            (0..9)
+                .map(|_| Value::Bytes(vec![0; certificate_bytes]))
+                .collect(),
+        );
+        let cose = cose_with_headers(
+            Vec::new(),
+            vec![(Value::Integer(COSE_HDR_X5CHAIN), over_total_limit)],
+        );
+        assert!(extract_x5chain(&cose).is_err());
+    }
 }

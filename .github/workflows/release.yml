@@ -11,9 +11,31 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
+  release-version:
+    name: Release version contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Match tag, workspace, and published dependency versions
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --locked --no-deps --format-version 1)
+          workspace_version=$(python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "encypher-c2pa"))' <<<"$metadata")
+          cli_requirement=$(python3 -c 'import json,sys; p=next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "encypher-c2pa-cli"); print(next(d["req"] for d in p["dependencies"] if d["name"] == "encypher-c2pa"))' <<<"$metadata")
+          tag_version=${GITHUB_REF_NAME#v}
+          test "$tag_version" = "$workspace_version" || {
+            echo "tag $GITHUB_REF_NAME does not match workspace version $workspace_version" >&2
+            exit 1
+          }
+          test "$cli_requirement" = "=$workspace_version" || {
+            echo "CLI dependency $cli_requirement does not exact-pin workspace version $workspace_version" >&2
+            exit 1
+          }
+
   crates:
     name: Publish Rust crates
-    needs: verify
+    needs: [verify, release-version]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -51,7 +73,7 @@ jobs:
 
   python-wheels:
     name: Python ${{ matrix.target }}
-    needs: verify
+    needs: [verify, release-version]
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +116,7 @@ jobs:
 
   python-sdist:
     name: Python sdist
-    needs: verify
+    needs: [verify, release-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +148,7 @@ jobs:
 
   npm:
     name: Publish browser WASM package
-    needs: verify
+    needs: [verify, release-version]
     runs-on: ubuntu-latest
     environment: release
     permissions:

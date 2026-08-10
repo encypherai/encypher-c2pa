@@ -10,8 +10,8 @@ mod error;
 
 pub(crate) use alg::CoseAlg;
 pub(crate) use cose::{
-    extract_cose_alg, extract_ocsp_staple, extract_ocsp_staples, extract_protected_x5chain,
-    extract_tsa_token, extract_tsa_tokens, extract_x5chain, timestamp_input, verify_claim,
+    extract_claim_tsa_tokens, extract_cose_alg, extract_tsa_tokens, extract_x5chain,
+    timestamp_input, timestamp_input_v1, verify_claim, visit_ocsp_staples, ClaimTimestampVersion,
 };
 pub(crate) use error::CryptoError;
 

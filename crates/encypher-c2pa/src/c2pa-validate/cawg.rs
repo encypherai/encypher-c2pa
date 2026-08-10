@@ -8,21 +8,24 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::c2pa_cbor::{decode, encode, Profile, Value};
+use crate::c2pa_cbor::{encode, Profile, Value};
 use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_crypto::{
-    extract_ocsp_staples, extract_protected_x5chain, extract_tsa_tokens, extract_x5chain,
-    timestamp_input, verify_claim, CryptoError,
+    extract_tsa_tokens, extract_x5chain, timestamp_input, verify_claim, CryptoError,
 };
 use crate::c2pa_trust::{
     certificate_eku_oids_der, certificate_policy_oids_der, certificate_valid_at,
-    leaf_profile_acceptable_der, resolve_issuer, validate_chain, OcspStatus, TrustList,
+    leaf_profile_acceptable_der, validate_chain, TrustList,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use time::OffsetDateTime;
 
-use super::{ref_fields, ClaimGeneration, ValidationResults, CLAIM_SIGNATURE_MISMATCH};
+use super::{
+    evaluate_embedded_ocsp, is_supported_hard_binding_label, ClaimAssertionReference,
+    ClaimAssertionRefs, EmbeddedOcspStatus as IdentityRevocationStatus, ValidationResults,
+    CLAIM_SIGNATURE_MISMATCH,
+};
 
 pub const CAWG_IDENTITY_TRUSTED: &str = "cawg.identity.trusted";
 pub const CAWG_IDENTITY_WELL_FORMED: &str = "cawg.identity.well-formed";
@@ -62,6 +65,47 @@ const CAWG_ICA_COSE: &str = "cawg.identity_claims_aggregation";
 const OID_KP_DOCUMENT_SIGNING: &str = "1.3.6.1.5.5.7.3.36";
 const OID_KP_EMAIL_PROTECTION: &str = "1.3.6.1.5.5.7.3.4";
 const MAX_IDENTITY_ASSERTIONS: usize = 64;
+
+fn is_identity_assertion_label(label: &str) -> bool {
+    label == "cawg.identity"
+        || label
+            .strip_prefix("cawg.identity__")
+            .is_some_and(|instance| !instance.is_empty())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IdentityWorkCounts {
+    materialized_records: usize,
+    identity_evaluations: usize,
+    cryptographic_evaluations: usize,
+    ocsp_evaluations: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static IDENTITY_WORK_COUNTS: std::cell::Cell<IdentityWorkCounts> =
+        std::cell::Cell::new(IdentityWorkCounts::default());
+}
+
+#[cfg(test)]
+fn record_identity_work(update: impl FnOnce(&mut IdentityWorkCounts)) {
+    IDENTITY_WORK_COUNTS.with(|counts| {
+        let mut current = counts.get();
+        update(&mut current);
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+fn reset_identity_work_counts() {
+    IDENTITY_WORK_COUNTS.with(|counts| counts.set(IdentityWorkCounts::default()));
+}
+
+#[cfg(test)]
+fn identity_work_counts() -> IdentityWorkCounts {
+    IDENTITY_WORK_COUNTS.with(std::cell::Cell::get)
+}
 const S_MIME_INTERIM_CUTOFF_UNIX: i64 = 1_806_537_600;
 const CAWG_SMIME_POLICY_OIDS: [&str; 6] = [
     "2.23.140.1.5.2.2",
@@ -74,14 +118,13 @@ const CAWG_SMIME_POLICY_OIDS: [&str; 6] = [
 
 pub(super) struct IdentityContext<'a> {
     pub manifest: &'a ParsedManifest<'a>,
-    pub manifests: &'a [ParsedManifest<'a>],
-    pub manifest_hashes: &'a HashMap<String, Vec<u8>>,
     pub claim: &'a Value,
-    pub generation: ClaimGeneration,
     pub validation_time: OffsetDateTime,
     pub claim_timestamp: Option<OffsetDateTime>,
     pub cawg_trust: Option<&'a TrustList>,
     pub cawg_allowed_certs: Option<&'a TrustList>,
+    /// Current time used for embedded OCSP response freshness.
+    pub ocsp_verification_time: OffsetDateTime,
     pub document_signing_require_anchor: bool,
     pub tsa_trust: Option<&'a TrustList>,
     pub did_documents: Option<&'a HashMap<String, serde_json::Value>>,
@@ -91,9 +134,29 @@ pub(super) struct IdentityContext<'a> {
 }
 
 /// Validate every CAWG identity assertion in the active manifest.
-pub(super) fn verify_identity_assertions(ctx: &mut IdentityContext<'_>) {
-    let claim_refs = collect_traced_claim_refs(ctx);
-    verify_countersigners(ctx.manifest, ctx.results);
+pub(super) fn verify_identity_assertions(
+    ctx: &mut IdentityContext<'_>,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    primary_binding: Option<&ClaimAssertionReference<'_>>,
+    certificate_status_assertions: &[&[u8]],
+) {
+    let identity_count = claim_refs
+        .references
+        .iter()
+        .filter(|reference| reference.label.is_some_and(is_identity_assertion_label))
+        .count();
+    if identity_count > MAX_IDENTITY_ASSERTIONS {
+        ctx.results.push_failure(
+            CAWG_IDENTITY_CBOR_INVALID,
+            format!("self#jumbf=/c2pa/{}", ctx.manifest.label),
+            format!(
+                "manifest has {identity_count} CAWG identities; maximum is {MAX_IDENTITY_ASSERTIONS}"
+            ),
+        );
+        return;
+    }
+
+    verify_countersigners(ctx.manifest, claim_refs, ctx.results);
     let topology_invalid: HashSet<String> = ctx
         .results
         .failure
@@ -109,32 +172,49 @@ pub(super) fn verify_identity_assertions(ctx: &mut IdentityContext<'_>) {
         })
         .map(|status| status.url.clone())
         .collect();
-    for (label, bytes) in &ctx.manifest.assertions {
-        if label == "cawg.identity" || label.starts_with("cawg.identity__") {
-            let url = format!(
-                "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
-                ctx.manifest.label
-            );
-            verify_identity_assertion(
-                ctx,
-                bytes,
-                &claim_refs,
-                &url,
-                !topology_invalid.contains(&url),
-            );
+    for reference in &claim_refs.references {
+        let Some(label) = reference.label else {
+            continue;
+        };
+        if !is_identity_assertion_label(label) {
+            continue;
         }
+        let Some(assertion) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+        else {
+            continue;
+        };
+        let url = format!(
+            "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
+            ctx.manifest.label
+        );
+        verify_identity_assertion(
+            ctx,
+            assertion,
+            claim_refs,
+            primary_binding,
+            certificate_status_assertions,
+            &url,
+            !topology_invalid.contains(&url),
+        );
     }
 }
 
 fn verify_identity_assertion(
     ctx: &mut IdentityContext<'_>,
-    bytes: &[u8],
-    claim_refs: &[Value],
+    assertion: &Value,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    primary_binding: Option<&ClaimAssertionReference<'_>>,
+    certificate_status_assertions: &[&[u8]],
     url: &str,
     topology_valid: bool,
 ) {
-    let claim_binds_identity = claim_refs.iter().any(|reference| {
+    #[cfg(test)]
+    record_identity_work(|counts| counts.identity_evaluations += 1);
+    let claim_binds_identity = claim_refs.references.iter().any(|reference| {
         reference
+            .value
             .get("url")
             .and_then(Value::as_text)
             .is_some_and(|reference_url| reference_targets_identity(reference_url, url))
@@ -147,14 +227,6 @@ fn verify_identity_assertion(
         );
         return;
     }
-    let Ok(assertion) = decode(bytes) else {
-        ctx.results.push_failure(
-            CAWG_IDENTITY_CBOR_INVALID,
-            url.into(),
-            "identity assertion is not valid CBOR".into(),
-        );
-        return;
-    };
     let Some(signer_payload) = assertion.get("signer_payload") else {
         invalid_cbor(ctx.results, url, "signer_payload is missing");
         return;
@@ -222,8 +294,9 @@ fn verify_identity_assertion(
             encode(reference, Profile::CanonicalForHashedSubstructures).unwrap_or_default();
         duplicate |= !unique.insert(encoded);
         mismatch |= !claim_refs
+            .references
             .iter()
-            .any(|claim_ref| same_hashed_uri(reference, claim_ref));
+            .any(|claim_ref| same_hashed_uri(reference, claim_ref.value));
     }
     if duplicate {
         ctx.results.push_failure(
@@ -240,9 +313,7 @@ fn verify_identity_assertion(
         );
     }
 
-    let claim_hard_binding = claim_refs
-        .iter()
-        .find(|reference| is_hard_binding(reference, &ctx.manifest.label));
+    let claim_hard_binding = primary_binding.map(|binding| binding.value);
     // Deduplicate before the hard-binding comparison: a duplicated reference is
     // reported once as `cawg.identity.assertion.duplicate` (terminal for this
     // assertion) and must not also trip the hard-binding count. Upstream
@@ -251,7 +322,13 @@ fn verify_identity_assertion(
     let mut unique_hard_bindings = HashSet::new();
     let signer_hard_bindings: Vec<&Value> = referenced
         .iter()
-        .filter(|reference| is_hard_binding(reference, &ctx.manifest.label))
+        .filter(|reference| {
+            reference
+                .get("url")
+                .and_then(Value::as_text)
+                .and_then(|url| super::assertion_label_for_manifest(url, &ctx.manifest.label))
+                .is_some_and(|label| is_supported_hard_binding_label(label, false))
+        })
         .filter(|reference| {
             let encoded =
                 encode(reference, Profile::CanonicalForHashedSubstructures).unwrap_or_default();
@@ -271,12 +348,15 @@ fn verify_identity_assertion(
         ctx.results.push_failure(
             CAWG_IDENTITY_HARD_BINDING_INCORRECT,
             url.into(),
-            "referenced_assertions does not contain exactly the claim hard binding".into(),
+            "referenced_assertions does not contain exactly the primary hard binding".into(),
         );
     }
     if duplicate || mismatch || !hard_binding_valid {
         return;
     }
+
+    #[cfg(test)]
+    record_identity_work(|counts| counts.cryptographic_evaluations += 1);
 
     if sig_type == CAWG_ICA_COSE {
         super::cawg_ica::verify_ica_assertion(
@@ -316,7 +396,7 @@ fn verify_identity_assertion(
         invalid_cbor(ctx.results, url, "signer_payload cannot be re-encoded");
         return;
     };
-    let chain = extract_protected_x5chain(signature).unwrap_or_default();
+    let chain = extract_x5chain(signature).unwrap_or_default();
     let Some(leaf) = chain.first() else {
         invalid_cbor(
             ctx.results,
@@ -402,14 +482,26 @@ fn verify_identity_assertion(
         );
         return;
     }
-    let revocation_status =
-        identity_revocation_status(signature, ctx.manifests, &chain, at, ctx.cawg_trust);
+    #[cfg(test)]
+    record_identity_work(|counts| counts.ocsp_evaluations += 1);
+
+    let revocation_status = evaluate_embedded_ocsp(
+        signature,
+        certificate_status_assertions,
+        &chain,
+        timestamp_trusted.then_some(at),
+        ctx.ocsp_verification_time,
+        ctx.cawg_trust,
+    );
     match revocation_status {
-        IdentityRevocationStatus::Revoked => {
+        IdentityRevocationStatus::LeafRevoked
+        | IdentityRevocationStatus::CaRevoked
+        | IdentityRevocationStatus::LeafAndCaRevoked => {
             ctx.results.push_failure(
                 CAWG_IDENTITY_CREDENTIAL_REVOKED,
                 url.into(),
-                "verified OCSP evidence reports a CAWG identity certificate revoked".into(),
+                "verified OCSP evidence reports an identity credential chain certificate revoked"
+                    .into(),
             );
             return;
         }
@@ -487,13 +579,22 @@ struct IdentityRecord {
     credential: Option<Vec<u8>>,
 }
 
-fn verify_countersigners(manifest: &ParsedManifest<'_>, results: &mut ValidationResults) {
-    let identities: Vec<IdentityRecord> = manifest
-        .assertions
+fn verify_countersigners(
+    manifest: &ParsedManifest<'_>,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    results: &mut ValidationResults,
+) {
+    let identities: Vec<IdentityRecord> = claim_refs
+        .references
         .iter()
-        .filter(|(label, _)| label == "cawg.identity" || label.starts_with("cawg.identity__"))
-        .filter_map(|(label, bytes)| {
-            let assertion = decode(bytes).ok()?;
+        .filter_map(|reference| {
+            let label = reference.label?;
+            if !is_identity_assertion_label(label) {
+                return None;
+            }
+            #[cfg(test)]
+            record_identity_work(|counts| counts.materialized_records += 1);
+            let assertion = claim_refs.indexed(label)?.decoded.as_ref()?;
             let signer_payload = assertion.get("signer_payload")?.clone();
             let partial_payload = without_expected_countersigners(&signer_payload);
             let partial_key =
@@ -501,7 +602,7 @@ fn verify_countersigners(manifest: &ParsedManifest<'_>, results: &mut Validation
             let credential = assertion
                 .get("signature")
                 .and_then(Value::as_bytes)
-                .and_then(|signature| extract_protected_x5chain(signature).ok())
+                .and_then(|signature| extract_x5chain(signature).ok())
                 .and_then(|chain| chain.into_iter().next());
             Some(IdentityRecord {
                 url: format!(
@@ -515,17 +616,6 @@ fn verify_countersigners(manifest: &ParsedManifest<'_>, results: &mut Validation
             })
         })
         .collect();
-    if identities.len() > MAX_IDENTITY_ASSERTIONS {
-        results.push_failure(
-            CAWG_IDENTITY_CBOR_INVALID,
-            format!("self#jumbf=/c2pa/{}", manifest.label),
-            format!(
-                "manifest has {} CAWG identities; maximum is {MAX_IDENTITY_ASSERTIONS}",
-                identities.len()
-            ),
-        );
-        return;
-    }
 
     for (identity_index, identity) in identities.iter().enumerate() {
         let Some(expected_value) = identity.signer_payload.get("expected_countersigners") else {
@@ -639,128 +729,6 @@ fn without_expected_countersigners(signer_payload: &Value) -> Value {
     partial
 }
 
-fn collect_claim_refs(claim: &Value, generation: ClaimGeneration) -> Vec<Value> {
-    let mut refs = Vec::new();
-    for field in ref_fields(generation) {
-        if let Some(Value::Array(values)) = claim.get(field) {
-            refs.extend(values.iter().cloned());
-        }
-    }
-    refs
-}
-
-fn collect_traced_claim_refs(ctx: &IdentityContext<'_>) -> Vec<Value> {
-    let mut collected = Vec::new();
-    let mut queued = vec![ctx.manifest.label.clone()];
-    let mut visited = HashSet::new();
-
-    while let Some(manifest_label) = queued.pop() {
-        if !visited.insert(manifest_label.clone()) {
-            continue;
-        }
-        let Some(manifest) = ctx
-            .manifests
-            .iter()
-            .find(|candidate| candidate.label == manifest_label)
-        else {
-            continue;
-        };
-        let (claim, generation) = if manifest.label == ctx.manifest.label {
-            (ctx.claim.clone(), ctx.generation)
-        } else {
-            let Some(claim_cbor) = manifest.claim_cbor else {
-                continue;
-            };
-            let Ok(claim) = decode(claim_cbor) else {
-                continue;
-            };
-            let generation = if manifest.claim_box_label.as_deref() == Some("c2pa.claim.v2") {
-                ClaimGeneration::V2
-            } else {
-                ClaimGeneration::V1
-            };
-            (claim, generation)
-        };
-        let claim_refs = collect_claim_refs(&claim, generation);
-
-        for reference in &claim_refs {
-            let Some(url) = reference.get("url").and_then(Value::as_text) else {
-                continue;
-            };
-            let Some(assertion_label) = super::assertion_label_for_manifest(url, &manifest.label)
-            else {
-                continue;
-            };
-            if !assertion_label.starts_with("c2pa.ingredient") {
-                continue;
-            }
-            let Some(assertion_jumbf) = manifest
-                .assertion_jumbf
-                .iter()
-                .find(|(label, _)| label == assertion_label)
-                .map(|(_, bytes)| *bytes)
-            else {
-                continue;
-            };
-            if !hash_matches(reference, assertion_jumbf) {
-                continue;
-            }
-            let Some(ingredient) = manifest
-                .assertions
-                .iter()
-                .find(|(label, _)| label == assertion_label)
-                .and_then(|(_, bytes)| decode(bytes).ok())
-            else {
-                continue;
-            };
-            let Some(active_manifest) = ingredient.get("activeManifest") else {
-                continue;
-            };
-            let Some(child_label) = active_manifest
-                .get("url")
-                .and_then(Value::as_text)
-                .and_then(super::extract_manifest_label)
-            else {
-                continue;
-            };
-            let expected_hash = active_manifest.get("hash").and_then(Value::as_bytes);
-            let algorithm = active_manifest
-                .get("alg")
-                .and_then(Value::as_text)
-                .unwrap_or("sha256");
-            if algorithm != "sha256"
-                || ctx.manifest_hashes.get(&child_label).map(Vec::as_slice) != expected_hash
-            {
-                continue;
-            }
-            let Some(child) = ctx
-                .manifests
-                .iter()
-                .find(|candidate| candidate.label == child_label)
-            else {
-                continue;
-            };
-            let (Some(child_claim), Some(child_signature)) =
-                (child.claim_cbor, child.signature_cose)
-            else {
-                continue;
-            };
-            let Ok(chain) = extract_x5chain(child_signature) else {
-                continue;
-            };
-            if chain
-                .first()
-                .is_none_or(|leaf| verify_claim(child_signature, child_claim, leaf).is_err())
-            {
-                continue;
-            }
-            queued.push(child_label);
-        }
-        collected.extend(claim_refs);
-    }
-    collected
-}
-
 fn reference_targets_identity(reference_url: &str, identity_url: &str) -> bool {
     if reference_url == identity_url {
         return true;
@@ -772,25 +740,7 @@ fn reference_targets_identity(reference_url: &str, identity_url: &str) -> bool {
 fn same_hashed_uri(left: &Value, right: &Value) -> bool {
     left.get("url").and_then(Value::as_text) == right.get("url").and_then(Value::as_text)
         && left.get("hash").and_then(Value::as_bytes) == right.get("hash").and_then(Value::as_bytes)
-        && left.get("alg").and_then(Value::as_text).unwrap_or("sha256")
-            == right
-                .get("alg")
-                .and_then(Value::as_text)
-                .unwrap_or("sha256")
-}
-
-fn is_hard_binding(reference: &Value, manifest_label: &str) -> bool {
-    let label = reference
-        .get("url")
-        .and_then(Value::as_text)
-        .and_then(|url| super::assertion_label_for_manifest(url, manifest_label))
-        .unwrap_or("");
-    label == "c2pa.hash.data"
-        || label == "c2pa.hash.bmff"
-        || label.starts_with("c2pa.hash.bmff.")
-        || label == "c2pa.hash.boxes"
-        || label == "c2pa.hash.collection.data"
-        || label == "c2pa.hash.multi-asset"
+        && left.get("alg").and_then(Value::as_text) == right.get("alg").and_then(Value::as_text)
 }
 
 fn valid_padding(value: Option<&Value>, required: bool) -> bool {
@@ -814,108 +764,6 @@ fn identity_timestamp(signature: &[u8], tsa_trust: Option<&TrustList>) -> Option
     let payload = timestamp_input(signature).ok()?;
     let result = crate::c2pa_trust::verify_timestamp_token(token, &payload, trust);
     result.verified.then_some(result.time).flatten()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IdentityRevocationStatus {
-    NotChecked,
-    NotRevoked,
-    Revoked,
-    Skipped,
-}
-
-impl IdentityRevocationStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NotChecked => "not_checked",
-            Self::NotRevoked => "not_revoked",
-            Self::Revoked => "revoked",
-            Self::Skipped => "skipped",
-        }
-    }
-}
-
-fn collect_ocsp_values(value: &Value, output: &mut Vec<Vec<u8>>, depth: usize) {
-    if depth > 4 {
-        return;
-    }
-    match value {
-        Value::Map(entries) => {
-            for (key, value) in entries {
-                if key.as_text() == Some("ocspVals") {
-                    if let Value::Array(values) = value {
-                        output.extend(
-                            values
-                                .iter()
-                                .filter_map(Value::as_bytes)
-                                .map(<[u8]>::to_vec),
-                        );
-                    }
-                } else {
-                    collect_ocsp_values(value, output, depth + 1);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_ocsp_values(value, output, depth + 1);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn identity_revocation_status(
-    signature: &[u8],
-    manifests: &[ParsedManifest<'_>],
-    chain: &[Vec<u8>],
-    at: OffsetDateTime,
-    trust: Option<&TrustList>,
-) -> IdentityRevocationStatus {
-    let mut staples = extract_ocsp_staples(signature);
-    for manifest in manifests {
-        for (label, bytes) in &manifest.assertions {
-            if label == "c2pa.certificate-status" {
-                if let Ok(assertion) = decode(bytes) {
-                    collect_ocsp_values(&assertion, &mut staples, 0);
-                }
-            }
-        }
-    }
-    if staples.is_empty() {
-        return IdentityRevocationStatus::NotChecked;
-    }
-    let mut issuer_candidates: Vec<Vec<u8>> = chain.iter().skip(1).cloned().collect();
-    if let Some(trust) = trust {
-        issuer_candidates.extend(trust.anchors.iter().cloned());
-    }
-    let mut leaf_good = false;
-    for (index, subject) in chain.iter().enumerate() {
-        let Some(issuer) = resolve_issuer(subject, &issuer_candidates) else {
-            continue;
-        };
-        for staple in &staples {
-            let Some(evaluation) =
-                crate::c2pa_trust::evaluate_ocsp_verified(staple, &issuer, Some(subject), at)
-            else {
-                continue;
-            };
-            if !evaluation.is_fresh_at(at) {
-                continue;
-            }
-            if evaluation.status == OcspStatus::Revoked {
-                return IdentityRevocationStatus::Revoked;
-            }
-            if index == 0 && evaluation.status == OcspStatus::Good {
-                leaf_good = true;
-            }
-        }
-    }
-    if leaf_good {
-        IdentityRevocationStatus::NotRevoked
-    } else {
-        IdentityRevocationStatus::Skipped
-    }
 }
 
 struct IdentityTrustEvidence {
@@ -1287,13 +1135,22 @@ mod tests {
     }
 
     fn identity_payload(role: &str, expected: Option<Vec<Value>>) -> Value {
+        identity_payload_with_binding(
+            role,
+            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22),
+            expected,
+        )
+    }
+
+    fn identity_payload_with_binding(
+        role: &str,
+        binding: Value,
+        expected: Option<Vec<Value>>,
+    ) -> Value {
         let mut fields = vec![
             (
                 Value::Text("referenced_assertions".into()),
-                Value::Array(vec![hashed_uri(
-                    "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data",
-                    0x22,
-                )]),
+                Value::Array(vec![binding]),
             ),
             (
                 Value::Text("sig_type".into()),
@@ -1330,6 +1187,24 @@ mod tests {
         )
         .expect("encode identity")
     }
+    fn identity_bytes_with_padding(payload: Value) -> Vec<u8> {
+        encode(
+            &Value::Map(vec![
+                (Value::Text("signer_payload".into()), payload),
+                (Value::Text("signature".into()), Value::Bytes(vec![1])),
+                (Value::Text("pad1".into()), Value::Bytes(Vec::new())),
+            ]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("encode identity")
+    }
+
+    fn claim_with_references(references: Vec<Value>) -> Value {
+        Value::Map(vec![(
+            Value::Text("created_assertions".into()),
+            Value::Array(references),
+        )])
+    }
 
     #[test]
     fn multi_identity_countersigner_matching_is_one_to_one_and_fail_closed() {
@@ -1342,6 +1217,7 @@ mod tests {
         let secondary_bytes = identity_bytes(secondary.clone());
         let manifest = ParsedManifest {
             label: "test".into(),
+            manifest_jumbf: &[],
             assertions: vec![
                 ("cawg.identity".into(), primary_bytes.as_slice()),
                 ("cawg.identity__1".into(), secondary_bytes.as_slice()),
@@ -1352,8 +1228,14 @@ mod tests {
             claim_count: 1,
             claim_box_label: Some("c2pa.claim.v2".into()),
         };
+        let claim = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 1),
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity__1", 2),
+        ]);
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
         let mut valid = ValidationResults::default();
-        verify_countersigners(&manifest, &mut valid);
+        verify_countersigners(&manifest, &claim_refs, &mut valid);
         assert!(valid.failure.is_empty());
 
         let unexpected_bytes = identity_bytes(identity_payload("cawg.publisher:unexpected", None));
@@ -1365,12 +1247,183 @@ mod tests {
             ],
             ..manifest
         };
+        let unexpected_claim = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 1),
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity__1", 2),
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity__2", 3),
+        ]);
+        let unexpected_refs = ClaimAssertionRefs::build(
+            &with_unexpected,
+            &unexpected_claim,
+            super::super::ClaimGeneration::V2,
+        );
         let mut invalid = ValidationResults::default();
-        verify_countersigners(&with_unexpected, &mut invalid);
+        verify_countersigners(&with_unexpected, &unexpected_refs, &mut invalid);
         assert!(invalid
             .failure
             .iter()
             .any(|status| status.code == CAWG_IDENTITY_UNEXPECTED_COUNTERSIGNER));
+    }
+    #[test]
+    fn countersigner_topology_does_not_rescue_a_stale_primary_binding() {
+        let primary_binding =
+            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
+        let fallback_binding = hashed_uri(
+            "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.multi-asset",
+            0x33,
+        );
+        let secondary = identity_payload_with_binding(
+            "cawg.publisher:secondary",
+            primary_binding.clone(),
+            None,
+        );
+        let primary = identity_payload_with_binding(
+            "cawg.publisher:primary",
+            fallback_binding.clone(),
+            Some(vec![countersigner_description(secondary.clone())]),
+        );
+        let primary_bytes = identity_bytes_with_padding(primary);
+        let secondary_bytes = identity_bytes_with_padding(secondary);
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![
+                ("cawg.identity".into(), primary_bytes.as_slice()),
+                ("cawg.identity__1".into(), secondary_bytes.as_slice()),
+            ],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 1),
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity__1", 2),
+            primary_binding,
+            fallback_binding,
+        ]);
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let primary_reference = claim_refs
+            .references
+            .iter()
+            .find(|reference| reference.label == Some("c2pa.hash.data"))
+            .unwrap();
+        let mut results = ValidationResults::default();
+        {
+            let mut ctx = IdentityContext {
+                manifest: &manifest,
+                claim: &claim,
+                validation_time: datetime!(2025-05-01 0:00 UTC),
+                claim_timestamp: None,
+                cawg_trust: None,
+                cawg_allowed_certs: None,
+                ocsp_verification_time: datetime!(2025-05-01 0:00 UTC),
+                document_signing_require_anchor: false,
+                tsa_trust: None,
+                did_documents: None,
+                strict_encoding: false,
+                results: &mut results,
+            };
+            verify_identity_assertions(&mut ctx, &claim_refs, Some(primary_reference), &[]);
+        }
+
+        assert!(!results.failure.iter().any(|status| {
+            matches!(
+                status.code.as_str(),
+                CAWG_IDENTITY_UNEXPECTED_COUNTERSIGNER
+                    | CAWG_IDENTITY_EXPECTED_COUNTERSIGNER_MISMATCH
+                    | CAWG_IDENTITY_EXPECTED_COUNTERSIGNER_MISSING
+                    | CAWG_IDENTITY_EXPECTED_COUNTERSIGNER_DUPLICATE
+            )
+        }));
+        let missing: Vec<_> = results
+            .failure
+            .iter()
+            .filter(|status| status.code == CAWG_IDENTITY_HARD_BINDING_MISSING)
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].url.ends_with("/cawg.identity"));
+    }
+
+    #[test]
+    fn identity_cap_stops_before_materialization_cryptography_and_ocsp() {
+        reset_identity_work_counts();
+        let labels: Vec<String> = (0..=MAX_IDENTITY_ASSERTIONS)
+            .map(|index| {
+                if index == 0 {
+                    "cawg.identity".to_string()
+                } else {
+                    format!("cawg.identity__{index}")
+                }
+            })
+            .collect();
+        let payloads: Vec<Vec<u8>> = labels
+            .iter()
+            .map(|_| identity_bytes(identity_payload("cawg.publisher:primary", None)))
+            .collect();
+        let assertions = labels
+            .iter()
+            .zip(&payloads)
+            .map(|(label, payload)| (label.clone(), payload.as_slice()))
+            .collect();
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions,
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let mut references: Vec<Value> = labels
+            .iter()
+            .map(|label| hashed_uri(&format!("self#jumbf=c2pa.assertions/{label}"), 0x01))
+            .collect();
+        references.push(hashed_uri(
+            "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data",
+            0x22,
+        ));
+        let claim = claim_with_references(references);
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let binding = claim_refs
+            .references
+            .iter()
+            .find(|reference| reference.label == Some("c2pa.hash.data"))
+            .expect("test hard binding reference");
+        let mut results = ValidationResults::default();
+        {
+            let mut ctx = IdentityContext {
+                manifest: &manifest,
+                claim: &claim,
+                validation_time: datetime!(2025-05-01 0:00 UTC),
+                claim_timestamp: None,
+                cawg_trust: None,
+                cawg_allowed_certs: None,
+                ocsp_verification_time: datetime!(2025-05-01 0:00 UTC),
+                document_signing_require_anchor: false,
+                tsa_trust: None,
+                did_documents: None,
+                strict_encoding: false,
+                results: &mut results,
+            };
+            verify_identity_assertions(
+                &mut ctx,
+                &claim_refs,
+                Some(binding),
+                &[b"must not be inspected"],
+            );
+        }
+
+        assert_eq!(identity_work_counts(), IdentityWorkCounts::default());
+        assert_eq!(results.failure.len(), 1);
+        assert_eq!(results.failure[0].code, CAWG_IDENTITY_CBOR_INVALID);
+        assert!(results.failure[0].explanation.contains("maximum is 64"));
+        assert!(results.success.is_empty());
+        assert!(results.informational.is_empty());
     }
 
     #[test]
@@ -1385,6 +1438,7 @@ mod tests {
         let secondary_bytes = identity_bytes(secondary);
         let manifest = ParsedManifest {
             label: "test".into(),
+            manifest_jumbf: &[],
             assertions: vec![
                 ("cawg.identity".into(), primary_bytes.as_slice()),
                 ("cawg.identity__1".into(), secondary_bytes.as_slice()),
@@ -1395,8 +1449,14 @@ mod tests {
             claim_count: 1,
             claim_box_label: Some("c2pa.claim.v2".into()),
         };
+        let claim = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 1),
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity__1", 2),
+        ]);
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
         let mut results = ValidationResults::default();
-        verify_countersigners(&manifest, &mut results);
+        verify_countersigners(&manifest, &claim_refs, &mut results);
         assert!(results
             .failure
             .iter()
@@ -1429,9 +1489,17 @@ mod tests {
     /// Run `verify_identity_assertion` against a minimal single-assertion
     /// manifest and return the recorded results.
     fn identity_verdict(assertion: &Value, claim_refs: &[Value]) -> ValidationResults {
+        identity_verdict_for_binding(assertion, claim_refs, "c2pa.hash.data")
+    }
+
+    fn identity_verdict_for_binding(
+        assertion: &Value,
+        claim_refs: &[Value],
+        primary_label: &str,
+    ) -> ValidationResults {
         let bytes =
             encode(assertion, Profile::CanonicalForHashedSubstructures).expect("encode assertion");
-        identity_verdict_bytes(&bytes, claim_refs, false)
+        identity_verdict_bytes_for_binding(&bytes, claim_refs, false, primary_label)
     }
 
     /// Run `verify_identity_assertion` on raw assertion bytes (preserving any
@@ -1441,8 +1509,18 @@ mod tests {
         claim_refs: &[Value],
         strict_encoding: bool,
     ) -> ValidationResults {
+        identity_verdict_bytes_for_binding(bytes, claim_refs, strict_encoding, "c2pa.hash.data")
+    }
+
+    fn identity_verdict_bytes_for_binding(
+        bytes: &[u8],
+        claim_refs: &[Value],
+        strict_encoding: bool,
+        primary_label: &str,
+    ) -> ValidationResults {
         let manifest = ParsedManifest {
             label: "test".into(),
+            manifest_jumbf: &[],
             assertions: vec![("cawg.identity".into(), bytes)],
             assertion_jumbf: Vec::new(),
             claim_cbor: None,
@@ -1450,20 +1528,25 @@ mod tests {
             claim_count: 1,
             claim_box_label: Some("c2pa.claim.v2".into()),
         };
-        let manifests: [ParsedManifest<'_>; 0] = [];
-        let manifest_hashes = HashMap::new();
-        let claim = Value::Map(Vec::new());
+        let claim = claim_with_references(claim_refs.to_vec());
+        let indexed_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let primary_binding = indexed_refs
+            .references
+            .iter()
+            .find(|reference| reference.label == Some(primary_label))
+            .expect("primary binding must be declared by the test claim");
+        let assertion =
+            crate::c2pa_cbor::decode(bytes).expect("identity assertion fixture must decode");
         let mut results = ValidationResults::default();
         let mut ctx = IdentityContext {
             manifest: &manifest,
-            manifests: &manifests,
-            manifest_hashes: &manifest_hashes,
             claim: &claim,
-            generation: ClaimGeneration::V2,
             validation_time: datetime!(2025-05-01 0:00 UTC),
             claim_timestamp: None,
             cawg_trust: None,
             cawg_allowed_certs: None,
+            ocsp_verification_time: datetime!(2025-05-01 0:00 UTC),
             document_signing_require_anchor: false,
             tsa_trust: None,
             did_documents: None,
@@ -1472,8 +1555,10 @@ mod tests {
         };
         verify_identity_assertion(
             &mut ctx,
-            bytes,
-            claim_refs,
+            &assertion,
+            &indexed_refs,
+            Some(primary_binding),
+            &[],
             "self#jumbf=/c2pa/test/c2pa.assertions/cawg.identity",
             true,
         );
@@ -1496,6 +1581,29 @@ mod tests {
                 hard_binding_hash,
             ),
         ]
+    }
+    #[test]
+    fn identity_requires_the_primary_hard_binding_when_fallback_validates_content() {
+        let primary = hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
+        let fallback = hashed_uri(
+            "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.multi-asset",
+            0x33,
+        );
+        let claim_refs = vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 0x01),
+            primary.clone(),
+            fallback.clone(),
+        ];
+
+        let primary_identity = identity_assertion_map(vec![primary]);
+        let primary_result =
+            identity_verdict_for_binding(&primary_identity, &claim_refs, "c2pa.hash.data");
+        assert!(!primary_result.has_failure(CAWG_IDENTITY_HARD_BINDING_INCORRECT));
+
+        let fallback_identity = identity_assertion_map(vec![fallback]);
+        let fallback_result =
+            identity_verdict_for_binding(&fallback_identity, &claim_refs, "c2pa.hash.data");
+        assert!(fallback_result.has_failure(CAWG_IDENTITY_HARD_BINDING_MISSING));
     }
 
     #[test]
@@ -1543,17 +1651,33 @@ mod tests {
     fn two_distinct_hard_bindings_still_report_hard_binding_incorrect() {
         let assertion = identity_assertion_map(vec![
             hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22),
-            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x33),
+            hashed_uri(
+                "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.boxes",
+                0x33,
+            ),
         ]);
         let mut claim_refs = binding_claim_refs(0x22);
         claim_refs.push(hashed_uri(
-            "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data",
+            "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.boxes",
             0x33,
         ));
         let results = identity_verdict(&assertion, &claim_refs);
         assert_eq!(
             failure_codes(&results),
             [CAWG_IDENTITY_HARD_BINDING_INCORRECT]
+        );
+    }
+
+    #[test]
+    fn legacy_bmff_reference_cannot_transplant_the_claim_hard_binding() {
+        let legacy = hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.bmff", 0x33);
+        let assertion = identity_assertion_map(vec![legacy.clone()]);
+        let mut claim_refs = binding_claim_refs(0x22);
+        claim_refs.push(legacy);
+        let results = identity_verdict(&assertion, &claim_refs);
+        assert_eq!(
+            failure_codes(&results),
+            [CAWG_IDENTITY_HARD_BINDING_MISSING]
         );
     }
 

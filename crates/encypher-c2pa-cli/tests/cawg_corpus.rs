@@ -7,6 +7,7 @@
 //! audit (needs the commercial engine) intentionally do not port.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -173,7 +174,7 @@ fn success_item<'a>(report: &'a Value, code: &str) -> &'a Value {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(64);
     for byte in Sha256::digest(bytes) {
-        hex.push_str(&format!("{byte:02x}"));
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
     }
     hex
 }
@@ -222,23 +223,27 @@ fn external_corpus_observation_is_stable() {
     }
 }
 
-/// Where the recorded observation matches the normative expectation, hold it.
-/// A divergent vector is a tracked verifier gap (the Python gate xfails it);
-/// the observation test above still pins its current behavior.
+/// Every pinned external vector must satisfy its spec-derived CAWG expectation.
+/// `current_sdk_observation` separately records implementation drift, but a
+/// normative disagreement fails CI rather than being logged and skipped.
 #[test]
 fn external_normative_expectations() {
+    let mut mismatches = Vec::new();
     for vector in vectors(&external_index()) {
-        let expected = required_codes(vector, "normative_expected");
         let observed = cawg_contract_codes(&verify(vector, CawgTrustMode::Allowed, false));
+        let expected = required_codes(vector, "normative_expected");
         if observed != expected {
-            eprintln!(
-                "tracked verifier gap {}: observed={observed:?}, normative={expected:?}",
+            mismatches.push(format!(
+                "{}: observed={observed:?}, normative={expected:?}",
                 vector["id"]
-            );
-            continue;
+            ));
         }
-        assert_eq!(observed, expected, "{}", vector["id"]);
     }
+    assert!(
+        mismatches.is_empty(),
+        "external CAWG normative mismatches:\n{}",
+        mismatches.join("\n")
+    );
 }
 
 /// With `--cawg-document-signing-require-anchor`, a document-signing identity

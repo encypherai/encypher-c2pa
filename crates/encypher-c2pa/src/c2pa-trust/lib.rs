@@ -15,12 +15,13 @@
 
 pub(crate) mod ocsp;
 pub(crate) use ocsp::{
-    evaluate as evaluate_ocsp, evaluate_verified as evaluate_ocsp_verified, OcspEvaluation,
-    OcspStatus,
+    evaluate_verified as evaluate_ocsp_verified, OcspStatus, MAX_OCSP_RESPONSE_BYTES,
 };
 mod timestamp;
 use std::collections::HashSet;
-pub(crate) use timestamp::{verify_timestamp_token, TimestampResult};
+pub(crate) use timestamp::{
+    inspect_timestamp_token, token_from_timestamp_response, verify_timestamp_token, TimestampResult,
+};
 
 use const_oid::ObjectIdentifier;
 use der::{Decode, Encode};
@@ -464,14 +465,18 @@ pub fn validate_chain(
 /// x5chain intermediates followed by the trust anchors).
 ///
 /// A candidate is accepted as the issuer when its subject DN equals `leaf`'s
-/// issuer DN **and** it actually signed `leaf`. Returns the issuer's DER.
+/// issuer DN **and** it actually signed `leaf`. Returns a borrowed issuer DER
+/// slice so callers do not clone a chain merely to evaluate revocation.
 ///
 /// This resolves the authority an OCSP responder must be authorized by: per
 /// RFC 6960 §4.2.2.2 the responder is either the issuer of the certificate in
 /// question or a responder certificate issued by that same issuer. The issuer
 /// is frequently a trust anchor that is *not* carried in the COSE x5chain, so it
 /// must be located across both the chain and the trust list.
-pub fn resolve_issuer(leaf_der: &[u8], candidates: &[Vec<u8>]) -> Option<Vec<u8>> {
+pub fn resolve_issuer<'a>(
+    leaf_der: &[u8],
+    candidates: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<&'a [u8]> {
     let leaf = Certificate::from_der(leaf_der).ok()?;
     let leaf_issuer_dn = leaf.tbs_certificate.issuer.to_der().ok()?;
     for cand_der in candidates {
@@ -482,7 +487,7 @@ pub fn resolve_issuer(leaf_der: &[u8], candidates: &[Vec<u8>]) -> Option<Vec<u8>
             continue;
         };
         if cand_subject_dn == leaf_issuer_dn && verify_signature(&leaf, &cand) {
-            return Some(cand_der.clone());
+            return Some(cand_der);
         }
     }
     None

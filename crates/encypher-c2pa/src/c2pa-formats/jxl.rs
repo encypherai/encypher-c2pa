@@ -157,12 +157,17 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip() {
+    fn embedded_jumb_extracts_exact_parseable_store() {
         let store = dummy_manifest_store();
         let embedded = embed(&tiny_jxl(), &store).unwrap();
+        let extracted = extract(&embedded).unwrap().unwrap();
+        assert_eq!(extracted, store);
         assert_eq!(
-            extract(&embedded).unwrap().as_deref(),
-            Some(store.as_slice())
+            crate::c2pa_core::jumbf::parse_manifest_store(&extracted)
+                .unwrap()
+                .manifests
+                .len(),
+            1
         );
     }
 

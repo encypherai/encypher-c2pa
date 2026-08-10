@@ -320,11 +320,12 @@ pub enum FormatError {
 }
 
 /// Re-export: resolve BMFF box-path exclusions to byte ranges (for bmffHash).
-pub(crate) use bmff::bmff_exclusion_ranges;
+pub(crate) use bmff::{bmff_box_ranges, bmff_exclusion_ranges};
 
-/// Re-export: compute the BMFF V2/V3 (non-merkle) hard-binding hash with the
-/// box-offset markers the C2PA algorithm requires (for bmffHash sign/verify).
-pub(crate) use bmff::bmff_hash;
+/// Re-export: compute BMFF V2/V3 hard-binding hashes.
+pub(crate) use bmff::{
+    bmff_hash, bmff_hash_with_exclusions, BmffDataMap, BmffExclusionMap, BmffSubsetMap,
+};
 
 /// Re-export: streaming, bounded-memory BMFF hash for assets too large to hold
 /// in memory (hours-long video). Byte-identical to [`bmff_hash`].

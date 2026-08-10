@@ -20,7 +20,7 @@ use x509_cert::{
     ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectKeyIdentifier},
     Certificate,
 };
-use x509_tsp::TstInfo;
+use x509_tsp::{TimeStampResp, TstInfo};
 
 use super::{common_name, validate_chain, TrustList, OID_KP_TIME_STAMPING};
 
@@ -34,6 +34,8 @@ const OID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwra
 const OID_EXT_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 const OID_EXT_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+const OID_KP_TIME_STAMPING_OBJ: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap(OID_KP_TIME_STAMPING);
 
 const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 const OID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
@@ -115,6 +117,17 @@ impl HashAlgorithm {
     }
 }
 
+/// Extract the CMS `TimeStampToken` from a legacy RFC 3161 `TimeStampResp`.
+pub fn token_from_timestamp_response(response_der: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let response =
+        TimeStampResp::from_der(response_der).map_err(|_| "timestamp_response_parse_error")?;
+    response
+        .time_stamp_token
+        .ok_or("timestamp_response_token_missing")?
+        .to_der()
+        .map_err(|_| "timestamp_response_token_invalid")
+}
+
 /// Verify an RFC 3161 `TimeStampToken` against the exact C2PA timestamp input.
 ///
 /// `timestamp_input` is the C2PA v2 CounterSignature `ToBeSigned` value, not the
@@ -128,15 +141,24 @@ pub fn verify_timestamp_token(
         .unwrap_or_else(TimestampResult::failure)
 }
 
+/// Validate a timestamp token's structure, imprint, CMS signature, and TSA
+/// leaf profile without deciding whether its certificate chain is trusted.
+pub fn inspect_timestamp_token(
+    token_der: &[u8],
+    timestamp_input: &[u8],
+) -> Result<(), &'static str> {
+    match verify_timestamp_token_inner(token_der, timestamp_input, &TrustList::default()) {
+        Err("no_tsa_anchors") => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Ok(()),
+    }
+}
+
 fn verify_timestamp_token_inner(
     token_der: &[u8],
     timestamp_input: &[u8],
     tsa_trust: &TrustList,
 ) -> Result<TimestampResult, &'static str> {
-    if tsa_trust.anchors.is_empty() {
-        return Err("no_tsa_anchors");
-    }
-
     let content_info = ContentInfo::from_der(token_der).map_err(|_| "timestamp_parse_error")?;
     if content_info.content_type != OID_SIGNED_DATA {
         return Err("timestamp_not_signed_data");
@@ -244,6 +266,9 @@ fn verify_timestamp_token_inner(
         })
         .filter(|der| der != &signer_der)
         .collect();
+    if tsa_trust.anchors.is_empty() {
+        return Err("no_tsa_anchors");
+    }
     let chain = validate_chain(&signer_der, &included_der, tsa_trust, Some(generated_at));
     if !chain.chain_validity_ok {
         return Err("timestamp_tsa_outside_validity");
@@ -310,7 +335,7 @@ fn has_strict_timestamping_eku(cert: &Certificate) -> bool {
         return false;
     }
     ExtendedKeyUsage::from_der(extension.extn_value.as_bytes())
-        .map(|eku| eku.0.len() == 1 && eku.0[0].to_string() == OID_KP_TIME_STAMPING)
+        .map(|eku| eku.0.len() == 1 && eku.0[0] == OID_KP_TIME_STAMPING_OBJ)
         .unwrap_or(false)
 }
 

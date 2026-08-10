@@ -498,12 +498,19 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_single_segment() {
+    fn embedded_single_segment_extracts_exact_parseable_store() {
         let store = dummy_manifest_store();
         let asset = tiny_jpeg();
         let embedded = embed(&asset, &store).unwrap();
-        let got = extract(&embedded).unwrap();
-        assert_eq!(got.as_deref(), Some(store.as_slice()));
+        let extracted = extract(&embedded).unwrap().unwrap();
+        assert_eq!(extracted, store);
+        assert_eq!(
+            crate::c2pa_core::jumbf::parse_manifest_store(&extracted)
+                .unwrap()
+                .manifests
+                .len(),
+            1
+        );
     }
 
     #[test]

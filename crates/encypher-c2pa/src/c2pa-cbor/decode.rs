@@ -2,7 +2,7 @@
 //!
 //! Used for verification: parsing claims/assertions/signatures regardless of
 //! which legacy emitter produced them (indefinite from c2pa-rs, definite from
-//! Pipeline B). Hardened against adversarial input (depth/length bounds).
+//! Pipeline B). Hardened against adversarial input (depth/length/node bounds).
 
 use crate::c2pa_cbor::value::Value;
 use thiserror::Error;
@@ -19,6 +19,9 @@ pub enum DecodeError {
     /// Nesting exceeded the configured maximum depth (DoS guard).
     #[error("maximum nesting depth exceeded")]
     DepthExceeded,
+    /// A CBOR item graph exceeded the decoder-wide allocation budget.
+    #[error("maximum decoded value node count exceeded ({0})")]
+    NodeLimitExceeded(usize),
     /// A declared length exceeded the remaining input (DoS guard).
     #[error("declared length {0} exceeds remaining input")]
     LengthOverflow(u64),
@@ -28,11 +31,49 @@ pub enum DecodeError {
 }
 
 const MAX_DEPTH: usize = 64;
+const MAX_VALUE_NODES: usize = 1 << 20;
+
+/// Input accepted by [`decode`].
+///
+/// Ordinary callers pass a byte slice. Verification code that retains several
+/// decoded values can pass `(bytes, &mut remaining_nodes)` so every decode
+/// spends from one caller-owned allocation budget.
+pub(crate) trait DecodeInput {
+    fn decode(self) -> Result<Value, DecodeError>;
+}
+
+impl<T> DecodeInput for &T
+where
+    T: AsRef<[u8]> + ?Sized,
+{
+    fn decode(self) -> Result<Value, DecodeError> {
+        let mut remaining_nodes = MAX_VALUE_NODES;
+        decode_bounded(self.as_ref(), &mut remaining_nodes)
+    }
+}
+
+impl DecodeInput for (&[u8], &mut usize) {
+    fn decode(self) -> Result<Value, DecodeError> {
+        decode_bounded(self.0, self.1)
+    }
+}
 
 /// Decode a single top-level CBOR item, rejecting trailing bytes.
-pub fn decode(data: &[u8]) -> Result<Value, DecodeError> {
-    let mut p = Parser { data, pos: 0 };
-    let v = p.item(0)?;
+pub(crate) fn decode(input: impl DecodeInput) -> Result<Value, DecodeError> {
+    DecodeInput::decode(input)
+}
+
+fn decode_bounded(data: &[u8], remaining_nodes: &mut usize) -> Result<Value, DecodeError> {
+    let node_limit = *remaining_nodes;
+    let mut p = Parser {
+        data,
+        pos: 0,
+        remaining_nodes: node_limit,
+        node_limit,
+    };
+    let parsed = p.item(0);
+    *remaining_nodes = p.remaining_nodes;
+    let v = parsed?;
     if p.pos != data.len() {
         return Err(DecodeError::Trailing(p.pos));
     }
@@ -41,10 +82,15 @@ pub fn decode(data: &[u8]) -> Result<Value, DecodeError> {
 
 /// Decode a single top-level CBOR item from the start of `data`, returning the
 /// value and the number of bytes consumed. Trailing bytes are permitted (the
-/// caller decides what they mean — e.g. the zero padding C2PA's auxiliary
+/// caller decides what they mean, for example the zero padding C2PA's auxiliary
 /// BMFF `merkle` boxes carry after their CBOR payload).
 pub fn decode_prefix(data: &[u8]) -> Result<(Value, usize), DecodeError> {
-    let mut p = Parser { data, pos: 0 };
+    let mut p = Parser {
+        data,
+        pos: 0,
+        remaining_nodes: MAX_VALUE_NODES,
+        node_limit: MAX_VALUE_NODES,
+    };
     let v = p.item(0)?;
     Ok((v, p.pos))
 }
@@ -52,6 +98,8 @@ pub fn decode_prefix(data: &[u8]) -> Result<(Value, usize), DecodeError> {
 struct Parser<'a> {
     data: &'a [u8],
     pos: usize,
+    remaining_nodes: usize,
+    node_limit: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -102,6 +150,10 @@ impl<'a> Parser<'a> {
         if depth > MAX_DEPTH {
             return Err(DecodeError::DepthExceeded);
         }
+        if self.remaining_nodes == 0 {
+            return Err(DecodeError::NodeLimitExceeded(self.node_limit));
+        }
+        self.remaining_nodes -= 1;
         let head = self.byte()?;
         let mt = head >> 5;
         let ai = head & 0x1f;
@@ -277,5 +329,31 @@ mod tests {
         let mut data = vec![0x9f; MAX_DEPTH + 5];
         data.extend(std::iter::repeat_n(0xff, MAX_DEPTH + 5));
         assert_eq!(decode(&data), Err(DecodeError::DepthExceeded));
+    }
+
+    #[test]
+    fn collection_node_guard_rejects_small_token_amplification() {
+        let declared = u32::try_from(MAX_VALUE_NODES).unwrap();
+        let mut data = Vec::with_capacity(5 + MAX_VALUE_NODES);
+        data.push(0x9a);
+        data.extend_from_slice(&declared.to_be_bytes());
+        data.extend(std::iter::repeat_n(0xf6, MAX_VALUE_NODES));
+
+        assert_eq!(
+            decode(&data),
+            Err(DecodeError::NodeLimitExceeded(MAX_VALUE_NODES))
+        );
+    }
+    #[test]
+    fn caller_owned_node_budget_is_shared_across_decodes() {
+        let value = [0x82, 0xf6, 0xf6]; // array plus two nulls = three nodes
+        let mut remaining = 5;
+        assert!(decode((value.as_slice(), &mut remaining)).is_ok());
+        assert_eq!(remaining, 2);
+        assert_eq!(
+            decode((value.as_slice(), &mut remaining)),
+            Err(DecodeError::NodeLimitExceeded(2))
+        );
+        assert_eq!(remaining, 0);
     }
 }

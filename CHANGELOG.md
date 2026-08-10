@@ -2,12 +2,21 @@
 
 All notable changes to this project are recorded here.
 
-## Unreleased
+## 1.0.0-rc.12 - 2026-08-10
 
 - Consolidated the six implementation crates (`encypher-c2pa-cbor`, `-core`, `-crypto`, `-formats`, `-trust`, `-validate`) into private modules of `encypher-c2pa`. They had no consumer, accounted for 81% of the public API surface, and publishing them is what forced manifest construction to hide behind a Cargo feature. Their existing versions through `1.0.0-rc.11` remain on crates.io and are not yanked; older releases of `encypher-c2pa` exact-pin them. New releases publish only `encypher-c2pa` and `encypher-c2pa-cli`.
 - Removed manifest construction and container writing from the published API. Claim building, JUMBF and manifest-store assembly, `embed_manifest`, `strip_manifest`, and `build_manifest_carrier` now live in private modules and compile only under `cfg(test)`. The SDK reads and verifies C2PA manifests and exposes no way to produce one. The `test-support` feature introduced for this purpose is gone; module privacy replaces it.
 - Breaking change for anyone depending on the six implementation crates directly. There are no known consumers. Use `encypher-c2pa`.
 - Added `scripts/check-public-surface.mjs`, a CI gate that enumerates every publicly reachable item and diffs it against the reviewed `public-surface.txt`. Any newly public item fails the build until a reviewer adds it deliberately, so a renamed writer cannot slip through the way a name-based check would. The gate runs on every pull request and before every release.
+- Added pinned, offline c2pa-rs core and CAWG interoperability corpora with fixed source commits, checksums, normative expected status codes, and CI enforcement.
+- Fixed legacy ES256 verification, claim-v1 RFC 3161 timestamp handling, manifest-carrier exclusion normalization, and ingredient active-manifest and claim-signature authentication.
+- Completed BMFF hard-binding verification across the full nested box tree: `c2pa.hash.bmff` V2 and V3 exclusion maps now resolve container boxes at any depth, apply each map's `data` match conditions and `subset` byte ranges, and read full-box version and flags, under bounded tree depth and box counts.
+- Enforced the mandatory C2PA 2.x actions structure on standard manifests: a created actions assertion must be present, its first action must be `c2pa.created` or `c2pa.opened` (a `c2pa.created` action requires a `digitalSourceType`), and exactly one such inception action may appear and only in first position; otherwise verification reports `assertion.action.malformed`.
+- Hardened untrusted-input verification: claim-v1 timestamps no longer anchor signer-certificate validity, positive stapled OCSP status now requires a trusted signing timestamp and the C2PA `producedAt` freshness window, ambiguous JUMBF labels fail closed, assertion and reference collections are bounded and indexed, and BMFF exclusion and Merkle chunk processing use bounded work and checked arithmetic.
+- Completed C2PA 2.4 assertion integrity checks: undeclared assertions fail closed, canonical JUMBF paths and cardinalities are enforced, one primary hard binding is separated from the `c2pa.hash.multi-asset` fallback, and the operative binding is carried into CAWG identity validation.
+- Added full bounded multi-asset validation for byte-range and BMFF-box locators with part-specific data, BMFF, and general-box hash methods. Ingredient, assertion, CBOR, JUMBF, BMFF Merkle, x5chain, CAWG identity, and embedded OCSP processing now have aggregate work, allocation, count, and byte limits.
+- Made embedded revocation evaluation store-wide and order-independent, with verified revocation taking precedence over good status, exact BasicOCSPResponse typing, bounded responder selection, and the C2PA embedded-evidence timing policy.
+- Added a release gate that requires the Git tag, workspace package version, and CLI's exact library dependency to match before any crate, wheel, or browser package is published.
 
 ## 1.0.0-rc.11 - 2026-08-08
 

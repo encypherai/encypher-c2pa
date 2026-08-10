@@ -6,10 +6,8 @@
 //! copying payloads; only the manifest bytes are materialized.
 
 #[cfg(test)]
-use crate::c2pa_formats::util::iso_box_header;
-#[cfg(test)]
-use crate::c2pa_formats::util::{be_u16, be_u24, be_u32, be_u64};
-use crate::c2pa_formats::util::{walk_iso_boxes, IsoBox};
+use crate::c2pa_formats::util::{be_u16, be_u24, iso_box_header};
+use crate::c2pa_formats::util::{be_u32, be_u64, walk_iso_boxes, IsoBox};
 use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Bmff;
@@ -43,6 +41,16 @@ fn is_c2pa_uuid(data: &[u8], b: &IsoBox) -> bool {
         && data[b.payload_start..b.payload_start + 16] == crate::c2pa_formats::C2PA_BMFF_UUID
 }
 
+fn xpath_box_types(xpaths: &[String]) -> Vec<[u8; 4]> {
+    xpaths
+        .iter()
+        .filter_map(|p| {
+            let b = p.trim_start_matches('/').as_bytes();
+            (b.len() == 4).then_some([b[0], b[1], b[2], b[3]])
+        })
+        .collect()
+}
+
 /// Extract the manifest store from the C2PA `uuid` box payload.
 ///
 /// Per the C2PA BMFF spec the `uuid` box payload is not the bare JUMBF: after
@@ -68,67 +76,108 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 
 /// Locate the top-level `jumb` manifest store within a C2PA `uuid` box payload
 /// (the bytes after the 16-byte UUID), skipping the version/flags + label +
-/// reserved prefix. Returns the slice from the `jumb` box's LBox onward.
+/// reserved prefix. Returns exactly the declared `jumb` box span, excluding
+/// any following carrier bytes.
 pub(crate) fn jumbf_from_uuid_payload(payload: &[u8]) -> Option<&[u8]> {
     // The manifest store is a `jumb` superbox: a 4-byte big-endian LBox
-    // immediately precedes the ASCII `jumb` TBox. Find the first such header.
+    // immediately precedes the ASCII `jumb` TBox. Find the first complete
+    // such box and honor its ordinary, extended, or size-to-end declaration.
     let mut i = 0usize;
     while i + 8 <= payload.len() {
         if &payload[i + 4..i + 8] == b"jumb" {
-            // sanity: LBox must be plausible (>= 8 and within payload, or
-            // extended size marker 1, or 0 = to-end).
             let lbox =
                 u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
-            let plausible = lbox == 0
-                || lbox == 1
-                || (lbox as usize >= 8 && i + lbox as usize <= payload.len());
-            if plausible {
-                return Some(&payload[i..]);
+            let (header_len, declared_len) = match lbox {
+                0 => (8, Some(payload.len() - i)),
+                1 => (
+                    16,
+                    payload.get(i + 8..i + 16).and_then(|bytes| {
+                        let bytes: [u8; 8] = bytes.try_into().ok()?;
+                        usize::try_from(u64::from_be_bytes(bytes)).ok()
+                    }),
+                ),
+                len => (8, Some(len as usize)),
+            };
+            if let Some(declared_len) = declared_len {
+                if declared_len >= header_len {
+                    if let Some(end) = i
+                        .checked_add(declared_len)
+                        .filter(|&end| end <= payload.len())
+                    {
+                        return Some(&payload[i..end]);
+                    }
+                }
             }
         }
         i += 1;
     }
     None
 }
-/// Resolve `c2pa.hash.bmff*` box-path exclusions to byte ranges for hashing.
+/// Resolve `c2pa.hash.bmff.v2` / `c2pa.hash.bmff.v3` box-path exclusions to byte ranges for hashing.
 ///
-/// BMFF hash assertions exclude whole top-level boxes by xpath (e.g. `/ftyp`,
-/// `/mfra`, and the C2PA `/uuid` box). This walks the top-level boxes and
-/// returns the `(start, length)` span of every box whose type matches one of
-/// the excluded paths. For `/uuid` only the C2PA manifest box is excluded
-/// (other `uuid` boxes are content and must be hashed). Ranges are returned
-/// sorted by start offset.
+/// This is the range-only form of the BMFF exclusion planner: it accepts xpath
+/// strings, applies the same nested/indexed path matcher used by
+/// [`bmff_hash_with_exclusions`], and returns sorted `(start, length)` spans.
+/// The legacy `/uuid` shorthand matches only the C2PA UUID carrier in both
+/// this range API and the full exclusion-map hashing path.
 pub fn bmff_exclusion_ranges(
     data: &[u8],
     xpaths: &[String],
 ) -> Result<Vec<(usize, usize)>, FormatError> {
-    // Map each xpath like "/ftyp" to its 4-byte box type.
-    let wanted: Vec<[u8; 4]> = xpaths
+    let exclusions: Vec<BmffExclusionMap> = xpaths
         .iter()
-        .filter_map(|p| {
-            let name = p.trim_start_matches('/');
-            let b = name.as_bytes();
-            if b.len() == 4 {
-                Some([b[0], b[1], b[2], b[3]])
-            } else {
-                None
-            }
+        .map(|xpath| BmffExclusionMap {
+            xpath: xpath.clone(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version: None,
+            flags: None,
+            exact: true,
         })
         .collect();
-    let mut ranges = Vec::new();
-    walk_iso_boxes(data, FMT, |b| {
-        let matches_path = wanted.contains(&b.box_type);
-        if !matches_path {
-            return;
-        }
-        // For `uuid`, only exclude the C2PA manifest box.
-        if &b.box_type == TYPE_UUID && !is_c2pa_uuid(data, b) {
-            return;
-        }
-        ranges.push((b.start, b.end - b.start));
-    })?;
-    ranges.sort_by_key(|(s, _)| *s);
-    Ok(ranges)
+    let BmffHashPlan { ranges, .. } = normalized_bmff_ranges(data, &exclusions)?;
+    Ok(ranges
+        .into_iter()
+        .map(|(start, end)| (start, end - start))
+        .collect())
+}
+/// Resolve multiple BMFF box paths against one parsed box tree.
+///
+/// Results preserve input-path order and box order. Each inner vector contains
+/// every full-box `(start, length)` span matched by that path. Aggregate
+/// path-by-box matching is rejected before scanning when it exceeds the shared
+/// verifier work bound.
+pub fn bmff_box_ranges(
+    data: &[u8],
+    xpaths: &[&str],
+) -> Result<Vec<Vec<(usize, usize)>>, FormatError> {
+    if xpaths.len() > MAX_BMFF_EXCLUSION_RANGES {
+        return Err(bmff_exclusion_matching_exceeds_bounds());
+    }
+    let parsed_xpaths = xpaths
+        .iter()
+        .map(|xpath| parse_bmff_xpath(xpath))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut boxes = Vec::new();
+    collect_hash_boxes(data, 0, data.len(), &[], 0, true, &mut boxes)?;
+    if parsed_xpaths
+        .len()
+        .checked_mul(boxes.len())
+        .is_none_or(|checks| checks > MAX_BMFF_EXCLUSION_MATCH_CHECKS)
+    {
+        return Err(bmff_exclusion_matching_exceeds_bounds());
+    }
+    Ok(parsed_xpaths
+        .iter()
+        .map(|xpath| {
+            boxes
+                .iter()
+                .filter(|candidate| path_matches(&candidate.path, xpath))
+                .map(|candidate| (candidate.start, candidate.end - candidate.start))
+                .collect()
+        })
+        .collect())
 }
 
 /// A parsed auxiliary C2PA `'merkle'` box from a fragment (or flat fMP4) file.
@@ -138,7 +187,7 @@ pub fn bmff_exclusion_ranges(
 /// CBOR (`bmff-merkle-map`): which Merkle tree the fragment belongs to
 /// (`uniqueId` + `localId`), its zero-based leaf index (`location`), and the
 /// proof hashes needed to climb from the leaf to the row stored in the
-/// manifest's `c2pa.hash.bmff*` assertion (leaf-most first). Trailing zero
+/// manifest's BMFF v2/v3 hash assertion (leaf-most first). Trailing zero
 /// padding after the CBOR (used to keep aux boxes fixed-size) is tolerated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmffMerkleBox {
@@ -164,8 +213,12 @@ pub fn bmff_merkle_boxes(
     data: &[u8],
 ) -> Result<Vec<Result<BmffMerkleBox, &'static str>>, FormatError> {
     let mut found = Vec::new();
+    let mut too_many = false;
+    let mut limit_error = None;
+    let mut total_proof_hashes = 0usize;
+    let mut total_proof_bytes = 0usize;
     walk_iso_boxes(data, FMT, |b| {
-        if !is_c2pa_uuid(data, b) {
+        if too_many || limit_error.is_some() || !is_c2pa_uuid(data, b) {
             return;
         }
         // Payload after the 16-byte UUID: 4-byte version+flags, then the
@@ -181,16 +234,58 @@ pub fn bmff_merkle_boxes(
         if &after_vf[..nul] != b"merkle" {
             return;
         }
+        if found.len() >= MAX_BMFF_MERKLE_BOXES {
+            too_many = true;
+            return;
+        }
         let cbor = &after_vf[nul + 1..];
-        found.push(parse_merkle_map(cbor));
+        let parsed = parse_merkle_map(cbor);
+        if let Ok(merkle_box) = &parsed {
+            let next_hashes = total_proof_hashes.checked_add(merkle_box.proof.len());
+            let next_bytes = merkle_box
+                .proof
+                .iter()
+                .try_fold(total_proof_bytes, |total, hash| {
+                    total.checked_add(hash.len())
+                });
+            let (Some(next_hashes), Some(next_bytes)) = (next_hashes, next_bytes) else {
+                limit_error = Some("BMFF merkle proof data exceeds verifier bound");
+                return;
+            };
+            if next_hashes > MAX_BMFF_MERKLE_TOTAL_PROOF_HASHES
+                || next_bytes > MAX_BMFF_MERKLE_TOTAL_PROOF_BYTES
+            {
+                limit_error = Some("BMFF merkle proof data exceeds verifier bound");
+                return;
+            }
+            total_proof_hashes = next_hashes;
+            total_proof_bytes = next_bytes;
+        }
+        found.push(parsed);
     })?;
+    if let Some(detail) = limit_error {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail,
+        });
+    }
+    if too_many {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "BMFF merkle box count exceeds verifier bound",
+        });
+    }
     Ok(found)
 }
 
 /// Decode one `bmff-merkle-map` from the aux box payload (padding tolerated).
 fn parse_merkle_map(cbor: &[u8]) -> Result<BmffMerkleBox, &'static str> {
     use crate::c2pa_cbor::{decode_prefix, Value};
-    let (v, _consumed) = decode_prefix(cbor).map_err(|_| "merkle box CBOR invalid")?;
+    let bounded = &cbor[..cbor.len().min(MAX_BMFF_MERKLE_ENCODED_BYTES)];
+    let (v, consumed) = decode_prefix(bounded).map_err(|_| "merkle box CBOR invalid")?;
+    if cbor[consumed..].iter().any(|byte| *byte != 0) {
+        return Err("merkle box has non-zero bytes after CBOR");
+    }
     let int = |k: &str| match v.get(k) {
         Some(Value::Integer(n)) => Some(*n),
         _ => None,
@@ -203,10 +298,20 @@ fn parse_merkle_map(cbor: &[u8]) -> Result<BmffMerkleBox, &'static str> {
     let proof = match v.get("hashes") {
         None => Vec::new(),
         Some(Value::Array(items)) => {
+            if items.len() > MAX_BMFF_MERKLE_PROOF_HASHES {
+                return Err("merkle box proof exceeds verifier bound");
+            }
             let mut out = Vec::with_capacity(items.len());
+            let mut proof_bytes = 0usize;
             for it in items {
                 match it {
-                    Value::Bytes(h) => out.push(h.clone()),
+                    Value::Bytes(h) => {
+                        proof_bytes = proof_bytes
+                            .checked_add(h.len())
+                            .filter(|bytes| *bytes <= MAX_BMFF_MERKLE_PROOF_BYTES)
+                            .ok_or("merkle box proof bytes exceed verifier bound")?;
+                        out.push(h.clone());
+                    }
                     _ => return Err("merkle box hashes entry is not a byte string"),
                 }
             }
@@ -230,19 +335,19 @@ fn parse_merkle_map(cbor: &[u8]) -> Result<BmffMerkleBox, &'static str> {
 pub fn bmff_fragment_leaf_hash(
     fragment: &[u8],
     alg: &str,
-    xpaths: &[String],
+    exclusions: &[BmffExclusionMap],
 ) -> Result<Vec<u8>, FormatError> {
     let mut hasher = BmffHasher::new(alg).ok_or(FormatError::UnsupportedVariant {
         format: FMT,
         detail: "unsupported bmff hash algorithm",
     })?;
-    let excl = bmff_exclusion_ranges(fragment, xpaths)?;
+    let BmffHashPlan { ranges, .. } = normalized_bmff_ranges(fragment, exclusions)?;
     let mut pos = 0usize;
-    for (start, len) in excl {
+    for (start, end) in ranges {
         if start > pos {
             hasher.update(&fragment[pos..start]);
         }
-        pos = pos.max(start + len);
+        pos = pos.max(end);
     }
     if pos < fragment.len() {
         hasher.update(&fragment[pos..]);
@@ -255,12 +360,601 @@ pub fn bmff_fragment_leaf_hash(
 /// zero-based `mdat` index per spec A.5.4.2).
 pub fn bmff_mdat_payloads(data: &[u8]) -> Result<Vec<(usize, usize)>, FormatError> {
     let mut spans = Vec::new();
+    let mut too_many = false;
     walk_iso_boxes(data, FMT, |b| {
         if &b.box_type == b"mdat" {
-            spans.push((b.payload_start, b.end - b.payload_start));
+            if spans.len() >= MAX_BMFF_HASH_BOXES {
+                too_many = true;
+            } else {
+                spans.push((b.payload_start, b.end - b.payload_start));
+            }
         }
     })?;
+    if too_many {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "BMFF mdat count exceeds verifier bound",
+        });
+    }
     Ok(spans)
+}
+
+/// One byte sequence that must match at a box-relative offset before a BMFF
+/// exclusion applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BmffDataMap {
+    pub offset: usize,
+    pub value: Vec<u8>,
+}
+
+/// A box-relative byte range excluded instead of the whole matched box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BmffSubsetMap {
+    pub offset: usize,
+    /// Zero means from `offset` through the end of the box.
+    pub length: usize,
+}
+
+/// Normalized BMFF v2/v3 exclusion map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BmffExclusionMap {
+    pub xpath: String,
+    pub length: Option<usize>,
+    pub data: Vec<BmffDataMap>,
+    pub subset: Vec<BmffSubsetMap>,
+    pub version: Option<u8>,
+    pub flags: Option<u32>,
+    pub exact: bool,
+}
+
+const HASH_CONTAINER_TYPES: [&[u8; 4]; 15] = [
+    b"moov", b"trak", b"mdia", b"minf", b"stbl", b"moof", b"traf", b"edts", b"udta", b"dinf",
+    b"tref", b"treg", b"mvex", b"mfra", b"schi",
+];
+const MAX_BMFF_HASH_DEPTH: usize = 16;
+const MAX_BMFF_XPATH_BYTES: usize = 1024;
+const MAX_BMFF_HASH_BOXES: usize = 100_000;
+const MAX_BMFF_EXCLUSION_MATCH_CHECKS: usize = 1_000_000;
+const MAX_BMFF_EXCLUSION_RANGES: usize = 100_000;
+const MAX_BMFF_EXCLUSION_DATA_QUALIFIERS: usize = 4_096;
+const MAX_BMFF_EXCLUSION_DATA_BYTES: usize = 1 << 20;
+const MAX_BMFF_EXCLUSION_SUBSETS: usize = 4_096;
+const MAX_BMFF_MERKLE_BOXES: usize = 100_000;
+const MAX_BMFF_MERKLE_ENCODED_BYTES: usize = 16 << 10;
+const MAX_BMFF_MERKLE_PROOF_HASHES: usize = 64;
+const MAX_BMFF_MERKLE_PROOF_BYTES: usize = 4096;
+const MAX_BMFF_MERKLE_TOTAL_PROOF_HASHES: usize = 262_144;
+const MAX_BMFF_MERKLE_TOTAL_PROOF_BYTES: usize = 16 << 20;
+
+#[derive(Debug, Clone, Copy)]
+struct HashPathComponent {
+    box_type: [u8; 4],
+    occurrence: usize,
+    c2pa_uuid: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BmffXpathComponent {
+    box_type: [u8; 4],
+    occurrence: Option<usize>,
+    c2pa_uuid: bool,
+}
+
+#[derive(Debug)]
+struct HashBox {
+    path: Vec<HashPathComponent>,
+    start: usize,
+    end: usize,
+    version: Option<u8>,
+    flags: Option<u32>,
+    top_level: bool,
+}
+
+struct BmffRootContribution {
+    start: usize,
+    included_spans: Vec<(usize, usize)>,
+}
+
+struct BmffHashPlan {
+    ranges: Vec<(usize, usize)>,
+    roots: Vec<BmffRootContribution>,
+}
+
+fn is_full_box(box_type: &[u8; 4]) -> bool {
+    matches!(
+        box_type,
+        b"pdin"
+            | b"mvhd"
+            | b"tkhd"
+            | b"mdhd"
+            | b"hdlr"
+            | b"nmhd"
+            | b"elng"
+            | b"stsd"
+            | b"stdp"
+            | b"stts"
+            | b"ctts"
+            | b"cslg"
+            | b"stss"
+            | b"stsh"
+            | b"elst"
+            | b"dref"
+            | b"stsz"
+            | b"stz2"
+            | b"stsc"
+            | b"stco"
+            | b"co64"
+            | b"padb"
+            | b"subs"
+            | b"saiz"
+            | b"saio"
+            | b"mehd"
+            | b"trex"
+            | b"mfhd"
+            | b"tfhd"
+            | b"trun"
+            | b"tfra"
+            | b"mfro"
+            | b"tfdt"
+            | b"leva"
+            | b"trep"
+            | b"assp"
+            | b"sbgp"
+            | b"sgpd"
+            | b"csgp"
+            | b"cprt"
+            | b"tsel"
+            | b"kind"
+            | b"meta"
+            | b"xml "
+            | b"bxml"
+            | b"iloc"
+            | b"pitm"
+            | b"ipro"
+            | b"infe"
+            | b"iinf"
+            | b"iref"
+            | b"ipma"
+            | b"schm"
+            | b"fiin"
+            | b"fpar"
+            | b"fecr"
+            | b"gitn"
+            | b"fire"
+            | b"stri"
+            | b"stsg"
+            | b"stvi"
+            | b"csch"
+            | b"sidx"
+            | b"ssix"
+            | b"prft"
+            | b"srpp"
+            | b"vmhd"
+            | b"smhd"
+            | b"srat"
+            | b"chnl"
+            | b"dmix"
+            | b"txtC"
+            | b"mime"
+            | b"uri "
+            | b"uriI"
+            | b"hmhd"
+            | b"sthd"
+            | b"vvhd"
+            | b"medc"
+    )
+}
+
+fn meta_has_full_box_header(data: &[u8], payload_start: usize, end: usize) -> bool {
+    if payload_start + 8 > end {
+        return true;
+    }
+    let child_size = be_u32(data, payload_start).unwrap_or(0) as usize;
+    !(child_size >= 8 && payload_start.saturating_add(child_size) <= end)
+}
+
+fn invalid_bmff_xpath() -> FormatError {
+    FormatError::InvalidStructure {
+        format: FMT,
+        detail: "BMFF exclusion xpath is invalid",
+    }
+}
+
+fn bmff_exclusion_matching_exceeds_bounds() -> FormatError {
+    FormatError::InvalidStructure {
+        format: FMT,
+        detail: "BMFF exclusion matching exceeds verifier bounds",
+    }
+}
+
+fn is_c2pa_type_selector(selector: &str) -> bool {
+    matches!(
+        selector.trim(),
+        "type=c2pa"
+            | "type='c2pa'"
+            | "type=\"c2pa\""
+            | "@type=c2pa"
+            | "@type='c2pa'"
+            | "@type=\"c2pa\""
+    )
+}
+
+fn parse_bmff_xpath_component(component: &str) -> Result<BmffXpathComponent, FormatError> {
+    let bytes = component.as_bytes();
+    if bytes.len() < 4 || !bytes[..4].iter().all(|b| b.is_ascii()) {
+        return Err(invalid_bmff_xpath());
+    }
+    if bytes.len() > 4 && !component.is_ascii() {
+        return Err(invalid_bmff_xpath());
+    }
+
+    let mut box_type = [0u8; 4];
+    box_type.copy_from_slice(&bytes[..4]);
+    let mut occurrence = None;
+    let mut c2pa_uuid = false;
+    let mut rest = &component[4..];
+    while !rest.is_empty() {
+        if !rest.starts_with('[') {
+            return Err(invalid_bmff_xpath());
+        }
+        let close = rest.find(']').ok_or_else(invalid_bmff_xpath)?;
+        let selector = rest[1..close].trim();
+        if selector.is_empty() {
+            return Err(invalid_bmff_xpath());
+        }
+        if selector.bytes().all(|b| b.is_ascii_digit()) {
+            let index = selector
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index > 0)
+                .ok_or_else(invalid_bmff_xpath)?;
+            if occurrence.replace(index).is_some() {
+                return Err(invalid_bmff_xpath());
+            }
+        } else if is_c2pa_type_selector(selector) {
+            if c2pa_uuid {
+                return Err(invalid_bmff_xpath());
+            }
+            c2pa_uuid = true;
+        } else {
+            return Err(invalid_bmff_xpath());
+        }
+        rest = &rest[close + 1..];
+    }
+    if c2pa_uuid && box_type != *TYPE_UUID {
+        return Err(invalid_bmff_xpath());
+    }
+    Ok(BmffXpathComponent {
+        box_type,
+        occurrence,
+        c2pa_uuid,
+    })
+}
+
+fn parse_bmff_xpath(xpath: &str) -> Result<Vec<BmffXpathComponent>, FormatError> {
+    if !xpath.starts_with('/') || xpath.len() > MAX_BMFF_XPATH_BYTES {
+        return Err(invalid_bmff_xpath());
+    }
+    let mut components = Vec::new();
+    for component in xpath.split('/').skip(1) {
+        if component.is_empty() {
+            return Err(invalid_bmff_xpath());
+        }
+        if components.len() >= MAX_BMFF_HASH_DEPTH {
+            return Err(invalid_bmff_xpath());
+        }
+        components.push(parse_bmff_xpath_component(component)?);
+    }
+    if components.is_empty() {
+        return Err(invalid_bmff_xpath());
+    }
+    if components.len() == 1
+        && components[0].box_type == *TYPE_UUID
+        && components[0].occurrence.is_none()
+        && !components[0].c2pa_uuid
+    {
+        components[0].c2pa_uuid = true;
+    }
+    Ok(components)
+}
+
+fn path_matches(path: &[HashPathComponent], xpath: &[BmffXpathComponent]) -> bool {
+    path.len() == xpath.len()
+        && path.iter().zip(xpath).all(|(actual, expected)| {
+            actual.box_type == expected.box_type
+                && expected
+                    .occurrence
+                    .is_none_or(|occurrence| occurrence == actual.occurrence)
+                && (!expected.c2pa_uuid || actual.c2pa_uuid)
+        })
+}
+
+fn collect_hash_boxes(
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    parent_path: &[HashPathComponent],
+    depth: usize,
+    top_level: bool,
+    out: &mut Vec<HashBox>,
+) -> Result<(), FormatError> {
+    if depth >= MAX_BMFF_HASH_DEPTH || out.len() > MAX_BMFF_HASH_BOXES {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "BMFF box tree exceeds verifier bounds",
+        });
+    }
+    let mut boxes = Vec::new();
+    let mut too_many_boxes = false;
+    walk_boxes_range(data, lo, hi, &mut |b| {
+        if out.len() + boxes.len() >= MAX_BMFF_HASH_BOXES {
+            too_many_boxes = true;
+        } else {
+            boxes.push((b.box_type, b.start, b.payload_start, b.end));
+        }
+    })?;
+    if too_many_boxes {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "BMFF box count exceeds verifier bound",
+        });
+    }
+    let mut occurrences = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for (box_type, start, payload_start, end) in boxes {
+        let b = IsoBox {
+            box_type,
+            start,
+            payload_start,
+            end,
+        };
+        if out.len() >= MAX_BMFF_HASH_BOXES {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "BMFF box count exceeds verifier bound",
+            });
+        }
+        let occurrence = occurrences.entry(b.box_type).or_insert(0);
+        *occurrence += 1;
+        let c2pa_uuid = &b.box_type == TYPE_UUID && is_c2pa_uuid(data, &b);
+        let mut path = Vec::with_capacity(parent_path.len() + 1);
+        path.extend_from_slice(parent_path);
+        path.push(HashPathComponent {
+            box_type: b.box_type,
+            occurrence: *occurrence,
+            c2pa_uuid,
+        });
+        let ext_start = if c2pa_uuid {
+            b.payload_start.checked_add(16)
+        } else if is_full_box(&b.box_type) {
+            Some(b.payload_start)
+        } else {
+            None
+        };
+        let (version, flags) = ext_start
+            .filter(|start| start + 4 <= b.end)
+            .map(|start| {
+                (
+                    Some(data[start]),
+                    Some(u32::from_be_bytes([
+                        0,
+                        data[start + 1],
+                        data[start + 2],
+                        data[start + 3],
+                    ])),
+                )
+            })
+            .unwrap_or((None, None));
+        out.push(HashBox {
+            path: path.clone(),
+            start: b.start,
+            end: b.end,
+            version,
+            flags,
+            top_level,
+        });
+
+        let child_start = if &b.box_type == b"meta" {
+            if meta_has_full_box_header(data, b.payload_start, b.end) {
+                b.payload_start + 4
+            } else {
+                b.payload_start
+            }
+        } else if HASH_CONTAINER_TYPES.contains(&&b.box_type) {
+            b.payload_start
+        } else {
+            continue;
+        };
+        if child_start < b.end {
+            collect_hash_boxes(data, child_start, b.end, &path, depth + 1, false, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn exclusion_matches(
+    data: &[u8],
+    b: &HashBox,
+    exclusion: &BmffExclusionMap,
+    xpath: &[BmffXpathComponent],
+) -> bool {
+    if !path_matches(&b.path, xpath)
+        || exclusion
+            .length
+            .is_some_and(|length| length != b.end - b.start)
+    {
+        return false;
+    }
+    if exclusion
+        .version
+        .is_some_and(|expected| b.version != Some(expected))
+    {
+        return false;
+    }
+    if let Some(expected) = exclusion.flags {
+        let Some(actual) = b.flags else {
+            return false;
+        };
+        if (exclusion.exact && expected != actual)
+            || (!exclusion.exact && (actual & expected) != expected)
+        {
+            return false;
+        }
+    }
+    exclusion.data.iter().all(|item| {
+        b.start
+            .checked_add(item.offset)
+            .and_then(|start| start.checked_add(item.value.len()).map(|end| (start, end)))
+            .is_some_and(|(start, end)| end <= b.end && data[start..end] == item.value)
+    })
+}
+
+fn normalized_bmff_ranges(
+    data: &[u8],
+    exclusions: &[BmffExclusionMap],
+) -> Result<BmffHashPlan, FormatError> {
+    let mut boxes = Vec::new();
+    collect_hash_boxes(data, 0, data.len(), &[], 0, true, &mut boxes)?;
+    let parsed_exclusions = exclusions
+        .iter()
+        .map(|exclusion| parse_bmff_xpath(&exclusion.xpath).map(|xpath| (exclusion, xpath)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_data_qualifiers = exclusions
+        .iter()
+        .try_fold(0usize, |total, exclusion| {
+            total.checked_add(exclusion.data.len())
+        })
+        .ok_or_else(bmff_exclusion_matching_exceeds_bounds)?;
+    let total_subset_entries = exclusions
+        .iter()
+        .try_fold(0usize, |total, exclusion| {
+            total.checked_add(exclusion.subset.len())
+        })
+        .ok_or_else(bmff_exclusion_matching_exceeds_bounds)?;
+    let total_data_bytes = exclusions
+        .iter()
+        .flat_map(|exclusion| &exclusion.data)
+        .try_fold(0usize, |total, qualifier| {
+            total.checked_add(qualifier.value.len())
+        })
+        .ok_or_else(bmff_exclusion_matching_exceeds_bounds)?;
+    if total_data_qualifiers > MAX_BMFF_EXCLUSION_DATA_QUALIFIERS
+        || total_data_bytes > MAX_BMFF_EXCLUSION_DATA_BYTES
+        || total_subset_entries > MAX_BMFF_EXCLUSION_SUBSETS
+    {
+        return Err(bmff_exclusion_matching_exceeds_bounds());
+    }
+    let work_exceeds = |units: usize| {
+        units > 0
+            && boxes
+                .len()
+                .checked_mul(units)
+                .is_none_or(|checks| checks > MAX_BMFF_EXCLUSION_MATCH_CHECKS)
+    };
+    if parsed_exclusions
+        .len()
+        .checked_mul(boxes.len())
+        .is_none_or(|checks| checks > MAX_BMFF_EXCLUSION_MATCH_CHECKS)
+        || work_exceeds(total_data_qualifiers)
+        || work_exceeds(total_data_bytes)
+        || work_exceeds(total_subset_entries)
+    {
+        return Err(bmff_exclusion_matching_exceeds_bounds());
+    }
+    let mut ranges = Vec::new();
+    for (exclusion, xpath) in &parsed_exclusions {
+        for b in boxes
+            .iter()
+            .filter(|candidate| exclusion_matches(data, candidate, exclusion, xpath))
+        {
+            if exclusion.subset.is_empty() {
+                if ranges.len() >= MAX_BMFF_EXCLUSION_RANGES {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "BMFF exclusion range count exceeds verifier bound",
+                    });
+                }
+                ranges.push((b.start, b.end));
+                continue;
+            }
+            let box_len = b.end - b.start;
+            for subset in &exclusion.subset {
+                if subset.offset >= box_len {
+                    continue;
+                }
+                let start = b.start + subset.offset;
+                let end = if subset.length == 0 {
+                    b.end
+                } else {
+                    start
+                        .checked_add(subset.length)
+                        .map_or(b.end, |end| end.min(b.end))
+                };
+                if start == end {
+                    continue;
+                }
+                if ranges.len() >= MAX_BMFF_EXCLUSION_RANGES {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "BMFF exclusion range count exceeds verifier bound",
+                    });
+                }
+                ranges.push((start, end));
+            }
+        }
+    }
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if end > data.len() || start > end {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "BMFF exclusion lies outside the asset",
+            });
+        }
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else if start != end {
+            merged.push((start, end));
+        }
+    }
+
+    let mut roots = Vec::new();
+    let mut range_cursor = 0usize;
+    for b in boxes.iter().filter(|b| b.top_level) {
+        while range_cursor < merged.len() && merged[range_cursor].1 <= b.start {
+            range_cursor += 1;
+        }
+        let mut included_spans = Vec::new();
+        let mut pos = b.start;
+        let mut i = range_cursor;
+        while i < merged.len() && merged[i].0 < b.end {
+            let (excluded_start, excluded_end) = merged[i];
+            if pos < excluded_start {
+                included_spans.push((pos, excluded_start.min(b.end)));
+            }
+            if excluded_end > pos {
+                pos = excluded_end.min(b.end);
+            }
+            if pos >= b.end {
+                break;
+            }
+            i += 1;
+        }
+        if pos < b.end {
+            included_spans.push((pos, b.end));
+        }
+        if !included_spans.is_empty() {
+            roots.push(BmffRootContribution {
+                start: b.start,
+                included_spans,
+            });
+        }
+    }
+
+    Ok(BmffHashPlan {
+        ranges: merged,
+        roots,
+    })
 }
 
 /// A multi-algorithm SHA hasher used for BMFF hard-binding computation.
@@ -305,7 +999,7 @@ impl BmffHasher {
     }
 }
 
-/// Compute a `c2pa.hash.bmff` (V2/V3, non-merkle) hard-binding hash over `data`.
+/// Compute a `c2pa.hash.bmff.v2` / `c2pa.hash.bmff.v3` hard-binding hash over `data`.
 ///
 /// The BMFF hash is **not** a plain "whole file minus excluded byte ranges"
 /// digest. Per the C2PA BMFF-based hash algorithm (V2 and V3), the asset is
@@ -328,14 +1022,7 @@ pub fn bmff_hash(data: &[u8], alg: &str, xpaths: &[String]) -> Result<Vec<u8>, F
         format: FMT,
         detail: "unsupported bmff hash algorithm",
     })?;
-    // Map each xpath like "/ftyp" to its 4-byte box type.
-    let wanted: Vec<[u8; 4]> = xpaths
-        .iter()
-        .filter_map(|p| {
-            let b = p.trim_start_matches('/').as_bytes();
-            (b.len() == 4).then(|| [b[0], b[1], b[2], b[3]])
-        })
-        .collect();
+    let wanted = xpath_box_types(xpaths);
     walk_iso_boxes(data, FMT, |b| {
         // A box is fully excluded when its type matches an exclusion path; for
         // `/uuid` only the C2PA manifest box matches (the assertion's data/offset
@@ -357,6 +1044,27 @@ pub fn bmff_hash(data: &[u8], alg: &str, xpaths: &[String]) -> Result<Vec<u8>, F
 /// hashed without loading the whole file.
 const STREAM_CHUNK: usize = 1 << 20;
 
+/// Compute a BMFF V2/V3 hash using the assertion's complete exclusion maps,
+/// including nested xpaths, match qualifiers, and partial-box subsets.
+pub fn bmff_hash_with_exclusions(
+    data: &[u8],
+    alg: &str,
+    exclusions: &[BmffExclusionMap],
+) -> Result<Vec<u8>, FormatError> {
+    let mut hasher = BmffHasher::new(alg).ok_or(FormatError::UnsupportedVariant {
+        format: FMT,
+        detail: "unsupported bmff hash algorithm",
+    })?;
+    let BmffHashPlan { roots, .. } = normalized_bmff_ranges(data, exclusions)?;
+    for root in roots {
+        hasher.update(&(root.start as u64).to_be_bytes());
+        for (start, end) in root.included_spans {
+            hasher.update(&data[start..end]);
+        }
+    }
+    Ok(hasher.finalize())
+}
+
 /// Streaming equivalent of [`bmff_hash`] for assets too large to hold in memory.
 ///
 /// Reads only top-level box headers (and the first 24 bytes of each `uuid` box,
@@ -377,13 +1085,7 @@ pub fn bmff_hash_reader<R: std::io::Read + std::io::Seek>(
         format: FMT,
         detail: "unsupported bmff hash algorithm",
     })?;
-    let wanted: Vec<[u8; 4]> = xpaths
-        .iter()
-        .filter_map(|p| {
-            let b = p.trim_start_matches('/').as_bytes();
-            (b.len() == 4).then(|| [b[0], b[1], b[2], b[3]])
-        })
-        .collect();
+    let wanted = xpath_box_types(xpaths);
 
     let total_len = reader
         .seek(SeekFrom::End(0))
@@ -588,7 +1290,6 @@ enum OffsetBoxKind {
 
 /// Walk boxes within `data[lo..hi)` (same header rules as `walk_iso_boxes`:
 /// 32-bit sizes, the 64-bit `largesize` escape, and size 0 = to-end-of-range).
-#[cfg(test)]
 fn walk_boxes_range(
     data: &[u8],
     lo: usize,
@@ -924,6 +1625,40 @@ mod tests {
     }
 
     #[test]
+    fn extraction_excludes_bytes_after_declared_jumbf_span() {
+        let ordinary = dummy_manifest_store();
+        let extended_size = u64::try_from(ordinary.len() + 8).unwrap();
+        let mut extended = Vec::with_capacity(ordinary.len() + 8);
+        extended.extend_from_slice(&1u32.to_be_bytes());
+        extended.extend_from_slice(&ordinary[4..8]);
+        extended.extend_from_slice(&extended_size.to_be_bytes());
+        extended.extend_from_slice(&ordinary[8..]);
+
+        for store in [ordinary, extended] {
+            let mut carrier_payload = Vec::new();
+            carrier_payload.extend_from_slice(&crate::c2pa_formats::C2PA_BMFF_UUID);
+            carrier_payload.extend_from_slice(&[0u8; 4]);
+            carrier_payload.extend_from_slice(b"manifest\0");
+            carrier_payload.extend_from_slice(&[0u8; 8]);
+            carrier_payload.extend_from_slice(&store);
+            carrier_payload.extend_from_slice(b"carrier padding");
+
+            let mut embedded = tiny_mp4();
+            embedded.extend_from_slice(&iso_box(TYPE_UUID, &carrier_payload));
+            let extracted = extract(&embedded).unwrap().unwrap();
+
+            assert_eq!(extracted, store);
+            assert_eq!(
+                crate::c2pa_core::jumbf::parse_manifest_store(&extracted)
+                    .unwrap()
+                    .manifests
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn re_embed_replaces_manifest() {
         let first_store = dummy_manifest_store();
         let second_assertion =
@@ -1006,6 +1741,46 @@ mod tests {
         // the digest differs from the ftyp-excluded one.
         let all = bmff_hash(&asset, "sha256", &[]).unwrap();
         assert_ne!(all, actual);
+    }
+
+    #[test]
+    fn partial_root_subset_still_hashes_offset_marker() {
+        use sha2::{Digest, Sha256};
+
+        let asset = tiny_mp4();
+        let mut mdat = (0usize, 0usize);
+        walk_iso_boxes(&asset, FMT, |b| {
+            if &b.box_type == b"mdat" {
+                mdat = (b.start, b.end);
+            }
+        })
+        .unwrap();
+        let exclusions = [BmffExclusionMap {
+            xpath: "/mdat".into(),
+            length: None,
+            data: Vec::new(),
+            subset: vec![BmffSubsetMap {
+                offset: 0,
+                length: 1,
+            }],
+            version: None,
+            flags: None,
+            exact: true,
+        }];
+
+        let actual = bmff_hash_with_exclusions(&asset, "sha256", &exclusions).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(0u64.to_be_bytes());
+        expected.update(&asset[..mdat.0]);
+        expected.update((mdat.0 as u64).to_be_bytes());
+        expected.update(&asset[mdat.0 + 1..mdat.1]);
+        assert_eq!(actual.as_slice(), &expected.finalize()[..]);
+
+        let mut without_marker = Sha256::new();
+        without_marker.update(0u64.to_be_bytes());
+        without_marker.update(&asset[..mdat.0]);
+        without_marker.update(&asset[mdat.0 + 1..mdat.1]);
+        assert_ne!(actual.as_slice(), &without_marker.finalize()[..]);
     }
 
     #[test]
@@ -1171,6 +1946,51 @@ mod tests {
         (v, target)
     }
 
+    #[test]
+    fn bmff_hash_honors_nested_match_and_subset_maps() {
+        let (asset, _) = tiny_stco_mp4();
+        let stco_type = asset.windows(4).position(|w| w == b"stco").unwrap();
+        let stco_start = stco_type - 4;
+        let exclusions = [BmffExclusionMap {
+            xpath: "/moov/trak/mdia/minf/stbl/stco".to_string(),
+            length: Some(20),
+            data: vec![BmffDataMap {
+                offset: 4,
+                value: b"stco".to_vec(),
+            }],
+            subset: vec![BmffSubsetMap {
+                offset: 16,
+                length: 4,
+            }],
+            version: Some(0),
+            flags: Some(0),
+            exact: true,
+        }];
+        let expected = bmff_hash_with_exclusions(&asset, "sha256", &exclusions).unwrap();
+
+        let mut changed_excluded_bytes = asset.clone();
+        changed_excluded_bytes[stco_start + 16..stco_start + 20]
+            .copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        assert_eq!(
+            bmff_hash_with_exclusions(&changed_excluded_bytes, "sha256", &exclusions).unwrap(),
+            expected,
+            "bytes selected by a subset map must not affect the digest"
+        );
+        assert_ne!(
+            bmff_hash(&changed_excluded_bytes, "sha256", &[]).unwrap(),
+            bmff_hash(&asset, "sha256", &[]).unwrap(),
+            "the same edit must affect an unqualified whole-file BMFF hash"
+        );
+
+        let mut wrong_match = exclusions[0].clone();
+        wrong_match.data[0].value = b"nope".to_vec();
+        assert_ne!(
+            bmff_hash_with_exclusions(&changed_excluded_bytes, "sha256", &[wrong_match]).unwrap(),
+            expected,
+            "a failed data qualifier must leave the box included"
+        );
+    }
+
     /// Read the single stco entry (layout from `tiny_stco_mp4`).
     fn stco_entry(data: &[u8]) -> u32 {
         let stco = data
@@ -1229,5 +2049,358 @@ mod tests {
             7,
             "idat-relative extent offset must not move"
         );
+    }
+
+    #[test]
+    fn indexed_and_unindexed_xpaths_match_sibling_occurrences() {
+        let first_pssh = iso_box(b"pssh", b"first");
+        let second_pssh = iso_box(b"pssh", b"second");
+        let first_moov = iso_box(b"moov", &first_pssh);
+        let second_moov = iso_box(b"moov", &second_pssh);
+        let mut asset = first_moov.clone();
+        asset.extend_from_slice(&second_moov);
+
+        let first_start = 8;
+        let second_start = first_moov.len() + 8;
+        assert_eq!(
+            bmff_exclusion_ranges(&asset, &["/moov[1]/pssh".into()]).unwrap(),
+            vec![(first_start, first_pssh.len())]
+        );
+        assert_eq!(
+            bmff_exclusion_ranges(&asset, &["/moov/pssh".into()]).unwrap(),
+            vec![
+                (first_start, first_pssh.len()),
+                (second_start, second_pssh.len())
+            ]
+        );
+
+        let mut siblings = first_pssh.clone();
+        siblings.extend_from_slice(&second_pssh);
+        let one_moov = iso_box(b"moov", &siblings);
+        assert_eq!(
+            bmff_exclusion_ranges(&one_moov, &["/moov/pssh[2]".into()]).unwrap(),
+            vec![(8 + first_pssh.len(), second_pssh.len())]
+        );
+    }
+
+    #[test]
+    fn batch_box_ranges_preserve_path_order_and_share_work_bound() {
+        let first = iso_box(b"free", b"first");
+        let second = iso_box(b"free", b"second");
+        let mut asset = first.clone();
+        asset.extend_from_slice(&second);
+        assert_eq!(
+            bmff_box_ranges(&asset, &["/free[2]", "/free[1]"]).unwrap(),
+            vec![vec![(first.len(), second.len())], vec![(0, first.len())],]
+        );
+
+        let excessive = vec!["/free"; MAX_BMFF_EXCLUSION_MATCH_CHECKS / 2 + 1];
+        assert!(matches!(
+            bmff_box_ranges(&asset, &excessive),
+            Err(FormatError::InvalidStructure {
+                detail: "BMFF exclusion matching exceeds verifier bounds",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_uuid_xpath_normalizes_to_the_c2pa_carrier() {
+        let mut foreign_payload = vec![0xA5; 16];
+        foreign_payload.extend_from_slice(b"foreign");
+        let foreign = iso_box(b"uuid", &foreign_payload);
+        let c2pa = build_c2pa_uuid_box(&[]);
+        let c2pa_start = foreign.len();
+        let mut asset = foreign;
+        asset.extend_from_slice(&c2pa);
+
+        assert_eq!(
+            bmff_exclusion_ranges(&asset, &["/uuid".into()]).unwrap(),
+            vec![(c2pa_start, c2pa.len())]
+        );
+        let full_map = BmffExclusionMap {
+            xpath: "/uuid".into(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version: None,
+            flags: None,
+            exact: true,
+        };
+        assert_eq!(
+            normalized_bmff_ranges(&asset, &[full_map]).unwrap().ranges,
+            vec![(c2pa_start, c2pa_start + c2pa.len())]
+        );
+    }
+
+    #[test]
+    fn fragment_leaf_hash_applies_qualified_nested_subset_exclusions() {
+        let trun = iso_box(b"trun", &[0, 0, 0, 0, 1, 2, 3, 4]);
+        let traf = iso_box(b"traf", &trun);
+        let fragment = iso_box(b"moof", &traf);
+        let trun_type = fragment
+            .windows(4)
+            .position(|bytes| bytes == b"trun")
+            .unwrap();
+        let trun_start = trun_type - 4;
+        let exclusions = [BmffExclusionMap {
+            xpath: "/moof/traf/trun".into(),
+            length: Some(trun.len()),
+            data: vec![BmffDataMap {
+                offset: 4,
+                value: b"trun".to_vec(),
+            }],
+            subset: vec![BmffSubsetMap {
+                offset: 14,
+                length: 2,
+            }],
+            version: Some(0),
+            flags: Some(0),
+            exact: true,
+        }];
+        let expected = bmff_fragment_leaf_hash(&fragment, "sha256", &exclusions).unwrap();
+
+        let mut excluded_change = fragment.clone();
+        excluded_change[trun_start + 14..trun_start + 16].copy_from_slice(&[9, 9]);
+        assert_eq!(
+            bmff_fragment_leaf_hash(&excluded_change, "sha256", &exclusions).unwrap(),
+            expected
+        );
+
+        let mut included_change = fragment;
+        included_change[trun_start + 13] ^= 0xFF;
+        assert_ne!(
+            bmff_fragment_leaf_hash(&included_change, "sha256", &exclusions).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn subset_exclusions_clip_to_the_matched_box() {
+        let asset = iso_box(b"free", &[1, 2, 3, 4]);
+        let clipped = BmffExclusionMap {
+            xpath: "/free".into(),
+            length: None,
+            data: Vec::new(),
+            subset: vec![BmffSubsetMap {
+                offset: asset.len() - 1,
+                length: 4,
+            }],
+            version: None,
+            flags: None,
+            exact: true,
+        };
+        assert_eq!(
+            normalized_bmff_ranges(&asset, &[clipped.clone()])
+                .unwrap()
+                .ranges,
+            vec![(asset.len() - 1, asset.len())]
+        );
+
+        let expected = bmff_hash_with_exclusions(&asset, "sha256", &[clipped.clone()]).unwrap();
+        let mut changed_excluded_tail = asset.clone();
+        *changed_excluded_tail.last_mut().unwrap() ^= 0xFF;
+        assert_eq!(
+            bmff_hash_with_exclusions(&changed_excluded_tail, "sha256", &[clipped]).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn subset_start_beyond_the_matched_box_is_empty() {
+        let asset = iso_box(b"free", &[1, 2, 3, 4]);
+        let beyond = BmffExclusionMap {
+            xpath: "/free".into(),
+            length: None,
+            data: Vec::new(),
+            subset: vec![BmffSubsetMap {
+                offset: asset.len() + 1,
+                length: 0,
+            }],
+            version: None,
+            flags: None,
+            exact: true,
+        };
+        assert!(normalized_bmff_ranges(&asset, &[beyond.clone()])
+            .unwrap()
+            .ranges
+            .is_empty());
+        assert_eq!(
+            bmff_hash_with_exclusions(&asset, "sha256", &[beyond]).unwrap(),
+            bmff_hash_with_exclusions(&asset, "sha256", &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn qualifier_and_subset_matching_work_is_globally_bounded() {
+        let mut asset = Vec::new();
+        for _ in 0..300 {
+            asset.extend_from_slice(&iso_box(b"free", &[]));
+        }
+        let base = BmffExclusionMap {
+            xpath: "/free".into(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version: None,
+            flags: None,
+            exact: true,
+        };
+        let mut qualified = base.clone();
+        qualified.data = vec![
+            BmffDataMap {
+                offset: 8,
+                value: Vec::new(),
+            };
+            4_000
+        ];
+        let mut byte_heavy = base.clone();
+        byte_heavy.data = vec![BmffDataMap {
+            offset: 8,
+            value: vec![0; 4_000],
+        }];
+        let mut subset = base;
+        subset.subset = vec![
+            BmffSubsetMap {
+                offset: 8,
+                length: 0,
+            };
+            4_000
+        ];
+        for exclusion in [qualified, byte_heavy, subset] {
+            assert!(matches!(
+                normalized_bmff_ranges(&asset, &[exclusion]),
+                Err(FormatError::InvalidStructure {
+                    detail: "BMFF exclusion matching exceeds verifier bounds",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn auxiliary_merkle_proof_count_and_bytes_are_bounded() {
+        use crate::c2pa_cbor::{encode, Profile, Value};
+
+        let encode_map = |hashes: Vec<Value>| {
+            let map = Value::Map(vec![
+                (Value::Text("uniqueId".into()), Value::Integer(1)),
+                (Value::Text("localId".into()), Value::Integer(2)),
+                (Value::Text("location".into()), Value::Integer(0)),
+                (Value::Text("hashes".into()), Value::Array(hashes)),
+            ]);
+            encode(&map, Profile::LegacyPipelineBDefinite).unwrap()
+        };
+        let too_many = encode_map(vec![
+            Value::Bytes(vec![0; 32]);
+            MAX_BMFF_MERKLE_PROOF_HASHES + 1
+        ]);
+        assert_eq!(
+            parse_merkle_map(&too_many),
+            Err("merkle box proof exceeds verifier bound")
+        );
+
+        let too_many_bytes = encode_map(vec![
+            Value::Bytes(vec![0; 65]);
+            MAX_BMFF_MERKLE_PROOF_HASHES
+        ]);
+        assert_eq!(
+            parse_merkle_map(&too_many_bytes),
+            Err("merkle box proof bytes exceed verifier bound")
+        );
+    }
+
+    #[test]
+    fn auxiliary_merkle_cbor_decode_is_bounded() {
+        use crate::c2pa_cbor::{encode, Profile, Value};
+
+        let oversized = Value::Map(vec![
+            (Value::Text("uniqueId".into()), Value::Integer(1)),
+            (Value::Text("localId".into()), Value::Integer(2)),
+            (Value::Text("location".into()), Value::Integer(0)),
+            (
+                Value::Text("hashes".into()),
+                Value::Array(vec![Value::Integer(0); MAX_BMFF_MERKLE_ENCODED_BYTES]),
+            ),
+        ]);
+        let cbor = encode(&oversized, Profile::LegacyPipelineBDefinite).unwrap();
+        assert_eq!(parse_merkle_map(&cbor), Err("merkle box CBOR invalid"));
+    }
+
+    #[test]
+    fn auxiliary_merkle_total_proof_count_is_bounded() {
+        use crate::c2pa_cbor::{encode, Profile, Value};
+
+        let map = Value::Map(vec![
+            (Value::Text("uniqueId".into()), Value::Integer(1)),
+            (Value::Text("localId".into()), Value::Integer(2)),
+            (Value::Text("location".into()), Value::Integer(0)),
+            (
+                Value::Text("hashes".into()),
+                Value::Array(vec![Value::Bytes(Vec::new()); MAX_BMFF_MERKLE_PROOF_HASHES]),
+            ),
+        ]);
+        let cbor = encode(&map, Profile::LegacyPipelineBDefinite).unwrap();
+        let mut payload = crate::c2pa_formats::C2PA_BMFF_UUID.to_vec();
+        payload.extend_from_slice(&[0; 4]);
+        payload.extend_from_slice(b"merkle\0");
+        payload.extend_from_slice(&cbor);
+        let one_box = iso_box(b"uuid", &payload);
+        let box_count = MAX_BMFF_MERKLE_TOTAL_PROOF_HASHES / MAX_BMFF_MERKLE_PROOF_HASHES + 1;
+        let mut asset = Vec::with_capacity(one_box.len() * box_count);
+        for _ in 0..box_count {
+            asset.extend_from_slice(&one_box);
+        }
+        assert!(matches!(
+            bmff_merkle_boxes(&asset),
+            Err(FormatError::InvalidStructure {
+                detail: "BMFF merkle proof data exceeds verifier bound",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn auxiliary_merkle_box_count_is_bounded() {
+        let mut payload = crate::c2pa_formats::C2PA_BMFF_UUID.to_vec();
+        payload.extend_from_slice(&[0; 4]);
+        payload.extend_from_slice(b"merkle\0");
+        let one_box = iso_box(b"uuid", &payload);
+        let mut asset = Vec::with_capacity(one_box.len() * (MAX_BMFF_MERKLE_BOXES + 1));
+        for _ in 0..=MAX_BMFF_MERKLE_BOXES {
+            asset.extend_from_slice(&one_box);
+        }
+        assert!(matches!(
+            bmff_merkle_boxes(&asset),
+            Err(FormatError::InvalidStructure {
+                detail: "BMFF merkle box count exceeds verifier bound",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn exclusion_box_cartesian_product_is_bounded() {
+        let mut asset = Vec::new();
+        for _ in 0..1_001 {
+            asset.extend_from_slice(&iso_box(b"free", &[]));
+        }
+        let exclusion = BmffExclusionMap {
+            xpath: "/free".into(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version: None,
+            flags: None,
+            exact: false,
+        };
+        let exclusions = vec![exclusion; 1_000];
+        assert!(matches!(
+            normalized_bmff_ranges(&asset, &exclusions),
+            Err(FormatError::InvalidStructure {
+                detail: "BMFF exclusion matching exceeds verifier bounds",
+                ..
+            })
+        ));
     }
 }

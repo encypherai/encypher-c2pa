@@ -46,7 +46,7 @@ Tagged releases publish the packages below. For an unreleased checkout, use [Bui
 ### CLI
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.0-rc.11
+cargo install encypher-c2pa-cli --version 1.0.0-rc.12
 encypher-c2pa verify composition.mp4
 encypher-c2pa verify composition.mp4 --json
 encypher-c2pa formats
@@ -58,7 +58,7 @@ Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupport
 
 ```toml
 [dependencies]
-encypher-c2pa = "=1.0.0-rc.11"
+encypher-c2pa = "=1.0.0-rc.12"
 ```
 
 ```rust
@@ -380,7 +380,7 @@ Report security issues through [GitHub private vulnerability reporting](https://
 
 ## Project status
 
-The implementation is independent of `c2pa-rs` at runtime. Interoperability tests use C2PA-conformant fixtures and public validation status codes. The format-specific code uses the public [`c2pa-text`](https://crates.io/crates/c2pa-text) crate for standardized structured-text carriers.
+The implementation is independent of `c2pa-rs` at runtime; it shares no verification code with any other implementation. Interoperability is checked offline against pinned third-party vectors, core C2PA media from `contentauth/c2pa-rs` and the CAWG identity corpus, with expected outcomes derived from C2PA 2.4 status-code semantics rather than another implementation's output. The format-specific code uses the public [`c2pa-text`](https://crates.io/crates/c2pa-text) crate for standardized structured-text carriers.
 
 C2PA and Content Credentials are standards and marks of their respective owners. This project is not a certification claim.
 

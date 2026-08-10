@@ -334,6 +334,7 @@ mod tests {
     fn manifest_with_label(label: Option<&str>) -> ParsedManifest<'static> {
         ParsedManifest {
             label: "urn:c2pa:test".into(),
+            manifest_jumbf: &[],
             assertions: Vec::new(),
             assertion_jumbf: Vec::new(),
             claim_cbor: None,
