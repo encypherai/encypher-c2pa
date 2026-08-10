@@ -361,6 +361,54 @@ completion gate: STOPPED at cycle 10, not cleared - see 'Why the loop stopped'
 
 ## Open
 
+- **RELEASE BLOCKER: the verifier disagrees with an independent implementation
+  on third-party reference assets, in both directions.** Found by running the
+  verifier against `c2pa-rs`'s own fixture corpus - assets produced by Adobe/CAI,
+  not by us - and cross-checking with the independent Python conformance suite
+  (`/home/agentdesk/code/c2pa-conformance-suite`, its own JUMBF/CBOR parser and
+  extractors, 150 predicates).
+
+  Of 21 comparable signed assets: 9 agree, 3 we reject and it accepts, 9 we
+  accept and it rejects. Trust failures are excluded from the comparison because
+  we report `trust: not_evaluated` by design.
+
+  We reject, it accepts - `video1.mp4`, `legacy.mp4`, `dashinit.mp4`. We report
+  `assertion.bmffHash.mismatch`; it extracts the BMFF JUMBF, parses the
+  manifests, reports `claimSignature.validated` and no hash failure. All three
+  are BMFF video.
+
+  We accept, it rejects - `CA.jpg`, `CACA.jpg`, `CACAE-uri-CA.jpg`, `CA_ct.jpg`,
+  `CIE-sig-CA.jpg`, `boxhash.jpg`, `legacy_ingredient_hash.jpg`, `ocsp.jpg`,
+  `ocsp_with_assertion.jpg`. It reports `assertion.dataHash.mismatch` plus
+  `claimSignature.mismatch`; we report integrity valid and hard binding match.
+
+  The suite is not simply broken, which was the first explanation I reached for
+  and then disproved: it passes `C.jpg` (the canonical valid asset) with no
+  non-trust failures and fails `XCA.jpg` (deliberately tampered) on exactly
+  those two predicates. It discriminates. So on the same bytes, one of the two
+  implementations is wrong, and I cannot say which without a third opinion.
+
+  This is the gap the self-signed fixtures hid. `tests/fixtures/` contains two
+  assets, both Encypher-generated and Encypher-verified, so nothing in CI ever
+  put the verifier in front of media it did not produce. Zero panics and zero
+  hangs across 53 reference assets, which is worth something, but agreement is
+  the property that matters for a verifier and it has never been measured until
+  now.
+
+  Next step is a tiebreak against `c2pa-rs` itself, which is the reference
+  implementation and is on disk at `/home/agentdesk/code/c2pa-rs-fork`. Until
+  that resolves, do not publish: a verifier that rejects valid video or accepts
+  invalid images is worse than no verifier, and this branch's whole argument is
+  that claims should match what the evidence supports.
+
+- **README:383 overstates interoperability.** It says "Interoperability tests
+  use C2PA-conformant fixtures and public validation status codes." The core
+  fixtures are Encypher-generated. The genuinely external material is 34 CAWG
+  vectors pinned from `contentauth/c2pa-rs` at `d7f13829`, and `corpus.json`
+  describes itself as "not an official conformance corpus". Narrow the claim or
+  earn it.
+
+
 - **There is no kernel drift gate, and there never was.** I searched the
   monorepo: `scripts/check_kernel_drift.py` does not exist, and the only drift
   gates in `.github/workflows` cover the Next.js build and WordPress plugin
