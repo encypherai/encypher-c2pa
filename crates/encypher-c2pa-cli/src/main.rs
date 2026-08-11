@@ -8,8 +8,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
-    mime_from_path, set_telemetry_enabled, supported_mime_types, telemetry_preference, verify_file,
-    verify_with_options, Error, TelemetryOptions, VerifyOptions,
+    detached_manifest_evidence, mime_from_path, set_telemetry_enabled, supported_mime_types,
+    telemetry_preference, verify_file, verify_with_options, Error, TelemetryOptions, VerifyOptions,
 };
 
 mod encypher_api;
@@ -80,12 +80,13 @@ enum Command {
         telemetry_endpoint: Option<String>,
         #[arg(long)]
         json: bool,
-        /// Query the Encypher provenance API after local verification. Sends
-        /// only a SHA-256 digest of the asset bytes; the response renders as a
-        /// separate section and never changes the local verdict or exit code.
+        /// Ask Encypher to validate the raw C2PA manifest and match its signed
+        /// registry. Requires `ENCYPHER_API_KEY` or `ENCYPHER_API_TOKEN`.
+        /// Sends the file SHA-256 plus the embedded manifest carrier, not the
+        /// media bytes. The response never changes the local verdict or exit code.
         #[arg(long)]
         encypher_api: bool,
-        /// Override the Encypher provenance lookup endpoint (self-hosting, tests).
+        /// Override the Encypher verification endpoint (self-hosting, tests).
         #[arg(long, value_name = "URL", hide = true)]
         encypher_api_endpoint: Option<String>,
     },
@@ -181,10 +182,21 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 };
                 let bytes = read_path_asset(&asset)?;
                 let report = verify_with_options(&bytes, &mime, &options)?;
-                let digest = encypher_api::content_sha256(&bytes);
+                let evidence = detached_manifest_evidence(&bytes, &mime)?;
                 let endpoint = encypher_api_endpoint
                     .unwrap_or_else(|| encypher_api::DEFAULT_ENDPOINT.to_string());
-                (report, Some(encypher_api::lookup(&endpoint, &digest)))
+                let api_key = std::env::var("ENCYPHER_API_KEY")
+                    .or_else(|_| std::env::var("ENCYPHER_API_TOKEN"))
+                    .ok();
+                let result = encypher_api::verify(
+                    &endpoint,
+                    api_key.as_deref(),
+                    &bytes,
+                    &mime,
+                    &report,
+                    evidence.as_ref(),
+                );
+                (report, Some(result))
             } else {
                 (verify_file(&asset, mime.as_deref(), &options)?, None)
             };

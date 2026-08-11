@@ -1,11 +1,9 @@
-//! Contract guards for the opt-in `--encypher-api` provenance lookup.
+//! Contract guards for opt-in `--encypher-api` server verification.
 //!
 //! These pin the privacy and stability contract: default verification makes no
-//! network call, the flag attaches Encypher's record verbatim without touching
-//! any local report field or the exit code, and every failure mode degrades to
-//! an error object plus a stderr warning rather than a changed verdict or a
-//! panic. The mock server is a bare std `TcpListener` returning canned JSON,
-//! mirroring the SDK's telemetry transport test.
+//! network call, the flag sends the exact file digest plus detached C2PA
+//! evidence but never the media payload, and failures never alter the local
+//! report or exit code. The mock server is a bare std `TcpListener`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -15,6 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -68,8 +67,8 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     request
 }
 
-/// Bind a one-shot lookup server returning `status_line` + `body`. Returns the
-/// endpoint URL and a receiver carrying the raw request bytes it observed.
+/// Bind a one-shot verification server returning `status_line` + `body`.
+/// Returns the endpoint URL and the raw request observed by the server.
 fn spawn_lookup_server(
     status_line: &'static str,
     body: &'static str,
@@ -112,8 +111,8 @@ fn no_flag_makes_no_lookup_and_omits_key() {
 }
 
 #[test]
-fn flag_attaches_verbatim_response_and_sends_only_the_digest() {
-    let body = r#"{"success":true,"found":true,"document_id":"doc_test123","verification_url":"https://verify.example/doc_test123","organization_name":"Test Org","media_type":"video","signed_at":"2026-08-07T00:00:00Z"}"#;
+fn flag_attaches_verbatim_response_without_uploading_media() {
+    let body = r#"{"protocol":"encypher-local-verification/1","asset":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size_bytes":22022,"mime":"video/mp4"},"server_manifest_validation":{"status":"valid","signature_valid":true,"trust":"trusted"},"local_claims":{"manifest_store_match":true,"binding_match":true,"signature_match":true,"trust_match":true},"encypher_registry":{"artifact_match":true,"binding_match":true,"document_id":"doc_test123","verification_url":"https://verify.example/doc_test123","media_type":"video","basis":"client_computed_sha256_and_server_validated_binding"}}"#;
     let (endpoint, requests) = spawn_lookup_server("HTTP/1.1 200 OK", body);
 
     let output = run_verify(&[
@@ -126,30 +125,38 @@ fn flag_attaches_verbatim_response_and_sends_only_the_digest() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let value: Value = serde_json::from_str(&stdout).unwrap();
     let expected: Value = serde_json::from_str(body).unwrap();
-    assert_eq!(
-        value.get("encypher_api"),
-        Some(&expected),
-        "encypher_api must be the verbatim parsed response:\n{stdout}"
-    );
+    assert_eq!(value.get("encypher_api"), Some(&expected));
 
     let sent = request_body(&requests.recv_timeout(Duration::from_secs(4)).unwrap());
-    let digest = sent["content_sha256"].as_str().expect("digest present");
-    let expected_digest = hex::encode(Sha256::digest(std::fs::read(signed_fixture()).unwrap()));
+    let expected_bytes = std::fs::read(signed_fixture()).unwrap();
+    assert_eq!(sent["protocol"], "encypher-local-verification/1");
     assert_eq!(
-        digest, expected_digest,
-        "digest must be SHA-256 of exact bytes"
+        sent["asset"]["sha256"],
+        hex::encode(Sha256::digest(&expected_bytes))
     );
-    assert!(
-        digest
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-        "digest must be 64 lowercase hex chars: {digest}"
-    );
+    assert_eq!(sent["asset"]["size_bytes"], expected_bytes.len());
+    assert_eq!(sent["asset"]["mime"], "video/mp4");
     assert_eq!(
-        sent.as_object().unwrap().len(),
-        1,
-        "only the content_sha256 digest leaves the machine: {sent}"
+        sent["local_validation"]["binding"]["algorithm"],
+        "c2pa.hash.bmff.v3"
     );
+    assert_eq!(sent["local_validation"]["binding"]["status"], "match");
+    let manifest = BASE64
+        .decode(sent["c2pa"]["manifest_store_b64"].as_str().unwrap())
+        .unwrap();
+    let carrier = BASE64
+        .decode(sent["c2pa"]["carrier_b64"].as_str().unwrap())
+        .unwrap();
+    assert!(!manifest.is_empty());
+    assert!(carrier.len() < expected_bytes.len());
+    assert_eq!(
+        sent["c2pa"]["manifest_store_sha256"],
+        hex::encode(Sha256::digest(&manifest))
+    );
+    assert!(sent.get("file").is_none());
+    assert!(sent.get("media").is_none());
+    assert!(sent.get("signed_file_b64").is_none());
+    assert!(sent.get("asset_b64").is_none());
 }
 
 #[test]
@@ -224,7 +231,7 @@ fn flag_preserves_local_report_bytes_and_exit_code_in_json() {
 
 #[test]
 fn human_mode_appends_trailing_block_without_disturbing_local_lines() {
-    let body = r#"{"success":true,"found":true,"verification_url":"https://verify.example/doc_test123","organization_name":"Test Org","media_type":"video"}"#;
+    let body = r#"{"protocol":"encypher-local-verification/1","asset":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size_bytes":22022,"mime":"video/mp4"},"server_manifest_validation":{"status":"valid","signature_valid":true,"trust":"trusted"},"local_claims":{"manifest_store_match":true,"binding_match":true,"signature_match":true,"trust_match":true},"encypher_registry":{"artifact_match":true,"binding_match":true,"document_id":"doc_test123","verification_url":"https://verify.example/doc_test123","media_type":"video","basis":"client_computed_sha256_and_server_validated_binding"}}"#;
     let (endpoint, _requests) = spawn_lookup_server("HTTP/1.1 200 OK", body);
     let flagged = run_verify(&["--encypher-api", "--encypher-api-endpoint", &endpoint]);
     let plain = run_verify(&[]);
@@ -239,7 +246,7 @@ fn human_mode_appends_trailing_block_without_disturbing_local_lines() {
     let trailing = &flagged_out[plain_out.len()..];
     assert_eq!(
         trailing,
-        "encypher api: found\n  verification url: https://verify.example/doc_test123\n  organization: Test Org\n  media type: video\n"
+        "encypher api: manifest valid\n  artifact match: yes\n  binding match: yes\n  verification url: https://verify.example/doc_test123\n"
     );
 }
 

@@ -2,6 +2,10 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+- Added opt-in Encypher verification to the local CLI. `--encypher-api` sends only the exact file SHA-256, file size and MIME type, detached C2PA manifest store, small format carrier, and local validation claims. The media bytes, path, and filename stay local, and API failures never alter the local verdict or exit code.
+
 ## 1.0.0 - 2026-08-10
 
 - Consolidated the six implementation crates (`encypher-c2pa-cbor`, `-core`, `-crypto`, `-formats`, `-trust`, `-validate`) into private modules of `encypher-c2pa`. They had no consumer, accounted for 81% of the public API surface, and publishing them is what forced manifest construction to hide behind a Cargo feature. All releases through `1.0.0-rc.11` of the facade, CLI, and six implementation crates are yanked; existing lockfiles continue to resolve, while fresh resolution waits for the stable release. New releases publish only `encypher-c2pa` and `encypher-c2pa-cli`.

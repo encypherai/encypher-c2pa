@@ -100,6 +100,7 @@ use crate::c2pa_validate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
@@ -196,6 +197,18 @@ pub struct VerificationReport {
     pub manifest_report: Value,
     pub content_credentials: Option<Value>,
 }
+/// Raw, read-only evidence needed to validate an embedded manifest remotely
+/// without uploading the host asset.
+///
+/// `carrier` is the single contiguous format carrier that contains
+/// `manifest_store`. Formats whose manifest spans multiple disjoint carriers
+/// return no detached evidence; local verification still covers them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedManifestEvidence {
+    pub manifest_store: Vec<u8>,
+    pub manifest_store_sha256: String,
+    pub carrier: Vec<u8>,
+}
 
 impl VerificationReport {
     pub fn to_json(&self) -> Result<String, Error> {
@@ -258,6 +271,44 @@ impl Error {
 /// with `telemetry.enabled` set to `Some(false)`.
 pub fn verify(data: &[u8], mime_type: &str) -> Result<VerificationReport, Error> {
     verify_with_options(data, mime_type, &VerifyOptions::default())
+}
+/// Extract the signed manifest store and its contiguous carrier for detached
+/// server validation.
+///
+/// This is read-only. It never performs network I/O and never constructs or
+/// writes a manifest. `Ok(None)` means the asset has no embedded manifest or
+/// its format cannot represent the manifest as one contiguous carrier.
+pub fn detached_manifest_evidence(
+    data: &[u8],
+    mime_type: &str,
+) -> Result<Option<DetachedManifestEvidence>, Error> {
+    let mime = canonicalize_mime(mime_type);
+    let format = crate::c2pa_formats::AssetFormat::from_mime(&mime)
+        .ok_or_else(|| Error::UnsupportedMime(mime.clone()))?;
+    if !crate::c2pa_formats::supports_hash_mode(&mime) {
+        return Ok(None);
+    }
+    let Some(manifest_store) = crate::c2pa_formats::extract_manifest(format, data)
+        .map_err(|error| Error::Verification(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let spans = crate::c2pa_formats::compute_data_hash_exclusions(format, data)
+        .map_err(|error| Error::Verification(error.to_string()))?;
+    let [span] = spans.as_slice() else {
+        return Ok(None);
+    };
+    let end = span
+        .start
+        .checked_add(span.length)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| Error::Verification("manifest carrier exceeds asset bounds".into()))?;
+    let manifest_store_sha256 = hex::encode(Sha256::digest(&manifest_store));
+    Ok(Some(DetachedManifestEvidence {
+        manifest_store,
+        manifest_store_sha256,
+        carrier: data[span.start..end].to_vec(),
+    }))
 }
 
 /// Verify asset bytes with caller-supplied static trust material. Failure
