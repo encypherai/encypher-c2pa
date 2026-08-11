@@ -5,6 +5,7 @@ All notable changes to this project are recorded here.
 ## Unreleased
 
 - Added opt-in Encypher verification to the local CLI. `--encypher-api` sends only the exact file SHA-256, file size and MIME type, detached C2PA manifest store, small format carrier, and local validation claims. The media bytes, path, and filename stay local, and API failures never alter the local verdict or exit code.
+- Release recovery now verifies and reuses an already-published exact-commit GitHub release without rewriting its assets, so a missing registry package can be retried after the GitHub release is live. The README and privacy guide now describe the detached manifest evidence sent by the opt-in API check.
 
 ## 1.0.0 - 2026-08-10
 
