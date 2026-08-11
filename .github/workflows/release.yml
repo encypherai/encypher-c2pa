@@ -1609,6 +1609,8 @@ jobs:
           package-manager-cache: false
       - run: npm install -g npm@12.0.2 --ignore-scripts
       - name: Publish or verify the browser package
+        id: npm-recovery
+        continue-on-error: true
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -1761,3 +1763,12 @@ jobs:
               raise SystemExit("GitHub release did not publish")
           print(release["html_url"])
           PY
+      - name: Require complete registry recovery
+        if: always()
+        env:
+          NPM_RECOVERY_OUTCOME: ${{ steps.npm-recovery.outcome }}
+        run: |
+          if [ "$NPM_RECOVERY_OUTCOME" != success ]; then
+            echo "npm recovery failed after the other registries were attempted" >&2
+            exit 1
+          fi
