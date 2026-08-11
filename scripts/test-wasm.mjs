@@ -69,7 +69,10 @@ assert.equal(report.profile, "c2pa-2.4");
 assert.equal(report.integrity, "valid");
 assert.equal(report.signature, "valid");
 assert.equal(report.hard_binding, "match");
-assert.equal(report.trust.status, "not_evaluated");
+assert.equal(report.trust.status, "not_valid_for_supplied_material");
+assert.equal(report.trust.basis, "bundled_static_material");
+const customTrustOnly = verify(asset, "image/jpeg", { no_default_trust: true });
+assert.equal(customTrustOnly.trust.status, "not_evaluated");
 assert.ok(supportedMimeTypes().includes("video/mp4"));
 
 let telemetryRequest;
