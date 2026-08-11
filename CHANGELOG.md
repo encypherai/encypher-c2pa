@@ -4,6 +4,10 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+## 1.0.2 - 2026-08-11
+
+- Corrected the top-level README summary to match the shipped trust behavior: bundled snapshots are evaluated by default, caller PEM extends them, and custom-only verification is explicit.
+
 ## 1.0.1 - 2026-08-11
 
 - Added pinned C2PA, C2PA TSA, IPTC VNPL, CAWG Mozilla Email, and Encypher trust snapshots to every binding. Verification evaluates them by default without a network call; caller PEM extends the snapshot, and `no_default_trust` / `--no-default-trust` provides a clean custom-only mode.

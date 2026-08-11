@@ -30,7 +30,7 @@ The verifier reads local bytes. It does not upload the asset, fetch a trust list
 - Verifies claim signatures, hashed-URI references, and format-specific hard bindings.
 - Walks ingredient and manifest chains included in the asset.
 - Validates CAWG identity assertions (X.509 COSE and identity-claims-aggregation credentials, offline `did:web`/`did:jwk` resolution) per CAWG Identity 1.2.
-- Evaluates trust only against PEM material supplied by the caller.
+- Evaluates trust against bundled snapshots plus caller PEM, with an explicit custom-only mode.
 - Reports revocation and freshness as unknown or not checked when the asset lacks usable evidence.
 - Runs through one Rust core in the CLI, Python wheel, Go binding, and browser WASM package.
 - Optionally reports bounded validation failure codes, without sending customer content.
@@ -46,7 +46,7 @@ Tagged releases publish the packages below. For an unreleased checkout, use [Bui
 ### CLI
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.1
+cargo install encypher-c2pa-cli --version 1.0.2
 encypher-c2pa verify composition.mp4
 encypher-c2pa verify composition.mp4 --json
 encypher-c2pa formats
@@ -58,7 +58,7 @@ Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupport
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.0.1"
+encypher-c2pa = "1.0.2"
 ```
 
 ```rust
