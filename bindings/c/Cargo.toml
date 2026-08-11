@@ -14,5 +14,5 @@ description = "Stable C ABI for the Encypher C2PA verifier"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-encypher-c2pa = { version = "=1.0.1", path = "../../crates/encypher-c2pa" }
+encypher-c2pa = { version = "=1.0.2", path = "../../crates/encypher-c2pa" }
 serde_json = { workspace = true }
