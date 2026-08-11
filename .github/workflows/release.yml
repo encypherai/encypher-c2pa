@@ -1447,34 +1447,19 @@ jobs:
           ' "$tag_sha" "$SOURCE_RUN_ID" <<<"$source_run"
           release_json=$(mktemp)
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_json"
-          release_id=$(python3 - "$RELEASE_TAG" "$tag_sha" "$version" "$release_json" <<'PY'
-          import json
-          import sys
-
-          tag, sha, version, path = sys.argv[1:]
-          releases = json.load(open(path, encoding="utf-8"))
-          matches = [release for release in releases if release.get("tag_name") == tag]
-          if len(matches) != 1:
-              raise SystemExit(f"expected one release checkpoint for {tag!r}, found {len(matches)}")
-          release = matches[0]
-          expected = {
-              "tag_name": tag,
-              "target_commitish": sha,
-              "name": f"Encypher C2PA {version}",
-              "draft": True,
-              "prerelease": "-" in version,
-              "published_at": None,
-          }
-          observed = {key: release.get(key) for key in expected}
-          if observed != expected:
-              raise SystemExit(f"release checkpoint mismatch: {observed!r} != {expected!r}")
-          print(release["id"])
-          PY
-          )
+          checkpoint=$(python3 .github/scripts/verify_release_checkpoint.py \
+            "$release_json" "$RELEASE_TAG" "$tag_sha" "$version")
+          release_id=$(python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["release_id"])' \
+            <<<"$checkpoint")
+          release_was_draft=$(python3 -c \
+            'import json,sys; print(str(json.load(sys.stdin)["was_draft"]).lower())' \
+            <<<"$checkpoint")
           {
             echo "RELEASE_VERSION=$version"
             echo "RELEASE_COMMIT=$tag_sha"
             echo "RELEASE_ID=$release_id"
+            echo "RELEASE_WAS_DRAFT=$release_was_draft"
           } >>"$GITHUB_ENV"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -1703,19 +1688,23 @@ jobs:
               raise SystemExit("recovered release inventory contains an invalid file")
           PY
           mapfile -t files < <(printf '%s\n' dist/release/*)
-          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+          if [ "$RELEASE_WAS_DRAFT" = true ]; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+          fi
           release_json=$(mktemp)
           valid=false
           for _ in {1..20}; do
             gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-            if python3 - "$release_json" dist/release "$RELEASE_TAG" "$RELEASE_COMMIT" <<'PY'
+            if python3 - "$release_json" dist/release "$RELEASE_TAG" \
+              "$RELEASE_COMMIT" "$RELEASE_WAS_DRAFT" <<'PY'
           import hashlib
           import json
           import re
           import sys
           from pathlib import Path
 
-          release_path, artifact_root, tag, commit = sys.argv[1:]
+          release_path, artifact_root, tag, commit, was_draft_raw = sys.argv[1:]
+          was_draft = was_draft_raw == "true"
           release = json.load(open(release_path, encoding="utf-8"))
           expected = {}
           for path in Path(artifact_root).iterdir():
@@ -1735,12 +1724,21 @@ jobs:
               observed[asset["name"]] = (asset["size"], digest)
           if observed != expected:
               raise SystemExit("GitHub release assets do not match recovered bytes")
-          if (
+          identity_changed = (
               release.get("tag_name") != tag
               or release.get("target_commitish") != commit
-              or release.get("draft") is not True
-              or release.get("published_at") is not None
-          ):
+          )
+          if was_draft:
+              state_changed = (
+                  release.get("draft") is not True
+                  or release.get("published_at") is not None
+              )
+          else:
+              state_changed = (
+                  release.get("draft") is not False
+                  or not release.get("published_at")
+              )
+          if identity_changed or state_changed:
               raise SystemExit("GitHub release checkpoint changed during recovery")
           PY
             then
@@ -1750,10 +1748,12 @@ jobs:
             sleep 3
           done
           test "$valid" = true
-          gh api --method PATCH \
-            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-            -F draft=false >/dev/null
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          if [ "$RELEASE_WAS_DRAFT" = true ]; then
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              -F draft=false >/dev/null
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          fi
           python3 - "$release_json" <<'PY'
           import json
           import sys

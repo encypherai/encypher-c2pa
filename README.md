@@ -256,9 +256,9 @@ See [Trust model](https://github.com/encypherai/encypher-c2pa/blob/main/docs/TRU
 
 ## Optional: query the Encypher API
 
-Verification stays local by default and makes no network call. Pass `--encypher-api` to `verify` to also look the asset up in Encypher's public provenance record. The SDK computes a SHA-256 digest of the exact asset bytes and sends only that digest. It does not upload the asset, the manifest, or any file path.
+Verification stays local by default and makes no network call. For an explicit server-side cross-check, set `ENCYPHER_API_KEY` and pass `--encypher-api` to `verify`. The request contains the exact asset SHA-256, byte length, MIME type, and a bounded summary of the local verdict. When the format exposes the embedded C2PA manifest in one contiguous carrier, it also contains that manifest store and carrier so Encypher can validate the detached evidence independently. The complete asset, filename, and file path stay local.
 
-The lookup runs after local verification and never changes the local verdict or the process exit code. In `--json` mode the response attaches under a new top-level `encypher_api` key. In human mode it prints a trailing `encypher api:` block reporting found or not found, plus the verification URL when Encypher has a record. A network error, a non-success status, or an unreadable response yields an error object and a stderr warning, never a failure.
+The API validates any detached manifest and compares its binding and exact file digest with Encypher's provenance records. Formats without contiguous detached evidence send no manifest data; the exact file digest can still be matched. The response never changes the local verdict or process exit code. In `--json` mode it attaches under a new top-level `encypher_api` key. In human mode it prints a trailing `encypher api:` block. A network error, non-success status, or unreadable response yields an error object and a stderr warning, never a verification failure.
 
 ```bash
 encypher-c2pa verify article-photo.jpg --encypher-api --json
