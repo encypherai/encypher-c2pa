@@ -35,7 +35,7 @@ flowchart LR
 - `crates/encypher-c2pa/src/c2pa-core`: JUMBF, claims, assertions, spec versions, and engine profiles.
 - `crates/encypher-c2pa/src/c2pa-formats`: format detection, manifest extraction, and hard-binding byte ranges.
 - `crates/encypher-c2pa/src/c2pa-crypto`: COSE signature algorithms and certificate extraction.
-- `crates/encypher-c2pa/src/c2pa-trust`: caller-supplied certificate-chain evaluation.
+- `crates/encypher-c2pa/src/c2pa-trust`: packaged and caller-supplied certificate-chain evaluation.
 - `crates/encypher-c2pa/src/c2pa-validate`: manifest-store traversal and validation status production.
 
 These are private modules, not separately published crates.

@@ -97,7 +97,13 @@ jobs:
           report = c.verify("tests/fixtures/signed_test.jpg")
           assert report["schema_version"] == "1.0"
           assert report["integrity"] == "valid"
-          assert report["trust"]["status"] == "not_evaluated"
+          assert report["trust"]["status"] == "not_valid_for_supplied_material"
+          assert report["trust"]["basis"] == "bundled_static_material"
+          custom_only = c.verify(
+              "tests/fixtures/signed_test.jpg",
+              no_default_trust=True,
+          )
+          assert custom_only["trust"]["status"] == "not_evaluated"
           PY
 
   wasm:

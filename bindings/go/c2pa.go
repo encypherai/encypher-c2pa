@@ -38,6 +38,7 @@ type Options struct {
 	AllowedCertsPEM     string                     `json:"allowed_list_pem,omitempty"`
 	CAWGTrustPEM        string                     `json:"cawg_trust_pem,omitempty"`
 	CAWGAllowedCertsPEM string                     `json:"cawg_allowed_certs_pem,omitempty"`
+	NoDefaultTrust      bool                       `json:"no_default_trust,omitempty"`
 	CAWGDIDDocuments    map[string]json.RawMessage `json:"cawg_did_documents,omitempty"`
 	CAWGStrictEncoding  bool                       `json:"cawg_strict_encoding,omitempty"`
 	ValidationTime      string                     `json:"validation_time,omitempty"`

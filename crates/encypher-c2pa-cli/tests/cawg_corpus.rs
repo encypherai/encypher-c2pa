@@ -75,6 +75,9 @@ fn verify_at(vector: &Value, mode: CawgTrustMode, validation_time: &str) -> Valu
         .arg(vector["mime_type"].as_str().expect("mime_type"))
         .arg("--time")
         .arg(validation_time)
+        // Corpus expectations are defined against the fixture's own trust
+        // inputs, not the SDK's independently refreshed packaged snapshot.
+        .arg("--no-default-trust")
         .arg("--json");
     let trust = &vector["trust"];
     if let Some(path) = trust["claim_allowed_list"].as_str() {

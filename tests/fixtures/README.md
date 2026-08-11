@@ -5,4 +5,4 @@
 
 Both fixtures are synthetic, contain no customer data, and are distributed under this repository's Apache-2.0 license. Their signing certificates are test credentials and are not trusted production identities.
 
-The public contract tests expect valid cryptographic integrity and `trust.status = "not_evaluated"` unless a test supplies its own trust material.
+The default public contract tests expect valid cryptographic integrity and rejection under the packaged production trust snapshot because these test certificates are deliberately absent. Opt-out tests set `no_default_trust` and expect `trust.status = "not_evaluated"`.
