@@ -104,12 +104,13 @@ jobs:
           PY
           }
           validate_release() {
-            python3 - "$GITHUB_REF_NAME" "$GITHUB_SHA" "$title" "$is_prerelease" <<'PY'
+            local release_json=$1
+            python3 - "$GITHUB_REF_NAME" "$GITHUB_SHA" "$title" "$is_prerelease" "$release_json" <<'PY'
           import json
           import sys
 
-          tag, sha, title, prerelease = sys.argv[1:]
-          actual = json.load(sys.stdin)
+          tag, sha, title, prerelease, raw = sys.argv[1:]
+          actual = json.loads(raw)
           expected = {
               "tag_name": tag,
               "target_commitish": sha,
@@ -131,7 +132,7 @@ jobs:
           }
           release=$(fetch_release)
           if [ "$release" != null ]; then
-            validate_release <<<"$release"
+            validate_release "$release"
             echo "$GITHUB_REF_NAME has a valid exact-commit release checkpoint"
             exit 0
           fi
@@ -188,12 +189,18 @@ jobs:
             "${prerelease[@]}"; then
             echo "checkpoint creation failed; checking for a concurrent exact match" >&2
           fi
-          release=$(fetch_release)
+          for _ in {1..10}; do
+            release=$(fetch_release)
+            if [ "$release" != null ]; then
+              break
+            fi
+            sleep 2
+          done
           if [ "$release" = null ]; then
             echo "release checkpoint was not created" >&2
             exit 1
           fi
-          validate_release <<<"$release"
+          validate_release "$release"
           echo "created exact-commit release checkpoint for $GITHUB_REF_NAME"
 
   crate-library-package:
@@ -1222,12 +1229,13 @@ jobs:
           PY
           }
           validate_release() {
-            python3 - "$GITHUB_REF_NAME" "$GITHUB_SHA" "$title" "$is_prerelease" <<'PY'
+            local release_json=$1
+            python3 - "$GITHUB_REF_NAME" "$GITHUB_SHA" "$title" "$is_prerelease" "$release_json" <<'PY'
           import json
           import sys
 
-          tag, sha, title, prerelease = sys.argv[1:]
-          actual = json.load(sys.stdin)
+          tag, sha, title, prerelease, raw = sys.argv[1:]
+          actual = json.loads(raw)
           expected = {
               "tag_name": tag,
               "target_commitish": sha,
@@ -1248,13 +1256,14 @@ jobs:
           PY
           }
           validate_asset_inventory() {
-            python3 - "$expected_assets" <<'PY'
+            local release_json=$1
+            python3 - "$expected_assets" "$release_json" <<'PY'
           import json
           import re
           import sys
 
           expected = json.loads(sys.argv[1])
-          release = json.load(sys.stdin)
+          release = json.loads(sys.argv[2])
           assets = release.get("assets")
           if not isinstance(expected, dict) or not isinstance(assets, list):
               raise SystemExit("release checkpoint has invalid asset metadata")
@@ -1336,10 +1345,10 @@ jobs:
           )
 
           release=$(fetch_release)
-          validate_release <<<"$release"
+          validate_release "$release"
           is_draft=$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["draft"]).lower())' <<<"$release")
           if [ "$is_draft" = false ]; then
-            validate_asset_inventory <<<"$release"
+            validate_asset_inventory "$release"
             echo "$GITHUB_REF_NAME is already published with the expected assets"
             exit 0
           fi
@@ -1347,15 +1356,15 @@ jobs:
           mapfile -t files < <(find dist/release -type f -print)
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
           release=$(fetch_release)
-          validate_release <<<"$release"
-          validate_asset_inventory <<<"$release"
+          validate_release "$release"
+          validate_asset_inventory "$release"
           release_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$release")
           gh api --method PATCH \
             "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             -F draft=false >/dev/null
           release=$(fetch_release)
-          validate_release <<<"$release"
-          validate_asset_inventory <<<"$release"
+          validate_release "$release"
+          validate_asset_inventory "$release"
           published=$(python3 -c 'import json,sys; print(str(not json.load(sys.stdin)["draft"]).lower())' <<<"$release")
           test "$published" = true || {
             echo "release checkpoint remained a draft" >&2
