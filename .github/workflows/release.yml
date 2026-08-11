@@ -1408,6 +1408,12 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          sparse-checkout: .github/scripts/verify_release_checkpoint.py
+          sparse-checkout-cone-mode: false
       - name: Verify the immutable release checkpoint and source run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1447,7 +1453,7 @@ jobs:
           ' "$tag_sha" "$SOURCE_RUN_ID" <<<"$source_run"
           release_json=$(mktemp)
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_json"
-          checkpoint=$(python3 .github/scripts/verify_release_checkpoint.py \
+          checkpoint=$(python3 .release-tools/.github/scripts/verify_release_checkpoint.py \
             "$release_json" "$RELEASE_TAG" "$tag_sha" "$version")
           release_id=$(python3 -c \
             'import json,sys; print(json.load(sys.stdin)["release_id"])' \
