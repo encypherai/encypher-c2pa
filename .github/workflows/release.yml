@@ -72,14 +72,26 @@ jobs:
 
           release_pages=$(mktemp)
           fetch_release() {
-            gh api --paginate --slurp \
+            gh api --paginate \
               "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_pages"
             python3 - "$GITHUB_REF_NAME" "$release_pages" <<'PY'
           import json
           import sys
 
           tag, path = sys.argv[1:]
-          pages = json.load(open(path, encoding="utf-8"))
+          raw = open(path, encoding="utf-8").read()
+          decoder = json.JSONDecoder()
+          pages = []
+          cursor = 0
+          while cursor < len(raw):
+              while cursor < len(raw) and raw[cursor].isspace():
+                  cursor += 1
+              if cursor == len(raw):
+                  break
+              page, cursor = decoder.raw_decode(raw, cursor)
+              if not isinstance(page, list):
+                  raise SystemExit("GitHub releases pagination returned a non-array page")
+              pages.append(page)
           matches = [
               release
               for page in pages
@@ -1176,14 +1188,26 @@ jobs:
 
           release_pages=$(mktemp)
           fetch_release() {
-            gh api --paginate --slurp \
+            gh api --paginate \
               "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_pages"
             python3 - "$GITHUB_REF_NAME" "$release_pages" <<'PY'
           import json
           import sys
 
           tag, path = sys.argv[1:]
-          pages = json.load(open(path, encoding="utf-8"))
+          raw = open(path, encoding="utf-8").read()
+          decoder = json.JSONDecoder()
+          pages = []
+          cursor = 0
+          while cursor < len(raw):
+              while cursor < len(raw) and raw[cursor].isspace():
+                  cursor += 1
+              if cursor == len(raw):
+                  break
+              page, cursor = decoder.raw_decode(raw, cursor)
+              if not isinstance(page, list):
+                  raise SystemExit("GitHub releases pagination returned a non-array page")
+              pages.append(page)
           matches = [
               release
               for page in pages
