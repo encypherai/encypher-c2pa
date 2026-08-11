@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_DISTRIBUTION_SUFFIXES = (".whl", ".tar.gz")
 
 
 def local_artifacts(root: Path) -> dict[str, str]:
@@ -21,6 +22,8 @@ def local_artifacts(root: Path) -> dict[str, str]:
         if path.is_symlink():
             raise ValueError(f"local artifact path is a symbolic link: {path}")
         if not path.is_file():
+            continue
+        if not path.name.endswith(_DISTRIBUTION_SUFFIXES):
             continue
         if path.name in artifacts:
             raise ValueError(f"duplicate local artifact name: {path.name!r}")

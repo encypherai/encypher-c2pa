@@ -2,6 +2,7 @@
 
 import importlib.util
 import unittest
+import tempfile
 from pathlib import Path
 
 _PATH = Path(__file__).with_name("verify_pypi_artifacts.py")
@@ -10,6 +11,7 @@ assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 compare_artifacts = _MODULE.compare_artifacts
+local_artifacts = _MODULE.local_artifacts
 remote_artifacts = _MODULE.remote_artifacts
 
 DIGEST_A = "a" * 64
@@ -27,6 +29,20 @@ class VerifyPyPIArtifactsTests(unittest.TestCase):
 
     def test_exact_subset(self):
         self.assertEqual(compare_artifacts(LOCAL, {"package.whl": DIGEST_A}), "subset")
+
+    def test_generated_attestations_are_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "package.whl"
+            wheel.write_bytes(b"wheel")
+            (root / "package.whl.publish.attestation").write_text(
+                "generated",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                local_artifacts(root),
+                {"package.whl": __import__("hashlib").sha256(b"wheel").hexdigest()},
+            )
 
     def test_digest_mismatch_fails(self):
         with self.assertRaisesRegex(ValueError, "mismatched"):
