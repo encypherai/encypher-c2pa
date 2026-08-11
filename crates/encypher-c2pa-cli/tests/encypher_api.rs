@@ -18,17 +18,22 @@ use std::time::Duration;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+const PATH_LIMIT: u64 = 128 * 1024 * 1024;
 fn signed_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/signed_test.mp4")
 }
 
-fn run_verify(args: &[&str]) -> Output {
+fn run_verify_path(asset: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_encypher-c2pa"))
         .arg("verify")
-        .arg(signed_fixture())
+        .arg(asset)
         .args(args)
         .output()
         .expect("run CLI")
+}
+
+fn run_verify(args: &[&str]) -> Output {
+    run_verify_path(&signed_fixture(), args)
 }
 
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -144,6 +149,38 @@ fn flag_attaches_verbatim_response_and_sends_only_the_digest() {
         sent.as_object().unwrap().len(),
         1,
         "only the content_sha256 digest leaves the machine: {sent}"
+    );
+}
+
+#[test]
+fn api_flag_rejects_oversized_asset_before_lookup() {
+    let path = std::env::temp_dir().join(format!(
+        "encypher-c2pa-cli-oversized-{}.mp4",
+        std::process::id()
+    ));
+    let file = std::fs::File::create(&path).expect("create sparse asset");
+    file.set_len(PATH_LIMIT + 1).expect("size sparse asset");
+    drop(file);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/lookup", listener.local_addr().unwrap());
+    let output = run_verify_path(
+        &path,
+        &["--encypher-api", "--encypher-api-endpoint", &endpoint],
+    );
+    std::fs::remove_file(&path).expect("remove sparse asset");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("128 MiB path limit"),
+        "expected bounded-reader rejection: {stderr}"
+    );
+    let lookup = listener.accept();
+    assert!(
+        matches!(&lookup, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "lookup must not occur before source rejection: {lookup:?}"
     );
 }
 

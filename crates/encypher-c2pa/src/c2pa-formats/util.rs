@@ -37,6 +37,16 @@ pub(crate) fn le_u32(data: &[u8], off: usize) -> Option<u32> {
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+fn u64_to_usize_with_max(value: u64, max: usize) -> Option<usize> {
+    let converted = usize::try_from(value).ok()?;
+    (converted <= max).then_some(converted)
+}
+
+#[inline]
+pub(crate) fn u64_to_usize(value: u64) -> Option<usize> {
+    u64_to_usize_with_max(value, usize::MAX)
+}
+
 /// One top-level ISOBMFF box: its type and byte span within the buffer.
 pub(crate) struct IsoBox {
     /// 4-byte box type code.
@@ -62,24 +72,26 @@ pub(crate) fn walk_iso_boxes(
 ) -> Result<(), FormatError> {
     let mut pos = 0usize;
     while pos + 8 <= data.len() {
-        let size32 = be_u32(data, pos).ok_or(FormatError::Truncated(format))? as u64;
+        let size32 = be_u32(data, pos).ok_or(FormatError::Truncated(format))?;
         let mut box_type = [0u8; 4];
         box_type.copy_from_slice(&data[pos + 4..pos + 8]);
 
         let (payload_start, end) = if size32 == 1 {
             let large = be_u64(data, pos + 8).ok_or(FormatError::Truncated(format))?;
+            let large = u64_to_usize(large).ok_or(FormatError::Truncated(format))?;
             let end = pos
-                .checked_add(large as usize)
-                .filter(|&e| (large as usize) >= 16 && e <= data.len())
+                .checked_add(large)
+                .filter(|&e| large >= 16 && e <= data.len())
                 .ok_or(FormatError::Truncated(format))?;
             (pos + 16, end)
         } else if size32 == 0 {
             // Extends to end of file.
             (pos + 8, data.len())
         } else {
+            let size = usize::try_from(size32).map_err(|_| FormatError::Truncated(format))?;
             let end = pos
-                .checked_add(size32 as usize)
-                .filter(|&e| (size32 as usize) >= 8 && e <= data.len())
+                .checked_add(size)
+                .filter(|&e| size >= 8 && e <= data.len())
                 .ok_or(FormatError::Truncated(format))?;
             (pos + 8, end)
         };
@@ -219,4 +231,46 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u64_length_conversion_respects_target_width() {
+        let wasm32_max = usize::try_from(u32::MAX).unwrap();
+        assert_eq!(
+            u64_to_usize_with_max(u64::from(u32::MAX), wasm32_max),
+            Some(wasm32_max)
+        );
+        assert_eq!(u64_to_usize_with_max(1u64 << 32, wasm32_max), None);
+    }
+
+    #[test]
+    fn iso_box_largesize_above_wasm32_range_fails_closed() {
+        let mut box_bytes = Vec::from(1u32.to_be_bytes());
+        box_bytes.extend_from_slice(b"free");
+        box_bytes.extend_from_slice(&((1u64 << 32) + 16).to_be_bytes());
+
+        assert_eq!(
+            walk_iso_boxes(&box_bytes, AssetFormat::Bmff, |_| {}),
+            Err(FormatError::Truncated(AssetFormat::Bmff))
+        );
+    }
+
+    #[test]
+    fn iso_box_minimum_largesize_is_accepted() {
+        let mut box_bytes = Vec::from(1u32.to_be_bytes());
+        box_bytes.extend_from_slice(b"free");
+        box_bytes.extend_from_slice(&16u64.to_be_bytes());
+        let mut span = None;
+
+        walk_iso_boxes(&box_bytes, AssetFormat::Bmff, |b| {
+            span = Some((b.payload_start, b.end));
+        })
+        .unwrap();
+
+        assert_eq!(span, Some((16, 16)));
+    }
 }

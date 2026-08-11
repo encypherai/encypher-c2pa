@@ -3,8 +3,12 @@ package c2pa
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestSignedJPEGReportsIntegrityWithoutTrust(t *testing.T) {
@@ -90,5 +94,80 @@ func TestTelemetryPreferenceRoundTrips(t *testing.T) {
 	}
 	if enabled == nil || *enabled {
 		t.Fatalf("expected disabled preference, got %v", enabled)
+	}
+}
+
+func TestPathReaderAcceptsExactBoundaryWithSmallLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "exact.jpg")
+	if err := os.WriteFile(path, []byte("1234"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	asset, err := readPathAsset(path, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(asset) != "1234" {
+		t.Fatalf("unexpected asset: %q", asset)
+	}
+}
+
+func TestVerifyFileRejectsSparseAssetOverPathLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized.jpg")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxPathAssetBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = VerifyFile(path, "image/jpeg", nil)
+	if err == nil || !strings.Contains(err.Error(), "128 MiB path limit") {
+		t.Fatalf("expected clear path-limit error, got %v", err)
+	}
+}
+
+func TestVerifyFileRejectsNonRegularSourceWithoutReadingIt(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("requires a POSIX character device")
+	}
+	_, err := VerifyFile("/dev/zero", "image/jpeg", nil)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected clear non-regular-file error, got %v", err)
+	}
+}
+
+func TestVerifyFileRejectsFIFOWithoutBlocking(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("requires POSIX FIFO support")
+	}
+	path := filepath.Join(t.TempDir(), "asset.fifo")
+	if err := exec.Command("mkfifo", path).Run(); err != nil {
+		t.Fatalf("create FIFO: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := VerifyFile(path, "image/jpeg", nil)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("expected clear non-regular-file error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		// Release a blocking reader before failing so the test leaves no stuck goroutine.
+		writer, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err == nil {
+			_ = writer.Close()
+		}
+		<-result
+		t.Fatal("VerifyFile blocked while opening a FIFO")
 	}
 }

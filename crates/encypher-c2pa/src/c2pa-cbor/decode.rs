@@ -95,6 +95,18 @@ pub fn decode_prefix(data: &[u8]) -> Result<(Value, usize), DecodeError> {
     Ok((v, p.pos))
 }
 
+fn length_to_usize_with_max(len: u64, max: usize) -> Result<usize, DecodeError> {
+    let converted = usize::try_from(len).map_err(|_| DecodeError::LengthOverflow(len))?;
+    if converted > max {
+        return Err(DecodeError::LengthOverflow(len));
+    }
+    Ok(converted)
+}
+
+fn length_to_usize(len: u64) -> Result<usize, DecodeError> {
+    length_to_usize_with_max(len, usize::MAX)
+}
+
 struct Parser<'a> {
     data: &'a [u8],
     pos: usize,
@@ -146,7 +158,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn item(&mut self, depth: usize) -> Result<Value, DecodeError> {
+    fn claim_node(&mut self, depth: usize) -> Result<(), DecodeError> {
         if depth > MAX_DEPTH {
             return Err(DecodeError::DepthExceeded);
         }
@@ -154,24 +166,32 @@ impl<'a> Parser<'a> {
             return Err(DecodeError::NodeLimitExceeded(self.node_limit));
         }
         self.remaining_nodes -= 1;
+        Ok(())
+    }
+
+    fn item(&mut self, depth: usize) -> Result<Value, DecodeError> {
+        self.claim_node(depth)?;
         let head = self.byte()?;
         let mt = head >> 5;
         let ai = head & 0x1f;
 
         match mt {
-            0 => Ok(Value::Integer(self.argument(ai)?.unwrap_or(0) as i128)),
-            1 => {
-                let n = self.argument(ai)?.unwrap_or(0) as i128;
-                Ok(Value::Integer(-1 - n))
+            0 | 1 => {
+                let n = self.argument(ai)?.ok_or(DecodeError::Unsupported(mt, 31))? as i128;
+                if mt == 0 {
+                    Ok(Value::Integer(n))
+                } else {
+                    Ok(Value::Integer(-1 - n))
+                }
             }
-            2 => self.byte_string(ai, depth),
-            3 => {
-                let v = self.byte_string(ai, depth)?;
-                match v {
-                    Value::Bytes(b) => Ok(Value::Text(
-                        String::from_utf8(b).map_err(|_| DecodeError::Unsupported(3, ai))?,
-                    )),
-                    other => Ok(other),
+            2 | 3 => {
+                let bytes = self.string(ai, depth, mt)?;
+                if mt == 2 {
+                    Ok(Value::Bytes(bytes))
+                } else {
+                    Ok(Value::Text(
+                        String::from_utf8(bytes).map_err(|_| DecodeError::Unsupported(3, ai))?,
+                    ))
                 }
             }
             4 => self.array(ai, depth),
@@ -186,30 +206,40 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn byte_string(&mut self, ai: u8, depth: usize) -> Result<Value, DecodeError> {
+    fn string(&mut self, ai: u8, depth: usize, required_major: u8) -> Result<Vec<u8>, DecodeError> {
         match self.argument(ai)? {
             Some(len) => {
-                let bytes = self.take(len as usize)?.to_vec();
-                Ok(Value::Bytes(bytes))
+                let bytes = self.take(length_to_usize(len)?)?;
+                if required_major == 3 {
+                    std::str::from_utf8(bytes).map_err(|_| DecodeError::Unsupported(3, ai))?;
+                }
+                Ok(bytes.to_vec())
             }
             None => {
-                // indefinite-length byte string: concatenate chunks until 0xff
                 let mut buf = Vec::new();
                 loop {
                     if *self.data.get(self.pos).ok_or(DecodeError::Eof(self.pos))? == 0xff {
                         self.pos += 1;
                         break;
                     }
-                    if depth > MAX_DEPTH {
-                        return Err(DecodeError::DepthExceeded);
+
+                    self.claim_node(depth + 1)?;
+                    let head = self.byte()?;
+                    let chunk_major = head >> 5;
+                    let chunk_ai = head & 0x1f;
+                    if chunk_major != required_major || chunk_ai == 31 {
+                        return Err(DecodeError::Unsupported(required_major, 31));
                     }
-                    match self.item(depth + 1)? {
-                        Value::Bytes(b) => buf.extend_from_slice(&b),
-                        Value::Text(s) => buf.extend_from_slice(s.as_bytes()),
-                        _ => return Err(DecodeError::Unsupported(2, 31)),
+                    let len = self
+                        .argument(chunk_ai)?
+                        .ok_or(DecodeError::Unsupported(required_major, 31))?;
+                    let chunk = self.take(length_to_usize(len)?)?;
+                    if required_major == 3 {
+                        std::str::from_utf8(chunk).map_err(|_| DecodeError::Unsupported(3, 31))?;
                     }
+                    buf.extend_from_slice(chunk);
                 }
-                Ok(Value::Bytes(buf))
+                Ok(buf)
             }
         }
     }
@@ -314,6 +344,71 @@ mod tests {
     fn rejects_trailing_bytes() {
         // two integers back to back -> trailing
         assert_eq!(decode(&[0x01, 0x02]), Err(DecodeError::Trailing(1)));
+    }
+
+    #[test]
+    fn declared_length_conversion_respects_target_width() {
+        let wasm32_max = usize::try_from(u32::MAX).unwrap();
+        assert_eq!(
+            length_to_usize_with_max(u64::from(u32::MAX), wasm32_max),
+            Ok(wasm32_max)
+        );
+        assert_eq!(
+            length_to_usize_with_max(1u64 << 32, wasm32_max),
+            Err(DecodeError::LengthOverflow(1u64 << 32))
+        );
+    }
+
+    #[test]
+    fn oversized_definite_byte_and_text_lengths_fail_closed() {
+        for major_type in [0x5b, 0x7b] {
+            let mut encoded = vec![major_type];
+            encoded.extend_from_slice(&(1u64 << 32).to_be_bytes());
+            assert_eq!(
+                decode(&encoded),
+                Err(DecodeError::LengthOverflow(1u64 << 32))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_indefinite_integer_and_tag_arguments() {
+        assert_eq!(decode(&[0x1f]), Err(DecodeError::Unsupported(0, 31)));
+        assert_eq!(decode(&[0x3f]), Err(DecodeError::Unsupported(1, 31)));
+        assert_eq!(decode(&[0xdf, 0x00]), Err(DecodeError::Unsupported(6, 31)));
+    }
+
+    #[test]
+    fn rejects_mixed_and_nested_indefinite_string_chunks() {
+        let invalid = [
+            &[0x5f, 0x61, b'a', 0xff][..],
+            &[0x7f, 0x41, b'a', 0xff],
+            &[0x5f, 0x5f, 0x41, b'a', 0xff, 0xff],
+            &[0x7f, 0x7f, 0x61, b'a', 0xff, 0xff],
+        ];
+
+        for encoded in invalid {
+            assert!(decode(encoded).is_err(), "{encoded:02x?} decoded");
+        }
+    }
+
+    #[test]
+    fn concatenates_definite_same_major_indefinite_string_chunks() {
+        assert_eq!(
+            decode(&[0x5f, 0x42, 0x00, 0x01, 0x41, 0xff, 0xff]),
+            Ok(Value::Bytes(vec![0x00, 0x01, 0xff]))
+        );
+        assert_eq!(
+            decode(&[0x7f, 0x62, b'a', b'b', 0x61, b'c', 0xff]),
+            Ok(Value::Text("abc".to_owned()))
+        );
+        assert_eq!(
+            decode(&[0x9f, 0x5f, 0x41, 0x01, 0xff, 0x02, 0xff]),
+            Ok(Value::Array(vec![
+                Value::Bytes(vec![0x01]),
+                Value::Integer(2),
+            ]))
+        );
     }
 
     #[test]

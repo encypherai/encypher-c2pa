@@ -19,12 +19,13 @@
 //! down a layer.
 //!
 //! The filter is an ALLOWLIST. Reads, memory operations, thread and signal
-//! operations and clocks pass; everything else kills the process. Three
+//! operations and clocks pass; everything else kills the process. Four
 //! syscalls are permitted only on their arguments: `openat` and `open` must
-//! carry no write flag, and `ioctl` must be the one terminal query the runtime
-//! makes at startup. `write` and `writev` are permitted nowhere.
+//! carry no write flag, `ioctl` must be the one terminal query the runtime
+//! makes at startup, and `fcntl` may only query descriptor flags with
+//! `F_GETFD`. `write` and `writev` are permitted nowhere.
 //!
-//! Eight tests run, and every one asks the kernel rather than a model of it.
+//! Nine tests run, and every one asks the kernel rather than a model of it.
 //! Most assert the sandbox bites - a writer dies, an unlisted syscall dies,
 //! each gate refuses the arguments it exists to refuse, and every route
 //! previously found open dies. Two assert the setup leaves nothing behind: no
@@ -122,7 +123,7 @@ fn fixture_dir() -> PathBuf {
 
 // How to read the permission lists below.
 //
-// They are an ALLOWLIST: anything absent kills the process. Three entries are
+// They are an ALLOWLIST: anything absent kills the process. Four entries are
 // constrained by argument rather than by number, and `write`/`writev` are
 // absent entirely. The reasons for both, and for every other defence in this
 // file, are in the History section of the module documentation - told once
@@ -141,7 +142,6 @@ const EXERCISED: &[u32] = &[
     3,   // close
     332, // statx
     10,  // mprotect
-    28,  // madvise
     318, // getrandom
 ];
 
@@ -256,6 +256,14 @@ const ARGUMENT_GATED: &[(u32, Gate)] = &[
         Gate::ArgEquals {
             arg: OFF_ARG1,
             value: TCGETS,
+        },
+    ),
+    // fcntl(fd, F_GETFD) - querying descriptor flags cannot mutate a file.
+    (
+        72,
+        Gate::ArgEquals {
+            arg: OFF_ARG1,
+            value: libc::F_GETFD as u32,
         },
     ),
 ];
@@ -899,6 +907,14 @@ fn each_argument_gate_holds_against_the_kernel() {
             libc::syscall(16, 0, 0x4008_6602u64, &flags);
         }),
     );
+    // fcntl is needed only to query descriptor flags. A mutating command must
+    // remain unavailable even though all inherited descriptors are closed.
+    must_die(
+        "fcntl F_SETFD".to_string(),
+        Box::new(|| unsafe {
+            libc::syscall(72, 0, libc::F_SETFD, libc::FD_CLOEXEC);
+        }),
+    );
 
     // And the permitted side of every gate still works. Without this the gates
     // would be indistinguishable from an outright ban, and the verification
@@ -930,6 +946,12 @@ fn each_argument_gate_holds_against_the_kernel() {
         // would fail here is a blanket ioctl ban.
         let mut termios: libc::termios = std::mem::zeroed();
         libc::syscall(16, 0, TCGETS as u64, &mut termios);
+        true
+    });
+    must_live("fcntl F_GETFD", || unsafe {
+        // As with ioctl above, EBADF is expected after close_range. Surviving
+        // proves the command gate allowed only the read-side query.
+        libc::syscall(72, 0, libc::F_GETFD);
         true
     });
 }
@@ -1036,7 +1058,7 @@ fn no_way_to_open_or_write_is_ungated() {
 #[test]
 fn every_allowed_syscall_is_needed() {
     // Every permitted syscall appears in exactly one list. Without this the
-    // argument-gated three sat outside both tiers, invisible to these checks.
+    // argument-gated four sat outside both tiers, invisible to these checks.
     let gated_numbers: Vec<u32> = ARGUMENT_GATED.iter().map(|(nr, _)| *nr).collect();
     let lists = [
         ("EXERCISED", EXERCISED),

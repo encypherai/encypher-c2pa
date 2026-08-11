@@ -181,12 +181,24 @@ pub fn zip_entry_data(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, Format
     let raw = &data[data_start..data_end];
     match entry.method {
         METHOD_STORED => Ok(Some(raw.to_vec())),
-        8 => miniz_oxide::inflate::decompress_to_vec(raw)
-            .map(Some)
-            .map_err(|_| FormatError::InvalidStructure {
-                format: FMT,
-                detail: "deflate stream corrupt",
-            }),
+        8 => {
+            miniz_oxide::inflate::decompress_to_vec_with_limit(raw, crate::MAX_MANIFEST_STORE_BYTES)
+                .map(Some)
+                .map_err(|error| {
+                    if error.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput {
+                        FormatError::ManifestTooLarge {
+                            format: FMT,
+                            max: crate::MAX_MANIFEST_STORE_BYTES,
+                            got: crate::MAX_MANIFEST_STORE_BYTES + 1,
+                        }
+                    } else {
+                        FormatError::InvalidStructure {
+                            format: FMT,
+                            detail: "deflate stream corrupt",
+                        }
+                    }
+                })
+        }
         _ => Err(FormatError::UnsupportedVariant {
             format: FMT,
             detail: "unsupported ZIP compression method",
@@ -308,6 +320,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
             detail: "C2PA ZIP entry must be stored, not compressed",
         });
     }
+    super::ensure_manifest_store_size(FMT, entry.comp_size as usize)?;
     // Read the local file header to find the data offset (extra field length can
     // differ from the central directory copy).
     let lh = entry.local_offset as usize;

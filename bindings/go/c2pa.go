@@ -14,7 +14,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
+	"runtime"
 	"unsafe"
 )
 
@@ -22,6 +23,8 @@ const (
 	ReportSchemaVersion = "1.0"
 	C2PAProfile         = "c2pa-2.4"
 )
+
+const maxPathAssetBytes int64 = 128 * 1024 * 1024
 
 type TelemetryOptions struct {
 	Enabled  *bool  `json:"enabled,omitempty"`
@@ -133,17 +136,17 @@ func Verify(asset []byte, mimeType string, options *Options) (*Report, error) {
 		}
 	}
 
-	var assetPtr unsafe.Pointer
+	var assetPtr *C.uint8_t
 	if len(asset) > 0 {
-		assetPtr = C.CBytes(asset)
-		defer C.free(assetPtr)
+		assetPtr = (*C.uint8_t)(unsafe.Pointer(&asset[0]))
 	}
 	mime := C.CString(mimeType)
 	defer C.free(unsafe.Pointer(mime))
 	opts := C.CString(string(optionsJSON))
 	defer C.free(unsafe.Pointer(opts))
 
-	result := C.encypher_c2pa_verify((*C.uint8_t)(assetPtr), C.size_t(len(asset)), mime, opts)
+	result := C.encypher_c2pa_verify(assetPtr, C.size_t(len(asset)), mime, opts)
+	runtime.KeepAlive(asset)
 	if result == nil {
 		return nil, errors.New("verifier returned no result")
 	}
@@ -205,11 +208,48 @@ func TelemetryEnabled() (*bool, error) {
 	return envelope.Enabled, nil
 }
 
-// VerifyFile reads and verifies a local asset.
+// VerifyFile reads and verifies a regular local asset up to 128 MiB.
 func VerifyFile(path, mimeType string, options *Options) (*Report, error) {
-	asset, err := os.ReadFile(path)
+	asset, err := readPathAsset(path, maxPathAssetBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read asset: %w", err)
 	}
 	return Verify(asset, mimeType, options)
+}
+
+func readPathAsset(path string, limit int64) ([]byte, error) {
+	file, err := openAsset(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("asset path is not a regular file: %s", path)
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("asset exceeds the 128 MiB path limit: %s", path)
+	}
+
+	expected := info.Size()
+	asset := make([]byte, expected+1)
+	read, err := io.ReadFull(file, asset[:expected])
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return asset[:read], nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	read, err = file.Read(asset[expected : expected+1])
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if read != 0 {
+		return nil, fmt.Errorf("asset grew while being read: %s", path)
+	}
+	return asset[:expected], nil
 }

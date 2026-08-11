@@ -1,15 +1,20 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
-    set_telemetry_enabled, supported_mime_types, telemetry_preference, verify_file, Error,
-    TelemetryOptions, VerifyOptions,
+    mime_from_path, set_telemetry_enabled, supported_mime_types, telemetry_preference, verify_file,
+    verify_with_options, Error, TelemetryOptions, VerifyOptions,
 };
 
 mod encypher_api;
+
+const MAX_PATH_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "encypher-c2pa", version, about = "Local C2PA verification")]
@@ -167,15 +172,21 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     sdk_name: Some("cli".to_string()),
                 },
             };
-            let report = verify_file(&asset, mime.as_deref(), &options)?;
-            let encypher_api_result = if encypher_api {
-                let bytes = fs::read(&asset)?;
+            let (report, encypher_api_result) = if encypher_api {
+                let mime = match mime {
+                    Some(value) => value,
+                    None => mime_from_path(&asset)
+                        .ok_or_else(|| Error::UnsupportedMime(asset.display().to_string()))?
+                        .to_string(),
+                };
+                let bytes = read_path_asset(&asset)?;
+                let report = verify_with_options(&bytes, &mime, &options)?;
                 let digest = encypher_api::content_sha256(&bytes);
                 let endpoint = encypher_api_endpoint
                     .unwrap_or_else(|| encypher_api::DEFAULT_ENDPOINT.to_string());
-                Some(encypher_api::lookup(&endpoint, &digest))
+                (report, Some(encypher_api::lookup(&endpoint, &digest)))
             } else {
-                None
+                (verify_file(&asset, mime.as_deref(), &options)?, None)
             };
             if json {
                 if let Some(lookup) = &encypher_api_result {
@@ -278,6 +289,48 @@ fn read_merged_pem(paths: &[PathBuf]) -> Result<Option<String>, Error> {
         }
     }
     Ok(Some(pem))
+}
+
+fn read_path_asset(path: &Path) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("asset path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_PATH_ASSET_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("asset exceeds the 128 MiB path limit: {}", path.display()),
+        ));
+    }
+
+    let expected_len = usize::try_from(metadata.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "asset size is not addressable"))?;
+    let mut data = vec![0_u8; expected_len + 1];
+    let mut used = 0;
+    while used < expected_len {
+        let count = file.read(&mut data[used..expected_len])?;
+        if count == 0 {
+            break;
+        }
+        used += count;
+    }
+    if used == expected_len && file.read(&mut data[expected_len..expected_len + 1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "asset grew while being read",
+        ));
+    }
+    data.truncate(used);
+    Ok(data)
 }
 
 /// Build the pinned offline `did:web` DID-document store from repeatable

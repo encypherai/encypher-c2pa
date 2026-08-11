@@ -74,7 +74,10 @@ pub use telemetry_consent::{
 };
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::c2pa_core::{
@@ -102,6 +105,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
 pub const C2PA_PROFILE: &str = "c2pa-2.4";
 const MAX_MANIFEST_STORE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PATH_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -248,7 +252,10 @@ impl Error {
     }
 }
 
-/// Verify asset bytes without network access.
+/// Verify asset bytes with default options. Parsing and validation stay offline;
+/// saved failure-telemetry consent may emit one bounded request. For guaranteed
+/// no egress, disable the `telemetry` feature or call [`verify_with_options`]
+/// with `telemetry.enabled` set to `Some(false)`.
 pub fn verify(data: &[u8], mime_type: &str) -> Result<VerificationReport, Error> {
     verify_with_options(data, mime_type, &VerifyOptions::default())
 }
@@ -357,6 +364,9 @@ fn verify_with_options_inner(
 }
 
 /// Read and verify one local asset.
+///
+/// Path-based verification accepts regular files up to 128 MiB. Byte-slice
+/// verification remains bounded only by caller memory.
 pub fn verify_file(
     path: impl AsRef<Path>,
     mime_type: Option<&str>,
@@ -369,8 +379,66 @@ pub fn verify_file(
             .ok_or_else(|| Error::UnsupportedMime(path.display().to_string()))?
             .to_string(),
     };
-    let data = fs::read(path)?;
+    let data = read_path_asset(path, MAX_PATH_ASSET_BYTES)?;
     verify_with_options(&data, &mime, options)
+}
+
+fn read_path_asset(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+    // Open once, then validate that exact handle. On Unix O_NONBLOCK prevents
+    // a FIFO substituted for the path from blocking before it can be rejected.
+    let mut file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    validate_path_asset(path, &opened_metadata, limit)?;
+    read_bounded_file(&mut file, opened_metadata.len(), limit)
+}
+
+fn validate_path_asset(path: &Path, metadata: &fs::Metadata, limit: u64) -> io::Result<()> {
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("asset path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("asset exceeds the 128 MiB path limit: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_file<R: Read>(file: &mut R, expected_len: u64, limit: u64) -> io::Result<Vec<u8>> {
+    if expected_len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "asset exceeds the path size limit",
+        ));
+    }
+    let expected_len = usize::try_from(expected_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "asset size is not addressable"))?;
+    let mut data = vec![0_u8; expected_len + 1];
+    let mut used = 0;
+    while used < expected_len {
+        let read = file.read(&mut data[used..expected_len])?;
+        if read == 0 {
+            break;
+        }
+        used += read;
+    }
+    if used == expected_len && file.read(&mut data[expected_len..expected_len + 1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "asset grew while being read",
+        ));
+    }
+    data.truncate(used);
+    Ok(data)
 }
 
 /// Canonical MIME types covered by the C2PA 2.4 profile and readable by this build.
@@ -579,8 +647,8 @@ fn trust_report(
 
 #[cfg(test)]
 mod tests {
-    use super::{mime_from_path, supported_mime_types, verify, Error};
-    use std::path::Path;
+    use super::{mime_from_path, read_bounded_file, supported_mime_types, verify, Error};
+    use std::{io::Cursor, path::Path};
 
     #[test]
     fn known_filename_maps_to_mime() {
@@ -593,6 +661,7 @@ mod tests {
     #[test]
     fn format_list_is_sorted_and_contains_composition_formats() {
         let formats = supported_mime_types();
+        assert_eq!(formats.len(), 69);
         assert!(formats.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(formats.contains(&"video/mp4"));
         assert!(formats.contains(&"image/jpeg"));
@@ -610,6 +679,20 @@ mod tests {
     fn unratified_hostless_store_is_not_in_public_profile() {
         let error = verify(b"jumb", "application/c2pa").unwrap_err();
         assert!(matches!(error, Error::UnsupportedMime(_)));
+    }
+
+    #[test]
+    fn bounded_reader_accepts_exact_limit_without_large_allocation() {
+        let mut input = Cursor::new(b"1234");
+        assert_eq!(read_bounded_file(&mut input, 4, 4).unwrap(), b"1234");
+    }
+
+    #[test]
+    fn bounded_reader_detects_growth_at_limit_plus_one() {
+        let mut input = Cursor::new(b"12345");
+        let error = read_bounded_file(&mut input, 4, 4).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("grew while being read"));
     }
 
     #[test]

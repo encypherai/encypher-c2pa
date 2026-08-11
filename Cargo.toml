@@ -43,6 +43,7 @@ signature = "2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 cms = "0.2.3"
 x509-tsp = "0.1.0"
+ureq = { version = "2.12.1", default-features = false, features = ["json", "tls"] }
 
 [profile.release]
 lto = "thin"

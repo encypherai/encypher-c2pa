@@ -425,6 +425,7 @@ dependencies = [
  "clap",
  "encypher-c2pa",
  "hex",
+ "libc",
  "serde_json",
  "sha2",
  "ureq",

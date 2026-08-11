@@ -26,7 +26,7 @@ char *encypher_c2pa_set_telemetry_enabled(bool enabled);
 /* Returns a JSON envelope whose enabled field is true, false, or null. */
 char *encypher_c2pa_telemetry_preference(void);
 
-/* Releases a string returned by encypher_c2pa_verify. */
+/* Releases any string returned by this library. */
 void encypher_c2pa_free_string(char *value);
 
 #ifdef __cplusplus

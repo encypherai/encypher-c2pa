@@ -82,6 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test release workflow helpers
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # stable
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -89,7 +91,8 @@ jobs:
           command: build
           args: --release --manifest-path bindings/python/Cargo.toml --out dist/python
       - run: uv venv .venv
-      - run: uv pip install --python .venv/bin/python dist/python/*.whl
+      - run: uv pip install --python .venv/bin/python dist/python/*.whl pytest
+      - run: .venv/bin/python -m pytest bindings/python/tests
       - run: |
           .venv/bin/python - <<'PY'
           import encypher_c2pa as c
@@ -111,6 +114,8 @@ jobs:
         with:
           node-version: 22
       - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
+        with:
+          version: v0.13.1
       - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
       - run: node scripts/package-wasm.mjs
       - run: node scripts/test-wasm.mjs

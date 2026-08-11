@@ -62,10 +62,9 @@ encypher-c2pa = "1.0.0"
 ```
 
 ```rust
-use encypher_c2pa::verify;
+use encypher_c2pa::{verify_file, VerifyOptions};
 
-let bytes = std::fs::read("composition.mp4")?;
-let report = verify(&bytes, "video/mp4")?;
+let report = verify_file("composition.mp4", None, &VerifyOptions::default())?;
 println!("integrity={} trust={}", report.integrity, report.trust.status);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -105,7 +104,8 @@ The browser package performs verification in WebAssembly. See [`examples/browser
 
 ### Go
 
-The Go binding uses the repository's stable C ABI. Build the static library before testing a source checkout:
+The Go source binding supports Linux and macOS and uses the repository's stable
+C ABI. Build the static library before testing a source checkout:
 
 ```bash
 cargo build -p encypher-c2pa-ffi --release
@@ -122,6 +122,8 @@ fmt.Println(report.Integrity, report.Trust.Status)
 ```
 
 The Go binding is a source distribution in this release. Its first interactive verification uses the shared native telemetry preference described below.
+
+Path-based convenience APIs in Rust, Python, and Go accept regular files up to 128 MiB; byte-slice APIs remain bounded only by caller memory.
 
 ## Optional failure telemetry
 
@@ -156,7 +158,7 @@ err := c2pa.ConfigureTelemetry(true)
 configureTelemetry(true);
 ```
 
-An explicit per-call value overrides the saved native preference. In Python, `verify(..., telemetry=True)` also saves that choice. Automated native deployments may set `ENCYPHER_C2PA_TELEMETRY=on` or `off` without writing a config file.
+An explicit per-call value overrides the saved native preference. In Python, `verify(..., telemetry=True)` attempts to save that choice; if the preference store is unavailable, the explicit value still governs that verification. Automated native deployments may set `ENCYPHER_C2PA_TELEMETRY=on` or `off` without writing a config file.
 
 ## Trust is caller-controlled: bring your own trust lists
 

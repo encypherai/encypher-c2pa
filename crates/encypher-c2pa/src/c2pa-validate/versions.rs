@@ -91,6 +91,35 @@ pub fn declared_spec_version(claim: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn optional_text_member_is_valid(map: &Value, key: &str) -> bool {
+    map.get(key).is_none() || map.get(key).and_then(Value::as_text).is_some()
+}
+
+fn hashed_uri_map_is_valid(value: &Value) -> bool {
+    matches!(value, Value::Map(_))
+        && value
+            .get("url")
+            .and_then(Value::as_text)
+            .is_some_and(|url| !url.is_empty())
+        && value
+            .get("hash")
+            .and_then(Value::as_bytes)
+            .is_some_and(|hash| !hash.is_empty())
+        && optional_text_member_is_valid(value, "alg")
+}
+
+fn generator_info_map_is_valid(value: &Value) -> bool {
+    matches!(value, Value::Map(_))
+        && value
+            .get("name")
+            .and_then(Value::as_text)
+            .is_some_and(|name| !name.is_empty())
+        && optional_text_member_is_valid(value, "version")
+        && optional_text_member_is_valid(value, "operating_system")
+        && optional_text_member_is_valid(value, "specVersion")
+        && value.get("icon").is_none_or(hashed_uri_map_is_valid)
+}
+
 /// Required claim-v1 fields absent from `claim` (empty = well-formed v1).
 pub fn v1_missing_fields(claim: &Value) -> Vec<&'static str> {
     let mut missing = Vec::new();
@@ -110,14 +139,32 @@ pub fn v1_missing_fields(claim: &Value) -> Vec<&'static str> {
     if !matches!(claim.get("assertions"), Some(Value::Array(a)) if !a.is_empty()) {
         missing.push("assertions");
     }
+    if !matches!(
+        claim.get("claim_generator_info"),
+        Some(Value::Array(entries))
+            if !entries.is_empty() && entries.iter().all(generator_info_map_is_valid)
+    ) {
+        missing.push("claim_generator_info");
+    }
     missing
 }
 
-/// Required claim-v2 fields absent from `claim` (empty = well-formed v2).
+/// Required claim-v2 fields absent or malformed in `claim` (empty =
+/// well-formed v2).
+///
+/// Unlike claim v1, claim v2 encodes `claim_generator_info` as one
+/// `GeneratorInfoMap`. Every present member is checked against its schema,
+/// including the required non-empty text `name` and optional hashed-URI icon.
 pub fn v2_missing_fields(claim: &Value) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if claim.get("instanceID").and_then(Value::as_text).is_none() {
         missing.push("instanceID");
+    }
+    if !claim
+        .get("claim_generator_info")
+        .is_some_and(generator_info_map_is_valid)
+    {
+        missing.push("claim_generator_info");
     }
     if !matches!(claim.get("created_assertions"), Some(Value::Array(a)) if !a.is_empty()) {
         missing.push("created_assertions");
@@ -329,7 +376,10 @@ pub fn evaluate(manifest: &ParsedManifest, claim: &Value, format: AssetFormat) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::c2pa_cbor::map_from_pairs;
+    use crate::c2pa_cbor::{map_from_pairs, Profile};
+    use crate::c2pa_core::claim::{
+        build_claim_value, AssertionRef, ClaimGeneratorInfo, ClaimOptions, HASH_ALG_SHA256,
+    };
 
     fn manifest_with_label(label: Option<&str>) -> ParsedManifest<'static> {
         ParsedManifest {
@@ -373,6 +423,13 @@ mod tests {
             ),
             ("dc:format".to_string(), Value::Text("image/jpeg".into())),
             (
+                "claim_generator_info".to_string(),
+                Value::Array(vec![map_from_pairs([(
+                    "name".to_string(),
+                    Value::Text("legacy".into()),
+                )])]),
+            ),
+            (
                 "assertions".to_string(),
                 Value::Array(vec![map_from_pairs([(
                     "url".to_string(),
@@ -380,6 +437,219 @@ mod tests {
                 )])]),
             ),
         ])
+    }
+
+    fn v2_claim_with_generator_info(info: Option<Value>) -> Value {
+        let mut fields = vec![
+            ("instanceID".to_string(), Value::Text("urn:uuid:x".into())),
+            (
+                "created_assertions".to_string(),
+                Value::Array(vec![map_from_pairs([(
+                    "url".to_string(),
+                    Value::Text("self#jumbf=c2pa.assertions/c2pa.hash.data".into()),
+                )])]),
+            ),
+        ];
+        if let Some(info) = info {
+            fields.push(("claim_generator_info".to_string(), info));
+        }
+        map_from_pairs(fields)
+    }
+
+    #[test]
+    fn canonical_builder_output_has_valid_v2_generator_info() {
+        let generator = ClaimGeneratorInfo {
+            name: "Encypher Engine".into(),
+            version: "1.0".into(),
+            spec_version: Some("2.4".into()),
+            c2pa_rs: None,
+        };
+        let options = ClaimOptions {
+            manifest_label: "urn:c2pa:test",
+            instance_id: "urn:uuid:test",
+            generator: &generator,
+            title: None,
+            alg: HASH_ALG_SHA256,
+            profile: Profile::LegacyPipelineBDefinite,
+        };
+        let claim = build_claim_value(
+            &options,
+            &[AssertionRef {
+                label: "c2pa.hash.data",
+                jumbf_content: b"assertion",
+            }],
+        );
+
+        assert!(v2_missing_fields(&claim).is_empty());
+    }
+
+    #[test]
+    fn v1_generator_info_requires_non_empty_array_of_named_maps() {
+        let valid = Value::Array(vec![
+            map_from_pairs([("name".to_string(), Value::Text("first".into()))]),
+            map_from_pairs([
+                ("name".to_string(), Value::Text("second".into())),
+                ("version".to_string(), Value::Text("1.0".into())),
+            ]),
+        ]);
+        let malformed = [
+            ("absent", None),
+            ("empty array", Some(Value::Array(Vec::new()))),
+            ("wrong outer type", Some(Value::Map(Vec::new()))),
+            (
+                "non-map entry",
+                Some(Value::Array(vec![Value::Text("generator".into())])),
+            ),
+            (
+                "missing name",
+                Some(Value::Array(vec![map_from_pairs([(
+                    "version".to_string(),
+                    Value::Text("1.0".into()),
+                )])])),
+            ),
+            (
+                "empty name",
+                Some(Value::Array(vec![map_from_pairs([(
+                    "name".to_string(),
+                    Value::Text(String::new()),
+                )])])),
+            ),
+            (
+                "one malformed entry",
+                Some(Value::Array(vec![
+                    map_from_pairs([("name".to_string(), Value::Text("valid".into()))]),
+                    map_from_pairs([("name".to_string(), Value::Integer(1.into()))]),
+                ])),
+            ),
+        ];
+
+        let mut valid_claim = v1_claim();
+        if let Value::Map(entries) = &mut valid_claim {
+            let generator_info = entries
+                .iter_mut()
+                .find(|(key, _)| key.as_text() == Some("claim_generator_info"))
+                .expect("fixture has generator info");
+            generator_info.1 = valid;
+        }
+        assert!(v1_missing_fields(&valid_claim).is_empty());
+
+        for (case, info) in malformed {
+            let mut claim = v1_claim();
+            if let Value::Map(entries) = &mut claim {
+                entries.retain(|(key, _)| key.as_text() != Some("claim_generator_info"));
+                if let Some(info) = info {
+                    entries.push((Value::Text("claim_generator_info".into()), info));
+                }
+            }
+            assert!(
+                v1_missing_fields(&claim).contains(&"claim_generator_info"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_info_optional_members_follow_schema() {
+        let valid_icon = map_from_pairs([
+            (
+                "url".to_string(),
+                Value::Text("self#jumbf=c2pa.assertions/c2pa.thumbnail.claim.jpeg".into()),
+            ),
+            ("alg".to_string(), Value::Text("sha256".into())),
+            ("hash".to_string(), Value::Bytes(vec![7; 32])),
+        ]);
+        let valid = map_from_pairs([
+            ("name".to_string(), Value::Text("generator".into())),
+            ("version".to_string(), Value::Text("1.0".into())),
+            (
+                "operating_system".to_string(),
+                Value::Text("Example OS".into()),
+            ),
+            ("specVersion".to_string(), Value::Text("2.4".into())),
+            ("icon".to_string(), valid_icon),
+        ]);
+        assert!(v2_missing_fields(&v2_claim_with_generator_info(Some(valid))).is_empty());
+
+        let malformed_icons = [
+            ("wrong icon type", Value::Text("icon".into())),
+            (
+                "missing icon url",
+                map_from_pairs([("hash".to_string(), Value::Bytes(vec![7; 32]))]),
+            ),
+            (
+                "missing icon hash",
+                map_from_pairs([(
+                    "url".to_string(),
+                    Value::Text("self#jumbf=c2pa.assertions/icon".into()),
+                )]),
+            ),
+        ];
+        for (case, icon) in malformed_icons {
+            let info = map_from_pairs([
+                ("name".to_string(), Value::Text("generator".into())),
+                ("icon".to_string(), icon),
+            ]);
+            assert_eq!(
+                v2_missing_fields(&v2_claim_with_generator_info(Some(info))),
+                vec!["claim_generator_info"],
+                "{case}"
+            );
+        }
+
+        for key in ["version", "operating_system", "specVersion"] {
+            let info = map_from_pairs([
+                ("name".to_string(), Value::Text("generator".into())),
+                (key.to_string(), Value::Integer(1.into())),
+            ]);
+            assert_eq!(
+                v2_missing_fields(&v2_claim_with_generator_info(Some(info))),
+                vec!["claim_generator_info"],
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_v2_generator_info_is_required_field_failure() {
+        let malformed = [
+            ("absent", None),
+            ("wrong outer type", Some(Value::Text("generator".into()))),
+            ("empty value", Some(Value::Map(Vec::new()))),
+            ("empty array", Some(Value::Array(Vec::new()))),
+            (
+                "legacy array-of-maps shape",
+                Some(Value::Array(vec![map_from_pairs([(
+                    "name".to_string(),
+                    Value::Text("generator".into()),
+                )])])),
+            ),
+            (
+                "non-map array entry",
+                Some(Value::Array(vec![Value::Text("generator".into())])),
+            ),
+            (
+                "missing name",
+                Some(map_from_pairs([(
+                    "version".to_string(),
+                    Value::Text("1.0".into()),
+                )])),
+            ),
+            (
+                "non-text name",
+                Some(map_from_pairs([(
+                    "name".to_string(),
+                    Value::Integer(1.into()),
+                )])),
+            ),
+        ];
+
+        for (case, info) in malformed {
+            assert_eq!(
+                v2_missing_fields(&v2_claim_with_generator_info(info)),
+                vec!["claim_generator_info"],
+                "{case}"
+            );
+        }
     }
 
     #[test]

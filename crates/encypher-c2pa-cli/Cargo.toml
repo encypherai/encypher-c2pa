@@ -21,4 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-ureq = { version = "2.12.1", default-features = false, features = ["json", "tls"] }
+ureq = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

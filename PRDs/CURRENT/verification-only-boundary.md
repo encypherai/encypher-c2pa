@@ -131,7 +131,7 @@ success and failure paths and creates no sibling files.
 
 - Default build of the published library exposes zero manifest constructors and
   zero container writers; `public-surface.txt` holds 171 reviewed items.
-- `cargo test --workspace` passes: 454 tests across 15 suites.
+- `cargo test --workspace` passes: 483 tests across 16 suites.
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - Exactly two publishable packages remain.
 - The gate fails on a writer becoming public through any of: a plain addition, a
@@ -148,14 +148,14 @@ success and failure paths and creates no sibling files.
 | Check | Result |
 |---|---|
 | Public surface inventory | 171 items, zero writers |
-| Workspace tests | 454 passed across 15 suites, 0 failed |
-| clippy `-D warnings` | 0 errors |
+| Workspace tests | 483 passed across 16 suites, 0 failed |
+| clippy `-D warnings` | pinned Rust 1.88, all targets, 0 errors |
 | CLI on a real signed MP4 | integrity valid, signature valid, hard binding match |
-| `cargo package` | 65 files, 1.3 MiB (291.9 KiB compressed); packaged source compiled |
-| Python wheel | `encypher-c2pa==1.0.0` installed in a clean venv; integrity valid, hard binding match |
-| Browser WASM | release build and verifier smoke clean; npm pack contains 7 intended files |
-| Go and C bindings | binding tests and compiled C consumer smoke clean |
-| MSRV 1.88 | clean |
+| `cargo package` | 65 files, 1.3 MiB (299.4 KiB compressed); packaged source compiled |
+| Python wheel | `encypher-c2pa==1.0.0` installed in a clean venv; 11 binding tests pass; integrity valid, hard binding match |
+| Browser WASM | pinned wasm-pack 0.13.1 release build and verifier smoke pass; npm pack contains 9 intended files |
+| Go and C bindings | rebuilt release C archive and Go binding tests pass |
+| MSRV 1.88 and dependency audit | clean; RustSec scanned 195 locked dependencies with no vulnerability |
 | Publishable packages | `encypher-c2pa`, `encypher-c2pa-cli` |
 | Gate vs. target-gated writer | FAIL as designed, item named |
 | Gate vs. implicit/redefined feature | FAIL as designed, resolved-vs-approved diff |
@@ -165,7 +165,7 @@ success and failure paths and creates no sibling files.
 | Sandbox vs. inherited `MAP_SHARED` mapping | unmapped before the filter; backing file unchanged |
 | Gate canaries, denied side | each of O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND isolated on both `openat` and `open`, plus `ioctl` FS_IOC_SETFLAGS: SIGSYS on all eleven |
 | Gate canaries vs. a mask losing one bit | each of the five removed in turn; each fails and names the flag |
-| Gate canaries, permitted side | read-only `openat` and `open` succeed, `ioctl` TCGETS survives, so the gates gate rather than ban |
+| Gate canaries, permitted side | read-only `openat` and `open` succeed; `ioctl` TCGETS and `fcntl` F_GETFD survive, so the gates gate rather than ban |
 | Allowlist minimality | removing any EXERCISED entry breaks the run |
 | Open/write guard, ungated arm | `open` or `openat` in EXERCISED or HEADROOM fails the build |
 | Open/write guard, ungateable arm | `creat`, `openat2`, `open_by_handle_at` or any io_uring entry in ANY tier fails, including a meaningless pointer gate in ARGUMENT_GATED |
@@ -209,15 +209,20 @@ Deviations from plan:
 Evidence status:
 
 - Directly confirmed on 2026-08-10: 171 reviewed public-surface items; two
-  publishable packages; 454 workspace tests across 15 suites; clippy with all
+  publishable packages; 483 workspace tests across 16 suites; clippy with all
   targets under `-D warnings`; Rust 1.88 MSRV; official C2PA core corpus and
   read-only capability suites; Rust, CLI, Python wheel, browser WASM, Go, and C
   smoke tests.
 - `cargo package -p encypher-c2pa --locked --offline` produced and verified a
-  65-file, 1.3 MiB package. The CLI package file list contains only the intended
-  source, notices, and README.
-- The release-version contract passed for the `v1.0.0` tag, workspace metadata,
-  CLI dependency requirement, and Python package version.
+  65-file, 1.3 MiB (299.4 KiB compressed) package. The CLI package file list
+  contains only the intended source, notices, and README.
+- The release-version contract covers the `v1.0.0` tag, workspace metadata,
+  CLI dependency requirement, and Python package version. Thirteen unit tests
+  cover recursive tag peeling and PyPI artifact-set comparison.
+- The CLI provenance lookup rejects an oversized source before network access
+  and hashes the same bounded byte buffer passed to local verification. Go
+  rejects FIFOs without blocking and has no path-opening fallback outside its
+  stated Linux and macOS source-binding platforms.
 - External interoperability is hermetic and pinned: 34 CAWG vectors from
   `contentauth/c2pa-rs@d7f13829`, six core C2PA vectors from
   `contentauth/c2pa-rs@bc3ca83d`, and seven generated conformance vectors from
@@ -271,6 +276,17 @@ the finalized source after the last parser, CAWG, and BMFF remediations.
 
   Completion gate CLEARED. GPT-5.5, Opus, and Sol each scored correctness,
   simplification, and security at or above 9.5 on the same finalized source.
+
+  Release-readiness cycle 1 found one medium CLI byte-identity defect:
+  `--encypher-api` reopened the path after verification. GPT-5.5 scored
+  correctness 9.0, simplification 9.6, security 9.0, and release readiness
+  9.0; Opus scored 9.7, 9.5, 9.8, and 9.6. The CLI now verifies and hashes one
+  bounded buffer, and the Go binding has no blocking path fallback.
+
+  Release-readiness cycle 2 CLEARED on the exact final staged diff. GPT-5.5
+  scored correctness 9.7, simplification 9.6, security 9.7, and release
+  readiness 9.6. Opus scored 9.8, 9.6, 9.9, and 9.7. Neither found a remaining
+  medium or high blocker.
   The analysis below is the retrospective of the earlier boundary-hardening
   cycles.
 

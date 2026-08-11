@@ -450,12 +450,21 @@ const WRITE_CAPABLE = [
   [/\bfs::(hard_link|soft_link)\b/, "fs::*link"],
   [/\bFile::create(_new)?\b/, "File::create"],
   [/\bOpenOptions\b/, "OpenOptions"],
+  [/\.(write|append|truncate|create|create_new)\s*\(\s*true\s*\)/, "OpenOptions write flag"],
   [/\bprocess::Command\b/, "process::Command"],
 ];
 
 // Modules permitted to hold a write capability, with the reason.
 const WRITE_ALLOWED = new Map([
   ["telemetry_consent.rs", "persists the user's opt-in telemetry choice"],
+]);
+
+// `read_path_asset` opens once with O_NONBLOCK before inspecting the handle, so
+// it must use OpenOptions rather than File::open. These exact lines are safe;
+// any mutating option remains caught by WRITE_CAPABLE above and by seccomp.
+const READ_ONLY_OPEN_OPTIONS = new Set([
+  "use std::fs::{self, OpenOptions};",
+  "let mut options = OpenOptions::new();",
 ]);
 
 function checkNoWriteCapability() {
@@ -489,6 +498,9 @@ function checkNoWriteCapability() {
       if (skip.has(i)) return;
       const code = line.replace(/\/\/.*$/, "");
       for (const [re, name] of WRITE_CAPABLE) {
+        if (name === "OpenOptions" && base === "lib.rs" && READ_ONLY_OPEN_OPTIONS.has(code.trim())) {
+          continue;
+        }
         if (re.test(code)) offenders.push(`${file}:${i + 1}  ${name}\n     ${line.trim().slice(0, 80)}`);
       }
     });

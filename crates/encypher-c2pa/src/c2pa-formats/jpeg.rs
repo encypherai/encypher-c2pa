@@ -29,6 +29,12 @@ const BOX_INSTANCE: u16 = 1;
 /// Maximum `Le` field value (including the 2 length bytes).
 #[cfg(test)]
 const MAX_SEGMENT_LEN: usize = 0xFFFF;
+/// Aggregate cap for parseable APP11 packet metadata across the JPEG.
+///
+/// A maximum-sized manifest needs fewer than 1,100 full APP11 segments. This
+/// higher limit preserves unusually fragmented carriers while bounding the
+/// packet vectors to roughly one MiB even when every fragment has no DBox.
+const MAX_APP11_PACKET_COUNT: usize = 16 * 1024;
 
 fn check_soi(data: &[u8]) -> Result<(), FormatError> {
     if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
@@ -244,16 +250,16 @@ pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>
 /// An APP11 fragment: `(Z sequence number, box header, dbox payload)`.
 
 #[derive(Clone)]
-struct App11Packet {
+struct App11Packet<'a> {
     start: usize,
     end: usize,
     en: u16,
     z: u32,
-    header: Vec<u8>,
-    dbox: Vec<u8>,
+    header: &'a [u8],
+    dbox: &'a [u8],
 }
 
-fn parse_app11_packet(data: &[u8], seg: &Segment) -> Option<App11Packet> {
+fn parse_app11_packet<'a>(data: &'a [u8], seg: &Segment) -> Option<App11Packet<'a>> {
     if seg.marker != MARKER_APP11 {
         return None;
     }
@@ -273,8 +279,8 @@ fn parse_app11_packet(data: &[u8], seg: &Segment) -> Option<App11Packet> {
         end: seg.end,
         en,
         z,
-        header: payload[8..8 + header_len].to_vec(),
-        dbox: payload[8 + header_len..].to_vec(),
+        header: &payload[8..8 + header_len],
+        dbox: &payload[8 + header_len..],
     })
 }
 
@@ -287,36 +293,62 @@ fn declared_box_len(header: &[u8]) -> Option<usize> {
     }
 }
 
+fn app11_family_is_valid(family: &[App11Packet<'_>]) -> Result<bool, FormatError> {
+    let Some(first) = family.first() else {
+        return Ok(false);
+    };
+    let dbox_len = family
+        .iter()
+        .try_fold(0usize, |total, packet| total.checked_add(packet.dbox.len()));
+    let Some(assembled_len) = dbox_len.and_then(|length| first.header.len().checked_add(length))
+    else {
+        return Err(FormatError::ManifestTooLarge {
+            format: FMT,
+            max: crate::MAX_MANIFEST_STORE_BYTES,
+            got: usize::MAX,
+        });
+    };
+    let sequence_is_valid = family.iter().enumerate().all(|(index, packet)| {
+        packet.z == index as u32 + 1
+            && packet.header == first.header
+            && (index == 0 || family[index - 1].end == packet.start)
+    });
+    if !sequence_is_valid || declared_box_len(first.header) != Some(assembled_len) {
+        return Ok(false);
+    }
+    super::ensure_manifest_store_size(FMT, assembled_len)?;
+    Ok(
+        crate::c2pa_core::jumbf::parse_manifest_store(&assemble_family(family))
+            .is_ok_and(|store| !store.manifests.is_empty()),
+    )
+}
+
 /// Return only complete, contiguous JUMBF APP11 families. A payload merely
 /// beginning with `JP` is foreign metadata unless its packet sequence,
 /// repeated box header, and declared store length all validate.
-fn valid_app11_families(data: &[u8]) -> Result<Vec<Vec<App11Packet>>, FormatError> {
-    let mut packets = Vec::new();
-    walk_segments(data, |seg| {
-        if let Some(packet) = parse_app11_packet(data, seg) {
-            packets.push(packet);
-        }
-    })?;
-    let valid = |family: &[App11Packet]| {
-        let Some(first) = family.first() else {
-            return false;
-        };
-        let assembled_len = first
-            .header
-            .len()
-            .checked_add(family.iter().map(|packet| packet.dbox.len()).sum::<usize>());
-        family.iter().enumerate().all(|(index, packet)| {
-            packet.z == index as u32 + 1
-                && packet.header == first.header
-                && (index == 0 || family[index - 1].end == packet.start)
-        }) && declared_box_len(&first.header) == assembled_len
-            && crate::c2pa_core::jumbf::parse_manifest_store(&assemble_family(family))
-                .is_ok_and(|store| !store.manifests.is_empty())
-    };
-
+fn valid_app11_families<'a>(data: &'a [u8]) -> Result<Vec<Vec<App11Packet<'a>>>, FormatError> {
+    let valid = |family: &[App11Packet<'_>]| app11_family_is_valid(family);
     let mut families = Vec::new();
-    let mut current: Vec<App11Packet> = Vec::new();
-    for packet in packets {
+    let mut current: Vec<App11Packet<'a>> = Vec::new();
+    let mut packet_count = 0usize;
+    let mut family_error = None;
+
+    walk_segments(data, |seg| {
+        if family_error.is_some() {
+            return;
+        }
+        let Some(packet) = parse_app11_packet(data, seg) else {
+            return;
+        };
+        packet_count += 1;
+        if packet_count > MAX_APP11_PACKET_COUNT {
+            family_error = Some(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "APP11 packet metadata limit exceeded",
+            });
+            return;
+        }
+
         let continues = current.last().is_some_and(|previous| {
             previous.en == packet.en
                 && previous.z.checked_add(1) == Some(packet.z)
@@ -324,15 +356,22 @@ fn valid_app11_families(data: &[u8]) -> Result<Vec<Vec<App11Packet>>, FormatErro
                 && previous.end == packet.start
         });
         if !current.is_empty() && !continues {
-            if valid(&current) {
-                families.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
+            match valid(&current) {
+                Ok(true) => families.push(std::mem::take(&mut current)),
+                Ok(false) => current.clear(),
+                Err(error) => {
+                    family_error = Some(error);
+                    return;
+                }
             }
         }
         current.push(packet);
+    })?;
+
+    if let Some(error) = family_error {
+        return Err(error);
     }
-    if valid(&current) {
+    if valid(&current)? {
         families.push(current);
     }
     Ok(families)
@@ -349,10 +388,10 @@ pub(crate) fn valid_app11_spans(data: &[u8]) -> Result<Vec<(usize, usize)>, Form
         .collect())
 }
 
-fn assemble_family(family: &[App11Packet]) -> Vec<u8> {
-    let mut out = family[0].header.clone();
+fn assemble_family(family: &[App11Packet<'_>]) -> Vec<u8> {
+    let mut out = family[0].header.to_vec();
     for packet in family {
-        out.extend_from_slice(&packet.dbox);
+        out.extend_from_slice(packet.dbox);
     }
     out
 }
@@ -541,6 +580,72 @@ mod tests {
         );
         let got = extract(&embedded).unwrap();
         assert_eq!(got.as_deref(), Some(store.as_slice()));
+    }
+
+    #[test]
+    fn oversized_app11_family_fails_before_assembly() {
+        let chunk = vec![0u8; 1024 * 1024];
+        let packet_count = crate::MAX_MANIFEST_STORE_BYTES / chunk.len() + 1;
+        let assembled_len = 8 + packet_count * chunk.len();
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&(assembled_len as u32).to_be_bytes());
+        header[4..].copy_from_slice(b"jumb");
+        let family = (0..packet_count)
+            .map(|index| App11Packet {
+                start: index,
+                end: index + 1,
+                en: 1,
+                z: index as u32 + 1,
+                header: &header,
+                dbox: &chunk,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            app11_family_is_valid(&family),
+            Err(FormatError::ManifestTooLarge {
+                format: FMT,
+                max: crate::MAX_MANIFEST_STORE_BYTES,
+                got,
+            }) if got == assembled_len
+        ));
+    }
+
+    fn append_empty_app11_packet(jpeg: &mut Vec<u8>, sequence: u32) {
+        jpeg.extend_from_slice(&[0xff, MARKER_APP11, 0x00, 0x12]);
+        jpeg.extend_from_slice(&CI_JP);
+        jpeg.extend_from_slice(&1u16.to_be_bytes());
+        jpeg.extend_from_slice(&sequence.to_be_bytes());
+        jpeg.extend_from_slice(&8u32.to_be_bytes());
+        jpeg.extend_from_slice(b"jumb");
+    }
+
+    fn empty_app11_packet_flood(packet_count: usize) -> Vec<u8> {
+        let mut jpeg = Vec::with_capacity(4 + packet_count * 20);
+        jpeg.extend_from_slice(&[0xff, 0xd8]);
+        for sequence in 1..=packet_count {
+            append_empty_app11_packet(&mut jpeg, sequence as u32);
+        }
+        jpeg.extend_from_slice(&[0xff, MARKER_EOI]);
+        jpeg
+    }
+
+    #[test]
+    fn app11_packet_metadata_limit_allows_exact_boundary() {
+        let jpeg = empty_app11_packet_flood(MAX_APP11_PACKET_COUNT);
+        assert_eq!(extract(&jpeg).unwrap(), None);
+    }
+
+    #[test]
+    fn app11_packet_metadata_limit_rejects_zero_payload_flood() {
+        let jpeg = empty_app11_packet_flood(MAX_APP11_PACKET_COUNT + 1);
+        assert!(matches!(
+            extract(&jpeg),
+            Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "APP11 packet metadata limit exceeded",
+            })
+        ));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 use crate::c2pa_formats::util::{be_u16, be_u24, iso_box_header};
-use crate::c2pa_formats::util::{be_u32, be_u64, walk_iso_boxes, IsoBox};
+use crate::c2pa_formats::util::{be_u32, be_u64, u64_to_usize, walk_iso_boxes, IsoBox};
 use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Bmff;
@@ -103,7 +103,7 @@ pub(crate) fn jumbf_from_uuid_payload(payload: &[u8]) -> Option<&[u8]> {
                         usize::try_from(u64::from_be_bytes(bytes)).ok()
                     }),
                 ),
-                len => (8, Some(len as usize)),
+                len => (8, usize::try_from(len).ok()),
             };
             if let Some(declared_len) = declared_len {
                 if declared_len >= header_len {
@@ -1103,13 +1103,13 @@ pub fn bmff_hash_reader<R: std::io::Read + std::io::Seek>(
 
     let mut pos: u64 = 0;
     let mut chunk = vec![0u8; STREAM_CHUNK];
-    while pos + 8 <= total_len {
+    while total_len.saturating_sub(pos) >= 8 {
         reader
             .seek(SeekFrom::Start(pos))
             .map_err(|_| FormatError::Truncated(FMT))?;
         let mut hdr = [0u8; 16];
         // Read up to 16 header bytes (8 minimum; 16 for the 64-bit size form).
-        let avail = (total_len - pos).min(16) as usize;
+        let avail = u64_to_usize((total_len - pos).min(16)).ok_or(FormatError::Truncated(FMT))?;
         reader
             .read_exact(&mut hdr[..avail])
             .map_err(|_| FormatError::Truncated(FMT))?;
@@ -1122,17 +1122,15 @@ pub fn bmff_hash_reader<R: std::io::Read + std::io::Seek>(
                 return Err(FormatError::Truncated(FMT));
             }
             let large = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
-            if large < 16 || pos + large > total_len {
-                return Err(FormatError::Truncated(FMT));
-            }
-            pos + large
+            pos.checked_add(large)
+                .filter(|&end| large >= 16 && end <= total_len)
+                .ok_or(FormatError::Truncated(FMT))?
         } else if size32 == 0 {
             total_len
         } else {
-            if size32 < 8 || pos + size32 > total_len {
-                return Err(FormatError::Truncated(FMT));
-            }
-            pos + size32
+            pos.checked_add(size32)
+                .filter(|&end| size32 >= 8 && end <= total_len)
+                .ok_or(FormatError::Truncated(FMT))?
         };
 
         // Decide exclusion. For `/uuid`, only the C2PA manifest box is excluded;
@@ -1156,7 +1154,7 @@ pub fn bmff_hash_reader<R: std::io::Read + std::io::Seek>(
             reader
                 .seek(SeekFrom::Start(pos))
                 .map_err(|_| FormatError::Truncated(FMT))?;
-            let mut remaining = (end - pos) as usize;
+            let mut remaining = u64_to_usize(end - pos).ok_or(FormatError::Truncated(FMT))?;
             while remaining > 0 {
                 let n = remaining.min(STREAM_CHUNK);
                 reader
@@ -1305,22 +1303,24 @@ fn walk_boxes_range(
 ) -> Result<(), FormatError> {
     let mut pos = lo;
     while pos + 8 <= hi {
-        let size32 = be_u32(data, pos).ok_or(FormatError::Truncated(FMT))? as u64;
+        let size32 = be_u32(data, pos).ok_or(FormatError::Truncated(FMT))?;
         let mut box_type = [0u8; 4];
         box_type.copy_from_slice(&data[pos + 4..pos + 8]);
         let (payload_start, end) = if size32 == 1 {
             let large = be_u64(data, pos + 8).ok_or(FormatError::Truncated(FMT))?;
+            let large = u64_to_usize(large).ok_or(FormatError::Truncated(FMT))?;
             let end = pos
-                .checked_add(large as usize)
-                .filter(|&e| (large as usize) >= 16 && e <= hi)
+                .checked_add(large)
+                .filter(|&e| large >= 16 && e <= hi)
                 .ok_or(FormatError::Truncated(FMT))?;
             (pos + 16, end)
         } else if size32 == 0 {
             (pos + 8, hi)
         } else {
+            let size = usize::try_from(size32).map_err(|_| FormatError::Truncated(FMT))?;
             let end = pos
-                .checked_add(size32 as usize)
-                .filter(|&e| (size32 as usize) >= 8 && e <= hi)
+                .checked_add(size)
+                .filter(|&e| size >= 8 && e <= hi)
                 .ok_or(FormatError::Truncated(FMT))?;
             (pos + 8, end)
         };
@@ -1619,6 +1619,33 @@ mod tests {
         let mut v = iso_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2");
         v.extend_from_slice(&iso_box(b"mdat", &[0xDE, 0xAD, 0xBE, 0xEF]));
         v
+    }
+
+    #[test]
+    fn ranged_box_walker_rejects_largesize_above_wasm32_range() {
+        let mut box_bytes = Vec::from(1u32.to_be_bytes());
+        box_bytes.extend_from_slice(b"free");
+        box_bytes.extend_from_slice(&((1u64 << 32) + 16).to_be_bytes());
+
+        assert_eq!(
+            walk_boxes_range(&box_bytes, 0, box_bytes.len(), &mut |_| {}),
+            Err(FormatError::Truncated(FMT))
+        );
+    }
+
+    #[test]
+    fn ranged_box_walker_accepts_minimum_largesize() {
+        let mut box_bytes = Vec::from(1u32.to_be_bytes());
+        box_bytes.extend_from_slice(b"free");
+        box_bytes.extend_from_slice(&16u64.to_be_bytes());
+        let mut span = None;
+
+        walk_boxes_range(&box_bytes, 0, box_bytes.len(), &mut |b| {
+            span = Some((b.payload_start, b.end));
+        })
+        .unwrap();
+
+        assert_eq!(span, Some((16, 16)));
     }
 
     #[test]
@@ -2198,13 +2225,14 @@ mod tests {
             exact: true,
         };
         assert_eq!(
-            normalized_bmff_ranges(&asset, &[clipped.clone()])
+            normalized_bmff_ranges(&asset, std::slice::from_ref(&clipped))
                 .unwrap()
                 .ranges,
             vec![(asset.len() - 1, asset.len())]
         );
 
-        let expected = bmff_hash_with_exclusions(&asset, "sha256", &[clipped.clone()]).unwrap();
+        let expected =
+            bmff_hash_with_exclusions(&asset, "sha256", std::slice::from_ref(&clipped)).unwrap();
         let mut changed_excluded_tail = asset.clone();
         *changed_excluded_tail.last_mut().unwrap() ^= 0xFF;
         assert_eq!(
@@ -2228,10 +2256,12 @@ mod tests {
             flags: None,
             exact: true,
         };
-        assert!(normalized_bmff_ranges(&asset, &[beyond.clone()])
-            .unwrap()
-            .ranges
-            .is_empty());
+        assert!(
+            normalized_bmff_ranges(&asset, std::slice::from_ref(&beyond))
+                .unwrap()
+                .ranges
+                .is_empty()
+        );
         assert_eq!(
             bmff_hash_with_exclusions(&asset, "sha256", &[beyond]).unwrap(),
             bmff_hash_with_exclusions(&asset, "sha256", &[]).unwrap()

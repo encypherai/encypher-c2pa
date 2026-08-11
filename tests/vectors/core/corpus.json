@@ -142,7 +142,7 @@
       }
     },
     {
-      "id": "reference-valid-bmff-nested-exclusions",
+      "id": "reference-invalid-bmff-missing-generator-info",
       "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/video1.mp4",
       "mime_type": "video/mp4",
       "fixed_validation_time": "2025-09-01T00:00:00Z",
@@ -152,16 +152,20 @@
         "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
         "path": "sdk/tests/fixtures/video1.mp4"
       },
+      "rationale": "The historical claim-v1 fixture predates claim_generator_info. C2PA 2.4 requires a non-empty generator-info array with a name, so validation stops before the BMFF binding can yield a success.",
       "normative_expected": {
-        "exit_code": 0,
-        "validation_state": "Valid",
+        "exit_code": 2,
+        "validation_state": "Invalid",
         "manifest_count": 2,
         "required_success_codes": [
-          "assertion.bmffHash.match",
-          "claimSignature.validated"
+          "claimSignature.insideValidity"
         ],
-        "forbidden_success_codes": [],
-        "failure_codes": []
+        "forbidden_success_codes": [
+          "assertion.bmffHash.match"
+        ],
+        "failure_codes": [
+          "claim.malformed"
+        ]
       }
     }
   ]

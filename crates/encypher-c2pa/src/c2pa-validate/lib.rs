@@ -722,6 +722,7 @@ fn verify_with_fragments(
         && crate::c2pa_formats::supports_hash_mode(input.mime)
         && has_conformance_additional_exclusions(manifest, format, input.data);
 
+    let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
     // SHA-256 over each manifest JUMBF superbox, used to authenticate
     // ingredient links and compound child bindings.
     let manifest_hashes = manifest_hashes(&store_bytes, &store.manifests)?;
@@ -736,10 +737,16 @@ fn verify_with_fragments(
         fragments,
         None,
         cawg_inputs,
+        &mut report_decode_nodes,
     );
     // Reader-shape parity: list every manifest in the store (ingredient
     // parents included), with `active_manifest` as the pointer.
-    append_store_manifests(&mut out.report_json, &store, &manifest.label);
+    append_store_manifests(
+        &mut out.report_json,
+        &store,
+        &manifest.label,
+        &mut report_decode_nodes,
+    );
     stamp_manifest_store_hash(&mut out, &store_bytes);
     if additional_exclusions_present {
         note_additional_exclusions(&mut out, &manifest.label);
@@ -1003,6 +1010,7 @@ pub fn verify_detached<'a>(
         return Ok(out);
     };
 
+    let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
     let manifest_hashes = manifest_hashes(manifest_store, &store.manifests)?;
 
     // Present the external content as the asset under verification, then run the
@@ -1023,8 +1031,14 @@ pub fn verify_detached<'a>(
         &[],
         None,
         CawgTrustInputs::default(),
+        &mut report_decode_nodes,
     );
-    append_store_manifests(&mut out.report_json, &store, &manifest.label);
+    append_store_manifests(
+        &mut out.report_json,
+        &store,
+        &manifest.label,
+        &mut report_decode_nodes,
+    );
     stamp_manifest_store_hash(&mut out, manifest_store);
     if out_of_scope {
         note_out_of_scope(&mut out, content_mime);
@@ -1063,6 +1077,7 @@ pub fn verify_prehashed_manifest<'a>(
         stamp_manifest_store_hash(&mut out, manifest_store);
         return Ok(out);
     };
+    let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
     let manifest_hashes = manifest_hashes(manifest_store, &store.manifests)?;
     let digest_input = VerifyInput {
         data: &[],
@@ -1080,8 +1095,14 @@ pub fn verify_prehashed_manifest<'a>(
         &[],
         Some(hard_binding_digest),
         CawgTrustInputs::default(),
+        &mut report_decode_nodes,
     );
-    append_store_manifests(&mut out.report_json, &store, &manifest.label);
+    append_store_manifests(
+        &mut out.report_json,
+        &store,
+        &manifest.label,
+        &mut report_decode_nodes,
+    );
     stamp_manifest_store_hash(&mut out, manifest_store);
     if input.profile.debug {
         out.crjson = Some(crjson::to_crjson_with_report(&store, &out.report_json));
@@ -1725,6 +1746,7 @@ fn record_embedded_ocsp_status(
 }
 
 /// Run the per-manifest verification steps and assemble the output.
+#[allow(clippy::too_many_arguments)] // one internal pass threads shared store/report budgets
 fn verify_manifest<'a>(
     manifest: &'a ParsedManifest<'a>,
     store: StoreContext<'a>,
@@ -1733,6 +1755,7 @@ fn verify_manifest<'a>(
     fragments: &[&[u8]],
     prehashed_digest: Option<&[u8]>,
     cawg_inputs: CawgTrustInputs<'_>,
+    report_decode_nodes: &mut usize,
 ) -> VerifyOutput {
     let label = manifest.label.clone();
     let sig_url = format!("self#jumbf=/c2pa/{label}/c2pa.signature");
@@ -1751,6 +1774,7 @@ fn verify_manifest<'a>(
             results,
             None,
             input.profile,
+            report_decode_nodes,
         );
     };
     let claim = match decode(claim_cbor) {
@@ -1771,6 +1795,7 @@ fn verify_manifest<'a>(
                 results,
                 None,
                 input.profile,
+                report_decode_nodes,
             );
         }
     };
@@ -1852,6 +1877,7 @@ fn verify_manifest<'a>(
             results,
             Some(verdict),
             input.profile,
+            report_decode_nodes,
         );
     };
 
@@ -1878,6 +1904,7 @@ fn verify_manifest<'a>(
             results,
             Some(verdict),
             input.profile,
+            report_decode_nodes,
         );
     }
 
@@ -2254,6 +2281,7 @@ fn verify_manifest<'a>(
         results,
         Some(verdict),
         input.profile,
+        report_decode_nodes,
     )
 }
 
@@ -2266,6 +2294,9 @@ fn verify_manifest<'a>(
 const MAX_CLAIM_ASSERTION_REFERENCES: usize = 4_096;
 const MAX_ASSERTION_HASH_WORK_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ASSERTION_DECODED_VALUE_NODES: usize = 1 << 20;
+// One verifier-call budget spans the active manifest and every ingredient
+// parent. No report assertion or parent receives a fresh decoder allowance.
+const MAX_REPORT_DECODED_VALUE_NODES: usize = 1 << 20;
 
 fn checked_hash_work_total(lengths: impl IntoIterator<Item = usize>) -> Option<usize> {
     lengths.into_iter().try_fold(0usize, |total, length| {
@@ -2344,6 +2375,34 @@ impl<'index, 'claim> BindingPlan<'index, 'claim> {
     }
 }
 
+const GENERATOR_ICON_REFERENCE_FIELD: &str = "claim_generator_info.icon";
+
+fn visit_generator_icon_references<'a>(
+    claim: &'a Value,
+    generation: ClaimGeneration,
+    mut visit: impl FnMut(&'a Value),
+) {
+    let Some(info) = claim.get("claim_generator_info") else {
+        return;
+    };
+    match generation {
+        ClaimGeneration::V1 => {
+            if let Value::Array(entries) = info {
+                for entry in entries {
+                    if let Some(icon) = entry.get("icon") {
+                        visit(icon);
+                    }
+                }
+            }
+        }
+        ClaimGeneration::V2 => {
+            if let Some(icon) = info.get("icon") {
+                visit(icon);
+            }
+        }
+    }
+}
+
 /// One bounded, exact-resolution view of a claim's assertion declarations.
 ///
 /// Every downstream validation phase uses this view. References are kept once
@@ -2382,6 +2441,19 @@ impl<'a> ClaimAssertionRefs<'a> {
             }
             total = next;
         }
+        let mut icon_overflow = false;
+        visit_generator_icon_references(claim, generation, |_| {
+            total = match total.checked_add(1) {
+                Some(next) if next <= MAX_CLAIM_ASSERTION_REFERENCES => next,
+                _ => {
+                    icon_overflow = true;
+                    total
+                }
+            };
+        });
+        if icon_overflow {
+            return Self::incomplete();
+        }
 
         let mut references = Vec::with_capacity(total);
         let mut declared_labels = std::collections::HashSet::with_capacity(total);
@@ -2416,6 +2488,23 @@ impl<'a> ClaimAssertionRefs<'a> {
                 });
             }
         }
+        visit_generator_icon_references(claim, generation, |value| {
+            let label = value
+                .get("url")
+                .and_then(Value::as_text)
+                .and_then(|url| assertion_label_for_manifest(url, &manifest.label));
+            if let Some(label) = label {
+                if !declared_labels.insert(label) {
+                    duplicate_label.get_or_insert(label);
+                    return;
+                }
+            }
+            references.push(ClaimAssertionReference {
+                field: GENERATOR_ICON_REFERENCE_FIELD,
+                value,
+                label,
+            });
+        });
 
         let payloads: std::collections::HashMap<&str, &[u8]> = manifest
             .assertions
@@ -2608,8 +2697,10 @@ fn verify_claim_structure(
     }
 
     // claim.malformed: fields required by the detected claim generation must
-    // be present (claim v1: instanceID/claim_generator/dc:format/assertions;
-    // claim v2: instanceID/created_assertions).
+    // be present and have their required shape (claim v1:
+    // instanceID/claim_generator/claim_generator_info/dc:format/assertions;
+    // claim v2: instanceID/claim_generator_info/created_assertions). This
+    // includes GeneratorInfoMap optional-member types and hashed-URI icons.
     let missing = match generation {
         ClaimGeneration::V1 => versions::v1_missing_fields(claim),
         ClaimGeneration::V2 => versions::v2_missing_fields(claim),
@@ -2663,6 +2754,16 @@ fn verify_claim_structure(
                 CLAIM_MALFORMED,
                 sig_url.to_string(),
                 "claim assertion reference is not a complete HashedUriMap".into(),
+            );
+            fatal = true;
+        }
+        if reference.field == GENERATOR_ICON_REFERENCE_FIELD
+            && !reference.label.is_some_and(is_generator_icon_label)
+        {
+            results.push_failure(
+                CLAIM_MALFORMED,
+                sig_url.to_string(),
+                "claim generator icon must reference a c2pa.icon assertion".into(),
             );
             fatal = true;
         }
@@ -3218,6 +3319,14 @@ fn ref_fields(generation: ClaimGeneration) -> &'static [&'static str] {
         ClaimGeneration::V2 => &["created_assertions", "gathered_assertions"],
     }
 }
+fn is_generator_icon_label(label: &str) -> bool {
+    label == "c2pa.icon"
+        || label
+            .strip_prefix("c2pa.icon__")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .is_some_and(|instance| instance > 0)
+}
+
 fn assertion_label_for_manifest<'a>(url: &'a str, manifest_label: &str) -> Option<&'a str> {
     if let Some(label) = url.strip_prefix("self#jumbf=c2pa.assertions/") {
         return (!label.is_empty() && !label.contains('/')).then_some(label);
@@ -6183,7 +6292,7 @@ fn bmff_exclusion_maps(
                     if previous_end.is_some_and(|end| offset < end) {
                         return Err("BMFF exclusion subsets overlap or are not sorted");
                     }
-                    previous_end = Some(offset.checked_add(length).unwrap_or(usize::MAX));
+                    previous_end = Some(offset.saturating_add(length));
                     normalized.push(crate::c2pa_formats::BmffSubsetMap { offset, length });
                 }
                 normalized
@@ -6559,6 +6668,7 @@ fn finish(
     results: ValidationResults,
     verdict: Option<VersionVerdict>,
     profile: EngineProfile,
+    report_decode_nodes: &mut usize,
 ) -> VerifyOutput {
     let state = compute_state(&results, profile);
     // Clear `validated_under` only when manifest *integrity* is broken (a
@@ -6604,6 +6714,7 @@ fn finish(
         cose,
         &results,
         state,
+        report_decode_nodes,
     );
     if let Some(obj) = report_json.as_object_mut() {
         // A manifest reached `finish`, so provenance is present.
@@ -6697,25 +6808,37 @@ fn validation_results_json(results: &ValidationResults) -> Json {
 fn manifest_entry_json(
     manifest: &ParsedManifest,
     claim: Option<&Value>,
+    claim_decode_budget_exhausted: bool,
     declared_assertions: Option<&std::collections::HashSet<&str>>,
     chain: &[Vec<u8>],
     cose: Option<&[u8]>,
+    report_decode_nodes: &mut usize,
 ) -> Json {
     let mut assertions = Vec::with_capacity(manifest.assertions.len());
     for (alabel, cbor) in &manifest.assertions {
         if declared_assertions.is_some_and(|labels| !labels.contains(alabel.as_str())) {
             continue;
         }
-        let data = decode(cbor)
-            .map(|v| report::cbor_to_json(&v))
-            .unwrap_or_else(|_| json!({}));
+        let data = match decode((*cbor, &mut *report_decode_nodes)) {
+            Ok(value) => report::cbor_to_json(&value),
+            Err(DecodeError::NodeLimitExceeded(_)) => {
+                json!({ "_encypher_omitted": "decoded assertion report node budget exceeded" })
+            }
+            Err(_) => json!({}),
+        };
         assertions.push(json!({ "label": alabel, "data": data }));
     }
 
-    let claim_generator_info = claim
-        .and_then(|c| c.get("claim_generator_info"))
-        .map(report::cbor_to_json)
-        .unwrap_or_else(|| Json::Array(Vec::new()));
+    let claim_generator_info = if claim_decode_budget_exhausted {
+        Json::Array(vec![
+            json!({ "_encypher_omitted": "decoded claim report node budget exceeded" }),
+        ])
+    } else {
+        claim
+            .and_then(|c| c.get("claim_generator_info"))
+            .map(report::cbor_to_json)
+            .unwrap_or_else(|| Json::Array(Vec::new()))
+    };
     let title = claim
         .and_then(|c| c.get("dc:title"))
         .and_then(Value::as_text)
@@ -6761,7 +6884,12 @@ fn manifest_entry_json(
 /// `validation_status`, and `validation_state` remain scoped to the active
 /// manifest, exactly like the Reader (parent validation is recorded by the
 /// signer in the ingredient assertion's `validationResults`, not recomputed).
-fn append_store_manifests(report: &mut Json, store: &ParsedStore<'_>, active_label: &str) {
+fn append_store_manifests(
+    report: &mut Json,
+    store: &ParsedStore<'_>,
+    active_label: &str,
+    report_decode_nodes: &mut usize,
+) {
     let Some(manifests) = report
         .as_object_mut()
         .and_then(|o| o.get_mut("manifests"))
@@ -6773,7 +6901,14 @@ fn append_store_manifests(report: &mut Json, store: &ParsedStore<'_>, active_lab
         if manifest.label == active_label || manifests.contains_key(&manifest.label) {
             continue;
         }
-        let claim = manifest.claim_cbor.and_then(|c| decode(c).ok());
+        let (claim, claim_decode_budget_exhausted) = match manifest.claim_cbor {
+            Some(cbor) => match decode((cbor, &mut *report_decode_nodes)) {
+                Ok(value) => (Some(value), false),
+                Err(DecodeError::NodeLimitExceeded(_)) => (None, true),
+                Err(_) => (None, false),
+            },
+            None => (None, false),
+        };
         let chain = manifest
             .signature_cose
             .and_then(|cose| extract_x5chain(cose).ok())
@@ -6783,9 +6918,11 @@ fn append_store_manifests(report: &mut Json, store: &ParsedStore<'_>, active_lab
             manifest_entry_json(
                 manifest,
                 claim.as_ref(),
+                claim_decode_budget_exhausted,
                 None,
                 &chain,
                 manifest.signature_cose,
+                report_decode_nodes,
             ),
         );
     }
@@ -6802,11 +6939,20 @@ fn build_report(
     cose: Option<&[u8]>,
     results: &ValidationResults,
     state: ValidationState,
+    report_decode_nodes: &mut usize,
 ) -> Json {
     let mut manifests = Map::new();
     manifests.insert(
         label.to_string(),
-        manifest_entry_json(manifest, claim, declared_assertions, chain, cose),
+        manifest_entry_json(
+            manifest,
+            claim,
+            false,
+            declared_assertions,
+            chain,
+            cose,
+            report_decode_nodes,
+        ),
     );
 
     json!({
@@ -7020,6 +7166,7 @@ mod tests {
             profile: EngineProfile::GENEROUS,
         };
 
+        let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
         let out = verify_manifest(
             &manifest,
             StoreContext {
@@ -7031,6 +7178,7 @@ mod tests {
             &[],
             None,
             CawgTrustInputs::default(),
+            &mut report_decode_nodes,
         );
 
         // The synthetic DER is not a real certificate, so credential validation
@@ -7870,6 +8018,257 @@ mod tests {
     }
 
     #[test]
+    fn malformed_v2_generator_info_is_fatal_claim_malformed() {
+        let malformed = [
+            ("absent", None),
+            ("wrong outer type", Some(Value::Text("generator".into()))),
+            ("empty value", Some(Value::Map(Vec::new()))),
+            ("empty array", Some(Value::Array(Vec::new()))),
+            (
+                "legacy array-of-maps shape",
+                Some(Value::Array(vec![vmap(vec![(
+                    "name",
+                    Value::Text("generator".into()),
+                )])])),
+            ),
+            (
+                "non-map array entry",
+                Some(Value::Array(vec![Value::Text("generator".into())])),
+            ),
+            (
+                "missing name",
+                Some(vmap(vec![("version", Value::Text("1.0".into()))])),
+            ),
+            (
+                "non-text name",
+                Some(vmap(vec![("name", Value::Integer(1.into()))])),
+            ),
+            (
+                "empty name",
+                Some(vmap(vec![("name", Value::Text(String::new()))])),
+            ),
+            (
+                "icon wrong type",
+                Some(vmap(vec![
+                    ("name", Value::Text("generator".into())),
+                    ("icon", Value::Text("icon".into())),
+                ])),
+            ),
+            (
+                "icon missing url",
+                Some(vmap(vec![
+                    ("name", Value::Text("generator".into())),
+                    ("icon", vmap(vec![("hash", Value::Bytes(vec![7; 32]))])),
+                ])),
+            ),
+            (
+                "icon missing hash",
+                Some(vmap(vec![
+                    ("name", Value::Text("generator".into())),
+                    (
+                        "icon",
+                        vmap(vec![(
+                            "url",
+                            Value::Text("self#jumbf=c2pa.assertions/icon".into()),
+                        )]),
+                    ),
+                ])),
+            ),
+        ];
+
+        for (case, info) in malformed {
+            let mut fields = vec![
+                ("instanceID", Value::Text("urn:uuid:test".into())),
+                ("created_assertions", Value::Array(vec![valid_hashed_uri()])),
+            ];
+            if let Some(info) = info {
+                fields.push(("claim_generator_info", info));
+            }
+            let (fatal, results) = run_structure(&vmap(fields));
+            assert!(fatal, "{case}");
+            assert!(results.has_failure(CLAIM_MALFORMED), "{case}");
+            assert!(
+                !results.has_success(ASSERTION_DATA_HASH_MATCH),
+                "{case} reached a valid integrity verdict"
+            );
+        }
+    }
+
+    fn run_generator_icon_binding(
+        generation: ClaimGeneration,
+        icon_label: &str,
+        expected_icon_hash: Vec<u8>,
+        stored_icon_jumbf: Option<&[u8]>,
+    ) -> (bool, ValidationResults) {
+        let hard_label = "c2pa.hash.data";
+        let hard_jumbf = b"hard-binding assertion jumbf";
+        let assertion_payload = enc(&vmap(vec![("data", Value::Bytes(vec![1]))]));
+        let icon_reference = vmap(vec![
+            (
+                "url",
+                Value::Text(format!("self#jumbf=c2pa.assertions/{icon_label}")),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(expected_icon_hash)),
+        ]);
+        let generator = vmap(vec![
+            ("name", Value::Text("generator".into())),
+            ("icon", icon_reference),
+        ]);
+        let hard_reference = vmap(vec![
+            (
+                "url",
+                Value::Text(format!("self#jumbf=c2pa.assertions/{hard_label}")),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(hard_jumbf))),
+        ]);
+        let claim = match generation {
+            ClaimGeneration::V1 => vmap(vec![
+                ("instanceID", Value::Text("xmp:iid:test".into())),
+                ("claim_generator", Value::Text("generator/1.0".into())),
+                ("claim_generator_info", Value::Array(vec![generator])),
+                ("dc:format", Value::Text("image/jpeg".into())),
+                ("assertions", Value::Array(vec![hard_reference])),
+            ]),
+            ClaimGeneration::V2 => vmap(vec![
+                ("instanceID", Value::Text("urn:uuid:test".into())),
+                ("claim_generator_info", generator),
+                ("created_assertions", Value::Array(vec![hard_reference])),
+            ]),
+        };
+        let mut assertions = vec![(hard_label.into(), assertion_payload.as_slice())];
+        let mut assertion_jumbf = vec![(hard_label.into(), hard_jumbf.as_slice())];
+        if let Some(icon_jumbf) = stored_icon_jumbf {
+            assertions.push((icon_label.into(), assertion_payload.as_slice()));
+            assertion_jumbf.push((icon_label.into(), icon_jumbf));
+        }
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:00000000-0000-4000-8000-000000000001".into(),
+            manifest_jumbf: &[],
+            assertions,
+            assertion_jumbf,
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some(
+                match generation {
+                    ClaimGeneration::V1 => "c2pa.claim",
+                    ClaimGeneration::V2 => "c2pa.claim.v2",
+                }
+                .into(),
+            ),
+        };
+        let manifests = [manifest];
+        let hashes = std::collections::HashMap::new();
+        let mut claim_refs = ClaimAssertionRefs::build(&manifests[0], &claim, generation);
+        let mut results = ValidationResults::default();
+        let fatal = verify_claim_structure(
+            &manifests[0],
+            StoreContext {
+                manifests: &manifests,
+                manifest_hashes: &hashes,
+            },
+            &claim,
+            generation,
+            &claim_refs,
+            AssetFormat::Jpeg,
+            "self#jumbf=/c2pa/test/c2pa.signature",
+            &mut results,
+        );
+        if !fatal {
+            verify_assertion_bindings(
+                &claim,
+                &mut claim_refs,
+                generation,
+                &manifests[0].label,
+                &mut results,
+            );
+        }
+        (fatal, results)
+    }
+
+    #[test]
+    fn generator_icon_references_are_indexed_and_bound_for_both_claim_generations() {
+        let icon_jumbf = b"embedded c2pa.icon assertion jumbf";
+        for (generation, label) in [
+            (ClaimGeneration::V1, "c2pa.icon__1"),
+            (ClaimGeneration::V2, "c2pa.icon"),
+        ] {
+            let (fatal, results) =
+                run_generator_icon_binding(generation, label, sha(icon_jumbf), Some(icon_jumbf));
+            assert!(!fatal, "{generation:?}");
+            assert!(
+                results.has_success(ASSERTION_HASHED_URI_MATCH),
+                "{generation:?}"
+            );
+            assert!(!results.has_failure(HASHED_URI_MISSING), "{generation:?}");
+            assert!(
+                !results.has_failure(ASSERTION_HASHED_URI_MISMATCH),
+                "{generation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_icon_missing_mismatch_and_wrong_label_fail_closed() {
+        let icon_jumbf = b"embedded c2pa.icon assertion jumbf";
+        let (fatal, missing) =
+            run_generator_icon_binding(ClaimGeneration::V2, "c2pa.icon", sha(icon_jumbf), None);
+        assert!(!fatal);
+        assert!(missing.has_failure(HASHED_URI_MISSING));
+
+        let (fatal, mismatch) = run_generator_icon_binding(
+            ClaimGeneration::V2,
+            "c2pa.icon",
+            sha(b"different icon assertion"),
+            Some(icon_jumbf),
+        );
+        assert!(!fatal);
+        assert!(mismatch.has_failure(ASSERTION_HASHED_URI_MISMATCH));
+
+        for label in ["c2pa.thumbnail.claim.jpeg", "c2pa.icon__0", "c2pa.icon__x"] {
+            let (fatal, wrong_label) = run_generator_icon_binding(
+                ClaimGeneration::V2,
+                label,
+                sha(icon_jumbf),
+                Some(icon_jumbf),
+            );
+            assert!(fatal, "{label}");
+            assert!(wrong_label.has_failure(CLAIM_MALFORMED), "{label}");
+            assert!(
+                !wrong_label.has_success(ASSERTION_HASHED_URI_MATCH),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_generator_icons_share_the_claim_reference_bound() {
+        let generator_info = (1..=MAX_CLAIM_ASSERTION_REFERENCES)
+            .map(|instance| {
+                vmap(vec![
+                    ("name", Value::Text(format!("generator {instance}"))),
+                    (
+                        "icon",
+                        hashed_uri_for_assertion(&format!("c2pa.icon__{instance}")),
+                    ),
+                ])
+            })
+            .collect();
+        let claim = vmap(vec![
+            (
+                "assertions",
+                Value::Array(vec![hashed_uri_for_assertion("c2pa.hash.data")]),
+            ),
+            ("claim_generator_info", Value::Array(generator_info)),
+        ]);
+        let manifest = structural_manifest();
+        let claim_refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V1);
+        assert!(!claim_refs.complete);
+    }
+
+    #[test]
     fn malformed_hashed_uri_map_is_fatal() {
         let claim = vmap(vec![
             ("instanceID", Value::Text("xmp:iid:test".into())),
@@ -8103,14 +8502,98 @@ mod tests {
                 .count(),
             2
         );
+        let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
         let report = manifest_entry_json(
             &manifests[0],
             Some(&claim),
+            false,
             Some(&claim_refs.declared_labels),
             &[],
             None,
+            &mut report_decode_nodes,
         );
         assert!(report["assertions"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn report_assertions_share_one_decode_budget() {
+        let payload = enc(&Value::Array(vec![Value::Null, Value::Null]));
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:report-budget".into(),
+            manifest_jumbf: &[],
+            assertions: vec![
+                ("com.example.first".into(), payload.as_slice()),
+                ("com.example.second".into(), payload.as_slice()),
+                ("com.example.third".into(), payload.as_slice()),
+            ],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let mut report_decode_nodes = 4;
+
+        let report = manifest_entry_json(
+            &manifest,
+            None,
+            false,
+            None,
+            &[],
+            None,
+            &mut report_decode_nodes,
+        );
+        let assertions = report["assertions"].as_array().unwrap();
+
+        assert_eq!(assertions[0]["data"], json!([null, null]));
+        assert_eq!(
+            assertions[1]["data"],
+            json!({
+                "_encypher_omitted": "decoded assertion report node budget exceeded"
+            })
+        );
+        assert_eq!(assertions[2]["data"], assertions[1]["data"]);
+        assert_eq!(report_decode_nodes, 0);
+    }
+
+    #[test]
+    fn report_assertion_data_is_unchanged_within_budget() {
+        let payload = enc(&vmap(vec![
+            ("name", Value::Text("example".into())),
+            ("enabled", Value::Bool(true)),
+        ]));
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:normal-report".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("com.example.normal".into(), payload.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
+
+        let report = manifest_entry_json(
+            &manifest,
+            None,
+            false,
+            None,
+            &[],
+            None,
+            &mut report_decode_nodes,
+        );
+
+        assert_eq!(
+            report["assertions"],
+            json!([{
+                "label": "com.example.normal",
+                "data": {
+                    "name": "example",
+                    "enabled": true,
+                },
+            }])
+        );
     }
 
     fn mdat(payload: &[u8]) -> Vec<u8> {
@@ -8635,7 +9118,7 @@ mod tests {
 
         let mut ordered = ValidationResults::default();
         assert!(verify_bmff_fragments(
-            &[entry.clone()],
+            std::slice::from_ref(&entry),
             "sha256",
             &[],
             &[fragment0.as_slice(), fragment1.as_slice()],
@@ -9141,6 +9624,10 @@ mod tests {
         let claim = vmap(vec![
             ("instanceID", Value::Text("xmp:iid:test".into())),
             (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("test".into()))]),
+            ),
+            (
                 "created_assertions",
                 Value::Array(vec![
                     hashed_uri_for_assertion("c2pa.hash.data"),
@@ -9349,6 +9836,7 @@ mod tests {
             validation_time: None,
             profile: EngineProfile::GENEROUS,
         };
+        let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
         let output = verify_manifest(
             &manifests[0],
             StoreContext {
@@ -9360,6 +9848,7 @@ mod tests {
             &[],
             None,
             CawgTrustInputs::default(),
+            &mut report_decode_nodes,
         );
         assert!(output.results.has_failure(CLAIM_SIGNATURE_MISSING));
         assert!(!output.results.has_failure(CLAIM_SIGNATURE_MISMATCH));
@@ -9445,6 +9934,7 @@ mod tests {
             validation_time: None,
             profile: EngineProfile::GENEROUS,
         };
+        let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
         let output = verify_manifest(
             &manifests[0],
             StoreContext {
@@ -9456,6 +9946,7 @@ mod tests {
             &[],
             None,
             CawgTrustInputs::default(),
+            &mut report_decode_nodes,
         );
         assert!(output.results.has_failure(CLAIM_SIGNATURE_MISSING));
         assert!(!output.results.has_failure(INGREDIENT_MANIFEST_MISSING));
