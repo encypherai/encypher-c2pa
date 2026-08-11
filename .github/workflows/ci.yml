@@ -29,10 +29,8 @@ jobs:
       # `#[cfg(target_arch = "wasm32")]` item at all. A reviewer hid a working
       # container writer that way. The gate documents every (target, feature)
       # combination a consumer can build and unions the result.
-      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # nightly
-        with:
-          toolchain: nightly-2026-08-07
-          targets: wasm32-unknown-unknown
+      - name: Install pinned nightly rustdoc toolchain
+        run: rustup toolchain install nightly-2026-08-07 --target wasm32-unknown-unknown --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Fails when anything becomes publicly reachable that is not in the
       # reviewed inventory. This repository publishes a verification-only SDK:
