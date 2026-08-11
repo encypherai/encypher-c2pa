@@ -1169,7 +1169,8 @@ jobs:
           echo "publishing $version to dist-tag $dist_tag"
           # The packed package is data, not executable input in this privileged
           # job. No repository or build dependency runs with id-token access.
-          npm publish "$tarball" --ignore-scripts --access public --tag "$dist_tag"
+          npm publish "$tarball" \
+            --ignore-scripts --access public --tag "$dist_tag" --loglevel verbose
 
   github-release:
     if: github.event_name == 'push'
@@ -1639,7 +1640,8 @@ jobs:
             echo "$name@$RELEASE_VERSION already matches the recovered tarball"
             exit 0
           fi
-          npm publish "$tarball" --ignore-scripts --access public --tag "$dist_tag"
+          npm publish "$tarball" \
+            --ignore-scripts --access public --tag "$dist_tag" --loglevel verbose
           for _ in {1..30}; do
             if verify_npm; then
               echo "$name@$RELEASE_VERSION is visible with the expected integrity"
