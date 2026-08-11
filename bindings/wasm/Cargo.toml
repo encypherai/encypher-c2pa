@@ -14,7 +14,7 @@ description = "Browser WebAssembly bindings for offline C2PA verification"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-encypher-c2pa = { version = "=1.0.0", path = "../../crates/encypher-c2pa", default-features = false }
+encypher-c2pa = { version = "=1.0.1", path = "../../crates/encypher-c2pa", default-features = false }
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
