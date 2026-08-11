@@ -11,18 +11,65 @@ readme.workspace = true
 description = "Offline, verification-only C2PA SDK"
 keywords = ["c2pa", "content-credentials", "provenance", "verification"]
 categories = ["cryptography", "multimedia"]
+# The two integration suites load fixtures from the workspace `tests/fixtures`
+# directory, which is outside this package. Shipping the suites without their
+# fixtures makes `cargo test` inside the unpacked crate fail on missing files,
+# which a reviewer hit. The unit tests carry their own fixtures under `src/`
+# and still ship, so the published artifact stays auditable.
+exclude = ["tests/**"]
 
 [features]
 default = ["telemetry"]
 telemetry = ["dep:ureq"]
 
 [dependencies]
-c2pa-core = { package = "encypher-c2pa-core", version = "=1.0.0-rc.11", path = "../../internal/c2pa-core" }
-c2pa-formats = { package = "encypher-c2pa-formats", version = "=1.0.0-rc.11", path = "../../internal/c2pa-formats" }
-c2pa-trust = { package = "encypher-c2pa-trust", version = "=1.0.0-rc.11", path = "../../internal/c2pa-trust" }
-c2pa-validate = { package = "encypher-c2pa-validate", version = "=1.0.0-rc.11", path = "../../internal/c2pa-validate" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true, features = ["oid"] }
+hex = { workspace = true }
 thiserror = { workspace = true }
+c2pa-text = { workspace = true }
+x509-cert = { workspace = true, features = ["pem"] }
+spki = { workspace = true }
+const-oid = { workspace = true }
+der = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing"] }
-ureq = { version = "2.12.1", optional = true, default-features = false, features = ["json", "tls"] }
+p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+p384 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+p521 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+ecdsa = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+pkcs8 = { workspace = true }
+signature = { workspace = true }
+rand_core = { workspace = true }
+cms = { workspace = true }
+x509-tsp = { workspace = true }
+unicode-normalization = "0.1"
+miniz_oxide = "0.8"
+ureq = { workspace = true, optional = true }
+
+[dev-dependencies]
+time = { workspace = true, features = ["macros"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The elliptic-curve stack reaches `getrandom` transitively (ecdsa -> p256 ->
+# elliptic-curve -> crypto-bigint -> rand_core), and on wasm32 that crate
+# refuses to compile unless a backend is selected. Until now the browser
+# binding declared this itself, which meant the published library did not
+# actually build for a target the README says it supports: a consumer taking
+# `encypher-c2pa` into the browser hit a compile error in a transitive
+# dependency. Declaring it here makes the library standalone-correct on wasm32.
+#
+# Not optional, so it creates no implicit Cargo feature - the surface gate
+# locks the feature map and would reject one.
+# Scoped to the browser target specifically, not all of wasm32. A reviewer
+# found that a bare `target_arch = "wasm32"` predicate also captured
+# wasm32-wasip1, where the pre-change tree resolved getrandom with `std` and
+# this would have forced `js`, `js-sys` and `wasm-bindgen` onto existing WASI
+# consumers.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

@@ -7,48 +7,603 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
-  crates:
-    name: Publish Rust crates
-    needs: verify
+  release-version:
+    name: Release version contract
     runs-on: ubuntu-latest
-    environment: release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - name: Publish support crates and public packages
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - name: Match tag, workspace, and published dependency versions
         run: |
           set -euo pipefail
-          packages=(
-            encypher-c2pa-cbor
-            encypher-c2pa-core
-            encypher-c2pa-formats
-            encypher-c2pa-trust
-            encypher-c2pa-crypto
-            encypher-c2pa-validate
-            encypher-c2pa
-            encypher-c2pa-cli
-          )
-          for package in "${packages[@]}"; do
-            for attempt in 1 2 3 4 5; do
-              if cargo publish --locked -p "$package"; then
-                break
-              fi
-              if [ "$attempt" = 5 ]; then
+          metadata=$(cargo metadata --locked --no-deps --format-version 1)
+          workspace_version=$(python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "encypher-c2pa"))' <<<"$metadata")
+          cli_requirement=$(python3 -c 'import json,sys; p=next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "encypher-c2pa-cli"); print(next(d["req"] for d in p["dependencies"] if d["name"] == "encypher-c2pa"))' <<<"$metadata")
+          python_version=$(python3 -c 'import ast,pathlib; tree=ast.parse(pathlib.Path("bindings/python/python/encypher_c2pa/__init__.py").read_text()); print(next(node.value.value for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)))')
+          tag_version=${GITHUB_REF_NAME#v}
+          test "$tag_version" = "$workspace_version" || {
+            echo "tag $GITHUB_REF_NAME does not match workspace version $workspace_version" >&2
+            exit 1
+          }
+          test "$python_version" = "$workspace_version" || {
+            echo "Python version $python_version does not match workspace version $workspace_version" >&2
+            exit 1
+          }
+          test "$cli_requirement" = "=$workspace_version" || {
+            echo "CLI dependency $cli_requirement does not exact-pin workspace version $workspace_version" >&2
+            exit 1
+          }
+
+  release-checkpoint:
+    name: Bind release to workflow commit
+    needs: [verify, release-version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify the release tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release_tag.py
+      - name: Validate or create the exact-commit release checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          title="Encypher C2PA $version"
+          is_prerelease=false
+          prerelease=()
+          case "$version" in
+            *-*)
+              is_prerelease=true
+              prerelease=(--prerelease)
+              ;;
+          esac
+
+          release_pages=$(mktemp)
+          fetch_release() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_pages"
+            python3 - "$GITHUB_REF_NAME" "$release_pages" <<'PY'
+          import json
+          import sys
+
+          tag, path = sys.argv[1:]
+          pages = json.load(open(path, encoding="utf-8"))
+          matches = [
+              release
+              for page in pages
+              for release in page
+              if release.get("tag_name") == tag
+          ]
+          if len(matches) > 1:
+              raise SystemExit(f"multiple GitHub releases exist for tag {tag!r}")
+          json.dump(matches[0] if matches else None, sys.stdout, separators=(",", ":"))
+          PY
+          }
+          validate_release() {
+            python3 - "$GITHUB_REF_NAME" "$GITHUB_SHA" "$title" "$is_prerelease" <<'PY'
+          import json
+          import sys
+
+          tag, sha, title, prerelease = sys.argv[1:]
+          actual = json.load(sys.stdin)
+          expected = {
+              "tag_name": tag,
+              "target_commitish": sha,
+              "name": title,
+              "prerelease": prerelease == "true",
+          }
+          observed = {key: actual.get(key) for key in expected}
+          if observed != expected:
+              raise SystemExit(
+                  f"release checkpoint mismatch: {observed!r} != {expected!r}"
+              )
+          if not isinstance(actual.get("draft"), bool):
+              raise SystemExit("release checkpoint has an invalid draft state")
+          if actual["draft"] and actual.get("published_at") is not None:
+              raise SystemExit("draft release checkpoint is already marked published")
+          if not actual["draft"] and not actual.get("published_at"):
+              raise SystemExit("published release checkpoint has no publication time")
+          PY
+          }
+          release=$(fetch_release)
+          if [ "$release" != null ]; then
+            validate_release <<<"$release"
+            echo "$GITHUB_REF_NAME has a valid exact-commit release checkpoint"
+            exit 0
+          fi
+
+          registry_exists() {
+            local label=$1
+            local url=$2
+            local status
+            if ! status=$(curl --user-agent "encypher-c2pa-release-workflow/1.0" \
+              --silent --show-error --retry 3 --retry-all-errors \
+              --output /dev/null --write-out '%{http_code}' "$url"); then
+              echo "could not determine whether $label exists" >&2
+              exit 1
+            fi
+            case "$status" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *)
+                echo "registry returned HTTP $status while checking $label" >&2
                 exit 1
-              fi
-              sleep 20
-            done
+                ;;
+            esac
+          }
+
+          published=()
+          if registry_exists "crate encypher-c2pa $version" \
+            "https://crates.io/api/v1/crates/encypher-c2pa/$version"; then
+            published+=("crate encypher-c2pa")
+          fi
+          if registry_exists "crate encypher-c2pa-cli $version" \
+            "https://crates.io/api/v1/crates/encypher-c2pa-cli/$version"; then
+            published+=("crate encypher-c2pa-cli")
+          fi
+          if registry_exists "PyPI package encypher-c2pa $version" \
+            "https://pypi.org/pypi/encypher-c2pa/$version/json"; then
+            published+=("PyPI package encypher-c2pa")
+          fi
+          if registry_exists "npm package @encypherai/c2pa $version" \
+            "https://registry.npmjs.org/@encypherai%2Fc2pa/$version"; then
+            published+=("npm package @encypherai/c2pa")
+          fi
+          if [ "${#published[@]}" -ne 0 ]; then
+            printf 'refusing to create a release checkpoint after publication: %s\n' \
+              "${published[*]}" >&2
+            exit 1
+          fi
+
+          if ! gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --target "$GITHUB_SHA" \
+            --title "$title" \
+            --generate-notes \
+            --draft \
+            "${prerelease[@]}"; then
+            echo "checkpoint creation failed; checking for a concurrent exact match" >&2
+          fi
+          release=$(fetch_release)
+          if [ "$release" = null ]; then
+            echo "release checkpoint was not created" >&2
+            exit 1
+          fi
+          validate_release <<<"$release"
+          echo "created exact-commit release checkpoint for $GITHUB_REF_NAME"
+
+  crate-library-package:
+    name: Package and verify Rust library
+    needs: [verify, release-version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - name: Package and verify the library
+        run: |
+          set -euo pipefail
+          cargo package --locked -p encypher-c2pa
+          python3 - <<'PY'
+          import os
+          import tarfile
+          import tomllib
+          from pathlib import Path, PurePosixPath
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          expected_name = f"encypher-c2pa-{version}.crate"
+          paths = sorted(Path("target/package").glob("*.crate"))
+          if [path.name for path in paths] != [expected_name]:
+              raise SystemExit(f"unexpected library crate archives: {paths!r}")
+          path = paths[0]
+          if path.is_symlink() or path.stat().st_size <= 0:
+              raise SystemExit(f"invalid library crate archive: {path}")
+          root = path.name.removesuffix(".crate")
+          cargo_toml = f"{root}/Cargo.toml"
+          metadata = None
+          with tarfile.open(path, mode="r:gz") as archive:
+              seen = set()
+              for member in archive:
+                  pure = PurePosixPath(member.name)
+                  if (
+                      member.name in seen
+                      or pure.is_absolute()
+                      or ".." in pure.parts
+                      or not pure.parts
+                      or pure.parts[0] != root
+                  ):
+                      raise SystemExit(f"{path}: unsafe archive member {member.name!r}")
+                  seen.add(member.name)
+                  if not (member.isfile() or member.isdir()):
+                      raise SystemExit(f"{path}: non-file member {member.name!r}")
+                  if member.name == cargo_toml:
+                      stream = archive.extractfile(member)
+                      if stream is None:
+                          raise SystemExit(f"{path}: Cargo.toml is unreadable")
+                      metadata = tomllib.load(stream)
+          if metadata is None:
+              raise SystemExit(f"{path}: Cargo.toml is missing")
+          package = metadata.get("package", {})
+          if (package.get("name"), package.get("version")) != (
+              "encypher-c2pa",
+              version,
+          ):
+              raise SystemExit(f"{path}: package identity mismatch")
+          print("verified exact Rust library crate archive")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-crate-library
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  crates-library:
+    name: Publish Rust library
+    needs: [release-checkpoint, crate-library-package]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rust-crate-library
+          path: dist/crates
+      - name: Check packaged library identity
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          shopt -s nullglob
+          archives=(dist/crates/*.crate)
+          expected="dist/crates/encypher-c2pa-$version.crate"
+          if [ "${#archives[@]}" -ne 1 ] || [ "${archives[0]}" != "$expected" ]; then
+            echo "expected only $expected" >&2
+            exit 1
+          fi
+          test -f "$expected" && test ! -L "$expected" && test -s "$expected"
+          cargo package --locked --no-verify -p encypher-c2pa
+          cmp "target/package/encypher-c2pa-$version.crate" "$expected"
+      - name: Reverify the release tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release_tag.py
+      - name: Authenticate to crates.io
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish the verified library archive
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          package=encypher-c2pa
+          version=${GITHUB_REF_NAME#v}
+          archive="dist/crates/$package-$version.crate"
+          expected=$(sha256sum "$archive" | cut -d' ' -f1)
+          fetch_checksum() {
+            local response status
+            response=$(mktemp)
+            if ! status=$(curl --user-agent "encypher-c2pa-release-workflow/1.0" \
+              --silent --show-error --retry 3 --retry-all-errors \
+              --output "$response" --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/$package/$version"); then
+              rm -f "$response"
+              return 2
+            fi
+            case "$status" in
+              200)
+                python3 - "$response" <<'PY'
+          import json
+          import sys
+
+          checksum = json.load(open(sys.argv[1], encoding="utf-8")).get("version", {}).get("checksum")
+          if not isinstance(checksum, str) or len(checksum) != 64:
+              raise SystemExit("crates.io returned an invalid checksum")
+          print(checksum)
+          PY
+                rm -f "$response"
+                ;;
+              404) rm -f "$response"; return 1 ;;
+              *)
+                echo "crates.io returned HTTP $status for $package $version" >&2
+                rm -f "$response"
+                return 2
+                ;;
+            esac
+          }
+          verify_checksum() {
+            local actual status
+            if actual=$(fetch_checksum); then
+              test "$actual" = "$expected" || {
+                echo "$package $version checksum mismatch: $actual != $expected" >&2
+                exit 1
+              }
+              return 0
+            else
+              status=$?
+              case "$status" in
+                1) return 1 ;;
+                *) exit 1 ;;
+              esac
+            fi
+          }
+          if verify_checksum; then
+            echo "$package $version is already published with the expected checksum"
+            exit 0
+          fi
+          sent=false
+          for attempt in {1..15}; do
+            if cargo publish --locked --no-verify -p "$package"; then
+              sent=true
+              break
+            fi
+            if verify_checksum; then
+              sent=true
+              echo "$package $version was published during this attempt"
+              break
+            fi
+            if [ "$attempt" = 15 ]; then
+              exit 1
+            fi
+            sleep 20
           done
+          test "$sent" = true
+          for attempt in {1..30}; do
+            if verify_checksum; then
+              echo "$package $version is visible with the expected checksum"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "$package $version did not become visible on crates.io" >&2
+          exit 1
+
+  crate-cli-package:
+    name: Package and verify Rust CLI
+    needs: [verify, release-version, crates-library]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - name: Package and verify the registry-resolved CLI
+        run: |
+          set -euo pipefail
+          packaged=false
+          for attempt in {1..30}; do
+            if cargo package --locked -p encypher-c2pa-cli; then
+              packaged=true
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              break
+            fi
+            echo "library is not yet available through the crates.io index; retrying"
+            sleep 10
+          done
+          test "$packaged" = true || {
+            echo "could not package the CLI against the published library" >&2
+            exit 1
+          }
+          python3 - <<'PY'
+          import os
+          import tarfile
+          import tomllib
+          from pathlib import Path, PurePosixPath
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          expected_name = f"encypher-c2pa-cli-{version}.crate"
+          paths = sorted(Path("target/package").glob("*.crate"))
+          if [path.name for path in paths] != [expected_name]:
+              raise SystemExit(f"unexpected CLI crate archives: {paths!r}")
+          path = paths[0]
+          if path.is_symlink() or path.stat().st_size <= 0:
+              raise SystemExit(f"invalid CLI crate archive: {path}")
+          root = path.name.removesuffix(".crate")
+          cargo_toml = f"{root}/Cargo.toml"
+          cargo_lock = f"{root}/Cargo.lock"
+          metadata = None
+          lock = None
+          with tarfile.open(path, mode="r:gz") as archive:
+              seen = set()
+              for member in archive:
+                  pure = PurePosixPath(member.name)
+                  if (
+                      member.name in seen
+                      or pure.is_absolute()
+                      or ".." in pure.parts
+                      or not pure.parts
+                      or pure.parts[0] != root
+                  ):
+                      raise SystemExit(f"{path}: unsafe archive member {member.name!r}")
+                  seen.add(member.name)
+                  if not (member.isfile() or member.isdir()):
+                      raise SystemExit(f"{path}: non-file member {member.name!r}")
+                  if member.name in (cargo_toml, cargo_lock):
+                      stream = archive.extractfile(member)
+                      if stream is None:
+                          raise SystemExit(f"{path}: {PurePosixPath(member.name).name} is unreadable")
+                      parsed = tomllib.load(stream)
+                      if member.name == cargo_toml:
+                          metadata = parsed
+                      else:
+                          lock = parsed
+          if metadata is None or lock is None:
+              raise SystemExit(f"{path}: Cargo.toml or Cargo.lock is missing")
+          package = metadata.get("package", {})
+          if (package.get("name"), package.get("version")) != (
+              "encypher-c2pa-cli",
+              version,
+          ):
+              raise SystemExit(f"{path}: package identity mismatch")
+          dependencies = [
+              package
+              for package in lock.get("package", [])
+              if package.get("name") == "encypher-c2pa"
+              and package.get("version") == version
+          ]
+          if len(dependencies) != 1:
+              raise SystemExit(f"{path}: exact library lock entry is missing")
+          dependency = dependencies[0]
+          source = dependency.get("source")
+          checksum = dependency.get("checksum")
+          if (
+              not isinstance(source, str)
+              or not source.startswith("registry+")
+              or not isinstance(checksum, str)
+              or len(checksum) != 64
+          ):
+              raise SystemExit(f"{path}: library lock entry is not registry-resolved")
+          print("verified registry-resolved Rust CLI crate archive")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-crate-cli
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  crates-cli:
+    name: Publish Rust CLI
+    needs: [release-checkpoint, crate-cli-package]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rust-crate-cli
+          path: dist/crates
+      - name: Check packaged CLI identity
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          shopt -s nullglob
+          archives=(dist/crates/*.crate)
+          expected="dist/crates/encypher-c2pa-cli-$version.crate"
+          if [ "${#archives[@]}" -ne 1 ] || [ "${archives[0]}" != "$expected" ]; then
+            echo "expected only $expected" >&2
+            exit 1
+          fi
+          test -f "$expected" && test ! -L "$expected" && test -s "$expected"
+          cargo package --locked --no-verify -p encypher-c2pa-cli
+          cmp "target/package/encypher-c2pa-cli-$version.crate" "$expected"
+      - name: Reverify the release tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release_tag.py
+      - name: Authenticate to crates.io
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish the verified CLI archive
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          package=encypher-c2pa-cli
+          version=${GITHUB_REF_NAME#v}
+          archive="dist/crates/$package-$version.crate"
+          expected=$(sha256sum "$archive" | cut -d' ' -f1)
+          fetch_checksum() {
+            local response status
+            response=$(mktemp)
+            if ! status=$(curl --user-agent "encypher-c2pa-release-workflow/1.0" \
+              --silent --show-error --retry 3 --retry-all-errors \
+              --output "$response" --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/$package/$version"); then
+              rm -f "$response"
+              return 2
+            fi
+            case "$status" in
+              200)
+                python3 - "$response" <<'PY'
+          import json
+          import sys
+
+          checksum = json.load(open(sys.argv[1], encoding="utf-8")).get("version", {}).get("checksum")
+          if not isinstance(checksum, str) or len(checksum) != 64:
+              raise SystemExit("crates.io returned an invalid checksum")
+          print(checksum)
+          PY
+                rm -f "$response"
+                ;;
+              404) rm -f "$response"; return 1 ;;
+              *)
+                echo "crates.io returned HTTP $status for $package $version" >&2
+                rm -f "$response"
+                return 2
+                ;;
+            esac
+          }
+          verify_checksum() {
+            local actual status
+            if actual=$(fetch_checksum); then
+              test "$actual" = "$expected" || {
+                echo "$package $version checksum mismatch: $actual != $expected" >&2
+                exit 1
+              }
+              return 0
+            else
+              status=$?
+              case "$status" in
+                1) return 1 ;;
+                *) exit 1 ;;
+              esac
+            fi
+          }
+          if verify_checksum; then
+            echo "$package $version is already published with the expected checksum"
+            exit 0
+          fi
+          sent=false
+          for attempt in {1..15}; do
+            if cargo publish --locked --no-verify -p "$package"; then
+              sent=true
+              break
+            fi
+            if verify_checksum; then
+              sent=true
+              echo "$package $version was published during this attempt"
+              break
+            fi
+            if [ "$attempt" = 15 ]; then
+              exit 1
+            fi
+            sleep 20
+          done
+          test "$sent" = true
+          for attempt in {1..30}; do
+            if verify_checksum; then
+              echo "$package $version is visible with the expected checksum"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "$package $version did not become visible on crates.io" >&2
+          exit 1
 
   python-wheels:
     name: Python ${{ matrix.target }}
-    needs: verify
+    needs: [verify, release-version]
     strategy:
       fail-fast: false
       matrix:
@@ -69,8 +624,8 @@ jobs:
             target: x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
           target: ${{ matrix.target }}
@@ -84,90 +639,490 @@ jobs:
           # aarch64 wheel never builds. Native aarch64 compilers define it
           # themselves, which is why only the cross build failed.
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-${{ matrix.os }}-${{ matrix.target }}-${{ strategy.job-index }}
           path: dist/*.whl
 
   python-sdist:
     name: Python sdist
-    needs: verify
+    needs: [verify, release-version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
           args: --manifest-path bindings/python/Cargo.toml --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-sdist
           path: dist/*.tar.gz
 
   pypi:
     name: Publish Python package
-    needs: [python-wheels, python-sdist]
+    needs: [release-checkpoint, python-wheels, python-sdist]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       id-token: write
+      contents: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: python-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Verify Python artifact identity and version
+        run: |
+          python3 - <<'PY'
+          import email.parser
+          import email.policy
+          import os
+          import re
+          import stat
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          EXPECTED_NAME = "encypher-c2pa"
+          EXPECTED_PLATFORMS = {
+              "linux-aarch64",
+              "linux-x86_64",
+              "macos-arm64",
+              "macos-x86_64",
+              "windows-amd64",
+          }
+          MAX_ARCHIVE_SIZE = 256 * 1024 * 1024
+          MAX_METADATA_SIZE = 1024 * 1024
+
+
+          def fail(message):
+              raise ValueError(message)
+
+
+          def safe_member_parts(name, archive):
+              if not name or "\0" in name or "\\" in name or name.startswith("/"):
+                  fail(f"{archive}: unsafe archive member name {name!r}")
+              trimmed = name[:-1] if name.endswith("/") else name
+              raw_parts = trimmed.split("/")
+              if (
+                  not trimmed
+                  or any(part in ("", ".", "..") for part in raw_parts)
+                  or raw_parts[0].endswith(":")
+                  or PurePosixPath(trimmed).is_absolute()
+              ):
+                  fail(f"{archive}: unsafe archive member name {name!r}")
+              return tuple(raw_parts)
+
+
+          def verify_metadata(data, artifact):
+              message = email.parser.BytesParser(
+                  policy=email.policy.default
+              ).parsebytes(data, headersonly=True)
+              if message.defects:
+                  fail(f"{artifact}: malformed package metadata: {message.defects}")
+              names = message.get_all("Name", [])
+              versions = message.get_all("Version", [])
+              if len(names) != 1 or len(versions) != 1:
+                  fail(
+                      f"{artifact}: metadata must contain exactly one Name and Version"
+                  )
+              if names[0] != EXPECTED_NAME:
+                  fail(
+                      f"{artifact}: project name {names[0]!r} is not {EXPECTED_NAME!r}"
+                  )
+              if versions[0] != expected_version:
+                  fail(
+                      f"{artifact}: version {versions[0]!r} is not "
+                      f"{expected_version!r}"
+                  )
+
+
+          def wheel_platform(filename):
+              try:
+                  platform = filename[:-4].rsplit("-", 3)[3]
+              except (IndexError, ValueError):
+                  fail(f"{filename}: malformed wheel filename")
+              tags = platform.split(".")
+              patterns = {
+                  "linux-aarch64": r"manylinux(?:_[0-9]+_[0-9]+|[0-9]+)_aarch64",
+                  "linux-x86_64": r"manylinux(?:_[0-9]+_[0-9]+|[0-9]+)_x86_64",
+                  "macos-arm64": r"macosx_[0-9]+_[0-9]+_arm64",
+                  "macos-x86_64": r"macosx_[0-9]+_[0-9]+_x86_64",
+                  "windows-amd64": r"win_amd64",
+              }
+              matches = [
+                  category
+                  for category, pattern in patterns.items()
+                  if tags and all(re.fullmatch(pattern, tag) for tag in tags)
+              ]
+              if len(matches) != 1:
+                  fail(f"{filename}: unexpected or ambiguous platform tag {platform!r}")
+              return matches[0]
+
+
+          def verify_wheel(path):
+              metadata_members = []
+              seen = set()
+              with zipfile.ZipFile(path) as archive:
+                  for member in archive.infolist():
+                      parts = safe_member_parts(member.filename, path)
+                      if member.filename in seen:
+                          fail(f"{path}: duplicate archive member {member.filename!r}")
+                      seen.add(member.filename)
+                      mode = member.external_attr >> 16
+                      kind = stat.S_IFMT(mode)
+                      if member.flag_bits & 1:
+                          fail(f"{path}: encrypted archive member {member.filename!r}")
+                      if kind == stat.S_IFLNK:
+                          fail(f"{path}: link archive member {member.filename!r}")
+                      if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                          fail(f"{path}: non-file archive member {member.filename!r}")
+                      if (
+                          len(parts) == 2
+                          and parts[0].endswith(".dist-info")
+                          and parts[1] == "METADATA"
+                      ):
+                          if member.is_dir() or kind == stat.S_IFDIR:
+                              fail(f"{path}: METADATA is not a regular file")
+                          metadata_members.append(member)
+                  if len(metadata_members) != 1:
+                      fail(
+                          f"{path}: expected one top-level .dist-info/METADATA, "
+                          f"found {len(metadata_members)}"
+                      )
+                  metadata = metadata_members[0]
+                  if metadata.file_size > MAX_METADATA_SIZE:
+                      fail(f"{path}: METADATA exceeds {MAX_METADATA_SIZE} bytes")
+                  verify_metadata(archive.read(metadata), path)
+
+
+          def verify_sdist(path):
+              metadata_members = []
+              seen = set()
+              roots = set()
+              with tarfile.open(path, mode="r:gz") as archive:
+                  for member in archive.getmembers():
+                      parts = safe_member_parts(member.name, path)
+                      if member.name in seen:
+                          fail(f"{path}: duplicate archive member {member.name!r}")
+                      seen.add(member.name)
+                      roots.add(parts[0])
+                      if member.issym() or member.islnk():
+                          fail(f"{path}: link archive member {member.name!r}")
+                      if not (member.isfile() or member.isdir()):
+                          fail(f"{path}: non-file archive member {member.name!r}")
+                      if len(parts) == 2 and parts[1] == "PKG-INFO":
+                          if not member.isfile():
+                              fail(f"{path}: PKG-INFO is not a regular file")
+                          metadata_members.append(member)
+                  if len(roots) != 1:
+                      fail(f"{path}: sdist must contain exactly one top-level directory")
+                  if len(metadata_members) != 1:
+                      fail(
+                          f"{path}: expected one top-level PKG-INFO, "
+                          f"found {len(metadata_members)}"
+                      )
+                  metadata = metadata_members[0]
+                  if metadata.size > MAX_METADATA_SIZE:
+                      fail(f"{path}: PKG-INFO exceeds {MAX_METADATA_SIZE} bytes")
+                  stream = archive.extractfile(metadata)
+                  if stream is None:
+                      fail(f"{path}: PKG-INFO is unreadable")
+                  verify_metadata(stream.read(), path)
+
+
+          try:
+              tag = os.environ["GITHUB_REF_NAME"]
+              if not tag.startswith("v") or len(tag) == 1:
+                  fail(f"release ref {tag!r} is not a version tag")
+              expected_version = tag[1:]
+              dist = Path("dist")
+              if not dist.is_dir():
+                  fail("artifact directory dist is missing")
+              files = []
+              for path in dist.rglob("*"):
+                  if path.is_symlink():
+                      fail(f"{path}: artifact path is a symbolic link")
+                  if path.is_file():
+                      files.append(path)
+              wheels = [path for path in files if path.name.endswith(".whl")]
+              sdists = [path for path in files if path.name.endswith(".tar.gz")]
+              unexpected = [
+                  path for path in files if path not in wheels and path not in sdists
+              ]
+              if unexpected:
+                  fail(
+                      "unexpected artifact file(s): "
+                      + ", ".join(str(path) for path in sorted(unexpected))
+                  )
+              if len(wheels) != 5 or len(sdists) != 1 or len(files) != 6:
+                  fail(
+                      "expected exactly five wheels and one sdist; found "
+                      f"{len(wheels)} wheel(s), {len(sdists)} sdist(s), "
+                      f"{len(files)} total file(s)"
+                  )
+              platforms = []
+              for path in sorted(files):
+                  size = path.stat().st_size
+                  if size > MAX_ARCHIVE_SIZE:
+                      fail(f"{path}: archive exceeds {MAX_ARCHIVE_SIZE} bytes")
+                  if size == 0:
+                      fail(f"{path}: archive is empty")
+                  if path in wheels:
+                      platforms.append(wheel_platform(path.name))
+                      verify_wheel(path)
+                  else:
+                      verify_sdist(path)
+              if set(platforms) != EXPECTED_PLATFORMS or len(set(platforms)) != 5:
+                  fail(
+                      "wheel platforms do not match the expected release set: "
+                      + ", ".join(platforms)
+                  )
+              print(
+                  f"verified {EXPECTED_NAME} {expected_version}: "
+                  "five platform wheels and one sdist"
+              )
+          except Exception as error:
+              raise SystemExit(f"Python artifact identity gate failed: {error}")
+          PY
+      - name: Match any existing PyPI release to local artifacts
+        id: pypi_registry
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          response=$(mktemp)
+          if ! status=$(curl --user-agent "encypher-c2pa-release-workflow/1.0" \
+            --silent --show-error --retry 3 --retry-all-errors \
+            --output "$response" --write-out '%{http_code}' \
+            "https://pypi.org/pypi/encypher-c2pa/$version/json"); then
+            echo "could not query PyPI for encypher-c2pa $version" >&2
+            exit 1
+          fi
+          case "$status" in
+            200)
+              state=$(python3 .github/scripts/verify_pypi_artifacts.py \
+                --metadata "$response" --artifacts dist)
+              case "$state" in
+                complete)
+                  echo "published=true" >>"$GITHUB_OUTPUT"
+                  echo "existing PyPI release exactly matches all local artifacts"
+                  ;;
+                subset)
+                  echo "published=false" >>"$GITHUB_OUTPUT"
+                  echo "existing PyPI release is an exact subset; resuming upload"
+                  ;;
+                *)
+                  echo "invalid PyPI comparison state: $state" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            404)
+              echo "published=false" >>"$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "PyPI returned HTTP $status for encypher-c2pa $version" >&2
+              exit 1
+              ;;
+          esac
+          rm -f "$response"
+      - name: Reverify the release tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release_tag.py
+      - if: steps.pypi_registry.outputs.published != 'true'
+        id: pypi_publish
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
+          skip-existing: true
+      - name: Require the complete exact PyPI artifact set
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          response=$(mktemp)
+          for attempt in {1..30}; do
+            if ! status=$(curl --user-agent "encypher-c2pa-release-workflow/1.0" \
+              --silent --show-error --retry 3 --retry-all-errors \
+              --output "$response" --write-out '%{http_code}' \
+              "https://pypi.org/pypi/encypher-c2pa/$version/json"); then
+              echo "could not query PyPI for encypher-c2pa $version" >&2
+              exit 1
+            fi
+            case "$status" in
+              200)
+                if state=$(python3 .github/scripts/verify_pypi_artifacts.py \
+                  --metadata "$response" --artifacts dist); then
+                  case "$state" in
+                    complete)
+                      rm -f "$response"
+                      echo "PyPI contains the complete exact local artifact set"
+                      exit 0
+                      ;;
+                    subset)
+                      echo "PyPI still exposes an exact artifact subset; retrying"
+                      ;;
+                    *)
+                      echo "invalid PyPI comparison state: $state" >&2
+                      exit 1
+                      ;;
+                  esac
+                else
+                  exit 1
+                fi
+                if [ "$attempt" = 30 ]; then
+                  break
+                fi
+                sleep 10
+                ;;
+              404)
+                if [ "$attempt" = 30 ]; then
+                  break
+                fi
+                sleep 10
+                ;;
+              *)
+                echo "PyPI returned HTTP $status for encypher-c2pa $version" >&2
+                exit 1
+                ;;
+            esac
+          done
+          rm -f "$response"
+          echo "complete PyPI release did not become visible" >&2
+          exit 1
+
+  npm-build:
+    name: Build browser WASM package
+    needs: [verify, release-version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
+        with:
+          version: v0.13.1
+      - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
+      - run: node scripts/package-wasm.mjs
+      - run: node scripts/test-wasm.mjs
+      - name: Pack the verified browser package
+        working-directory: bindings/wasm/pkg
+        run: |
+          mkdir -p ../../../dist/npm
+          npm pack --pack-destination ../../../dist/npm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-wasm-package
+          path: dist/npm/*.tgz
+          if-no-files-found: error
 
   npm:
     name: Publish browser WASM package
-    needs: verify
+    needs: [release-checkpoint, npm-build]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+          name: browser-wasm-package
+          path: dist/npm
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      # Trusted publishing (OIDC): no registry-url here on purpose -
-      # setup-node's registry-url writes an .npmrc _authToken placeholder that
-      # errors when NODE_AUTH_TOKEN is unset. npm >= 11.5.1 is required for
-      # OIDC; Node 22 bundles npm 10, so upgrade the CLI explicitly.
-      - run: npm install -g npm@latest
-      - uses: jetli/wasm-pack-action@v0.4.0
-      - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
-      - run: node scripts/package-wasm.mjs
-      - run: node scripts/test-wasm.mjs
+      # Node 22 bundles npm 10. OIDC trusted publishing requires npm >=11.5.1.
+      # Ignore install scripts while the short-lived id-token permission is live.
+      - run: npm install -g npm@11.5.1 --ignore-scripts
+      - name: Reverify the release tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release_tag.py
       - name: Publish to npm (OIDC trusted publishing)
-        working-directory: bindings/wasm/pkg
         run: |
           set -euo pipefail
-          version=$(node -p "require('./package.json').version")
-          name=$(node -p "require('./package.json').name")
-          # A prerelease must never DISPLACE a stable `latest`: npm publish
-          # defaults to `latest`, which would hand every plain
-          # `npm i @encypherai/c2pa` a release candidate.
-          #
-          # But the first-ever publish of a package takes `latest`
-          # regardless of --tag, and OIDC trusted publishing cannot run
-          # `npm dist-tag add` (npm/cli#8547 - only `npm publish` is
-          # supported), so rc.6 pinned `latest` and no later release could
-          # move it: plain installs kept getting the first RC ever cut.
-          #
-          # `npm publish --tag` is the only lever OIDC gives us, so a
-          # prerelease claims `latest` too while no stable release exists
-          # to protect. Once 1.0.0 ships it takes `latest` and every later
-          # prerelease goes to `next` alone, which is the original intent.
+          shopt -s nullglob
+          tarballs=(dist/npm/*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "expected one browser package, found ${#tarballs[@]}" >&2
+            exit 1
+          fi
+          tarball=${tarballs[0]}
+          package_json=$(tar -xOf "$tarball" package/package.json)
+          version=$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(0, "utf8")).version)' <<<"$package_json")
+          name=$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(0, "utf8")).name)' <<<"$package_json")
+          expected_version=${GITHUB_REF_NAME#v}
+          test "$name" = "@encypherai/c2pa" || {
+            echo "unexpected browser package name: $name" >&2
+            exit 1
+          }
+          test "$version" = "$expected_version" || {
+            echo "browser package version $version does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+          error_file=$(mktemp)
+          if published=$(npm view "$name@$version" --json 2>"$error_file"); then
+            node -e '
+              const crypto = require("crypto");
+              const fs = require("fs");
+              const path = process.argv[1];
+              const metadata = JSON.parse(fs.readFileSync(0, "utf8"));
+              if (metadata.version !== process.argv[2]) {
+                throw new Error(`npm returned unexpected version: ${metadata.version}`);
+              }
+              const bytes = fs.readFileSync(path);
+              const integrity = `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`;
+              const shasum = crypto.createHash("sha1").update(bytes).digest("hex");
+              if (metadata.dist?.integrity) {
+                if (metadata.dist.integrity !== integrity) {
+                  throw new Error(`npm integrity mismatch: ${metadata.dist.integrity} != ${integrity}`);
+                }
+              } else if (metadata.dist?.shasum) {
+                if (metadata.dist.shasum !== shasum) {
+                  throw new Error(`npm shasum mismatch: ${metadata.dist.shasum} != ${shasum}`);
+                }
+              } else {
+                throw new Error("npm returned neither dist.integrity nor dist.shasum");
+              }
+              if (metadata.dist?.shasum && metadata.dist.shasum !== shasum) {
+                throw new Error(`npm shasum mismatch: ${metadata.dist.shasum} != ${shasum}`);
+              }
+            ' "$tarball" "$version" <<<"$published"
+            rm -f "$error_file"
+            echo "$name@$version is already published with matching package bytes"
+            exit 0
+          else
+            error=$(<"$error_file")
+            rm -f "$error_file"
+            if [[ "$error" != *"E404"* ]]; then
+              echo "$error" >&2
+              exit 1
+            fi
+          fi
+          # Stable releases own `latest`. After stable exists, prereleases
+          # publish only to `next`.
           case "$version" in
             *-*)
-              current=$(npm view "$name@latest" version 2>/dev/null || true)
+              if ! current=$(npm view "$name@latest" version 2>&1); then
+                if [[ "$current" = *"E404"* ]]; then
+                  current=""
+                else
+                  echo "$current" >&2
+                  exit 1
+                fi
+              fi
               case "$current" in
                 "" | *-*) dist_tag=latest ;;
                 *) dist_tag=next ;;
@@ -176,8 +1131,210 @@ jobs:
             *) dist_tag=latest ;;
           esac
           echo "publishing $version to dist-tag $dist_tag"
-          # No token: authentication is the OIDC exchange against the trusted
-          # publisher configured on npmjs.com (org encypherai, this repo,
-          # release.yml, environment release). Provenance is attached by
-          # default under trusted publishing.
-          npm publish --access public --tag "$dist_tag"
+          # The packed package is data, not executable input in this privileged
+          # job. No repository or build dependency runs with id-token access.
+          npm publish "$tarball" --ignore-scripts --access public --tag "$dist_tag"
+
+  github-release:
+    name: Publish GitHub release
+    needs: [crates-library, crates-cli, pypi, npm]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: python-*
+          path: dist/release
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: browser-wasm-package
+          path: dist/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rust-crate-*
+          merge-multiple: true
+          path: dist/release
+      - name: Reverify the release tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release_tag.py
+      - name: Validate assets and publish the existing checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          title="Encypher C2PA $version"
+          is_prerelease=false
+          case "$version" in
+            *-*) is_prerelease=true ;;
+          esac
+
+          release_pages=$(mktemp)
+          fetch_release() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_pages"
+            python3 - "$GITHUB_REF_NAME" "$release_pages" <<'PY'
+          import json
+          import sys
+
+          tag, path = sys.argv[1:]
+          pages = json.load(open(path, encoding="utf-8"))
+          matches = [
+              release
+              for page in pages
+              for release in page
+              if release.get("tag_name") == tag
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"expected exactly one GitHub release for {tag!r}, found {len(matches)}"
+              )
+          json.dump(matches[0], sys.stdout, separators=(",", ":"))
+          PY
+          }
+          validate_release() {
+            python3 - "$GITHUB_REF_NAME" "$GITHUB_SHA" "$title" "$is_prerelease" <<'PY'
+          import json
+          import sys
+
+          tag, sha, title, prerelease = sys.argv[1:]
+          actual = json.load(sys.stdin)
+          expected = {
+              "tag_name": tag,
+              "target_commitish": sha,
+              "name": title,
+              "prerelease": prerelease == "true",
+          }
+          observed = {key: actual.get(key) for key in expected}
+          if observed != expected:
+              raise SystemExit(
+                  f"release checkpoint mismatch: {observed!r} != {expected!r}"
+              )
+          if not isinstance(actual.get("draft"), bool):
+              raise SystemExit("release checkpoint has an invalid draft state")
+          if actual["draft"] and actual.get("published_at") is not None:
+              raise SystemExit("draft release checkpoint is already marked published")
+          if not actual["draft"] and not actual.get("published_at"):
+              raise SystemExit("published release checkpoint has no publication time")
+          PY
+          }
+          validate_asset_inventory() {
+            python3 - "$expected_assets" <<'PY'
+          import json
+          import re
+          import sys
+
+          expected = json.loads(sys.argv[1])
+          release = json.load(sys.stdin)
+          assets = release.get("assets")
+          if not isinstance(expected, dict) or not isinstance(assets, list):
+              raise SystemExit("release checkpoint has invalid asset metadata")
+          observed = [asset.get("name") for asset in assets]
+          if sorted(observed) != sorted(expected):
+              raise SystemExit(
+                  f"release asset mismatch: {sorted(observed)!r} != {sorted(expected)!r}"
+              )
+          for asset in assets:
+              name = asset["name"]
+              wanted = expected[name]
+              digest = asset.get("digest")
+              if (
+                  asset.get("state") != "uploaded"
+                  or not isinstance(asset.get("size"), int)
+                  or not isinstance(digest, str)
+                  or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+              ):
+                  raise SystemExit(f"release asset is not valid: {asset!r}")
+              if asset["size"] != wanted["size"] or digest != wanted["digest"]:
+                  raise SystemExit(
+                      f"release asset byte mismatch for {name!r}: "
+                      f"size={asset['size']!r}, digest={digest!r}, "
+                      f"expected={wanted!r}"
+                  )
+          PY
+          }
+
+          expected_assets=$(python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("dist/release")
+          if not root.is_dir():
+              raise SystemExit("release artifact directory is missing")
+          files = []
+          for path in root.rglob("*"):
+              if path.is_symlink():
+                  raise SystemExit(f"release artifact path is a symbolic link: {path}")
+              if path.is_file():
+                  if path.stat().st_size <= 0:
+                      raise SystemExit(f"release artifact is empty: {path}")
+                  files.append(path)
+          wheels = [path for path in files if path.name.endswith(".whl")]
+          sdists = [path for path in files if path.name.endswith(".tar.gz")]
+          npm = [path for path in files if path.name.endswith(".tgz")]
+          crates = [path for path in files if path.name.endswith(".crate")]
+          expected = wheels + sdists + npm + crates
+          if (
+              len(wheels) != 5
+              or len(sdists) != 1
+              or len(npm) != 1
+              or len(crates) != 2
+          ):
+              raise SystemExit(
+                  "expected five wheels, one Python sdist, one npm package, "
+                  "and two Rust crates; "
+                  f"found {len(wheels)}, {len(sdists)}, {len(npm)}, "
+                  f"and {len(crates)}"
+              )
+          if len(files) != 9 or len(expected) != len(files):
+              raise SystemExit(f"unexpected release artifacts: {files!r}")
+          names = [path.name for path in files]
+          if len(names) != len(set(names)):
+              raise SystemExit(f"duplicate release artifact names: {names!r}")
+          metadata = {}
+          for path in files:
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              metadata[path.name] = {
+                  "size": path.stat().st_size,
+                  "digest": f"sha256:{digest.hexdigest()}",
+              }
+          print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+          PY
+          )
+
+          release=$(fetch_release)
+          validate_release <<<"$release"
+          is_draft=$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["draft"]).lower())' <<<"$release")
+          if [ "$is_draft" = false ]; then
+            validate_asset_inventory <<<"$release"
+            echo "$GITHUB_REF_NAME is already published with the expected assets"
+            exit 0
+          fi
+
+          mapfile -t files < <(find dist/release -type f -print)
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          release=$(fetch_release)
+          validate_release <<<"$release"
+          validate_asset_inventory <<<"$release"
+          release_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$release")
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false >/dev/null
+          release=$(fetch_release)
+          validate_release <<<"$release"
+          validate_asset_inventory <<<"$release"
+          published=$(python3 -c 'import json,sys; print(str(not json.load(sys.stdin)["draft"]).lower())' <<<"$release")
+          test "$published" = true || {
+            echo "release checkpoint remained a draft" >&2
+            exit 1
+          }
+          echo "published exact-commit release $GITHUB_REF_NAME"

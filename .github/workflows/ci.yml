@@ -11,15 +11,49 @@ permissions:
   contents: read
 
 jobs:
+  surface:
+    name: Public API surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      # rustdoc JSON is nightly-only and its schema is unstable, so the
+      # toolchain is pinned rather than floating. The script asserts the schema
+      # version it was written against and fails loudly if that changes, which
+      # is what makes a pinned nightly safe to bump deliberately.
+      #
+      # wasm32 is required, not incidental: rustdoc only emits items enabled for
+      # the target it documents, so a host-only run cannot see a
+      # `#[cfg(target_arch = "wasm32")]` item at all. A reviewer hid a working
+      # container writer that way. The gate documents every (target, feature)
+      # combination a consumer can build and unions the result.
+      - name: Install pinned nightly rustdoc toolchain
+        run: rustup toolchain install nightly-2026-08-07 --target wasm32-unknown-unknown --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Fails when anything becomes publicly reachable that is not in the
+      # reviewed inventory. This repository publishes a verification-only SDK:
+      # manifest construction and container writing live in private modules
+      # under `cfg(test)` and must never appear here. The surface comes from
+      # rustdoc's own view, so re-exports, macro-generated items and impl
+      # methods are resolved by rustc rather than guessed.
+      #
+      # This locks the SHAPE of the API. The behaviour of the items in it is
+      # covered by the non-mutation contract tests in the `rust` job.
+      - run: node scripts/check-public-surface.mjs
+        env:
+          SURFACE_TOOLCHAIN: "+nightly-2026-08-07"
+
   rust:
     name: Rust core and CLI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # A plain `cargo audit`, not rustsec/audit-check: that action requires a
@@ -27,7 +61,7 @@ jobs:
       # and a reusable workflow can never hold more permission than its
       # caller - release.yml grants only `contents: read`, so the action would
       # fail on every tag run even once wired up here.
-      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@e40e306b80d964fa5d3792fcbb48bf976d23dce8 # cargo-audit
       - run: cargo audit
       - run: cargo test --workspace
       - run: cargo run -q -p encypher-c2pa-cli -- verify tests/fixtures/signed_test.mp4
@@ -36,24 +70,27 @@ jobs:
     name: Rust 1.88 minimum version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo check --workspace
 
   python:
     name: Python wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v6
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test release workflow helpers
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # stable
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
           args: --release --manifest-path bindings/python/Cargo.toml --out dist/python
       - run: uv venv .venv
-      - run: uv pip install --python .venv/bin/python dist/python/*.whl
+      - run: uv pip install --python .venv/bin/python dist/python/*.whl pytest
+      - run: .venv/bin/python -m pytest bindings/python/tests
       - run: |
           .venv/bin/python - <<'PY'
           import encypher_c2pa as c
@@ -67,14 +104,16 @@ jobs:
     name: Browser WASM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: jetli/wasm-pack-action@v0.4.0
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
+        with:
+          version: v0.13.1
       - run: wasm-pack build bindings/wasm --target web --release --out-dir pkg
       - run: node scripts/package-wasm.mjs
       - run: node scripts/test-wasm.mjs
@@ -83,9 +122,9 @@ jobs:
     name: Go binding
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # stable
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.22"
       - run: cargo build -p encypher-c2pa-ffi --release

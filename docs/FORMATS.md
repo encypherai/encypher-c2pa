@@ -1,6 +1,6 @@
 # Format coverage
 
-The `c2pa-2.4` profile exposes 69 canonical MIME types. Run `encypher-c2pa formats` to read the list from the installed build.
+Run `encypher-c2pa formats` to read the canonical MIME types covered by the installed `c2pa-2.4` engine profile.
 
 ## Images
 

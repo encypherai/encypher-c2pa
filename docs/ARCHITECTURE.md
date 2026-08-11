@@ -27,18 +27,18 @@ flowchart LR
 
 ## Public facade
 
-`crates/encypher-c2pa` owns the stable API and report mapping. Consumers should depend on this crate, not support crates under `internal/`.
-
-The support crates are separately packaged only because crates.io requires every dependency in a published package graph to exist in the registry. Their APIs are implementation details and may change in any alpha release.
+`crates/encypher-c2pa` owns the stable API, report mapping, and all verifier implementation modules. Consumers depend only on this crate.
 
 ## Verification core
 
-- `internal/c2pa-cbor`: exact CBOR profiles used by C2PA claims and assertions.
-- `internal/c2pa-core`: JUMBF, claims, assertions, spec versions, and engine profiles.
-- `internal/c2pa-formats`: format detection, manifest extraction, and hard-binding byte ranges.
-- `internal/c2pa-crypto`: COSE signature algorithms and certificate extraction.
-- `internal/c2pa-trust`: caller-supplied certificate-chain evaluation.
-- `internal/c2pa-validate`: manifest-store traversal and validation status production.
+- `crates/encypher-c2pa/src/c2pa-cbor`: exact CBOR profiles used by C2PA claims and assertions.
+- `crates/encypher-c2pa/src/c2pa-core`: JUMBF, claims, assertions, spec versions, and engine profiles.
+- `crates/encypher-c2pa/src/c2pa-formats`: format detection, manifest extraction, and hard-binding byte ranges.
+- `crates/encypher-c2pa/src/c2pa-crypto`: COSE signature algorithms and certificate extraction.
+- `crates/encypher-c2pa/src/c2pa-trust`: caller-supplied certificate-chain evaluation.
+- `crates/encypher-c2pa/src/c2pa-validate`: manifest-store traversal and validation status production.
+
+These are private modules, not separately published crates.
 
 No support crate contains a network client. The public facade's default `telemetry` feature provides the opt-in native transport; WASM disables that feature and uses the browser transport only after explicit consent.
 
@@ -62,4 +62,4 @@ The core caps pathological data-hash exclusion lists before parsing or hashing t
 
 ## Release graph
 
-Rust support crates publish first, then the public facade and CLI. Python wheels, npm WASM packages, Go/C archives, and CLI binaries are built from the same tag. CI verifies that every binding reports the same `schema_version` and `profile` for the shared fixtures.
+The workflow publishes `encypher-c2pa`, waits for its immutable crates.io version, then publishes the exact-pinned `encypher-c2pa-cli`. Separate jobs build Python wheels and an sdist for PyPI and browser WASM for npm. A GitHub Release is created only after all three registries succeed. C and Go remain source bindings in this repository; v1 does not publish separate C/Go archives or standalone CLI binaries.

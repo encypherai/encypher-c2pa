@@ -1,15 +1,20 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
-    set_telemetry_enabled, supported_mime_types, telemetry_preference, verify_file, Error,
-    TelemetryOptions, VerifyOptions,
+    detached_manifest_evidence, mime_from_path, set_telemetry_enabled, supported_mime_types,
+    telemetry_preference, verify_file, verify_with_options, Error, TelemetryOptions, VerifyOptions,
 };
 
 mod encypher_api;
+
+const MAX_PATH_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "encypher-c2pa", version, about = "Local C2PA verification")]
@@ -52,10 +57,6 @@ enum Command {
         /// Directly allowed CAWG end-entity certificates (PEM). Repeatable.
         #[arg(long, value_name = "PEM")]
         cawg_allowed: Vec<PathBuf>,
-        /// Require CAWG document-signing credentials to chain to a supplied
-        /// anchor (or match the allowed list).
-        #[arg(long)]
-        cawg_document_signing_require_anchor: bool,
         /// Pinned offline did:web DID documents for CAWG ICA issuers.
         /// Repeatable; each file is a DID document, an array of documents, or
         /// a DID -> document map. Without it did:web resolution fails closed.
@@ -79,12 +80,13 @@ enum Command {
         telemetry_endpoint: Option<String>,
         #[arg(long)]
         json: bool,
-        /// Query the Encypher provenance API after local verification. Sends
-        /// only a SHA-256 digest of the asset bytes; the response renders as a
-        /// separate section and never changes the local verdict or exit code.
+        /// Ask Encypher to validate the raw C2PA manifest and match its signed
+        /// registry. Requires `ENCYPHER_API_KEY` or `ENCYPHER_API_TOKEN`.
+        /// Sends the file SHA-256 plus the embedded manifest carrier, not the
+        /// media bytes. The response never changes the local verdict or exit code.
         #[arg(long)]
         encypher_api: bool,
-        /// Override the Encypher provenance lookup endpoint (self-hosting, tests).
+        /// Override the Encypher verification endpoint (self-hosting, tests).
         #[arg(long, value_name = "URL", hide = true)]
         encypher_api_endpoint: Option<String>,
     },
@@ -126,7 +128,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             allowed,
             cawg_trust,
             cawg_allowed,
-            cawg_document_signing_require_anchor,
             cawg_did_documents,
             cawg_strict_encoding,
             time,
@@ -163,7 +164,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 allowed_list_pem: read_merged_pem(&allowed)?,
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
-                cawg_document_signing_require_anchor,
                 cawg_did_documents: read_did_documents(&cawg_did_documents)?,
                 cawg_strict_encoding,
                 validation_time: time,
@@ -173,15 +173,32 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     sdk_name: Some("cli".to_string()),
                 },
             };
-            let report = verify_file(&asset, mime.as_deref(), &options)?;
-            let encypher_api_result = if encypher_api {
-                let bytes = fs::read(&asset)?;
-                let digest = encypher_api::content_sha256(&bytes);
+            let (report, encypher_api_result) = if encypher_api {
+                let mime = match mime {
+                    Some(value) => value,
+                    None => mime_from_path(&asset)
+                        .ok_or_else(|| Error::UnsupportedMime(asset.display().to_string()))?
+                        .to_string(),
+                };
+                let bytes = read_path_asset(&asset)?;
+                let report = verify_with_options(&bytes, &mime, &options)?;
+                let evidence = detached_manifest_evidence(&bytes, &mime)?;
                 let endpoint = encypher_api_endpoint
                     .unwrap_or_else(|| encypher_api::DEFAULT_ENDPOINT.to_string());
-                Some(encypher_api::lookup(&endpoint, &digest))
+                let api_key = std::env::var("ENCYPHER_API_KEY")
+                    .or_else(|_| std::env::var("ENCYPHER_API_TOKEN"))
+                    .ok();
+                let result = encypher_api::verify(
+                    &endpoint,
+                    api_key.as_deref(),
+                    &bytes,
+                    &mime,
+                    &report,
+                    evidence.as_ref(),
+                );
+                (report, Some(result))
             } else {
-                None
+                (verify_file(&asset, mime.as_deref(), &options)?, None)
             };
             if json {
                 if let Some(lookup) = &encypher_api_result {
@@ -284,6 +301,48 @@ fn read_merged_pem(paths: &[PathBuf]) -> Result<Option<String>, Error> {
         }
     }
     Ok(Some(pem))
+}
+
+fn read_path_asset(path: &Path) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("asset path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_PATH_ASSET_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("asset exceeds the 128 MiB path limit: {}", path.display()),
+        ));
+    }
+
+    let expected_len = usize::try_from(metadata.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "asset size is not addressable"))?;
+    let mut data = vec![0_u8; expected_len + 1];
+    let mut used = 0;
+    while used < expected_len {
+        let count = file.read(&mut data[used..expected_len])?;
+        if count == 0 {
+            break;
+        }
+        used += count;
+    }
+    if used == expected_len && file.read(&mut data[expected_len..expected_len + 1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "asset grew while being read",
+        ));
+    }
+    data.truncate(used);
+    Ok(data)
 }
 
 /// Build the pinned offline `did:web` DID-document store from repeatable

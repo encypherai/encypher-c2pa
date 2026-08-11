@@ -23,6 +23,8 @@ Additive fields may appear within schema 1.x. A field removal, rename, type chan
 | `manifest_report` | object | Detailed active-manifest and manifest-store reader report. |
 | `content_credentials` | object or null | Content Credentials-shaped projection when one is available. |
 
+`manifest_report` spends from one bounded decoded-value budget per verification. If hostile claim or assertion data exhausts it, the affected nested value is replaced by `{"_encypher_omitted": "..."}`; validation results and the surrounding report shape remain intact.
+
 ## Trust object
 
 | Field | Values | Meaning |

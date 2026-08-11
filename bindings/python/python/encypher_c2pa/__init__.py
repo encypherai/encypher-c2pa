@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
+import os
+import stat
 from pathlib import Path
 from typing import Any, Mapping, Optional, Union
 
 from ._native import (
+    extensions_json as _extensions_json,
     formats_json,
     get_telemetry_preference,
     set_telemetry_preference,
@@ -20,9 +24,48 @@ __all__ = [
     "telemetry_enabled",
     "verify",
 ]
-__version__ = "1.0.0rc6"
+__version__ = "1.0.0"
 
 Asset = Union[bytes, bytearray, memoryview, str, Path]
+_MAX_PATH_ASSET_BYTES = 128 * 1024 * 1024
+_SUPPORTED_EXTENSIONS = dict(json.loads(_extensions_json()))
+
+
+def _read_path(path: Path, limit: int = _MAX_PATH_ASSET_BYTES) -> bytearray:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(errno.EINVAL, "asset path is not a regular file", path)
+        if metadata.st_size > limit:
+            raise OSError(
+                errno.EFBIG,
+                f"asset exceeds the 128 MiB path limit ({limit} bytes)",
+                path,
+            )
+
+        expected = metadata.st_size
+        buffer = bytearray(expected + 1)
+        used = 0
+        with os.fdopen(fd, "rb", buffering=0, closefd=False) as asset_file:
+            view = memoryview(buffer)
+            while used < expected:
+                count = asset_file.readinto(view[used:expected])
+                if not count:
+                    break
+                used += count
+            if used == expected and asset_file.readinto(view[expected : expected + 1]):
+                raise OSError(errno.EFBIG, "asset grew while being read", path)
+        view.release()
+        del buffer[used:]
+        return buffer
+    finally:
+        os.close(fd)
+
+def _infer_mime_type(path: Path) -> Optional[str]:
+    extension = path.suffix.removeprefix(".").lower()
+    return _SUPPORTED_EXTENSIONS.get(extension) or mimetypes.guess_type(path.name)[0]
 
 
 def verify(
@@ -34,7 +77,6 @@ def verify(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
-    cawg_document_signing_require_anchor: bool = False,
     cawg_did_documents: Optional[Mapping[str, Any]] = None,
     cawg_strict_encoding: bool = False,
     validation_time: Optional[str] = None,
@@ -49,19 +91,20 @@ def verify(
     ``cawg_did_documents`` maps a primary DID (e.g. ``did:web:example.com``)
     to its DID document for offline ``did:web`` ICA resolution (absent
     issuers fail closed), and ``cawg_strict_encoding`` refuses CAWG 1.1-era
-    legacy encodings. On first interactive use, the
-    SDK asks whether failure telemetry should be enabled and saves the answer.
-    Passing ``telemetry=True`` or ``False`` changes that saved preference.
+    legacy encodings. On first interactive use, the SDK asks whether failure
+    telemetry should be enabled and saves the answer. Passing
+    ``telemetry=True`` or ``False`` attempts to save that preference; the
+    explicit value still governs this verification if persistence fails.
     Telemetry sends bounded failure codes, never asset bytes, manifests, paths,
     keys, trust material, or account identifiers.
     """
     if isinstance(asset, (str, Path)):
         path = Path(asset)
-        data = path.read_bytes()
+        data = _read_path(path)
         if mime_type is None:
-            mime_type = mimetypes.guess_type(path.name)[0]
+            mime_type = _infer_mime_type(path)
     elif isinstance(asset, (bytes, bytearray, memoryview)):
-        data = bytes(asset)
+        data = asset
     else:
         raise TypeError("asset must be bytes or a filesystem path")
 
@@ -69,7 +112,10 @@ def verify(
         raise ValueError("mime_type is required when it cannot be inferred from a path")
 
     if telemetry is not None:
-        configure_telemetry(telemetry)
+        try:
+            set_telemetry_preference(bool(telemetry))
+        except Exception:
+            pass
 
     options = {
         "trust_pem": trust_pem,
@@ -77,7 +123,6 @@ def verify(
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
-        "cawg_document_signing_require_anchor": bool(cawg_document_signing_require_anchor),
         "cawg_did_documents": dict(cawg_did_documents) if cawg_did_documents else None,
         "cawg_strict_encoding": bool(cawg_strict_encoding),
         "validation_time": validation_time,

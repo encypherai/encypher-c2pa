@@ -25,11 +25,15 @@ This is a useful result. It says the credential is internally intact. It does no
 
 ## Caller-supplied material
 
-`VerifyOptions` accepts three independent PEM bundles:
+`VerifyOptions` accepts five independent PEM bundles:
 
 - `trust_pem`: claim-signing trust anchors.
 - `tsa_trust_pem`: timestamp-authority trust anchors.
-- `allowed_list_pem`: end-entity certificates accepted directly by the caller.
+- `allowed_list_pem`: claim-signing end-entity certificates accepted directly by the caller.
+- `cawg_trust_pem`: CAWG X.509 identity trust anchors.
+- `cawg_allowed_certs_pem`: CAWG X.509 end-entity certificates accepted directly by the caller.
+
+CAWG document-signing credentials require a supplied CAWG anchor or allowed-list match; certificate profile alone never establishes trust. `cawg_did_documents` supplies a pinned DID-to-document map for offline `did:web` identity resolution. `cawg_strict_encoding` rejects legacy CAWG encodings.
 
 Malformed PEM is a hard input error. The verifier never converts malformed trust material into a silent `not_evaluated` result.
 
@@ -46,7 +50,7 @@ The public SDK does not:
 - accept a signer because a certificate is syntactically valid;
 - cache a trust decision between calls.
 
-Only bytes in the asset and trust material in the call can affect the result.
+The verification result depends only on asset bytes and explicit call options.
 
 ## Revocation and freshness
 

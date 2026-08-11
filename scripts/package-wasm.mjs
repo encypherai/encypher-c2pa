@@ -24,8 +24,9 @@ Object.assign(pkg, {
       import: "./encypher_c2pa_wasm.js",
     },
   },
+  sideEffects: ["./snippets/**"],
 });
-pkg.files = [...new Set([...pkg.files, "LICENSE", "NOTICE", "README.md"])];
+pkg.files = [...new Set([...pkg.files, "snippets", "LICENSE", "NOTICE", "README.md"])];
 
 await writeFile(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
 await copyFile(resolve(root, "LICENSE"), resolve(pkgDir, "LICENSE"));

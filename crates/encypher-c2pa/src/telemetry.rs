@@ -117,8 +117,8 @@ fn bounded_codes<'a>(codes: impl Iterator<Item = &'a str>) -> Vec<String> {
 }
 
 fn safe_mime(mime_type: &str) -> Option<String> {
-    let mime = c2pa_core::spec::canonicalize_mime(mime_type);
-    c2pa_core::spec::mimes_for_version(c2pa_core::SpecVersion::V2_4)
+    let mime = crate::c2pa_core::spec::canonicalize_mime(mime_type);
+    crate::c2pa_core::spec::mimes_for_version(crate::c2pa_core::SpecVersion::V2_4)
         .contains(&mime.as_str())
         .then_some(mime)
 }

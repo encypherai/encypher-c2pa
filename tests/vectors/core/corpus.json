@@ -1,0 +1,172 @@
+{
+  "schema_version": "1.0",
+  "description": "Pinned third-party core C2PA vectors with spec-derived validator expectations.",
+  "network_policy": "offline",
+  "spec_version": "2.4",
+  "normative_basis": "https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html",
+  "sources": [
+    {
+      "repository": "https://github.com/contentauth/c2pa-rs",
+      "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+      "license": "Apache-2.0 OR MIT",
+      "license_files": [
+        "external/contentauth-c2pa-rs/bc3ca83d/LICENSE-APACHE",
+        "external/contentauth-c2pa-rs/bc3ca83d/LICENSE-MIT"
+      ]
+    }
+  ],
+  "vectors": [
+    {
+      "id": "reference-valid-jpeg",
+      "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/C.jpg",
+      "mime_type": "image/jpeg",
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "size": 132518,
+      "sha256": "a2d14755db55de67a47c04090340d8266e892367be4104a45626d7a6fa6e9ffd",
+      "source": {
+        "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+        "path": "sdk/tests/fixtures/C.jpg"
+      },
+      "normative_expected": {
+        "exit_code": 0,
+        "validation_state": "Valid",
+        "manifest_count": 1,
+        "required_success_codes": [
+          "claimSignature.validated",
+          "assertion.dataHash.match"
+        ],
+        "forbidden_success_codes": [],
+        "failure_codes": []
+      }
+    },
+    {
+      "id": "reference-valid-ingredient-chain",
+      "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/CACA.jpg",
+      "mime_type": "image/jpeg",
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "size": 279782,
+      "sha256": "e735fe9e50057f8280baf96182a38d516a4acfb144da7f1e6aad32de44c76aea",
+      "source": {
+        "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+        "path": "sdk/tests/fixtures/CACA.jpg"
+      },
+      "normative_expected": {
+        "exit_code": 0,
+        "validation_state": "Valid",
+        "manifest_count": 2,
+        "required_success_codes": [
+          "claimSignature.validated",
+          "assertion.dataHash.match",
+          "ingredient.manifest.validated"
+        ],
+        "forbidden_success_codes": [],
+        "failure_codes": []
+      }
+    },
+    {
+      "id": "reference-tampered-data-hash",
+      "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/XCA.jpg",
+      "mime_type": "image/jpeg",
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "size": 142765,
+      "sha256": "81f20702a2e81611b29aa773f811b59ade6095acd3d089d6ffdae6b591d6d5a5",
+      "source": {
+        "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+        "path": "sdk/tests/fixtures/XCA.jpg"
+      },
+      "normative_expected": {
+        "exit_code": 2,
+        "validation_state": "Invalid",
+        "manifest_count": 1,
+        "required_success_codes": [
+          "claimSignature.validated"
+        ],
+        "forbidden_success_codes": [
+          "assertion.dataHash.match"
+        ],
+        "failure_codes": [
+          "assertion.dataHash.mismatch"
+        ]
+      }
+    },
+    {
+      "id": "reference-tampered-claim-signature",
+      "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/E-sig-CA.jpg",
+      "mime_type": "image/jpeg",
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "size": 166864,
+      "sha256": "20dc072a4c843d3b7d7cb4f4002fbb4d8f20d7ee859ca726f2458c1e0358a98c",
+      "source": {
+        "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+        "path": "sdk/tests/fixtures/E-sig-CA.jpg"
+      },
+      "normative_expected": {
+        "exit_code": 2,
+        "validation_state": "Invalid",
+        "manifest_count": 1,
+        "required_success_codes": [],
+        "forbidden_success_codes": [
+          "claimSignature.validated"
+        ],
+        "failure_codes": [
+          "claimSignature.mismatch"
+        ]
+      }
+    },
+    {
+      "id": "reference-missing-hash-algorithm",
+      "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/no_alg.jpg",
+      "mime_type": "image/jpeg",
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "size": 86499,
+      "sha256": "7c91641416c18319b823c292ae603c5354892ac365c05543519154c48c6a1f8a",
+      "source": {
+        "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+        "path": "sdk/tests/fixtures/no_alg.jpg"
+      },
+      "normative_expected": {
+        "exit_code": 2,
+        "validation_state": "Invalid",
+        "manifest_count": 1,
+        "required_success_codes": [
+          "assertion.dataHash.match",
+          "claimSignature.validated"
+        ],
+        "forbidden_success_codes": [
+          "assertion.hashedURI.match"
+        ],
+        "failure_codes": [
+          "algorithm.unsupported",
+          "assertion.action.malformed"
+        ]
+      }
+    },
+    {
+      "id": "reference-invalid-bmff-missing-generator-info",
+      "path": "external/contentauth-c2pa-rs/bc3ca83d/assets/video1.mp4",
+      "mime_type": "video/mp4",
+      "fixed_validation_time": "2025-09-01T00:00:00Z",
+      "size": 828571,
+      "sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "source": {
+        "commit": "bc3ca83d0455a7d86da6db60c294b96671727e88",
+        "path": "sdk/tests/fixtures/video1.mp4"
+      },
+      "rationale": "The historical claim-v1 fixture predates claim_generator_info. C2PA 2.4 requires a non-empty generator-info array with a name, so validation stops before the BMFF binding can yield a success.",
+      "normative_expected": {
+        "exit_code": 2,
+        "validation_state": "Invalid",
+        "manifest_count": 2,
+        "required_success_codes": [
+          "claimSignature.insideValidity"
+        ],
+        "forbidden_success_codes": [
+          "assertion.bmffHash.match"
+        ],
+        "failure_codes": [
+          "claim.malformed"
+        ]
+      }
+    }
+  ]
+}

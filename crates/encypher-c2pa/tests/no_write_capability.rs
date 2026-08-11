@@ -1,0 +1,1172 @@
+//! Verification runs with the ability to write taken away by the kernel.
+//!
+//! The other controls in this repository reason about source text. The
+//! public-surface gate locks the shape of the API from rustdoc's own output,
+//! and `read_only_contract.rs` checks the observable behaviour of each entry
+//! point. Neither can establish the general property that verification does
+//! not write, and one attempt to get there with a pattern list over the source
+//! was defeated twice in a sitting by `use std::fs as io_fs` and by
+//! `File::options().create(true)`. A denylist over text cannot decide this.
+//!
+//! So stop asking the source and ask the kernel. This forks a child, installs
+//! a seccomp filter that refuses every syscall capable of creating, truncating
+//! or removing a file, and then runs the three public verification entry
+//! points inside it. If they still succeed, they did not write - not because
+//! no writer was spotted, but because no writer was possible. Aliases,
+//! re-export paths, generic `io::Write` indirection, macro expansion,
+//! `include!`, `unsafe`, and a dependency writing on the crate's behalf are all
+//! equally powerless against it, which is the whole point of moving the check
+//! down a layer.
+//!
+//! The filter is an ALLOWLIST. Reads, memory operations, thread and signal
+//! operations and clocks pass; everything else kills the process. Four
+//! syscalls are permitted only on their arguments: `openat` and `open` must
+//! carry no write flag, `ioctl` must be the one terminal query the runtime
+//! makes at startup, and `fcntl` may only query descriptor flags with
+//! `F_GETFD`. `write` and `writev` are permitted nowhere.
+//!
+//! Nine tests run, and every one asks the kernel rather than a model of it.
+//! Most assert the sandbox bites - a writer dies, an unlisted syscall dies,
+//! each gate refuses the arguments it exists to refuse, and every route
+//! previously found open dies. Two assert the setup leaves nothing behind: no
+//! inherited descriptor reaches the sandbox and no inherited shared mapping
+//! outlives it. One keeps the allowlist honest, by requiring every exercised
+//! entry to be load-bearing. And one is the point of the exercise:
+//! verification of every declared MIME and extension completes inside the
+//! sandbox with the signed fixtures coming back present, valid and
+//! hard-binding matched.
+//!
+//! # History
+//!
+//! Every defence here exists because something got past an earlier version,
+//! demonstrated end to end rather than argued. They are collected once, here,
+//! so the rest of the file can say what it does without re-arguing why.
+//!
+//! - **A denylist of mutating syscalls** missed `io_uring`, which performs
+//!   `openat` and `write` as ring submissions without issuing either syscall.
+//!   It also missed `setxattr`, `utimensat` and `fallocate`. Hence an
+//!   allowlist: enumerating ways to write is a losing game at any layer.
+//! - **Returning `EPERM` instead of killing** let two writers through. Both
+//!   were written `let _ = write(..)`, so the write failed, the result was
+//!   discarded, and verification finished normally. Refusing a syscall shows
+//!   verification does not DEPEND on writing; killing shows it does not TRY.
+//! - **Permitting `write` to stdout** so the child could print handed a writer
+//!   a live descriptor whenever the harness redirected stdout into a file. The
+//!   child reports by exit status instead, so it needs neither.
+//! - **An inherited `O_RDWR` descriptor** survived into the sandbox, where a
+//!   filter over syscall numbers cannot see it. Descriptors are closed first.
+//! - **An inherited `MAP_SHARED` mapping** outlived the descriptor it was made
+//!   through; the permitted `mprotect` restored write access and an ordinary
+//!   store changed the file with no syscall at all. Mappings are swept too.
+//! - **`ioctl` with `FS_IOC_SETFLAGS`** altered an inode through a READ-ONLY
+//!   descriptor, which is why that gate is on the request and not the mode.
+//! - **A symbolic interpreter** used to check the filter statically. It never
+//!   found a defect in the filter and was itself the defect four times, always
+//!   the same one: the model disagreeing with the kernel. It was deleted in
+//!   favour of canaries that ask the kernel, which cannot have that bug. See
+//!   `each_argument_gate_holds_against_the_kernel`.
+
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
+use std::path::{Path, PathBuf};
+
+use encypher_c2pa::{verify, verify_file, verify_with_options, VerifyOptions};
+
+// Exit codes. The child cannot panic usefully - the harness's machinery is not
+// reachable once it is sandboxed - so it reports by status and the parent
+// translates.
+const OK: i32 = 0;
+const NO_NEW_PRIVS_REFUSED: i32 = 10;
+const SECCOMP_REFUSED: i32 = 11;
+const SANDBOX_NOT_ENGAGED: i32 = 12;
+const VERIFY_FAILED: i32 = 20;
+const VERIFY_WITH_OPTIONS_FAILED: i32 = 21;
+const VERIFY_FILE_FAILED: i32 = 22;
+const SIGNED_INPUT_NOT_PARSED: i32 = 23;
+const INHERITED_MAPPING_SURVIVED: i32 = 24;
+const DESCRIPTORS_NOT_CLOSED: i32 = 25;
+
+/// Everything the sandboxed child needs, gathered before the fork so its own
+/// work is exactly the calls under test.
+struct Cases {
+    signed_jpg: Vec<u8>,
+    signed_mp4: Vec<u8>,
+    jpg_path: PathBuf,
+    mp4_path: PathBuf,
+    mimes: Vec<String>,
+    extensions: Vec<String>,
+}
+
+impl Cases {
+    fn collect() -> Self {
+        let dir = fixture_dir();
+        Self {
+            signed_jpg: std::fs::read(dir.join("signed_test.jpg")).expect("jpg fixture"),
+            signed_mp4: std::fs::read(dir.join("signed_test.mp4")).expect("mp4 fixture"),
+            jpg_path: dir.join("signed_test.jpg"),
+            mp4_path: dir.join("signed_test.mp4"),
+            mimes: encypher_c2pa::supported_mime_types()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            extensions: encypher_c2pa::SUPPORTED_EXTENSIONS
+                .iter()
+                .map(|(ext, _)| (*ext).to_string())
+                .collect(),
+        }
+    }
+}
+
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+}
+
+// How to read the permission lists below.
+//
+// They are an ALLOWLIST: anything absent kills the process. Four entries are
+// constrained by argument rather than by number, and `write`/`writev` are
+// absent entirely. The reasons for both, and for every other defence in this
+// file, are in the History section of the module documentation - told once
+// there rather than restated at each site.
+//
+// The lists are deliberately not minimal. Trimming further would buy nothing
+// and would make the suite brittle against an allocator change. What matters
+// is the direction of the default: a new way to write is denied because it was
+// not listed, rather than denied only if someone thought of it.
+
+/// Syscalls the sandboxed scenario actually makes. Removing any one of these
+/// kills the run, which `every_allowed_syscall_is_needed` proves on every CI
+/// run - so this tier cannot quietly accumulate.
+const EXERCISED: &[u32] = &[
+    0,   // read
+    3,   // close
+    332, // statx
+    10,  // mprotect
+    318, // getrandom
+];
+
+/// Permitted but not exercised here, and deliberately kept.
+///
+/// A reviewer asked how the allowlist could be shown minimal rather than merely
+/// sufficient. Measuring it was the easy part: the child is forked from a warm
+/// process, so it inherits its mappings and its allocator arena and ends up
+/// needing only the six above. Trimming to exactly those would make this
+/// suite fail on a machine with a different libc, allocator or kernel, and a
+/// test that fails on a contributor's laptop teaches people to delete the test.
+///
+/// So the surplus is declared instead of hidden. Every entry here is a read,
+/// a memory operation, a thread or signal operation, or a clock - none can
+/// create or modify a file, which is the only property soundness rests on. The
+/// point of splitting the list is that a NEW permission cannot arrive
+/// unnoticed: it either proves itself necessary, or it is written down here
+/// where a reviewer sees it.
+const HEADROOM: &[u32] = &[
+    // Harness, not verification. The child ends in `_exit`, so removing this
+    // always kills the run and it would pass the necessity test without that
+    // proving anything about the code under test. Declared here instead of
+    // taking undeserved credit there.
+    231, // exit_group
+    17,  // pread64
+    19,  // readv
+    295, // preadv
+    4,   // stat
+    5,   // fstat
+    6,   // lstat
+    262, // newfstatat
+    8,   // lseek
+    217, // getdents64
+    79,  // getcwd
+    89,  // readlink
+    267, // readlinkat
+    9,   // mmap
+    11,  // munmap
+    12,  // brk
+    25,  // mremap
+    13,  // rt_sigaction
+    14,  // rt_sigprocmask
+    15,  // rt_sigreturn
+    131, // sigaltstack
+    202, // futex
+    24,  // sched_yield
+    204, // sched_getaffinity
+    39,  // getpid
+    186, // gettid
+    102, // getuid
+    107, // geteuid
+    104, // getgid
+    108, // getegid
+    60,  // exit
+    96,  // gettimeofday
+    228, // clock_gettime
+    229, // clock_getres
+    35,  // nanosleep
+    230, // clock_nanosleep
+    157, // prctl
+    158, // arch_prctl
+    218, // set_tid_address
+    273, // set_robust_list
+    334, // rseq
+    324, // membarrier
+    99,  // sysinfo
+    63,  // uname
+    7,   // poll
+    271, // ppoll
+    281, // epoll_pwait
+    291, // epoll_create1
+    233, // epoll_ctl
+    302, // prlimit64
+];
+
+/// The terminal-attribute query behind `isatty`, which the Rust runtime makes
+/// on startup. The only `ioctl` request permitted.
+const TCGETS: u32 = 0x5401;
+
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+// Byte offsets into `struct seccomp_data`: nr, arch, instruction_pointer, then
+// args[6]. The argument offsets are named here because the gate table below
+// refers to them, and a wrong offset would silently inspect the wrong value.
+const OFF_NR: u32 = 0;
+const OFF_ARCH: u32 = 4;
+const OFF_ARG1: u32 = 24;
+const OFF_ARG2: u32 = 32;
+
+/// How a permitted syscall's arguments are constrained.
+enum Gate {
+    /// `openat`/`open`: the flags argument may carry no write flag.
+    NoWriteFlags { arg: u32 },
+    /// `ioctl`: the request argument must be exactly this value.
+    ArgEquals { arg: u32, value: u32 },
+}
+
+/// Permitted only for specific argument values, so these sit in neither tier
+/// above: the syscall number alone does not decide the verdict.
+///
+/// The filter is generated from this table, so a permission cannot exist in the
+/// program without appearing here.
+const ARGUMENT_GATED: &[(u32, Gate)] = &[
+    // openat(dirfd, path, flags, mode) - flags is args[2], at offset 32.
+    (257, Gate::NoWriteFlags { arg: OFF_ARG2 }),
+    // open(path, flags, mode) - flags is args[1], at offset 24.
+    (2, Gate::NoWriteFlags { arg: OFF_ARG1 }),
+    // ioctl(fd, request, ..) - request is args[1]. Only TCGETS, the terminal
+    // query the Rust runtime makes on startup.
+    (
+        16,
+        Gate::ArgEquals {
+            arg: OFF_ARG1,
+            value: TCGETS,
+        },
+    ),
+    // fcntl(fd, F_GETFD) - querying descriptor flags cannot mutate a file.
+    (
+        72,
+        Gate::ArgEquals {
+            arg: OFF_ARG1,
+            value: libc::F_GETFD as u32,
+        },
+    ),
+];
+
+/// The filter's allowlist: both tiers.
+fn allowed() -> Vec<u32> {
+    EXERCISED.iter().chain(HEADROOM).copied().collect()
+}
+
+fn filter(exclude: Option<u32>) -> Vec<libc::sock_filter> {
+    // Classic BPF opcodes.
+    const LD_W_ABS: u16 = 0x20;
+    const ALU_AND_K: u16 = 0x54;
+    const JMP_JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+    // Any of these in the open flags means the caller wants to modify a file.
+    // `O_TMPFILE` includes `O_DIRECTORY` and is caught by `O_WRONLY`/`O_RDWR`,
+    // which it must be combined with to be useful.
+    const WRITE_FLAGS: u32 =
+        (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
+
+    // x86_64 numbers for what verification legitimately does: read files and
+    // directories, manage its own memory and threads, ask the time, get
+    // randomness, and exit. None of these can create or modify a file.
+
+    let ins = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+
+    // Refuse to run at all on an unexpected architecture. A filter written
+    // against the wrong syscall table is worse than none, because it would
+    // silently permit everything it thinks it is denying.
+    let mut p = vec![
+        ins(LD_W_ABS, 0, 0, OFF_ARCH),
+        ins(JMP_JEQ_K, 1, 0, AUDIT_ARCH_X86_64),
+        ins(RET_K, 0, 0, RET_KILL_PROCESS),
+        ins(LD_W_ABS, 0, 0, OFF_NR),
+    ];
+
+    // The argument-gated syscalls, built FROM the table rather than alongside
+    // it, so a permission cannot exist in the program without appearing in a
+    // list: there is nowhere else for one to come from.
+    //
+    // `write` and `writev` appear in no list, and so in no filter. See History.
+    for (nr, gate) in ARGUMENT_GATED {
+        match gate {
+            // openat/open: no write flag may be set.
+            Gate::NoWriteFlags { arg } => {
+                p.push(ins(JMP_JEQ_K, 0, 5, *nr));
+                p.push(ins(LD_W_ABS, 0, 0, *arg));
+                p.push(ins(ALU_AND_K, 0, 0, WRITE_FLAGS));
+                p.push(ins(JMP_JEQ_K, 1, 0, 0));
+                p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+                p.push(ins(RET_K, 0, 0, RET_ALLOW));
+            }
+            // ioctl: one permitted request. The gate is on the request and not
+            // the descriptor's mode - see History.
+            Gate::ArgEquals { arg, value } => {
+                p.push(ins(JMP_JEQ_K, 0, 4, *nr));
+                p.push(ins(LD_W_ABS, 0, 0, *arg));
+                p.push(ins(JMP_JEQ_K, 1, 0, *value));
+                p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+                p.push(ins(RET_K, 0, 0, RET_ALLOW));
+            }
+        }
+        p.push(ins(LD_W_ABS, 0, 0, OFF_NR));
+    }
+
+    // The allowlist proper. Each comparison jumps forward to the single ALLOW,
+    // and falling off the end reaches KILL - so an unlisted syscall dies.
+    // Minimality testing removes one entry and requires the scenario to die.
+    let allowed: Vec<u32> = allowed()
+        .into_iter()
+        .filter(|nr| Some(*nr) != exclude)
+        .collect();
+
+    let start = p.len();
+    let allow_at = start + allowed.len() + 1;
+    for (i, nr) in allowed.iter().enumerate() {
+        let jt = (allow_at - (start + i) - 1) as u8;
+        p.push(ins(JMP_JEQ_K, jt, 0, *nr));
+    }
+    p.push(ins(RET_K, 0, 0, RET_KILL_PROCESS));
+    p.push(ins(RET_K, 0, 0, RET_ALLOW));
+
+    p
+}
+
+/// Unmap every shared file-backed mapping inherited from the parent.
+///
+/// A shared mapping of a file is a write capability regardless of its current
+/// protection, because `mprotect` can restore `PROT_WRITE` and a store then
+/// reaches the file with no syscall at all. Closing the descriptor it was made
+/// through does not remove it.
+///
+/// `/proc/self/maps` lines are
+/// `start-end perms offset dev inode pathname`. The rule applied is:
+///
+///   unmap it when the fourth character of `perms` is `s` and `inode` is not 0.
+///
+/// That is deliberately conservative rather than exact, and the difference is
+/// worth stating because an earlier version of this comment claimed the exact
+/// version and was wrong. Inode 0 does mean anonymous, but the converse fails:
+/// a reviewer showed that `MAP_SHARED | MAP_ANONYMOUS` is reported as
+/// `/dev/zero` with a real inode, so the rule sweeps up some anonymous shared
+/// mappings too. That costs a little memory the child was not going to use and
+/// removes a class of mapping this code would otherwise have to reason about,
+/// so it is left as is - but it is not the rule "unmap file-backed mappings",
+/// and a maintainer should not be told that it is.
+///
+/// The decision uses the inode rather than the pathname on purpose. A pathname
+/// may contain spaces, so splitting on whitespace cannot delimit it, and the
+/// first version got the field arithmetic wrong anyway: it read field 4 while
+/// believing that was the path. Field 4 is the inode. It behaved only because
+/// nothing here maps a file shared.
+fn unmap_inherited_shared_mappings() -> Result<(), ()> {
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|_| ())?;
+
+    for line in maps.lines() {
+        let fields: Vec<&str> = line.split_whitespace().take(5).collect();
+        let [range, perms, _offset, _dev, inode] = fields[..] else {
+            continue;
+        };
+        if perms.as_bytes().get(3) != Some(&b's') || inode == "0" {
+            continue;
+        }
+
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+
+        let rc = unsafe { libc::munmap(start as *mut libc::c_void, end - start) };
+        if rc != 0 {
+            return Err(());
+        }
+    }
+
+    Ok(())
+}
+
+/// Drop the ability to create or modify any file, irreversibly, for this
+/// process and everything it goes on to call.
+fn engage_sandbox(exclude: Option<u32>) -> Result<(), i32> {
+    // Two kinds of inherited capability must go before the filter, because a
+    // filter over syscall numbers cannot see either. Both routes are in the
+    // module History.
+    //
+    // Descriptors first. The child never prints and opens its fixtures by
+    // path, read-only, so it needs none of the parent's. The return is checked
+    // rather than assumed: a refused `close_range` would leave the child with
+    // them open while everything downstream believed otherwise.
+    if unsafe { libc::close_range(0, u32::MAX, 0) } != 0 {
+        return Err(DESCRIPTORS_NOT_CLOSED);
+    }
+
+    // Then shared file-backed mappings, which closing a descriptor does not
+    // remove. `/proc/self/maps` names every one. This runs while reading
+    // `/proc` and unmapping are still permitted, and a mapping that cannot be
+    // unmapped is a hard failure - the point is that none survives.
+    if unmap_inherited_shared_mappings().is_err() {
+        return Err(INHERITED_MAPPING_SURVIVED);
+    }
+
+    // Required before an unprivileged process may install a filter.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(NO_NEW_PRIVS_REFUSED);
+    }
+    let prog = filter(exclude);
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &fprog as *const libc::sock_fprog,
+        )
+    };
+    if rc != 0 {
+        return Err(SECCOMP_REFUSED);
+    }
+    Ok(())
+}
+
+/// Attempt a write under the filter. Must not survive.
+fn canary_child() -> ! {
+    if let Err(code) = engage_sandbox(None) {
+        unsafe { libc::_exit(code) }
+    }
+    let _ = std::fs::write("/tmp/encypher-seccomp-canary", b"x");
+    // Reaching this line means the filter permitted a file creation.
+    unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+}
+
+/// Call a syscall that is simply not on the list. Must not survive.
+///
+/// `io_uring_setup` specifically, because it is what showed the previous
+/// denylist to be unsound: a ring performs `openat` and `write` as submission
+/// entries, so refusing those syscall numbers refuses nothing. It succeeds on
+/// this kernel outside the sandbox. Inside, it is not on the allowlist, and
+/// that is the whole difference between the two designs.
+fn unlisted_syscall_child() -> ! {
+    if let Err(code) = engage_sandbox(None) {
+        unsafe { libc::_exit(code) }
+    }
+    let mut params = [0u8; 120];
+    unsafe { libc::syscall(425, 8, params.as_mut_ptr()) };
+    unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+}
+
+/// Run the public entry points under the filter, across the whole supported
+/// surface. Must exit cleanly.
+///
+/// An earlier version verified one JPEG and one MP4 and asserted only that the
+/// call returned `Ok`. A reviewer pointed out that this proves very little: a
+/// mutation on a format or an error path never executed is a mutation the
+/// sandbox never sees, and `Ok` does not show the manifest was actually parsed.
+///
+/// So this drives every MIME in `supported_mime_types()` and every extension in
+/// `SUPPORTED_EXTENSIONS`, on signed input, on unsigned input, and on truncated
+/// input - the error paths being the easiest place for a side effect to hide -
+/// and it asserts what the signed cases must actually conclude.
+fn verify_child(cases: Cases, exclude: Option<u32>) -> ! {
+    let Cases {
+        signed_jpg,
+        signed_mp4,
+        jpg_path,
+        mp4_path,
+        mimes,
+        extensions,
+    } = cases;
+
+    let code = (|| {
+        engage_sandbox(exclude)?;
+
+        // The signed fixtures must reach a real conclusion, not merely return.
+        // One predicate for all three entry points: an earlier version checked
+        // a different pair of fields at each call, so a report could satisfy
+        // the suite while failing the property the README describes.
+        let signed_ok = |r: &encypher_c2pa::VerificationReport| {
+            r.present && r.integrity == "valid" && r.hard_binding == "match"
+        };
+
+        for (bytes, mime) in [(&signed_jpg, "image/jpeg"), (&signed_mp4, "video/mp4")] {
+            let report = verify(bytes, mime).map_err(|_| VERIFY_FAILED)?;
+            if !signed_ok(&report) {
+                return Err(SIGNED_INPUT_NOT_PARSED);
+            }
+        }
+
+        let report = verify_with_options(&signed_mp4, "video/mp4", &VerifyOptions::default())
+            .map_err(|_| VERIFY_WITH_OPTIONS_FAILED)?;
+        if !signed_ok(&report) {
+            return Err(SIGNED_INPUT_NOT_PARSED);
+        }
+
+        for path in [&jpg_path, &mp4_path] {
+            let report = verify_file(path, None, &VerifyOptions::default())
+                .map_err(|_| VERIFY_FILE_FAILED)?;
+            if !signed_ok(&report) {
+                return Err(SIGNED_INPUT_NOT_PARSED);
+            }
+        }
+
+        // Every declared MIME, on content that does not match it. These are the
+        // error paths: a format sniffer, a truncated parse, an unsupported
+        // branch. Success or failure is equally fine here - what matters is that
+        // the code ran with writing impossible.
+        for mime in &mimes {
+            let _ = verify(b"", mime);
+            let _ = verify(b"not a media file at all", mime);
+            let _ = verify(&signed_jpg[..signed_jpg.len() / 2], mime);
+            let _ = verify_with_options(&signed_mp4, mime, &VerifyOptions::default());
+        }
+
+        // Every declared extension, so MIME inference runs on each one. The file
+        // does not exist, which exercises the error path that a careless
+        // implementation might use to create it.
+        for ext in &extensions {
+            let missing = jpg_path.with_extension(ext);
+            let _ = verify_file(&missing, None, &VerifyOptions::default());
+        }
+
+        // And the real fixtures under an explicitly overridden MIME.
+        for mime in &mimes {
+            let _ = verify_file(&jpg_path, Some(mime), &VerifyOptions::default());
+        }
+
+        Ok(())
+    })()
+    .err()
+    .unwrap_or(OK);
+
+    // `_exit`, not `exit`: destructors and buffered-output flushing belong to
+    // the parent's test harness and must not run twice.
+    unsafe { libc::_exit(code) }
+}
+
+/// Fork, run `f` in the child, and return the child's wait status.
+fn in_child(f: impl FnOnce()) -> i32 {
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        f();
+        // Both children end in `_exit`, so this is unreachable. It exists
+        // because a diverging closure cannot be named on stable Rust.
+        unsafe { libc::_exit(70) }
+    }
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(waited, pid, "waitpid failed");
+    status
+}
+
+/// The filter must actually bite. Without this the next test would pass just as
+/// happily with no filter at all.
+#[test]
+fn the_sandbox_kills_a_writer() {
+    let status = in_child(|| canary_child());
+
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        let why = match code {
+            NO_NEW_PRIVS_REFUSED => "PR_SET_NO_NEW_PRIVS was refused",
+            SECCOMP_REFUSED => "PR_SET_SECCOMP was refused; seccomp may be unavailable here",
+            SANDBOX_NOT_ENGAGED => "a file was created with the filter installed",
+            DESCRIPTORS_NOT_CLOSED => "close_range or getrlimit failed",
+            _ => "unexpected exit",
+        };
+        panic!("{why} (exit {code}) - the write-capability test cannot mean anything");
+    }
+
+    assert!(
+        libc::WIFSIGNALED(status),
+        "child neither exited nor signalled"
+    );
+    assert_eq!(
+        libc::WTERMSIG(status),
+        libc::SIGSYS,
+        "expected the write attempt to be killed by SIGSYS",
+    );
+}
+
+/// The allowlist is default-deny, and this is what makes that claim testable.
+#[test]
+fn the_sandbox_kills_an_unlisted_syscall() {
+    let status = in_child(|| unlisted_syscall_child());
+
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        let why = match code {
+            NO_NEW_PRIVS_REFUSED => "PR_SET_NO_NEW_PRIVS was refused",
+            SECCOMP_REFUSED => "PR_SET_SECCOMP was refused; seccomp may be unavailable here",
+            SANDBOX_NOT_ENGAGED => {
+                "io_uring_setup returned instead of being killed - the filter is \
+                 not default-deny, so every syscall absent from the allowlist is \
+                 permitted and this whole test file proves nothing"
+            }
+            _ => "unexpected exit",
+        };
+        panic!("{why} (exit {code})");
+    }
+
+    assert!(
+        libc::WIFSIGNALED(status),
+        "child neither exited nor signalled"
+    );
+    assert_eq!(
+        libc::WTERMSIG(status),
+        libc::SIGSYS,
+        "expected an unlisted syscall to be killed by SIGSYS",
+    );
+}
+
+/// Each capability a reviewer actually used, pinned so it cannot come back.
+///
+/// These are not hypothetical. Every one was demonstrated end to end against an
+/// earlier version of this filter, on a real file, while the whole suite
+/// reported success. They are listed by the route rather than the syscall
+/// because that is how they were found.
+#[test]
+fn no_writable_descriptor_reaches_the_sandbox() {
+    // The mmap route is closed by descriptor hygiene rather than by the filter,
+    // so it needs its own assertion. A reviewer took an inherited `O_RDWR`
+    // descriptor, mapped it `MAP_SHARED`, and rewrote a file's bytes without
+    // issuing one denied syscall. No filter over syscall numbers can see that;
+    // the only defence is that no such descriptor exists.
+    //
+    // Checked before the filter goes on, because `fcntl` is not permitted after.
+    const A_DESCRIPTOR_IS_WRITABLE: i32 = 30;
+    const MMAP_SHARED_SUCCEEDED: i32 = 31;
+
+    let status = in_child(|| {
+        if unsafe { libc::close_range(0, u32::MAX, 0) } != 0 {
+            unsafe { libc::_exit(DESCRIPTORS_NOT_CLOSED) }
+        }
+
+        // Scan to the process limit, not to an arbitrary 256. A writable
+        // descriptor above the old bound would have gone unnoticed, and the
+        // limit is what bounds the space that can hold one.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            unsafe { libc::_exit(DESCRIPTORS_NOT_CLOSED) }
+        }
+        let highest = limit.rlim_cur.min(1 << 20) as libc::c_int;
+
+        for fd in 0..=highest {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                continue; // not open, which is the expected case
+            }
+            let access = flags & libc::O_ACCMODE;
+            if access == libc::O_WRONLY || access == libc::O_RDWR {
+                unsafe { libc::_exit(A_DESCRIPTOR_IS_WRITABLE) }
+            }
+        }
+
+        // And with nothing writable open, the mapping the reviewer used cannot
+        // be built at all.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                3,
+                0,
+            )
+        };
+        if mapped != libc::MAP_FAILED {
+            unsafe { libc::_exit(MMAP_SHARED_SUCCEEDED) }
+        }
+
+        unsafe { libc::_exit(OK) }
+    });
+
+    assert!(
+        libc::WIFEXITED(status),
+        "descriptor check did not exit cleanly"
+    );
+    match libc::WEXITSTATUS(status) {
+        OK => {}
+        A_DESCRIPTOR_IS_WRITABLE => panic!(
+            "a writable descriptor survived into the sandbox - mmap MAP_SHARED \
+             over it rewrites a file without any denied syscall",
+        ),
+        MMAP_SHARED_SUCCEEDED => panic!("a writable shared mapping was still obtainable"),
+        code => panic!("unexpected exit {code}"),
+    }
+}
+
+#[test]
+fn an_inherited_shared_mapping_cannot_outlive_the_sandbox() {
+    // The reviewer's exact attack, kept as a test because it is the subtlest
+    // route found here and the only one that needed no syscall at all.
+    //
+    // Map a file MAP_SHARED before forking, with PROT_READ so it looks
+    // harmless. The child closes every descriptor and installs the filter -
+    // neither of which touches the mapping. Then `mprotect`, which is
+    // permitted, restores PROT_WRITE on the surviving VMA and a plain store
+    // changes the file. Nothing was denied because nothing was asked.
+    //
+    // The fix is that the mapping is gone by the time the filter goes on, so
+    // the mprotect has nothing to upgrade.
+    const MPROTECT_SUCCEEDED: i32 = 40;
+
+    let dir = std::env::temp_dir().join(format!("encypher-vma-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("target");
+    std::fs::write(&path, b"A").expect("seed");
+
+    let raw = std::ffi::CString::new(path.to_str().expect("path")).expect("cstring");
+    let fd = unsafe { libc::open(raw.as_ptr(), libc::O_RDWR) };
+    assert!(fd >= 0, "open target");
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    assert!(mapped != libc::MAP_FAILED, "map target");
+
+    let status = in_child(move || {
+        if let Err(code) = engage_sandbox(None) {
+            unsafe { libc::_exit(code) }
+        }
+        // If the mapping survived, this upgrade succeeds and the store lands.
+        if unsafe { libc::mprotect(mapped, 4096, libc::PROT_READ | libc::PROT_WRITE) } == 0 {
+            unsafe { std::ptr::write_volatile(mapped as *mut u8, b'Z') };
+            unsafe { libc::_exit(MPROTECT_SUCCEEDED) }
+        }
+        unsafe { libc::_exit(OK) }
+    });
+
+    unsafe { libc::munmap(mapped, 4096) };
+    unsafe { libc::close(fd) };
+    let after = std::fs::read(&path).expect("read back");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == MPROTECT_SUCCEEDED {
+        panic!(
+            "an inherited MAP_SHARED mapping survived into the sandbox: \
+             mprotect restored write access and the file now reads {after:?}. \
+             Closing descriptors does not remove mappings made through them.",
+        );
+    }
+    assert_eq!(after, b"A", "the sandboxed child changed the backing file");
+}
+
+#[test]
+fn the_demonstrated_bypasses_all_die() {
+    let probes: &[(&str, fn())] = &[
+        // Writing to stdout when the harness has redirected it into a file.
+        // The fix was to drop write/writev rather than permit them to fd 1-2.
+        ("write to fd 1", || unsafe {
+            libc::write(1, [120u8].as_ptr() as *const _, 1);
+        }),
+        // Opening anything for writing at all - the precondition for the
+        // MAP_SHARED mapping trick below.
+        ("open O_RDWR", || unsafe {
+            libc::open(c"/tmp".as_ptr(), libc::O_RDWR);
+        }),
+        // FS_IOC_SETFLAGS on a READ-ONLY descriptor toggled FS_NODUMP_FL, so
+        // read-only is not the safety property it appears to be. ioctl is now
+        // gated by request, not by descriptor.
+        ("ioctl FS_IOC_SETFLAGS", || unsafe {
+            let flags: libc::c_long = 0;
+            libc::ioctl(0, 0x4008_6602, &flags);
+        }),
+        // io_uring performs openat and write as ring operations, which is what
+        // made the original denylist unsound.
+        ("io_uring_setup", || unsafe {
+            let mut params = [0u8; 120];
+            libc::syscall(425, 8, params.as_mut_ptr());
+        }),
+    ];
+
+    for (name, probe) in probes {
+        let status = in_child(|| {
+            if let Err(code) = engage_sandbox(None) {
+                unsafe { libc::_exit(code) }
+            }
+            probe();
+            unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+        });
+
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "{name}: expected SIGSYS, but the capability survived the filter. \
+             This route was demonstrated against an earlier version and must \
+             stay closed.",
+        );
+    }
+}
+
+/// Each argument gate, tested against the kernel rather than against a model
+/// of it.
+///
+/// A symbolic interpreter used to check these boundaries statically. It was
+/// deleted; the History section says why, and it is the single most useful
+/// thing in this file to have read before changing it.
+///
+/// The default-deny canary above covers what remains: a mangled jump offset
+/// that let an unlisted syscall fall through to ALLOW would let
+/// `io_uring_setup` live, and that test would fail.
+#[test]
+fn each_argument_gate_holds_against_the_kernel() {
+    // Each write flag in isolation, on both open variants.
+    //
+    // An earlier version tried one denied value per gate, which a reviewer
+    // pointed out is representative rather than equivalent to the universal
+    // check it replaced: a mask that lost `O_TRUNC` or `O_APPEND` would leave
+    // it green. Isolating each bit means a mask can lose any one of them and
+    // this test names which.
+    const WRITE_FLAGS: &[(&str, libc::c_int)] = &[
+        ("O_WRONLY", libc::O_WRONLY),
+        ("O_RDWR", libc::O_RDWR),
+        ("O_CREAT", libc::O_CREAT),
+        ("O_TRUNC", libc::O_TRUNC),
+        ("O_APPEND", libc::O_APPEND),
+    ];
+    const PATH: &std::ffi::CStr = c"/tmp/encypher-gate-canary";
+
+    let must_die = |name: String, probe: Box<dyn Fn()>| {
+        let status = in_child(|| {
+            if let Err(code) = engage_sandbox(None) {
+                unsafe { libc::_exit(code) }
+            }
+            probe();
+            unsafe { libc::_exit(SANDBOX_NOT_ENGAGED) }
+        });
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "{name}: the gate let it through. A gated syscall reachable on the \
+             wrong arguments is not gated.",
+        );
+    };
+
+    for (flag, bit) in WRITE_FLAGS {
+        let bit = *bit;
+        // openat(dirfd, path, flags, mode) - flags is the third argument.
+        must_die(
+            format!("openat {flag}"),
+            Box::new(move || unsafe {
+                libc::syscall(257, libc::AT_FDCWD, PATH.as_ptr(), bit, 0o600);
+            }),
+        );
+        // open(path, flags, mode) - the same gate one argument earlier, which
+        // is its own chance to be wired to the wrong offset.
+        must_die(
+            format!("open {flag}"),
+            Box::new(move || unsafe {
+                libc::syscall(2, PATH.as_ptr(), bit, 0o600);
+            }),
+        );
+    }
+
+    // ioctl passes for TCGETS and nothing else. FS_IOC_SETFLAGS is the request
+    // that altered an inode through a READ-ONLY descriptor, which is why this
+    // gate is on the request rather than the descriptor.
+    must_die(
+        "ioctl FS_IOC_SETFLAGS".to_string(),
+        Box::new(|| unsafe {
+            let flags: libc::c_long = 0;
+            libc::syscall(16, 0, 0x4008_6602u64, &flags);
+        }),
+    );
+    // fcntl is needed only to query descriptor flags. A mutating command must
+    // remain unavailable even though all inherited descriptors are closed.
+    must_die(
+        "fcntl F_SETFD".to_string(),
+        Box::new(|| unsafe {
+            libc::syscall(72, 0, libc::F_SETFD, libc::FD_CLOEXEC);
+        }),
+    );
+
+    // And the permitted side of every gate still works. Without this the gates
+    // would be indistinguishable from an outright ban, and the verification
+    // test would be passing for the wrong reason.
+    let must_live = |name: &str, probe: fn() -> bool| {
+        let status = in_child(move || {
+            if let Err(code) = engage_sandbox(None) {
+                unsafe { libc::_exit(code) }
+            }
+            unsafe { libc::_exit(if probe() { OK } else { SANDBOX_NOT_ENGAGED }) }
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == OK,
+            "{name} was refused, so that gate is banning rather than gating",
+        );
+    };
+
+    must_live("a read-only openat", || unsafe {
+        libc::syscall(257, libc::AT_FDCWD, c"/proc/self/maps".as_ptr(), 0, 0) >= 0
+    });
+    must_live("a read-only open", || unsafe {
+        libc::syscall(2, c"/proc/self/maps".as_ptr(), 0, 0) >= 0
+    });
+    must_live("ioctl TCGETS", || unsafe {
+        // fd 0 was closed by `close_range`, so this returns EBADF. That is the
+        // point rather than a flaw: seccomp decides ALLOW or KILL from the
+        // request argument before the kernel ever looks up the descriptor, so
+        // surviving the call is exactly the gate contract being asserted. What
+        // would fail here is a blanket ioctl ban.
+        let mut termios: libc::termios = std::mem::zeroed();
+        libc::syscall(16, 0, TCGETS as u64, &mut termios);
+        true
+    });
+    must_live("fcntl F_GETFD", || unsafe {
+        // As with ioctl above, EBADF is expected after close_range. Surviving
+        // proves the command gate allowed only the read-side query.
+        libc::syscall(72, 0, libc::F_GETFD);
+        true
+    });
+}
+
+/// No way to open or write may be permitted without a gate that means something.
+///
+/// This is the one piece of advice in this file that could do real damage if
+/// followed carelessly, so it is a check rather than a sentence.
+///
+/// `EXERCISED` and `HEADROOM` are ungated: a number in either is permitted with
+/// any arguments whatsoever. That is fine for a reader like `statx`, and not
+/// fine for anything that opens, because opening is where the write mode
+/// lives. That is the entire reason `openat` and `open` sit in
+/// `ARGUMENT_GATED` instead.
+///
+/// The realistic way this goes wrong is not malice. A dependency bump routes
+/// opens through `openat2`, the completion test fails with SIGSYS, and someone
+/// reads "a read can go in HEADROOM", decides an open is basically a read, and
+/// adds 437. CI goes green and the gate is gone. `openat2` cannot even be gated
+/// the way `openat` is - its flags live in an `open_how` struct behind a
+/// pointer, and classic BPF cannot dereference one - so denied is the only
+/// honest answer for it.
+#[test]
+fn no_way_to_open_or_write_is_ungated() {
+    // Two rules, because the syscalls divide into two cases and a single list
+    // would imply a coverage it does not hold.
+    //
+    // These may be permitted, but only behind an argument gate. Their flags are
+    // a plain register value, so a gate on them means something.
+    const GATEABLE: &[(u32, &str)] = &[(2, "open"), (257, "openat")];
+
+    // These may not be permitted at all, in any tier.
+    //
+    // `creat` always creates, so there is no argument worth inspecting.
+    // `openat2` and `open_by_handle_at` take their arguments through a pointer,
+    // and classic BPF cannot dereference one - a `NoWriteFlags` gate on either
+    // would compare a pointer value against a flag mask and mean nothing, which
+    // is a worse outcome than denial because it reads as protection.
+    // The io_uring trio is here whole rather than by halves: `setup` plus
+    // `enter` is the write path, `register` alone is not, and a list naming one
+    // of the three suggests the other two were considered and permitted.
+    //
+    // DO NOT grow this toward exhaustiveness. It is a tripwire for the openers
+    // someone might plausibly reach for while trying to turn CI green, not an
+    // inventory of every way the kernel can open a file. `open_tree`, `fsopen`
+    // and whatever arrives next are already denied for the ordinary reason -
+    // they are not on the allowlist - and `the_sandbox_kills_an_unlisted_syscall`
+    // proves that layer bites. Extending this list to cover them would be
+    // maintaining a copy of the syscall table by hand, which is the habit this
+    // file spent two review cycles shedding.
+    const UNGATEABLE: &[(u32, &str)] = &[
+        (85, "creat"),
+        (437, "openat2"),
+        (304, "open_by_handle_at"),
+        (425, "io_uring_setup"),
+        (426, "io_uring_enter"),
+        (427, "io_uring_register"),
+    ];
+
+    let ungated = allowed();
+    let gated: Vec<u32> = ARGUMENT_GATED.iter().map(|(nr, _)| *nr).collect();
+
+    let wrongly_ungated: Vec<&str> = GATEABLE
+        .iter()
+        .filter(|(nr, _)| ungated.contains(nr))
+        .map(|(_, name)| *name)
+        .collect();
+    assert!(
+        wrongly_ungated.is_empty(),
+        "{wrongly_ungated:?} appear in EXERCISED or HEADROOM, which are \
+         ungated, so they are permitted with any arguments including a write \
+         mode. An opening syscall belongs in ARGUMENT_GATED behind a flags \
+         check, or nowhere.",
+    );
+
+    let wrongly_permitted: Vec<&str> = UNGATEABLE
+        .iter()
+        .filter(|(nr, _)| ungated.contains(nr) || gated.contains(nr))
+        .map(|(_, name)| *name)
+        .collect();
+    assert!(
+        wrongly_permitted.is_empty(),
+        "{wrongly_permitted:?} are permitted, and none of them can be. Either \
+         they always write, or their arguments live behind a pointer that \
+         classic BPF cannot dereference - so no gate on them would mean \
+         anything, and a gate that means nothing is worse than a denial \
+         because it reads as protection. If a dependency now requires one, \
+         that is a dependency to pin or replace, not a line to add here.",
+    );
+}
+
+/// Every entry in the exercised tier is load-bearing, and the two tiers agree.
+///
+/// An allowlist answers "is this sound?" far better than a denylist, but it
+/// invites a different rot: entries drift in, nobody can say why, and the list
+/// slowly becomes permissive. A reviewer asked how it could be shown minimal
+/// rather than merely sufficient. This is the answer, and it is honest about
+/// which half is proved.
+///
+/// For each syscall in `EXERCISED`, build the filter without it and run the
+/// whole scenario: it must die. Anything that survives was not needed and
+/// belongs in `HEADROOM` or nowhere. Nothing may appear in both tiers, so a
+/// permission cannot be justified twice over.
+#[test]
+fn every_allowed_syscall_is_needed() {
+    // Every permitted syscall appears in exactly one list. Without this the
+    // argument-gated four sat outside both tiers, invisible to these checks.
+    let gated_numbers: Vec<u32> = ARGUMENT_GATED.iter().map(|(nr, _)| *nr).collect();
+    let lists = [
+        ("EXERCISED", EXERCISED),
+        ("HEADROOM", HEADROOM),
+        ("ARGUMENT_GATED", gated_numbers.as_slice()),
+    ];
+    for (i, (name_a, a)) in lists.iter().enumerate() {
+        for (name_b, b) in lists.iter().skip(i + 1) {
+            let overlap: Vec<u32> = a.iter().copied().filter(|nr| b.contains(nr)).collect();
+            assert!(
+                overlap.is_empty(),
+                "listed in both {name_a} and {name_b}: {overlap:?}",
+            );
+        }
+    }
+
+    // And the lists describe the filter that is actually built, rather than a
+    // parallel document that can drift away from it.
+    let program = filter(None);
+    for nr in EXERCISED.iter().chain(HEADROOM).chain(&gated_numbers) {
+        assert!(
+            program.iter().any(|i| i.k == *nr),
+            "syscall {nr} is listed as permitted but appears nowhere in the \
+             assembled filter",
+        );
+    }
+
+    let mut unnecessary = Vec::new();
+    for nr in EXERCISED {
+        let cases = Cases::collect();
+        let status = in_child(move || verify_child(cases, Some(*nr)));
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == OK {
+            unnecessary.push(*nr);
+        }
+    }
+
+    assert!(
+        unnecessary.is_empty(),
+        "these are in EXERCISED but the scenario runs without them: \
+         {unnecessary:?}. Either move them to HEADROOM, where unexercised \
+         permissions are declared and justified, or delete them.",
+    );
+}
+
+/// The property itself: with writing impossible, verification still works.
+#[test]
+fn verification_completes_with_the_write_capability_removed() {
+    // Read the fixtures and the format tables BEFORE forking, so the child's
+    // job is exactly the calls under test.
+    let cases = Cases::collect();
+    let status = in_child(move || verify_child(cases, None));
+
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        if sig == libc::SIGSYS {
+            panic!(
+                "verification issued a syscall the allowlist does not permit, \
+                 and the kernel killed the process for it.\n\n\
+                 Usually that means something beneath verify, \
+                 verify_with_options or verify_file tried to create, truncate \
+                 or remove a file - which is what this test exists to catch.\n\n\
+                 But the filter is default-deny, so a perfectly innocent \
+                 syscall that is simply not on the list dies exactly the same \
+                 way. A libc or dependency bump that starts routing metadata \
+                 lookups through faccessat2 or a newer statx, or a format \
+                 needing a syscall nobody listed, both land here.\n\n\
+                 Find out WHICH syscall before concluding there is a writer: \
+                 run the child under strace, or build the filter with \
+                 SECCOMP_RET_LOG in place of the kill and read the audit log.\n\n\
+                 Then, and this is the part that matters:\n\n\
+                 - A pure read with no open mode - faccessat2, a statx variant, \
+                 a readlink variant - can go in HEADROOM with a note saying why \
+                 it cannot modify a file.\n\n\
+                 - Anything in the OPEN family cannot. HEADROOM is ungated, so \
+                 putting openat2 or open_by_handle_at there permits it with any \
+                 flags at all, which reopens exactly the channel the openat and \
+                 open gates exist to close. openat2 also cannot be gated the way \
+                 they are: its flags live in an open_how struct behind a \
+                 pointer, and classic BPF cannot dereference one. So for the \
+                 open family the answer is that it stays denied. If a dependency \
+                 genuinely requires openat2, that is a dependency problem to \
+                 solve upstream or pin around, not a line to add here.",
+            );
+        }
+        panic!("sandboxed child was killed by signal {sig}");
+    }
+    assert!(
+        libc::WIFEXITED(status),
+        "child neither exited nor signalled"
+    );
+
+    let code = libc::WEXITSTATUS(status);
+    let explain = match code {
+        OK => return,
+        NO_NEW_PRIVS_REFUSED => "PR_SET_NO_NEW_PRIVS was refused, so no filter could be installed",
+        DESCRIPTORS_NOT_CLOSED => {
+            "close_range failed, so the child kept the parent's descriptors and \
+             the sandbox would have been a fiction"
+        }
+        SECCOMP_REFUSED => "PR_SET_SECCOMP was refused; seccomp may be unavailable here",
+        VERIFY_FAILED => "verify() failed with writes denied",
+        VERIFY_WITH_OPTIONS_FAILED => "verify_with_options() failed with writes denied",
+        VERIFY_FILE_FAILED => "verify_file() failed with writes denied",
+        SIGNED_INPUT_NOT_PARSED => {
+            "a signed fixture did not verify as present and valid inside the \
+             sandbox, so the scenario proved nothing about the parsing path"
+        }
+        _ => "child exited with an unexpected status",
+    };
+    panic!("{explain} (exit {code})");
+}

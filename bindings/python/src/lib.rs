@@ -2,7 +2,7 @@
 
 use encypher_c2pa::{
     set_telemetry_enabled, supported_mime_types, telemetry_preference, verify_with_options,
-    VerifyOptions,
+    VerifyOptions, SUPPORTED_EXTENSIONS,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -39,10 +39,17 @@ fn formats_json() -> PyResult<String> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
+#[pyfunction]
+fn extensions_json() -> PyResult<String> {
+    serde_json::to_string(SUPPORTED_EXTENSIONS)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(verify_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(formats_json, module)?)?;
+    module.add_function(wrap_pyfunction!(extensions_json, module)?)?;
     module.add_function(wrap_pyfunction!(set_telemetry_preference, module)?)?;
     module.add_function(wrap_pyfunction!(get_telemetry_preference, module)?)?;
     Ok(())

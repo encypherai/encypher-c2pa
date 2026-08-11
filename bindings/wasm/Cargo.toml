@@ -14,11 +14,10 @@ description = "Browser WebAssembly bindings for offline C2PA verification"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-encypher-c2pa = { version = "=1.0.0-rc.11", path = "../../crates/encypher-c2pa", default-features = false }
+encypher-c2pa = { version = "=1.0.0", path = "../../crates/encypher-c2pa", default-features = false }
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
-getrandom = { version = "0.2", features = ["js"] }
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz"]

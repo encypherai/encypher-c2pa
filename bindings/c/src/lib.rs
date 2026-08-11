@@ -107,7 +107,7 @@ pub extern "C" fn encypher_c2pa_telemetry_preference() -> *mut c_char {
         .into_raw()
 }
 
-/// Release a string returned by [`encypher_c2pa_verify`].
+/// Release any string returned by this library.
 ///
 /// # Safety
 /// `value` must be null or a pointer returned by this library that has not yet
