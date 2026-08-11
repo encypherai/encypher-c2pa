@@ -18,7 +18,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 #[test]
-fn signed_jpeg_reports_integrity_without_implying_trust() {
+fn signed_jpeg_uses_bundled_trust_without_implying_integrity() {
     let report = verify(&fixture("signed_test.jpg"), "image/jpeg").expect("verification succeeds");
 
     assert_eq!(report.schema_version, REPORT_SCHEMA_VERSION);
@@ -27,9 +27,23 @@ fn signed_jpeg_reports_integrity_without_implying_trust() {
     assert_eq!(report.integrity, "valid");
     assert_eq!(report.signature, "valid");
     assert_eq!(report.hard_binding, "match");
+    assert_eq!(report.trust.status, "not_valid_for_supplied_material");
+    assert_eq!(report.trust.basis, "bundled_static_material");
+    assert_eq!(report.trust.revocation.status, "not_checked");
+}
+
+#[test]
+fn bundled_trust_can_be_disabled_for_caller_controlled_verification() {
+    let options = VerifyOptions {
+        no_default_trust: true,
+        ..Default::default()
+    };
+    let report = verify_with_options(&fixture("signed_test.jpg"), "image/jpeg", &options)
+        .expect("verification succeeds");
+
+    assert_eq!(report.integrity, "valid");
     assert_eq!(report.trust.status, "not_evaluated");
     assert_eq!(report.trust.basis, "none");
-    assert_eq!(report.trust.revocation.status, "not_checked");
 }
 
 #[test]

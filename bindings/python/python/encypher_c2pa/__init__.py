@@ -77,6 +77,7 @@ def verify(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
+    no_default_trust: bool = False,
     cawg_did_documents: Optional[Mapping[str, Any]] = None,
     cawg_strict_encoding: bool = False,
     validation_time: Optional[str] = None,
@@ -85,13 +86,16 @@ def verify(
 ) -> Mapping[str, Any]:
     """Verify one asset locally and return a JSON-compatible report.
 
-    ``asset`` may be bytes or a local path. Trust is evaluated only against
-    static PEM material supplied by the caller. CAWG named-actor credentials
-    are evaluated against ``cawg_trust_pem``/``cawg_allowed_certs_pem``;
+    Bundled C2PA, IPTC, and Encypher trust snapshots are used by default;
+    caller-supplied PEM bundles extend them. Set ``no_default_trust=True`` to
+    evaluate only caller-supplied trust material. CAWG named-actor credentials
+    are evaluated against the packaged Mozilla Email, IPTC VNPL, and Encypher
+    identity lists plus ``cawg_trust_pem``/``cawg_allowed_certs_pem``;
     ``cawg_did_documents`` maps a primary DID (e.g. ``did:web:example.com``)
-    to its DID document for offline ``did:web`` ICA resolution (absent
-    issuers fail closed), and ``cawg_strict_encoding`` refuses CAWG 1.1-era
-    legacy encodings. On first interactive use, the SDK asks whether failure
+    to its DID document for
+    offline ``did:web`` ICA resolution (absent issuers fail closed), and
+    ``cawg_strict_encoding`` refuses CAWG 1.1-era legacy encodings. On first
+    interactive use, the SDK asks whether failure
     telemetry should be enabled and saves the answer. Passing
     ``telemetry=True`` or ``False`` attempts to save that preference; the
     explicit value still governs this verification if persistence fails.
@@ -123,6 +127,7 @@ def verify(
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
+        "no_default_trust": bool(no_default_trust),
         "cawg_did_documents": dict(cawg_did_documents) if cawg_did_documents else None,
         "cawg_strict_encoding": bool(cawg_strict_encoding),
         "validation_time": validation_time,

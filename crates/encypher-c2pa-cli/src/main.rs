@@ -57,6 +57,9 @@ enum Command {
         /// Directly allowed CAWG end-entity certificates (PEM). Repeatable.
         #[arg(long, value_name = "PEM")]
         cawg_allowed: Vec<PathBuf>,
+        /// Verify with caller-supplied trust only; ignore bundled snapshots.
+        #[arg(long)]
+        no_default_trust: bool,
         /// Pinned offline did:web DID documents for CAWG ICA issuers.
         /// Repeatable; each file is a DID document, an array of documents, or
         /// a DID -> document map. Without it did:web resolution fails closed.
@@ -128,6 +131,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             allowed,
             cawg_trust,
             cawg_allowed,
+            no_default_trust,
             cawg_did_documents,
             cawg_strict_encoding,
             time,
@@ -164,6 +168,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 allowed_list_pem: read_merged_pem(&allowed)?,
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
+                no_default_trust,
                 cawg_did_documents: read_did_documents(&cawg_did_documents)?,
                 cawg_strict_encoding,
                 validation_time: time,
@@ -427,10 +432,8 @@ fn explain(code: &str) -> Option<&'static str> {
         "assertion.bmffHash.mismatch" => {
             "The BMFF boxes do not match the signed box-hash assertion."
         }
-        "signingCredential.trusted" => "The signer chains to caller-supplied trust material.",
-        "signingCredential.untrusted" => {
-            "The signer does not chain to caller-supplied trust material."
-        }
+        "signingCredential.trusted" => "The signer chains to configured trust material.",
+        "signingCredential.untrusted" => "The signer does not chain to configured trust material.",
         "signingCredential.ocsp.revoked" => {
             "Supplied revocation evidence marks the signer as revoked."
         }

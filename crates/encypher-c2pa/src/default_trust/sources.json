@@ -1,0 +1,46 @@
+{
+  "snapshot_date": "2026-08-11",
+  "lists": {
+    "c2pa": {
+      "file": "c2pa-trust.pem",
+      "url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/179a824a557a4a0c5ac1b6d2b98d67f436a2f34a/trust-list/C2PA-TRUST-LIST.pem",
+      "sha256": "5fc0f1571f9eb4dff7a242291e1b198d347a768709bd6915022e9b59d6d7769c"
+    },
+    "c2paTsa": {
+      "file": "c2pa-tsa-trust.pem",
+      "url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/600b28d3950b4803f3ba41352b205601ec1a77b5/trust-list/C2PA-TSA-TRUST-LIST.pem",
+      "sha256": "76788c4c36644ee24674f6d63e9ee6f0186c3e25e39ea80da67d1b6f35dbea62"
+    },
+    "iptcEndEntity": {
+      "file": "iptc-vnpl-end-entity.pem",
+      "url": "https://trust.iptc.org/end-entity-list.pem",
+      "sha256": "364a6d6bee6f1ce20c5c710976e57815c5538736c1bbc621733d92e22822303f"
+    },
+    "encypherRoot": {
+      "file": "encypher-c2pa-root.pem",
+      "url": "https://api.encypher.com/ca/repository/root-ca.crt",
+      "sha256": "a5f459b908fc3716767f7d147219d0ef847c3e5650e0b42d85fabdab1c042794"
+    },
+    "encypherTsa": {
+      "file": "encypher-tsa-issuing-ca.pem",
+      "url": "https://api.encypher.com/ca/repository/tsa-issuing-ca.crt",
+      "sha256": "f52daeb4270d31fdc1643155bf33f0656ccc437018488b0f15fa4a379febab45"
+    },
+    "encypherIdentity": {
+      "file": "encypher-identity-root.pem",
+      "url": "https://trust.encypher.com/anchor-list.pem",
+      "sha256": "f9a538590ad2d9da3f43ce8d940d429736a0592f64ac8fdfe94cf8fcee49e248"
+    },
+    "mozillaEmailRoots": {
+      "file": "cawg-mozilla-email-roots.pem",
+      "url": "https://ccadb.my.salesforce-sites.com/mozilla/IncludedRootsPEMTxt?TrustBitsInclude=Email",
+      "sha256": "96300d3f277722d613a8d5a8fbd5a6b07ccedd136fca6992a68b39ac20187775"
+    },
+    "iptcAnchors": {
+      "file": "iptc-vnpl-anchors.pem",
+      "url": "https://trust.iptc.org/anchor-list.pem",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "note": "The published IPTC anchor list was empty at snapshot time."
+    }
+  }
+}

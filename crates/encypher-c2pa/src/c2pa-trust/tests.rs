@@ -24,6 +24,23 @@ fn make_cert(configure: impl FnOnce(&mut CertificateParams)) -> (Vec<u8>, String
     (cert.der().as_ref().to_vec(), cert.pem())
 }
 
+fn make_named_ca(common_name: &str) -> (rcgen::Certificate, KeyPair) {
+    let key = KeyPair::generate().expect("CA key");
+    let mut params = CertificateParams::new(vec!["ca.example".to_string()]).expect("CA params");
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, common_name);
+    params.distinguished_name = name;
+    params.not_before = datetime!(2025-01-01 0:00 UTC);
+    params.not_after = datetime!(2030-01-01 0:00 UTC);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    let certificate = params.self_signed(&key).expect("self-signed CA");
+    (certificate, key)
+}
+
 /// DER bytes of an EKU extension value containing a single OID.
 fn eku_value(oid: &str) -> Vec<u8> {
     let oid = const_oid::ObjectIdentifier::new_unwrap(oid);
@@ -154,6 +171,35 @@ fn untrusted_when_anchor_not_present() {
     let result = validate_chain(&der, &[], &empty, at);
     assert!(!result.trusted);
     assert!(result.reason.unwrap().contains("does not chain"));
+}
+
+#[test]
+fn chain_builder_skips_same_subject_ca_with_wrong_key() {
+    let (wrong_issuer, _) = make_named_ca("Shared Test CA");
+    let (issuer, issuer_key) = make_named_ca("Shared Test CA");
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut params = CertificateParams::new(vec!["leaf.example".to_string()]).expect("leaf params");
+    params.not_before = datetime!(2025-01-01 0:00 UTC);
+    params.not_after = datetime!(2027-01-01 0:00 UTC);
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    let leaf = params
+        .signed_by(&leaf_key, &issuer, &issuer_key)
+        .expect("issued leaf");
+    let trust = TrustList {
+        anchors: vec![
+            wrong_issuer.der().as_ref().to_vec(),
+            issuer.der().as_ref().to_vec(),
+        ],
+    };
+
+    let result = validate_chain(
+        leaf.der().as_ref(),
+        &[],
+        &trust,
+        Some(datetime!(2026-01-01 0:00 UTC)),
+    );
+    assert!(result.trusted, "{:?}", result.reason);
 }
 
 #[test]

@@ -15,7 +15,7 @@ Additive fields may appear within schema 1.x. A field removal, rename, type chan
 | `integrity` | string | `valid`, `invalid`, or `absent`. This is not a trust decision. |
 | `signature` | string | `valid`, `invalid`, `missing`, or `unknown`. |
 | `hard_binding` | string | `match`, `mismatch`, `missing`, or `unknown`. |
-| `trust` | object | Caller-controlled trust evaluation. |
+| `trust` | object | Trust evaluation against packaged defaults and optional caller material. |
 | `policy` | object or null | Always null in the public offline verifier. Managed policy is a hosted product concern. |
 | `managed_receipt` | object or null | Always null in the public offline verifier. |
 | `validation_state` | string | Engine state: `Valid`, `Invalid`, `Trusted`, or `None`. |
@@ -29,8 +29,8 @@ Additive fields may appear within schema 1.x. A field removal, rename, type chan
 
 | Field | Values | Meaning |
 |---|---|---|
-| `status` | `valid_for_supplied_material`, `not_valid_for_supplied_material`, `not_evaluated` | Whether the signer validates under the exact caller-supplied static material. |
-| `basis` | `caller_supplied_static_material`, `none` | Source of the trust decision. The verifier has no hidden default trust list. |
+| `status` | `valid_for_supplied_material`, `not_valid_for_supplied_material`, `not_evaluated` | Whether the signer validates under the static material evaluated for this run. |
+| `basis` | `bundled_static_material`, `bundled_and_caller_supplied_static_material`, `caller_supplied_static_material`, `none` | Source of the trust decision. |
 | `validation_time` | RFC 3339 string | Certificate validity instant used for this run. |
 | `revocation.status` | `revoked`, `not_revoked`, `not_checked` | Result from usable evidence embedded in the asset. |
 | `revocation.source` | `embedded_ocsp`, `none` | Evidence source. No network lookup occurs. |

@@ -61,8 +61,10 @@ mod c2pa_trust;
 #[path = "c2pa-validate/lib.rs"]
 #[allow(dead_code, unused_imports, reason = "production kernel mirror")]
 mod c2pa_validate;
+mod default_trust;
 mod telemetry;
 mod telemetry_consent;
+pub use default_trust::SNAPSHOT_DATE as DEFAULT_TRUST_SNAPSHOT_DATE;
 
 pub use telemetry::{
     validation_failure_telemetry, TelemetryOptions, ValidationFailureTelemetry,
@@ -123,6 +125,10 @@ pub struct VerifyOptions {
     pub cawg_trust_pem: Option<String>,
     /// PEM bundle of directly allowed CAWG end-entity certificates.
     pub cawg_allowed_certs_pem: Option<String>,
+    /// Disable the bundled C2PA, IPTC, and Encypher trust snapshots. By
+    /// default, caller-supplied PEM bundles extend those snapshots; setting
+    /// this to `true` evaluates only caller-supplied trust material.
+    pub no_default_trust: bool,
     /// Pinned offline `did:web` DID-document store for CAWG ICA issuers,
     /// keyed by primary DID (no fragment). Resolution never touches the
     /// network: an issuer absent from the store fails closed with
@@ -311,8 +317,9 @@ pub fn detached_manifest_evidence(
     }))
 }
 
-/// Verify asset bytes with caller-supplied static trust material. Failure
-/// telemetry follows the explicit override or saved per-user preference.
+/// Verify asset bytes against the bundled trust snapshots plus any static
+/// trust material supplied by the caller. Failure telemetry follows the
+/// explicit override or saved per-user preference.
 pub fn verify_with_options(
     data: &[u8],
     mime_type: &str,
@@ -343,11 +350,27 @@ fn verify_with_options_inner(
         return Err(Error::UnsupportedMime(mime));
     }
 
-    let claim_trust = parse_trust(options.trust_pem.as_deref())?;
-    let tsa_trust = parse_trust(options.tsa_trust_pem.as_deref())?;
-    let allowed_certs = parse_trust(options.allowed_list_pem.as_deref())?;
-    let cawg_trust = parse_trust(options.cawg_trust_pem.as_deref())?;
-    let cawg_allowed_certs = parse_trust(options.cawg_allowed_certs_pem.as_deref())?;
+    let use_defaults = !options.no_default_trust;
+    let claim_trust = resolve_trust(
+        options.trust_pem.as_deref(),
+        use_defaults.then(default_trust::claim_signing),
+    )?;
+    let tsa_trust = resolve_trust(
+        options.tsa_trust_pem.as_deref(),
+        use_defaults.then(default_trust::timestamp_authorities),
+    )?;
+    let allowed_certs = resolve_trust(
+        options.allowed_list_pem.as_deref(),
+        use_defaults.then(default_trust::allowed_claim_signers),
+    )?;
+    let cawg_trust = resolve_trust(
+        options.cawg_trust_pem.as_deref(),
+        use_defaults.then(default_trust::cawg_identity),
+    )?;
+    let cawg_allowed_certs = resolve_trust(
+        options.cawg_allowed_certs_pem.as_deref(),
+        use_defaults.then(default_trust::cawg_allowed_identities),
+    )?;
     let validation_time = parse_validation_time(options.validation_time.as_deref())?;
     let validation_time_text = validation_time
         .format(&Rfc3339)
@@ -357,14 +380,14 @@ fn verify_with_options_inner(
         &VerifyInput {
             data,
             mime: &mime,
-            claim_signer_trust: claim_trust.as_ref(),
-            tsa_trust: tsa_trust.as_ref(),
-            allowed_certs: allowed_certs.as_ref(),
+            claim_signer_trust: claim_trust.as_ref().map(ResolvedTrust::get),
+            tsa_trust: tsa_trust.as_ref().map(ResolvedTrust::get),
+            allowed_certs: allowed_certs.as_ref().map(ResolvedTrust::get),
             validation_time: Some(validation_time),
             profile: EngineProfile::GENEROUS,
         },
-        cawg_trust.as_ref(),
-        cawg_allowed_certs.as_ref(),
+        cawg_trust.as_ref().map(ResolvedTrust::get),
+        cawg_allowed_certs.as_ref().map(ResolvedTrust::get),
         true,
         options.cawg_did_documents.as_ref(),
         options.cawg_strict_encoding,
@@ -389,12 +412,14 @@ fn verify_with_options_inner(
         .to_string();
     let signature = signature_status(&output.results);
     let hard_binding = hard_binding_status(&output.results);
-    let trust = trust_report(
-        &output.results,
-        present,
-        claim_trust.is_some() || allowed_certs.is_some(),
-        validation_time_text,
-    );
+    let custom_claim_trust = options.trust_pem.is_some() || options.allowed_list_pem.is_some();
+    let trust_basis = match (use_defaults, custom_claim_trust) {
+        (true, true) => "bundled_and_caller_supplied_static_material",
+        (true, false) => "bundled_static_material",
+        (false, true) => "caller_supplied_static_material",
+        (false, false) => "none",
+    };
+    let trust = trust_report(&output.results, present, trust_basis, validation_time_text);
 
     Ok(VerificationReport {
         schema_version: REPORT_SCHEMA_VERSION.to_string(),
@@ -564,11 +589,38 @@ pub fn mime_from_path(path: &Path) -> Option<&'static str> {
         .map(|(_, mime)| *mime)
 }
 
-fn parse_trust(value: Option<&str>) -> Result<Option<TrustList>, Error> {
-    value
+enum ResolvedTrust {
+    Bundled(&'static TrustList),
+    Owned(TrustList),
+}
+
+impl ResolvedTrust {
+    fn get(&self) -> &TrustList {
+        match self {
+            Self::Bundled(trust) => trust,
+            Self::Owned(trust) => trust,
+        }
+    }
+}
+
+fn resolve_trust(
+    custom_pem: Option<&str>,
+    bundled: Option<&'static TrustList>,
+) -> Result<Option<ResolvedTrust>, Error> {
+    let custom = custom_pem
         .map(TrustList::from_pem)
         .transpose()
-        .map_err(|error| Error::InvalidTrust(error.to_string()))
+        .map_err(|error| Error::InvalidTrust(error.to_string()))?;
+    match (bundled, custom) {
+        (None, None) => Ok(None),
+        (Some(trust), None) => Ok(Some(ResolvedTrust::Bundled(trust))),
+        (None, Some(trust)) => Ok(Some(ResolvedTrust::Owned(trust))),
+        (Some(bundled), Some(custom)) => {
+            let mut merged = bundled.clone();
+            merged.anchors.extend(custom.anchors);
+            Ok(Some(ResolvedTrust::Owned(merged)))
+        }
+    }
 }
 
 fn parse_validation_time(value: Option<&str>) -> Result<OffsetDateTime, Error> {
@@ -643,9 +695,10 @@ fn hard_binding_status(results: &CoreResults) -> String {
 fn trust_report(
     results: &CoreResults,
     present: bool,
-    supplied: bool,
+    basis: &str,
     validation_time: String,
 ) -> TrustReport {
+    let supplied = basis != "none";
     let trusted = results.has_success(SIGNING_CREDENTIAL_TRUSTED);
     let rejected = results.has_failure(SIGNING_CREDENTIAL_UNTRUSTED)
         || results.has_failure(SIGNING_CREDENTIAL_INVALID);
@@ -660,12 +713,7 @@ fn trust_report(
             "not_evaluated"
         }
         .to_string(),
-        basis: if supplied {
-            "caller_supplied_static_material"
-        } else {
-            "none"
-        }
-        .to_string(),
+        basis: basis.to_string(),
         validation_time,
         revocation: RevocationReport {
             status: if revoked {

@@ -160,72 +160,52 @@ configureTelemetry(true);
 
 An explicit per-call value overrides the saved native preference. In Python, `verify(..., telemetry=True)` attempts to save that choice; if the preference store is unavailable, the explicit value still governs that verification. Automated native deployments may set `ENCYPHER_C2PA_TELEMETRY=on` or `off` without writing a config file.
 
-## Trust is caller-controlled: bring your own trust lists
+## Bundled trust lists by default
 
-Default verification proves integrity. It does not declare that an organization should trust the signer.
+Default verification evaluates both integrity and signer trust, but keeps those conclusions separate. Every install compiles a pinned `2026-08-11` snapshot into the Rust library, CLI, Python wheel, Go/C library, and browser WASM package. Verification remains local and deterministic; it makes no trust-list, AIA, OCSP, CRL, DID, ingredient, or assertion network request.
 
-Verification performs no network fetches: no OCSP or CRL retrieval, no live DID resolution, no download of a default trust list. Revocation evidence is read only from OCSP responses stapled into the manifest. Every trust decision is made against caller-supplied PEM bundles, so a run is deterministic and works air-gapped: the same asset, trust lists, and validation time always produce the same report.
+| Packaged source | Default use |
+|---|---|
+| C2PA Trust List | Claim-signing trust anchors |
+| C2PA TSA Trust List | RFC 3161 timestamp-authority anchors |
+| IPTC Verified News Publishers end-entity list | Directly allowed claim-signing and CAWG identity certificates |
+| IPTC Verified News Publishers anchor list | CAWG identity anchors; empty at this snapshot |
+| Mozilla Root Store with the Email trust bit | CAWG 1.2 interim X.509 identity anchors |
+| Encypher C2PA Root CA | Claim-signing trust anchor |
+| Encypher C2PA TSA Issuing CA | Timestamp-authority anchor |
+| Encypher Verified Organizations List | CAWG identity trust anchor |
 
-Six inputs control trust. Each is optional; omitting one skips that check (the report then carries no corresponding trust verdict rather than a fake "trusted").
+The Mozilla and IPTC CAWG sources implement the CAWG Identity 1.2 interim X.509 trust configuration in section 8.2.4.1. The validator also enforces that section's EKU, certificate-policy, timestamp, and 31 March 2027 cutoff rules.
+
+The exact source URLs and SHA-256 digests live in [`default_trust/sources.json`](https://github.com/encypherai/encypher-c2pa/blob/main/crates/encypher-c2pa/src/default_trust/sources.json). `DEFAULT_TRUST_SNAPSHOT_DATE` exposes the snapshot date to Rust callers. A new SDK release is required to refresh these packaged bytes.
+
+Caller-supplied PEM bundles extend the packaged defaults. Set `no_default_trust: true` (Python: `no_default_trust=True`, Go: `NoDefaultTrust: true`, CLI: `--no-default-trust`) to ignore every packaged list and evaluate only caller-supplied material.
 
 | CLI flag | `VerifyOptions` field / Python keyword | Gates |
 |---|---|---|
-| `--trust` | `trust_pem` | Claim-signing trust anchors: the claim signer's chain must terminate at one of these CAs (`signingCredential.trusted` / `.untrusted`). |
-| `--tsa-trust` | `tsa_trust_pem` | Timestamp-authority anchors: RFC 3161 timestamps count only when the TSA chains to one of these (`timeStamp.trusted` / `.untrusted`). |
-| `--allowed` | `allowed_list_pem` | Allowed leaf certificates: an exact end-entity allow-list accepted even without a chain to an anchor. |
-| `--cawg-trust` | `cawg_trust_pem` | CAWG identity trust anchors for X.509-backed identity assertions (`cawg.identity.trusted`). |
-| `--cawg-allowed` | `cawg_allowed_certs_pem` | CAWG allowed certificates: exact end-entity allow-list for identity signers. |
-| `--cawg-did-documents` | `cawg_did_documents` | Pinned offline DID-document store for `did:web` identity-claims-aggregation issuers: JSON files holding a DID document, an array of documents, or a `DID -> document` map. An issuer absent from the store fails closed with `cawg.ica.did_unavailable` (`did:jwk` issuers need no store; they resolve by pure local decoding). |
+| `--trust` | `trust_pem` | Additional claim-signing trust anchors |
+| `--tsa-trust` | `tsa_trust_pem` | Additional timestamp-authority anchors |
+| `--allowed` | `allowed_list_pem` | Additional directly allowed claim-signing certificates |
+| `--cawg-trust` | `cawg_trust_pem` | Additional CAWG X.509 identity anchors |
+| `--cawg-allowed` | `cawg_allowed_certs_pem` | Directly allowed CAWG identity certificates |
+| `--cawg-did-documents` | `cawg_did_documents` | Pinned offline DID documents for `did:web` ICA issuers |
+| `--no-default-trust` | `no_default_trust` | Disable all packaged trust snapshots |
 
-CAWG document-signing credentials must chain to a `--cawg-trust` (`cawg_trust_pem`) anchor or appear on `--cawg-allowed` (`cawg_allowed_certs_pem`); certificate profile alone never establishes trust. `--cawg-strict-encoding` (`cawg_strict_encoding`) refuses CAWG 1.1-era legacy encodings; without it they verify and are surfaced through the informational `com.encypher.cawg.legacyProfile` status.
-
-CAWG identity outcomes are assertion-scoped: `cawg.*` codes report the identity assertion's own verdict and never flip the C2PA manifest's `validation_state` or integrity verdict. A tampered identity assertion still fails the manifest through the C2PA-level hashed-URI check.
-
-Every CLI trust flag is repeatable; repeated occurrences merge, so separate bundles (your own CA, the C2PA official list, a partner list) need no preprocessing. Pass `--time` (Rust/Python: `validation_time`, RFC 3339) to evaluate certificate validity at a fixed instant for fully reproducible verification.
-
-```rust
-use encypher_c2pa::{verify_with_options, VerifyOptions};
-
-let options = VerifyOptions {
-    trust_pem: Some(std::fs::read_to_string("anchors.pem")?),
-    cawg_trust_pem: Some(std::fs::read_to_string("cawg-anchors.pem")?),
-    validation_time: Some("2026-08-03T12:00:00Z".into()),
-    ..Default::default()
-};
-let report = verify_with_options(&bytes, "video/mp4", &options)?;
-for status in report.cawg_statuses() {
-    println!("{}: {}", status.code, status.explanation);
-}
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-### Validating news content with the published trust lists
-
-News-industry C2PA content is anchored by published PEM lists: the C2PA conformance program trust list (claim-signing anchors), the C2PA conformance TSA trust list (RFC 3161 timestamp-authority anchors), the IPTC Verified News Publishers List (VNPL, end-entity certificates of vetted newsrooms), and the Encypher-hosted lists (the Encypher C2PA root and TSA issuing CA, and the Encypher Verified Organizations List of identity anchors). Verification never fetches, so the recipe is fetch-then-pin: download the lists once, commit or cache them, and pass the pinned copies.
+Every CLI trust flag is repeatable and repeated bundles merge. CAWG document-signing credentials must chain to a CAWG anchor or match a CAWG allowed certificate; certificate profile alone never establishes trust. `--cawg-strict-encoding` (`cawg_strict_encoding`) refuses CAWG 1.1-era legacy encodings. CAWG identity outcomes remain assertion-scoped: they never turn a valid C2PA integrity result into a trust result.
 
 ```bash
-# 1. Fetch (once, or on your refresh cadence)
-curl -o c2pa-trust.pem \
-  https://raw.githubusercontent.com/c2pa-org/conformance-public/refs/heads/main/trust-list/C2PA-TRUST-LIST.pem
-curl -o c2pa-tsa-trust.pem \
-  https://raw.githubusercontent.com/c2pa-org/conformance-public/refs/heads/main/trust-list/C2PA-TSA-TRUST-LIST.pem
-curl -o vnpl-end-entity.pem https://trust.iptc.org/end-entity-list.pem
-curl -o encypher-root.pem https://api.encypher.com/ca/repository/root-ca.crt
-curl -o encypher-tsa.pem https://api.encypher.com/ca/repository/tsa-issuing-ca.crt
-curl -o evol-anchors.pem https://trust.encypher.com/anchor-list.pem
+# Out-of-box verification uses the packaged snapshot.
+encypher-c2pa verify article-photo.jpg --json
 
-# 2. Verify against the pinned lists
+# A closed deployment can replace the defaults with its own pinned policy.
 encypher-c2pa verify article-photo.jpg \
-  --trust c2pa-trust.pem --trust encypher-root.pem \
-  --tsa-trust c2pa-tsa-trust.pem --tsa-trust encypher-tsa.pem \
-  --cawg-trust evol-anchors.pem \
-  --cawg-allowed vnpl-end-entity.pem \
-  --time 2026-08-05T00:00:00Z --json
+  --no-default-trust \
+  --trust organization-anchors.pem \
+  --tsa-trust organization-tsa-anchors.pem \
+  --time 2026-08-11T00:00:00Z --json
 ```
 
-`--trust` gates the claim signer, `--tsa-trust` gates RFC 3161 timestamps, `--cawg-trust` gates identity-assertion signers by CA anchor, and `--cawg-allowed` accepts identity signers by exact end-entity certificate. Every flag is repeatable and repeated bundles merge, so the C2PA, IPTC, and Encypher lists combine without preprocessing. A timestamp from a TSA outside the pinned anchors correctly reports `timeStamp.untrusted`, matching the reference implementation. With the Encypher lists pinned, content signed through the Encypher platform verifies as trusted under the same recipe. The VNPL anchor list and the Encypher end-entity list may legitimately be empty today; an empty PEM file is rejected with a clean error, so only pass files that contain certificates.
-
-Pinned copies of these three lists ship with the real-world corpus under [`tests/vectors/cawg/realworld/`](https://github.com/encypherai/encypher-c2pa/tree/main/tests/vectors/cawg/realworld). The news assets themselves are redistribution-pending and are not in the repository; `python3 tests/vectors/cawg/realworld/manage_realworld.py fetch` downloads them from the pinned URLs and verifies the recorded digests. The shipped CAWG interoperability corpus under [`tests/vectors/cawg/`](https://github.com/encypherai/encypher-c2pa/tree/main/tests/vectors/cawg) (pinned c2pa-rs / c2pa-cpp fixtures plus Encypher-generated CAWG 1.2 vectors) runs fully offline in `cargo test --workspace`.
+Revocation evidence is read only from OCSP responses stapled into the manifest. The offline verifier cannot prove that a packaged or caller-supplied list is still current, so `freshness.status` remains `unknown`.
 
 The top-level report keeps these conclusions apart:
 
@@ -237,9 +217,9 @@ The top-level report keeps these conclusions apart:
   "signature": "valid",
   "hard_binding": "match",
   "trust": {
-    "status": "not_evaluated",
-    "basis": "none",
-    "validation_time": "2026-08-03T12:00:00Z",
+    "status": "not_valid_for_supplied_material",
+    "basis": "bundled_static_material",
+    "validation_time": "2026-08-11T12:00:00Z",
     "revocation": {
       "status": "not_checked",
       "source": "none",
@@ -293,7 +273,7 @@ node ../../scripts/test-wasm.mjs
 
 ## Security boundary
 
-The public repository contains verification, parsing, format handling, signature checks, static caller-supplied trust evaluation, and the opt-in failure telemetry client. It excludes signing keys, managed trust policy, registry lookups, proprietary watermarking and fingerprinting, customer workflows, service credentials, and telemetry backends.
+The public repository contains verification, parsing, format handling, signature checks, pinned packaged trust snapshots, caller-supplied trust evaluation, and the opt-in failure telemetry client. It excludes signing keys, managed trust policy, registry lookups, proprietary watermarking and fingerprinting, customer workflows, service credentials, and telemetry backends.
 
 Manifest construction and container writing are not part of the published API. The verification kernel lives in private modules of the single published library, so that code is unreachable from outside the crate by construction rather than by configuration, and the writers are additionally `cfg(test)` so they are not compiled into the released artifact at all. No Cargo feature can expose them.
 

@@ -11,12 +11,12 @@ import (
 	"time"
 )
 
-func TestSignedJPEGReportsIntegrityWithoutTrust(t *testing.T) {
+func TestSignedJPEGCanDisableBundledTrust(t *testing.T) {
 	asset, err := os.ReadFile(filepath.Join("..", "..", "tests", "fixtures", "signed_test.jpg"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := Verify(asset, "image/jpeg", nil)
+	report, err := Verify(asset, "image/jpeg", &Options{NoDefaultTrust: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +34,7 @@ func TestCAWGOptionsAndStatusDetailsRoundTrip(t *testing.T) {
 		CAWGAllowedCertsPEM: "leaf",
 		CAWGDIDDocuments:    map[string]json.RawMessage{"did:web:example.test": json.RawMessage(`{"id":"did:web:example.test"}`)},
 		CAWGStrictEncoding:  true,
+		NoDefaultTrust:      true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -47,6 +48,7 @@ func TestCAWGOptionsAndStatusDetailsRoundTrip(t *testing.T) {
 		"cawg_allowed_certs_pem",
 		"cawg_did_documents",
 		"cawg_strict_encoding",
+		"no_default_trust",
 	} {
 		if _, ok := options[key]; !ok {
 			t.Fatalf("missing CAWG option %q in %s", key, optionsJSON)

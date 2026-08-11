@@ -65,6 +65,9 @@ fn verify(vector: &Value) -> (i32, Value) {
                 .as_str()
                 .expect("fixed_validation_time"),
         )
+        // The corpus contract covers validation statuses, not the SDK's
+        // independently refreshed packaged trust snapshot.
+        .arg("--no-default-trust")
         .arg("--json")
         .output()
         .expect("run Encypher CLI");

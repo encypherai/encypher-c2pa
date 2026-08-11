@@ -400,10 +400,15 @@ pub fn validate_chain(
             break;
         }
 
-        // Find an issuer whose subject matches the current issuer name.
+        // Subject names are not unique. Trust lists can contain distinct CAs
+        // with the same name, so choose the candidate that actually signed
+        // this certificate rather than failing on the first name match.
         let issuer = candidates
             .iter()
-            .find(|c| c.tbs_certificate.subject == current.tbs_certificate.issuer)
+            .find(|candidate| {
+                candidate.tbs_certificate.subject == current.tbs_certificate.issuer
+                    && verify_signature(&current, candidate)
+            })
             .cloned();
         let Some(issuer) = issuer else {
             break; // Cannot walk further; trust decision falls to fingerprint set.
@@ -418,12 +423,6 @@ pub fn validate_chain(
             if intermediates_below > max {
                 return untrusted_with("issuer pathLenConstraint violated", chain_validity_ok);
             }
-        }
-        if !verify_signature(&current, &issuer) {
-            return untrusted_with(
-                "certificate signature verification failed",
-                chain_validity_ok,
-            );
         }
         if !valid_at(&issuer, at) {
             chain_validity_ok = false;
