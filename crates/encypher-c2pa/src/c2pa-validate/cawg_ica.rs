@@ -377,6 +377,9 @@ fn parse_ica_credential(
     } else {
         "unknown"
     };
+    if context_version == "unknown" {
+        return Err("credential lacks a CAWG ICA JSON-LD context");
+    }
     if strict_encoding && context_version != "1.2" {
         return Err("strict encoding requires the CAWG 1.2 ICA JSON-LD context");
     }
@@ -386,6 +389,12 @@ fn parse_ica_credential(
         .ok_or("type is missing or not an array")?;
     if types.is_empty() || !types.iter().all(|entry| entry.is_string()) {
         return Err("type must be a non-empty array of strings");
+    }
+    let has_type = |expected: &str| types.iter().any(|entry| entry.as_str() == Some(expected));
+    if !has_type("VerifiableCredential") || !has_type("IdentityClaimsAggregationCredential") {
+        return Err(
+            "type must include VerifiableCredential and IdentityClaimsAggregationCredential",
+        );
     }
 
     let issuer = object
@@ -1165,6 +1174,37 @@ mod tests {
             .informational
             .iter()
             .any(|status| status.code == CAWG_LEGACY_PROFILE));
+    }
+
+    #[test]
+    fn unknown_context_is_invalid_verifiable_credential() {
+        let key = signing_key();
+        let mut vc = vc_json(&did_jwk(&key), Some("2025-01-01T00:00:00Z"), None);
+        vc["@context"] = json!(["https://www.w3.org/ns/credentials/v2"]);
+        let results = run(&ica_cose(&key, &vc));
+        assert_eq!(
+            codes(&results.failure),
+            vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL]
+        );
+        assert!(results.success.is_empty());
+    }
+
+    #[test]
+    fn vc_type_must_name_the_ica_credential_profile() {
+        let key = signing_key();
+        for types in [
+            json!(["VerifiableCredential"]),
+            json!(["IdentityClaimsAggregationCredential"]),
+        ] {
+            let mut vc = vc_json(&did_jwk(&key), Some("2025-01-01T00:00:00Z"), None);
+            vc["type"] = types;
+            let results = run(&ica_cose(&key, &vc));
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL]
+            );
+            assert!(results.success.is_empty());
+        }
     }
 
     #[test]
