@@ -141,6 +141,10 @@ pub struct VerifyOptions {
     /// are surfaced via the informational `com.encypher.cawg.legacyProfile`
     /// status.
     pub cawg_strict_encoding: bool,
+    /// Apply the C2PA 2.4 Conformance Program posture instead of the default
+    /// generous core-spec read. This raises applicable SHOULD requirements to
+    /// the conformance bar and emits strict diagnostics in the reader report.
+    pub strict_conformance: bool,
     /// RFC 3339 validation instant. Current UTC time is used when omitted.
     pub validation_time: Option<String>,
     /// Failure telemetry override. `None` uses the saved per-user preference.
@@ -427,7 +431,11 @@ fn verify_with_options_inner(
         tsa_trust: tsa_trust.as_ref().map(ResolvedTrust::get),
         allowed_certs: allowed_certs.as_ref().map(ResolvedTrust::get),
         validation_time: Some(validation_time),
-        profile: EngineProfile::GENEROUS,
+        profile: if options.strict_conformance {
+            EngineProfile::strict(SpecVersion::V2_4)
+        } else {
+            EngineProfile::GENEROUS
+        },
     };
     let cawg_trust = cawg_trust.as_ref().map(ResolvedTrust::get);
     let cawg_allowed_certs = cawg_allowed_certs.as_ref().map(ResolvedTrust::get);
@@ -806,7 +814,10 @@ fn trust_report(
 
 #[cfg(test)]
 mod tests {
-    use super::{mime_from_path, read_bounded_file, supported_mime_types, verify, Error};
+    use super::{
+        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_with_options,
+        Error, VerifyOptions,
+    };
     use std::{io::Cursor, path::Path};
 
     #[test]
@@ -843,6 +854,28 @@ mod tests {
         let report = verify(asset, "audio/aac; codecs=mp4a.40.2").unwrap();
         assert_eq!(report.mime_type, "audio/mp4");
         assert!(!report.present);
+    }
+
+    #[test]
+    fn strict_conformance_option_selects_the_program_profile() {
+        let asset = include_bytes!("../../../tests/fixtures/signed_test.jpg");
+        let report = verify_with_options(
+            asset,
+            "image/jpeg",
+            &VerifyOptions {
+                strict_conformance: true,
+                ..VerifyOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.manifest_report["engine_profile"]["operating_mode"],
+            "conformance"
+        );
+        assert_eq!(
+            report.manifest_report["engine_profile"]["compliance_level"],
+            "conformance-program"
+        );
     }
 
     #[test]

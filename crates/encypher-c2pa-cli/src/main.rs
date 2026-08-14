@@ -176,6 +176,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 no_default_trust,
                 cawg_did_documents: read_did_documents(&cawg_did_documents)?,
                 cawg_strict_encoding,
+                strict_conformance: false,
                 validation_time: time,
                 telemetry: TelemetryOptions {
                     enabled: explicit_telemetry,
