@@ -2,7 +2,7 @@
 
 All notable changes to this project are recorded here.
 
-## Unreleased
+## 1.0.3 - 2026-08-14
 - CAWG ICA success statuses now include the verified DID issuer, verified identity records, trust source, and trusted timestamp fields so bindings can render named actors without decoding the signed credential again.
 - ICA verification now rejects credentials that omit the CAWG ICA JSON-LD context or required `VerifiableCredential` and `IdentityClaimsAggregationCredential` types.
 - Added C2PA 2.4 verification for OpenDocument Graphics and tab-separated values, bringing the public profile to 71 canonical MIME types.

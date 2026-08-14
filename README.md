@@ -47,7 +47,7 @@ Tagged releases publish the packages below. For an unreleased checkout, use [Bui
 ### CLI
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.2
+cargo install encypher-c2pa-cli --version 1.0.3
 encypher-c2pa verify composition.mp4
 encypher-c2pa verify composition.mp4 --json
 encypher-c2pa formats
@@ -59,7 +59,7 @@ Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupport
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.0.2"
+encypher-c2pa = "1.0.3"
 ```
 
 ```rust

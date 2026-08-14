@@ -25,7 +25,7 @@ __all__ = [
     "telemetry_enabled",
     "verify",
 ]
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 Asset = Union[bytes, bytearray, memoryview, str, Path]
 _MAX_PATH_ASSET_BYTES = 128 * 1024 * 1024
