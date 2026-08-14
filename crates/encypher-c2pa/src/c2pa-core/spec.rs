@@ -395,6 +395,10 @@ pub static FORMAT_REGISTRY: &[FormatEntry] = &[
         versions: &[V2_4],
     }, // A.8 unstructured (VS)
     FormatEntry {
+        mime: "text/tab-separated-values",
+        versions: &[V2_4],
+    }, // A.8 unstructured (VS)
+    FormatEntry {
         mime: "text/html",
         versions: &[V2_4],
     }, // A.7 HTML
@@ -537,6 +541,10 @@ pub static FORMAT_REGISTRY: &[FormatEntry] = &[
     },
     FormatEntry {
         mime: "application/vnd.oasis.opendocument.presentation",
+        versions: &[V2_4],
+    },
+    FormatEntry {
+        mime: "application/vnd.oasis.opendocument.graphics",
         versions: &[V2_4],
     },
     FormatEntry {

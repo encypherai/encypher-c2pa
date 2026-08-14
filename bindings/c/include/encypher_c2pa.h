@@ -20,6 +20,20 @@ char *encypher_c2pa_verify(
     const char *options_json
 );
 
+/*
+ * Verifies fragmented ISO BMFF. asset is the initialization segment.
+ * fragments and fragment_lengths are parallel arrays with fragment_count entries.
+ */
+char *encypher_c2pa_verify_fragmented(
+    const uint8_t *asset,
+    size_t asset_len,
+    const uint8_t *const *fragments,
+    const size_t *fragment_lengths,
+    size_t fragment_count,
+    const char *mime_type,
+    const char *options_json
+);
+
 /* Saves failure telemetry consent for subsequent native SDK verifications. */
 char *encypher_c2pa_set_telemetry_enabled(bool enabled);
 

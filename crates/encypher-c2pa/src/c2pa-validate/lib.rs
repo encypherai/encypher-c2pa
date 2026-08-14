@@ -966,6 +966,33 @@ pub fn verify_fragmented_with_cawg_trust_policy_safe(
         Err(_) => Err(ValidateError::Panic),
     }
 }
+/// Panic-containment wrapper for fragmented verification with the full CAWG
+/// trust, policy, pinned DID-document, and encoding option set.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encoding_safe(
+    input: &VerifyInput,
+    fragments: &[&[u8]],
+    cawg_trust: Option<&TrustList>,
+    cawg_allowed_certs: Option<&TrustList>,
+    document_signing_require_anchor: bool,
+    cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
+    cawg_strict_encoding: bool,
+) -> Result<VerifyOutput, ValidateError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encoding(
+            input,
+            fragments,
+            cawg_trust,
+            cawg_allowed_certs,
+            document_signing_require_anchor,
+            cawg_did_documents,
+            cawg_strict_encoding,
+        )
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(ValidateError::Panic),
+    }
+}
 
 /// Verify a DETACHED / sidecar C2PA manifest store against its external content.
 ///

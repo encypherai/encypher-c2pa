@@ -28,6 +28,7 @@ The verifier reads local bytes. It does not upload the asset, fetch a trust list
 
 - Extracts C2PA manifests from images, video, audio, documents, fonts, archives, and structured text.
 - Verifies claim signatures, hashed-URI references, and format-specific hard bindings.
+- Verifies fragmented BMFF streams (fMP4 and CMAF) from an initialization segment plus any available media-segment subset.
 - Walks ingredient and manifest chains included in the asset.
 - Validates CAWG identity assertions (X.509 COSE and identity-claims-aggregation credentials, offline `did:web`/`did:jwk` resolution) per CAWG Identity 1.2.
 - Evaluates trust against bundled snapshots plus caller PEM, with an explicit custom-only mode.
@@ -248,9 +249,22 @@ The response is Encypher's own record, separate from the local verdict: a match 
 
 ## Format coverage
 
-`encypher-c2pa formats` prints the canonical MIME types covered by the installed C2PA 2.4 engine profile. Container readers cover JPEG, PNG, WebP, TIFF/DNG, GIF, SVG, JPEG XL, ISO BMFF media, RIFF media, FLAC, MP3, PDF, ZIP-derived documents, fonts, EPUB, and text.
+`encypher-c2pa formats` prints the 71 canonical MIME types covered by the installed C2PA 2.4 engine profile. Container readers cover JPEG, PNG, WebP, TIFF/DNG, GIF, SVG, JPEG XL, ISO BMFF media, RIFF media, FLAC, MP3, PDF, ZIP-derived documents, fonts, EPUB, and text. The C2PA 2.4 set includes OpenDocument Graphics (`application/vnd.oasis.opendocument.graphics`) and tab-separated values (`text/tab-separated-values`).
 
-Text coverage is every method C2PA 2.4 defines, through the published [`c2pa-text`](https://crates.io/crates/c2pa-text) crate: A.8 unstructured text (the invisible variation-selector wrapper on `text/plain`, CSV, JSON, and social-post content), A.9 structured text (the ASCII-armour comment block for Markdown, XML/XHTML, YAML, TOML, CSS, JavaScript, Python, and every comment syntax `c2pa-text` defines), and A.7 HTML (the inline `application/c2pa` script element). Encypher's proprietary text markers are not part of C2PA and are deliberately not read here; they are served by the [Encypher API](https://api.encypher.com/docs).
+Text coverage is every method C2PA 2.4 defines, through the published [`c2pa-text`](https://crates.io/crates/c2pa-text) crate: A.8 unstructured text (the invisible variation-selector wrapper on `text/plain`, CSV, TSV, JSON, and social-post content), A.9 structured text (the ASCII-armour comment block for Markdown, XML/XHTML, YAML, TOML, CSS, JavaScript, Python, and every comment syntax `c2pa-text` defines), and A.7 HTML (the inline `application/c2pa` script element). Encypher's proprietary text markers are not part of this SDK.
+
+### Fragmented BMFF
+
+For fMP4 and CMAF, the ordinary MIME type remains `video/mp4`. Pass the signed initialization segment as the asset and each available `.m4s` media segment as a fragment. The verifier checks the initialization-segment hash and each supplied fragment's A.5.4 Merkle leaf. It does not require the complete stream.
+
+```bash
+encypher-c2pa verify init.mp4 \
+  --fragment seg-0.m4s \
+  --fragment seg-1.m4s \
+  --mime video/mp4
+```
+
+Rust uses `verify_fragmented` or `verify_fragmented_with_options`. Python uses `verify(init, "video/mp4", fragments=[...])`. Browser WASM exports `verifyFragmented(init, fragments, "video/mp4", options)`. The C ABI exposes `encypher_c2pa_verify_fragmented`.
 
 Coverage means the verifier has a reader and C2PA hard-binding path for the MIME type. It does not mean every malformed or vendor-specific variant can be recovered. See [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md).
 

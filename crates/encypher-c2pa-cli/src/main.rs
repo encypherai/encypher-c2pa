@@ -9,7 +9,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
     detached_manifest_evidence, mime_from_path, set_telemetry_enabled, supported_mime_types,
-    telemetry_preference, verify_file, verify_with_options, Error, TelemetryOptions, VerifyOptions,
+    telemetry_preference, verify_file, verify_fragmented_with_options, verify_with_options, Error,
+    TelemetryOptions, VerifyOptions,
 };
 
 mod encypher_api;
@@ -42,6 +43,9 @@ enum Command {
         asset: PathBuf,
         #[arg(long)]
         mime: Option<String>,
+        /// Fragmented BMFF media segment (`.m4s`). Repeat for each available segment.
+        #[arg(long, value_name = "FILE", conflicts_with = "encypher_api")]
+        fragment: Vec<PathBuf>,
         /// Claim-signer trust anchors (PEM bundle). Repeatable; bundles merge.
         #[arg(long, value_name = "PEM")]
         trust: Vec<PathBuf>,
@@ -126,6 +130,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Verify {
             asset,
             mime,
+            fragment,
             trust,
             tsa_trust,
             allowed,
@@ -202,8 +207,25 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     evidence.as_ref(),
                 );
                 (report, Some(result))
-            } else {
+            } else if fragment.is_empty() {
                 (verify_file(&asset, mime.as_deref(), &options)?, None)
+            } else {
+                let mime = match mime {
+                    Some(value) => value,
+                    None => mime_from_path(&asset)
+                        .ok_or_else(|| Error::UnsupportedMime(asset.display().to_string()))?
+                        .to_string(),
+                };
+                let init_segment = read_path_asset(&asset)?;
+                let fragment_bytes: Vec<Vec<u8>> = fragment
+                    .iter()
+                    .map(|path| read_path_asset(path))
+                    .collect::<Result<_, _>>()?;
+                let fragment_refs: Vec<&[u8]> = fragment_bytes.iter().map(Vec::as_slice).collect();
+                (
+                    verify_fragmented_with_options(&init_segment, &fragment_refs, &mime, &options)?,
+                    None,
+                )
             };
             if json {
                 if let Some(lookup) = &encypher_api_result {

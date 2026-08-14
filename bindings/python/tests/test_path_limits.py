@@ -9,12 +9,18 @@ import pytest
 
 native = types.ModuleType("encypher_c2pa._native")
 native.extensions_json = lambda: json.dumps(
-    [["jpg", "image/jpeg"], ["dng", "image/x-adobe-dng"]]
+    [
+        ["jpg", "image/jpeg"],
+        ["dng", "image/x-adobe-dng"],
+        ["odg", "application/vnd.oasis.opendocument.graphics"],
+        ["tsv", "text/tab-separated-values"],
+    ]
 )
 native.formats_json = lambda: "[]"
 native.get_telemetry_preference = lambda: None
 native.set_telemetry_preference = lambda enabled: None
 native.verify_bytes = lambda *args: "{}"
+native.verify_fragmented_bytes = lambda *args: "{}"
 sys.modules.setdefault("encypher_c2pa._native", native)
 
 import encypher_c2pa
@@ -131,3 +137,63 @@ def test_verify_passes_buffer_to_native_without_wrapper_copy(
     encypher_c2pa.verify(asset, "image/jpeg")
 
     assert observed["data"] is asset
+
+
+def test_verify_routes_fragmented_buffers_to_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {}
+
+    def capture_verify(init, fragments, mime_type, options_json):
+        observed.update(
+            init=init,
+            fragments=fragments,
+            mime_type=mime_type,
+            options=json.loads(options_json),
+        )
+        return "{}"
+
+    monkeypatch.setattr(
+        encypher_c2pa, "verify_fragmented_bytes", capture_verify
+    )
+    fragments = [b"one", bytearray(b"two"), memoryview(b"three")]
+    encypher_c2pa.verify(
+        b"init",
+        "video/mp4",
+        fragments=fragments,
+        telemetry=False,
+    )
+
+    assert observed["init"] == b"init"
+    assert observed["fragments"] == fragments
+    assert observed["mime_type"] == "video/mp4"
+    assert observed["options"]["telemetry"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("drawing.odg", "application/vnd.oasis.opendocument.graphics"),
+        ("data.tsv", "text/tab-separated-values"),
+    ],
+)
+def test_new_extensions_use_the_public_registry(
+    name: str, expected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / name
+    path.write_bytes(b"asset")
+    observed = {}
+
+    def capture_verify(_data, mime_type, _options_json):
+        observed["mime_type"] = mime_type
+        return "{}"
+
+    monkeypatch.setattr(encypher_c2pa, "verify_bytes", capture_verify)
+    monkeypatch.setattr(
+        encypher_c2pa.mimetypes,
+        "guess_type",
+        lambda _name: ("application/octet-stream", None),
+    )
+
+    encypher_c2pa.verify(path)
+    assert observed["mime_type"] == expected

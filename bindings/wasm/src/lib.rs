@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use encypher_c2pa::{
-    supported_mime_types, validation_failure_telemetry, verify_with_options, VerifyOptions,
+    supported_mime_types, validation_failure_telemetry, verify_fragmented_with_options,
+    verify_with_options, VerifyOptions,
 };
 use wasm_bindgen::prelude::*;
 
@@ -62,6 +63,55 @@ pub fn verify_js(
         options.telemetry.sdk_name = Some("browser".to_string());
     }
     let result = verify_with_options(asset, mime_type, &options);
+    if let Some(event) = validation_failure_telemetry(mime_type, &result, &options.telemetry) {
+        if let Ok(payload) = event.to_json() {
+            post_validation_failure(options.telemetry.endpoint(), &payload);
+        }
+    }
+    let report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
+    serde_wasm_bindgen::to_value(&report)
+        .map_err(|error| js_error("serialization_error", error.to_string()))
+}
+
+#[wasm_bindgen(js_name = verifyFragmented)]
+pub fn verify_fragmented_js(
+    init_segment: &[u8],
+    fragments: js_sys::Array,
+    mime_type: &str,
+    options: Option<JsValue>,
+) -> Result<JsValue, JsValue> {
+    let mut options = match options {
+        None => VerifyOptions::default(),
+        Some(value) if value.is_null() || value.is_undefined() => VerifyOptions::default(),
+        Some(value) => serde_wasm_bindgen::from_value(value)
+            .map_err(|error| js_error("invalid_options", error.to_string()))?,
+    };
+    if options.validation_time.is_none() {
+        options.validation_time = js_sys::Date::new_0().to_iso_string().as_string();
+    }
+    if options.telemetry.enabled.is_none() {
+        options.telemetry.enabled = Some(resolve_telemetry_preference());
+    }
+    if options.telemetry.enabled == Some(true) {
+        options.telemetry.sdk_name = Some("browser".to_string());
+    }
+
+    let fragment_bytes: Vec<Vec<u8>> = fragments
+        .iter()
+        .map(|value| {
+            value
+                .dyn_into::<js_sys::Uint8Array>()
+                .map(|bytes| bytes.to_vec())
+                .map_err(|_| {
+                    js_error(
+                        "invalid_argument",
+                        "each fragment must be a Uint8Array".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let fragment_refs: Vec<&[u8]> = fragment_bytes.iter().map(Vec::as_slice).collect();
+    let result = verify_fragmented_with_options(init_segment, &fragment_refs, mime_type, &options);
     if let Some(event) = validation_failure_telemetry(mime_type, &result, &options.telemetry) {
         if let Ok(payload) = event.to_json() {
             post_validation_failure(options.telemetry.endpoint(), &payload);

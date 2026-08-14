@@ -88,6 +88,7 @@ use crate::c2pa_core::{
 };
 use crate::c2pa_trust::TrustList;
 use crate::c2pa_validate::{
+    verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encoding_safe as verify_fragmented_safe,
     verify_with_cawg_trust_policy_did_documents_and_strict_encoding_safe as verify_safe,
     StatusCode as CoreStatus, ValidationResults as CoreResults, VerifyInput,
     ASSERTION_BMFF_HASH_MALFORMED, ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH,
@@ -278,6 +279,24 @@ impl Error {
 pub fn verify(data: &[u8], mime_type: &str) -> Result<VerificationReport, Error> {
     verify_with_options(data, mime_type, &VerifyOptions::default())
 }
+
+/// Verify a fragmented ISO BMFF stream with default options.
+///
+/// `init_segment` carries the manifest. Each entry in `fragments` is one media
+/// segment (`.m4s`). A subset may be supplied: each segment carries its own
+/// Merkle-tree location and is checked independently.
+pub fn verify_fragmented(
+    init_segment: &[u8],
+    fragments: &[&[u8]],
+    mime_type: &str,
+) -> Result<VerificationReport, Error> {
+    verify_fragmented_with_options(
+        init_segment,
+        fragments,
+        mime_type,
+        &VerifyOptions::default(),
+    )
+}
 /// Extract the signed manifest store and its contiguous carrier for detached
 /// server validation.
 ///
@@ -326,7 +345,31 @@ pub fn verify_with_options(
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
-    let result = verify_with_options_inner(data, mime_type, options);
+    let result = verify_with_options_inner(data, None, mime_type, options);
+    if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
+        mime_type,
+        &result,
+        &options.telemetry,
+        telemetry_enabled,
+    ) {
+        telemetry::enqueue(options.telemetry.endpoint(), event);
+    }
+    result
+}
+
+/// Verify a fragmented ISO BMFF stream with explicit trust, validation-time,
+/// CAWG, and telemetry options.
+///
+/// `init_segment` carries the C2PA manifest. `fragments` may be the complete
+/// stream or any available subset; validation covers every supplied fragment.
+pub fn verify_fragmented_with_options(
+    init_segment: &[u8],
+    fragments: &[&[u8]],
+    mime_type: &str,
+    options: &VerifyOptions,
+) -> Result<VerificationReport, Error> {
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let result = verify_with_options_inner(init_segment, Some(fragments), mime_type, options);
     if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
         mime_type,
         &result,
@@ -340,6 +383,7 @@ pub fn verify_with_options(
 
 fn verify_with_options_inner(
     data: &[u8],
+    fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
@@ -376,22 +420,36 @@ fn verify_with_options_inner(
         .format(&Rfc3339)
         .map_err(|error| Error::InvalidValidationTime(error.to_string()))?;
 
-    let output = verify_safe(
-        &VerifyInput {
-            data,
-            mime: &mime,
-            claim_signer_trust: claim_trust.as_ref().map(ResolvedTrust::get),
-            tsa_trust: tsa_trust.as_ref().map(ResolvedTrust::get),
-            allowed_certs: allowed_certs.as_ref().map(ResolvedTrust::get),
-            validation_time: Some(validation_time),
-            profile: EngineProfile::GENEROUS,
-        },
-        cawg_trust.as_ref().map(ResolvedTrust::get),
-        cawg_allowed_certs.as_ref().map(ResolvedTrust::get),
-        true,
-        options.cawg_did_documents.as_ref(),
-        options.cawg_strict_encoding,
-    )
+    let input = VerifyInput {
+        data,
+        mime: &mime,
+        claim_signer_trust: claim_trust.as_ref().map(ResolvedTrust::get),
+        tsa_trust: tsa_trust.as_ref().map(ResolvedTrust::get),
+        allowed_certs: allowed_certs.as_ref().map(ResolvedTrust::get),
+        validation_time: Some(validation_time),
+        profile: EngineProfile::GENEROUS,
+    };
+    let cawg_trust = cawg_trust.as_ref().map(ResolvedTrust::get);
+    let cawg_allowed_certs = cawg_allowed_certs.as_ref().map(ResolvedTrust::get);
+    let output = match fragments {
+        Some(fragments) => verify_fragmented_safe(
+            &input,
+            fragments,
+            cawg_trust,
+            cawg_allowed_certs,
+            true,
+            options.cawg_did_documents.as_ref(),
+            options.cawg_strict_encoding,
+        ),
+        None => verify_safe(
+            &input,
+            cawg_trust,
+            cawg_allowed_certs,
+            true,
+            options.cawg_did_documents.as_ref(),
+            options.cawg_strict_encoding,
+        ),
+    }
     .map_err(|error| match error {
         crate::c2pa_validate::ValidateError::UnsupportedMime(value) => {
             Error::UnsupportedMime(value)
@@ -575,9 +633,11 @@ pub const SUPPORTED_EXTENSIONS: &[(&str, &str)] = &[
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ),
     ("odt", "application/vnd.oasis.opendocument.text"),
+    ("odg", "application/vnd.oasis.opendocument.graphics"),
     ("ttf", "font/ttf"),
     ("otf", "font/otf"),
     ("txt", "text/plain"),
+    ("tsv", "text/tab-separated-values"),
 ];
 
 /// Infer a MIME type from a filename extension, case-insensitively.
@@ -755,15 +815,26 @@ mod tests {
             mime_from_path(Path::new("composition.MP4")),
             Some("video/mp4")
         );
+
+        assert_eq!(
+            mime_from_path(Path::new("drawing.odg")),
+            Some("application/vnd.oasis.opendocument.graphics")
+        );
+        assert_eq!(
+            mime_from_path(Path::new("data.tsv")),
+            Some("text/tab-separated-values")
+        );
     }
 
     #[test]
     fn format_list_is_sorted_and_contains_composition_formats() {
         let formats = supported_mime_types();
-        assert_eq!(formats.len(), 69);
+        assert_eq!(formats.len(), 71);
         assert!(formats.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(formats.contains(&"video/mp4"));
         assert!(formats.contains(&"image/jpeg"));
+        assert!(formats.contains(&"text/tab-separated-values"));
+        assert!(formats.contains(&"application/vnd.oasis.opendocument.graphics"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ import mimetypes
 import os
 import stat
 from pathlib import Path
-from typing import Any, Mapping, Optional, Union
+from typing import Any, Mapping, Optional, Sequence, Union
 
 from ._native import (
     extensions_json as _extensions_json,
@@ -16,6 +16,7 @@ from ._native import (
     get_telemetry_preference,
     set_telemetry_preference,
     verify_bytes,
+    verify_fragmented_bytes,
 )
 
 __all__ = [
@@ -71,6 +72,7 @@ def _infer_mime_type(path: Path) -> Optional[str]:
 def verify(
     asset: Asset,
     mime_type: Optional[str] = None,
+    fragments: Optional[Sequence[Asset]] = None,
     *,
     trust_pem: Optional[str] = None,
     tsa_trust_pem: Optional[str] = None,
@@ -137,7 +139,20 @@ def verify(
             "sdk_name": "python",
         },
     }
-    report = verify_bytes(data, mime_type, json.dumps(options))
+    if fragments is None:
+        report = verify_bytes(data, mime_type, json.dumps(options))
+    else:
+        fragment_data = []
+        for fragment in fragments:
+            if isinstance(fragment, (str, Path)):
+                fragment_data.append(_read_path(Path(fragment)))
+            elif isinstance(fragment, (bytes, bytearray, memoryview)):
+                fragment_data.append(fragment)
+            else:
+                raise TypeError("each fragment must be bytes or a filesystem path")
+        report = verify_fragmented_bytes(
+            data, fragment_data, mime_type, json.dumps(options)
+        )
     return json.loads(report)
 
 

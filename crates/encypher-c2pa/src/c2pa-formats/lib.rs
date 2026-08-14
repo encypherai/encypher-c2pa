@@ -203,6 +203,7 @@ impl AssetFormat {
             | "application/vnd.oasis.opendocument.text"
             | "application/vnd.oasis.opendocument.spreadsheet"
             | "application/vnd.oasis.opendocument.presentation"
+            | "application/vnd.oasis.opendocument.graphics"
             | "application/oxps"
             | "application/vnd.ms-xpsdocument" => Self::Zip,
             "font/otf"
@@ -217,7 +218,9 @@ impl AssetFormat {
             // from the `c2pa-text` SSOT (`comment_syntax`), so the engine and
             // the published reference crate can never drift; `None` there means
             // the type has no comment convention and is unsupported here.
-            "text/plain" | "text/csv" | "application/json" => Self::TextUnstructured,
+            "text/plain" | "text/csv" | "text/tab-separated-values" | "application/json" => {
+                Self::TextUnstructured
+            }
             "text/html" => Self::TextHtml,
             // Python: c2pa-text's `recommended_method` routes it to the
             // structured (A.9) method, but its `comment_syntax` table carries
@@ -624,6 +627,10 @@ mod tests {
                 "application/vnd.oasis.opendocument.presentation",
                 AssetFormat::Zip,
             ),
+            (
+                "application/vnd.oasis.opendocument.graphics",
+                AssetFormat::Zip,
+            ),
             ("application/oxps", AssetFormat::Zip),
             ("application/vnd.ms-xpsdocument", AssetFormat::Zip),
             ("font/otf", AssetFormat::Font),
@@ -663,6 +670,7 @@ mod tests {
         let text_types = [
             "text/plain",
             "text/csv",
+            "text/tab-separated-values",
             "text/html",
             "text/markdown",
             "text/xml",

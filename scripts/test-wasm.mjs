@@ -44,8 +44,14 @@ await execFileAsync(
   { env: npmEnv },
 );
 const pkg = resolve(installRoot, "node_modules/@encypherai/c2pa");
-const { default: init, configureTelemetry, telemetryEnabled, verify, supportedMimeTypes } =
-  await import(pathToFileURL(resolve(pkg, "encypher_c2pa_wasm.js")).href);
+const {
+  default: init,
+  configureTelemetry,
+  telemetryEnabled,
+  verify,
+  verifyFragmented,
+  supportedMimeTypes,
+} = await import(pathToFileURL(resolve(pkg, "encypher_c2pa_wasm.js")).href);
 const wasm = await readFile(resolve(pkg, "encypher_c2pa_wasm_bg.wasm"));
 await init({ module_or_path: wasm });
 assert.equal(telemetryEnabled(), null);
@@ -74,6 +80,12 @@ assert.equal(report.trust.basis, "bundled_static_material");
 const customTrustOnly = verify(asset, "image/jpeg", { no_default_trust: true });
 assert.equal(customTrustOnly.trust.status, "not_evaluated");
 assert.ok(supportedMimeTypes().includes("video/mp4"));
+assert.ok(supportedMimeTypes().includes("text/tab-separated-values"));
+assert.ok(supportedMimeTypes().includes("application/vnd.oasis.opendocument.graphics"));
+const mp4 = await readFile(resolve(root, "tests/fixtures/signed_test.mp4"));
+const fragmented = verifyFragmented(mp4, [], "video/mp4");
+assert.equal(fragmented.integrity, "valid");
+assert.equal(fragmented.hard_binding, "match");
 
 let telemetryRequest;
 const originalFetch = globalThis.fetch;
