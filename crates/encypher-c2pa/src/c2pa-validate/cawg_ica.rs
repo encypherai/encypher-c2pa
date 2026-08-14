@@ -246,11 +246,24 @@ pub(super) fn verify_ica_assertion(
     }
 
     if ok {
+        let trusted_at = timestamp.and_then(|at| at.format(&Rfc3339).ok());
+        let trust_source = if credential.issuer.starts_with("did:jwk:") {
+            "did_jwk"
+        } else {
+            "caller_pinned_did_document"
+        };
         results.push_success_with_details(
             CAWG_ICA_CREDENTIAL_VALID,
             url.into(),
             "identity claims aggregation credential validated".into(),
-            serde_json::json!({ "ica_context": credential.context_version }),
+            serde_json::json!({
+                "ica_context": credential.context_version,
+                "issuer": credential.issuer,
+                "verified_identities": credential.verified_identities,
+                "trust_source": trust_source,
+                "timestamp_trusted": timestamp.is_some(),
+                "trusted_at": trusted_at,
+            }),
         );
     }
 }
@@ -332,6 +345,7 @@ struct IcaCredential {
     valid_from: Option<OffsetDateTime>,
     valid_until: Option<OffsetDateTime>,
     c2pa_asset: Json,
+    verified_identities: Vec<Json>,
     /// CAWG ICA JSON-LD context generation: `"1.2"`, `"1.1"`, or `"unknown"`.
     context_version: &'static str,
 }
@@ -467,6 +481,7 @@ fn parse_ica_credential(
         valid_from: parse_instant("validFrom")?,
         valid_until: parse_instant("validUntil")?,
         c2pa_asset,
+        verified_identities: identities.clone(),
         context_version,
     })
 }
@@ -1022,6 +1037,17 @@ mod tests {
             results.failure
         );
         assert_eq!(codes(&results.success), vec![CAWG_ICA_CREDENTIAL_VALID]);
+        let details = results.success[0]
+            .details
+            .as_ref()
+            .expect("valid ICA reports identity details");
+        assert_eq!(details["trust_source"], "did_jwk");
+        assert_eq!(details["timestamp_trusted"], false);
+        assert_eq!(details["trusted_at"], Json::Null);
+        assert_eq!(
+            details["verified_identities"],
+            vc["credentialSubject"]["verifiedIdentities"]
+        );
     }
 
     #[test]
