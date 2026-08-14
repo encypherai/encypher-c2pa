@@ -2,6 +2,10 @@
 
 All notable changes to this project are recorded here.
 
+## 1.0.4 - 2026-08-14
+
+- Fragmented verification now rejects every non-ISO-BMFF MIME before parsing, so caller-supplied fragments can never be ignored by an ordinary asset verifier.
+
 ## 1.0.3 - 2026-08-14
 - CAWG ICA success statuses now include the verified DID issuer, verified identity records, trust source, and trusted timestamp fields so bindings can render named actors without decoding the signed credential again.
 - ICA verification now rejects credentials that omit the CAWG ICA JSON-LD context or required `VerifiableCredential` and `IdentityClaimsAggregationCredential` types.

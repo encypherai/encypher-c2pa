@@ -373,7 +373,14 @@ pub fn verify_fragmented_with_options(
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
-    let result = verify_with_options_inner(init_segment, Some(fragments), mime_type, options);
+    let mime = canonicalize_mime(mime_type);
+    let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
+        == Some(crate::c2pa_formats::AssetFormat::Bmff)
+    {
+        verify_with_options_inner(init_segment, Some(fragments), &mime, options)
+    } else {
+        Err(Error::UnsupportedMime(mime))
+    };
     if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
         mime_type,
         &result,
@@ -815,8 +822,8 @@ fn trust_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_with_options,
-        Error, VerifyOptions,
+        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_fragmented,
+        verify_with_options, Error, VerifyOptions,
     };
     use std::{io::Cursor, path::Path};
 
@@ -876,6 +883,17 @@ mod tests {
             report.manifest_report["engine_profile"]["compliance_level"],
             "conformance-program"
         );
+    }
+
+    #[test]
+    fn fragmented_entry_point_rejects_non_bmff_mime() {
+        let error = verify_fragmented(
+            include_bytes!("../../../tests/fixtures/signed_test.jpg"),
+            &[b"ignored fragment"],
+            "image/jpeg",
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedMime(mime) if mime == "image/jpeg"));
     }
 
     #[test]

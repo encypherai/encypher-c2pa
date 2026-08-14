@@ -283,6 +283,32 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_entry_point_rejects_non_bmff_mime() {
+        let asset = b"asset";
+        let fragment = b"fragment";
+        let fragment_pointers = [fragment.as_ptr()];
+        let fragment_lengths = [fragment.len()];
+        let mime = CString::new("image/jpeg").unwrap();
+        // SAFETY: All pointers satisfy the public ABI contract.
+        let ptr = unsafe {
+            encypher_c2pa_verify_fragmented(
+                asset.as_ptr(),
+                asset.len(),
+                fragment_pointers.as_ptr(),
+                fragment_lengths.as_ptr(),
+                1,
+                mime.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        // SAFETY: `ptr` came from the function above and remains owned here.
+        let result = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+        assert!(result.contains("\"code\":\"unsupported_mime\""));
+        // SAFETY: This is the one release of the returned pointer.
+        unsafe { encypher_c2pa_free_string(ptr) };
+    }
+
+    #[test]
     fn fragmented_entry_point_returns_the_public_report() {
         let asset = include_bytes!("../../../tests/fixtures/signed_test.mp4");
         let mime = CString::new("video/mp4").unwrap();
