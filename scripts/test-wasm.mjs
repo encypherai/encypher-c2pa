@@ -86,6 +86,10 @@ const mp4 = await readFile(resolve(root, "tests/fixtures/signed_test.mp4"));
 const fragmented = verifyFragmented(mp4, [], "video/mp4");
 assert.equal(fragmented.integrity, "valid");
 assert.equal(fragmented.hard_binding, "match");
+assert.throws(
+  () => verifyFragmented(asset, [new Uint8Array([1])], "image/jpeg"),
+  /unsupported_mime/,
+);
 
 let telemetryRequest;
 const originalFetch = globalThis.fetch;
