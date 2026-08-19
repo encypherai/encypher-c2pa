@@ -447,7 +447,7 @@ fn verify_identity_assertion(
         );
     }
 
-    let identity_time = identity_timestamp(signature, ctx.tsa_trust);
+    let identity_time = identity_timestamp(signature, ctx.tsa_trust, ctx.validation_time);
     let timestamp_trusted = identity_time.is_some() || ctx.claim_timestamp.is_some();
     let at = identity_time
         .or(ctx.claim_timestamp)
@@ -780,14 +780,19 @@ fn invalid_cbor(results: &mut ValidationResults, url: &str, explanation: &str) {
     results.push_failure(CAWG_IDENTITY_CBOR_INVALID, url.into(), explanation.into());
 }
 
-fn identity_timestamp(signature: &[u8], tsa_trust: Option<&TrustList>) -> Option<OffsetDateTime> {
+fn identity_timestamp(
+    signature: &[u8],
+    tsa_trust: Option<&TrustList>,
+    verification_time: OffsetDateTime,
+) -> Option<OffsetDateTime> {
     let tokens = extract_tsa_tokens(signature);
     let [Some(token)] = tokens.as_slice() else {
         return None;
     };
     let trust = tsa_trust?;
     let payload = timestamp_input(signature).ok()?;
-    let result = crate::c2pa_trust::verify_timestamp_token(token, &payload, trust);
+    let result =
+        crate::c2pa_trust::verify_timestamp_token(token, &payload, trust, verification_time);
     result.verified.then_some(result.time).flatten()
 }
 

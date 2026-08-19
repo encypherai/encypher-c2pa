@@ -1990,8 +1990,11 @@ fn verify_manifest<'a>(
             );
             return None;
         };
-        if let Err(error) =
-            crate::c2pa_trust::inspect_timestamp_token(&normalized_token, &timestamp_payload)
+        if let Err(error) = crate::c2pa_trust::inspect_timestamp_token(
+            &normalized_token,
+            &timestamp_payload,
+            input.validation_time.unwrap_or_else(OffsetDateTime::now_utc),
+        )
         {
             results.push_informational(
                 TIME_STAMP_MALFORMED,
@@ -2008,8 +2011,12 @@ fn verify_manifest<'a>(
             );
             return None;
         };
-        let verification =
-            crate::c2pa_trust::verify_timestamp_token(&normalized_token, &timestamp_payload, trust);
+        let verification = crate::c2pa_trust::verify_timestamp_token(
+            &normalized_token,
+            &timestamp_payload,
+            trust,
+            input.validation_time.unwrap_or_else(OffsetDateTime::now_utc),
+        );
         if matches!(timestamp_version, Some(ClaimTimestampVersion::V1)) && verification.verified {
             results.push_informational(
                 TIME_STAMP_UNTRUSTED,

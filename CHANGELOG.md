@@ -2,6 +2,11 @@
 
 All notable changes to this project are recorded here.
 
+## 1.0.5 - 2026-08-19
+
+- Browser verification reports now serialize map-backed fields as plain JavaScript objects, so consumers can read active manifests and validation failures without Rust `Map` semantics.
+- RFC 3161 checks now use the caller-supplied validation time across claim, CAWG identity, and ICA verification, including browser WASM.
+
 ## 1.0.4 - 2026-08-14
 
 - Fragmented verification now rejects every non-ISO-BMFF MIME before parsing, so caller-supplied fragments can never be ignored by an ordinary asset verifier.
