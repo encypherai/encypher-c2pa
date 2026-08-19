@@ -160,7 +160,7 @@ pub(super) fn verify_ica_assertion(
         }
     }
 
-    let timestamp = match ica_timestamp(signature, tsa_trust) {
+    let timestamp = match ica_timestamp(signature, tsa_trust, validation_time) {
         IcaTimestamp::Absent => None,
         IcaTimestamp::Valid(at) => {
             results.push_success(
@@ -676,7 +676,11 @@ enum IcaTimestamp {
 /// CAWG profile treats the timestamp as evidence about the credential's
 /// validity window, not as a C2PA trust decision, matching the reference
 /// validator's passthrough trust policy.
-fn ica_timestamp(signature: &[u8], tsa_trust: Option<&TrustList>) -> IcaTimestamp {
+fn ica_timestamp(
+    signature: &[u8],
+    tsa_trust: Option<&TrustList>,
+    verification_time: OffsetDateTime,
+) -> IcaTimestamp {
     let tokens = extract_tsa_tokens(signature);
     if tokens.is_empty() {
         return IcaTimestamp::Absent;
@@ -697,7 +701,8 @@ fn ica_timestamp(signature: &[u8], tsa_trust: Option<&TrustList>) -> IcaTimestam
             &passthrough
         }
     };
-    let result = crate::c2pa_trust::verify_timestamp_token(token, &payload, trust);
+    let result =
+        crate::c2pa_trust::verify_timestamp_token(token, &payload, trust, verification_time);
     match (result.verified, result.time) {
         (true, Some(at)) => IcaTimestamp::Valid(at),
         _ => IcaTimestamp::Invalid,

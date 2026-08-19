@@ -136,8 +136,9 @@ pub fn verify_timestamp_token(
     token_der: &[u8],
     timestamp_input: &[u8],
     tsa_trust: &TrustList,
+    verification_time: OffsetDateTime,
 ) -> TimestampResult {
-    verify_timestamp_token_inner(token_der, timestamp_input, tsa_trust)
+    verify_timestamp_token_inner(token_der, timestamp_input, tsa_trust, verification_time)
         .unwrap_or_else(TimestampResult::failure)
 }
 
@@ -146,8 +147,14 @@ pub fn verify_timestamp_token(
 pub fn inspect_timestamp_token(
     token_der: &[u8],
     timestamp_input: &[u8],
+    verification_time: OffsetDateTime,
 ) -> Result<(), &'static str> {
-    match verify_timestamp_token_inner(token_der, timestamp_input, &TrustList::default()) {
+    match verify_timestamp_token_inner(
+        token_der,
+        timestamp_input,
+        &TrustList::default(),
+        verification_time,
+    ) {
         Err("no_tsa_anchors") => Ok(()),
         Err(error) => Err(error),
         Ok(_) => Ok(()),
@@ -158,6 +165,7 @@ fn verify_timestamp_token_inner(
     token_der: &[u8],
     timestamp_input: &[u8],
     tsa_trust: &TrustList,
+    verification_time: OffsetDateTime,
 ) -> Result<TimestampResult, &'static str> {
     let content_info = ContentInfo::from_der(token_der).map_err(|_| "timestamp_parse_error")?;
     if content_info.content_type != OID_SIGNED_DATA {
@@ -184,7 +192,7 @@ fn verify_timestamp_token_inner(
     let generated_at =
         OffsetDateTime::from_unix_timestamp(tst_info.gen_time.to_unix_duration().as_secs() as i64)
             .map_err(|_| "timestamp_time_invalid")?;
-    if generated_at > OffsetDateTime::now_utc() + MAX_FUTURE_SKEW {
+    if generated_at > verification_time + MAX_FUTURE_SKEW {
         return Err("timestamp_time_in_future");
     }
 
@@ -566,9 +574,13 @@ mod tests {
         TrustList::from_pem(include_str!("tests/fixtures/rfc3161_root.pem")).unwrap()
     }
 
+    fn verification_time() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_785_839_000).unwrap()
+    }
+
     #[test]
     fn verifies_cms_imprint_eku_chain_and_generation_time() {
-        let result = verify_timestamp_token(&token(), PAYLOAD, &trust());
+        let result = verify_timestamp_token(&token(), PAYLOAD, &trust(), verification_time());
 
         assert_eq!(result.error, None);
         assert!(result.verified);
@@ -582,7 +594,12 @@ mod tests {
 
     #[test]
     fn rejects_an_imprint_for_different_c2pa_timestamp_input() {
-        let result = verify_timestamp_token(&token(), b"different payload", &trust());
+        let result = verify_timestamp_token(
+            &token(),
+            b"different payload",
+            &trust(),
+            verification_time(),
+        );
 
         assert!(!result.verified);
         assert_eq!(result.error, Some("timestamp_imprint_mismatch"));
@@ -593,7 +610,7 @@ mod tests {
     fn rejects_a_tampered_cms_signature() {
         let mut token = token();
         *token.last_mut().unwrap() ^= 1;
-        let result = verify_timestamp_token(&token, PAYLOAD, &trust());
+        let result = verify_timestamp_token(&token, PAYLOAD, &trust(), verification_time());
 
         assert!(!result.verified);
         assert_eq!(result.error, Some("timestamp_signature_invalid"));
@@ -607,9 +624,19 @@ mod tests {
             &TrustList {
                 anchors: vec![vec![0x30, 0x00]],
             },
+            verification_time(),
         );
 
         assert!(!result.verified);
         assert_eq!(result.error, Some("timestamp_tsa_untrusted"));
+    }
+
+    #[test]
+    fn rejects_a_token_generated_after_the_supplied_validation_time() {
+        let before_token = OffsetDateTime::from_unix_timestamp(1_785_838_000).unwrap();
+        let result = verify_timestamp_token(&token(), PAYLOAD, &trust(), before_token);
+
+        assert!(!result.verified);
+        assert_eq!(result.error, Some("timestamp_time_in_future"));
     }
 }

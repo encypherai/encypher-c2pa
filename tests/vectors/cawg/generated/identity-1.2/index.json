@@ -15,7 +15,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-eddsa-jpeg",
       "identity_references": [
@@ -62,7 +62,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-jpeg",
       "identity_references": [
@@ -109,7 +109,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-ps256-jpeg",
       "identity_references": [
@@ -156,7 +156,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-png",
       "identity_references": [
@@ -203,7 +203,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.bmff.v3",
       "id": "x509-es256-mp4",
       "identity_references": [
@@ -250,7 +250,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-wav",
       "identity_references": [
@@ -297,7 +297,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-pdf",
       "identity_references": [
@@ -344,7 +344,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-wrong-eku-jpeg",
       "identity_references": [
@@ -392,7 +392,7 @@
       "composition": false,
       "credential_lane": "smime",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-smime-jpeg",
       "identity_references": [
@@ -442,7 +442,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-pad1-jpeg",
       "identity_references": [
@@ -489,7 +489,7 @@
       "composition": true,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-composed-jpeg",
       "identity_references": [
@@ -536,7 +536,7 @@
       "composition": false,
       "credential_lane": "document_signing",
       "credential_type": "x509",
-      "fixed_validation_time": "2026-08-04T00:00:00Z",
+      "fixed_validation_time": "2026-08-06T00:00:00Z",
       "hard_binding": "c2pa.hash.data",
       "id": "x509-es256-bestpractice-jpeg",
       "identity_references": [

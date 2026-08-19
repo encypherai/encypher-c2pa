@@ -77,6 +77,12 @@ assert.equal(report.signature, "valid");
 assert.equal(report.hard_binding, "match");
 assert.equal(report.trust.status, "not_valid_for_supplied_material");
 assert.equal(report.trust.basis, "bundled_static_material");
+assert.equal(
+  Object.getPrototypeOf(report.manifest_report.manifests),
+  Object.prototype,
+);
+assert.ok(Object.keys(report.manifest_report.manifests).length > 0);
+assert.ok(report.manifest_report.active_manifest);
 const customTrustOnly = verify(asset, "image/jpeg", { no_default_trust: true });
 assert.equal(customTrustOnly.trust.status, "not_evaluated");
 assert.ok(supportedMimeTypes().includes("video/mp4"));
@@ -86,6 +92,28 @@ const mp4 = await readFile(resolve(root, "tests/fixtures/signed_test.mp4"));
 const fragmented = verifyFragmented(mp4, [], "video/mp4");
 assert.equal(fragmented.integrity, "valid");
 assert.equal(fragmented.hard_binding, "match");
+assert.equal(
+  Object.getPrototypeOf(fragmented.manifest_report.manifests),
+  Object.prototype,
+);
+const timestampedAsset = await readFile(
+  resolve(
+    root,
+    "tests/vectors/cawg/generated/identity-1.2/assets/x509-es256-smime-jpeg.jpg",
+  ),
+);
+const historicalReport = verify(timestampedAsset, "image/jpeg", {
+  validation_time: "2020-01-01T00:00:00Z",
+  telemetry: { enabled: false },
+});
+assert.equal(historicalReport.trust.validation_time, "2020-01-01T00:00:00Z");
+assert.ok(
+  historicalReport.validation_results.informational.some(
+    ({ code, explanation }) =>
+      code === "timeStamp.malformed" &&
+      explanation.includes("timestamp_time_in_future"),
+  ),
+);
 assert.throws(
   () => verifyFragmented(asset, [new Uint8Array([1])], "image/jpeg"),
   /unsupported_mime/,

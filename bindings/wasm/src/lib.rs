@@ -4,6 +4,7 @@ use encypher_c2pa::{
     supported_mime_types, validation_failure_telemetry, verify_fragmented_with_options,
     verify_with_options, VerifyOptions,
 };
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(inline_js = r#"
@@ -69,7 +70,8 @@ pub fn verify_js(
         }
     }
     let report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
-    serde_wasm_bindgen::to_value(&report)
+    report
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| js_error("serialization_error", error.to_string()))
 }
 
@@ -118,7 +120,8 @@ pub fn verify_fragmented_js(
         }
     }
     let report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
-    serde_wasm_bindgen::to_value(&report)
+    report
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| js_error("serialization_error", error.to_string()))
 }
 
