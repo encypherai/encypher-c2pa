@@ -2,6 +2,10 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+- Fixed a `claim.malformed` regression that rejected any manifest carrying a claim-generator icon. A `claim_generator_info` icon is a hashed-URI pointer to an assertion the claim also declares, not a second declaration of it, and claim v1 lets several generator-info entries share one icon. Icon references were being merged into the same set used to detect a label declared twice, so a conforming manifest, such as those written by OpenAI's image service, failed with `claim declares assertion 'c2pa.icon' more than once`. Icon references are still resolved and hash-verified individually; declaring one assertion twice in `assertions`, `created_assertions`, or `gathered_assertions` remains a fatal `claim.malformed`.
+
 ## 1.0.5 - 2026-08-19
 
 - Browser verification reports now serialize map-backed fields as plain JavaScript objects, so consumers can read active manifests and validation failures without Rust `Map` semantics.
