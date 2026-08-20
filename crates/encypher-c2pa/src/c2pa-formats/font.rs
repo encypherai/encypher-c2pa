@@ -97,7 +97,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         return Ok(None);
     };
     if is_legacy_raw_store(table) {
-        return Ok(Some(table.to_vec()));
+        return Ok(Some(super::logical_manifest_store(table).to_vec()));
     }
     if table.len() < C2PA_TABLE_RECORD_LEN {
         return Err(FormatError::Truncated(FMT));
@@ -110,7 +110,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         length,
         "invalid C2PA font-table manifest-store range",
     )?
-    .map(ToOwned::to_owned))
+    .map(|store| super::logical_manifest_store(store).to_vec()))
 }
 
 /// Return the active-manifest URI declared by a C2PA 2.4 font table.
@@ -489,6 +489,15 @@ mod tests {
             store.as_slice()
         );
         assert!(exclusions(&bare_font()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn extraction_trims_zero_filled_placeholder_tail() {
+        let store = crate::c2pa_formats::tests::dummy_manifest_store();
+        let mut padded = store.clone();
+        padded.resize(store.len() + 1024, 0);
+        let font = font_with_manifest(&padded);
+        assert_eq!(extract(&font).unwrap().as_deref(), Some(store.as_slice()));
     }
 
     #[test]

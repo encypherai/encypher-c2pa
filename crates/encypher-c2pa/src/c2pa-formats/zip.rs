@@ -409,7 +409,9 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         .checked_add(entry.comp_size as usize)
         .filter(|&e| e <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
-    Ok(Some(data[data_start..data_end].to_vec()))
+    Ok(Some(
+        super::logical_manifest_store(&data[data_start..data_end]).to_vec(),
+    ))
 }
 
 /// The stored manifest entry's data region as a `c2pa.hash.data` exclusion.
@@ -676,6 +678,18 @@ mod tests {
     fn roundtrip() {
         let store = dummy_manifest_store();
         let embedded = embed(&tiny_zip(), &store).unwrap();
+        assert_eq!(
+            extract(&embedded).unwrap().as_deref(),
+            Some(store.as_slice())
+        );
+    }
+
+    #[test]
+    fn extraction_trims_zero_filled_placeholder_tail() {
+        let store = dummy_manifest_store();
+        let mut padded = store.clone();
+        padded.resize(store.len() + 1024, 0);
+        let embedded = embed(&tiny_zip(), &padded).unwrap();
         assert_eq!(
             extract(&embedded).unwrap().as_deref(),
             Some(store.as_slice())

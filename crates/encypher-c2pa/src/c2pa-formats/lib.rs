@@ -542,6 +542,41 @@ pub(crate) fn carrier_placement_error(
     }
 }
 
+/// Remove zero-filled capacity reserved after a complete top-level JUMBF box.
+///
+/// ZIP entries and SFNT tables have no separate logical-content length. C2PA
+/// signers therefore reserve their fixed carrier size with zero bytes after the
+/// manifest store. The JUMBF box length remains authoritative. Non-zero trailing
+/// bytes stay visible so the strict parser rejects them.
+fn logical_manifest_store(data: &[u8]) -> &[u8] {
+    let Some(header) = data.get(..8) else {
+        return data;
+    };
+    if &header[4..8] != b"jumb" {
+        return data;
+    }
+    let short_size = u32::from_be_bytes(header[..4].try_into().expect("four-byte size"));
+    let declared = match short_size {
+        0 => return data,
+        1 => {
+            let Some(extended) = data.get(8..16) else {
+                return data;
+            };
+            let size = u64::from_be_bytes(extended.try_into().expect("eight-byte size"));
+            let Ok(size) = usize::try_from(size) else {
+                return data;
+            };
+            size
+        }
+        size => size as usize,
+    };
+    if declared >= 8 && declared < data.len() && data[declared..].iter().all(|byte| *byte == 0) {
+        &data[..declared]
+    } else {
+        data
+    }
+}
+
 /// Extract the raw JUMBF manifest-store bytes from `data`.
 ///
 /// Returns `Ok(Some(bytes))` with the manifest-store superbox (suitable for
