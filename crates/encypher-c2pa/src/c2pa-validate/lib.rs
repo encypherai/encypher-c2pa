@@ -2411,6 +2411,18 @@ impl<'index, 'claim> BindingPlan<'index, 'claim> {
 
 const GENERATOR_ICON_REFERENCE_FIELD: &str = "claim_generator_info.icon";
 
+/// Identity of the binding a hashed-URI reference asserts: the assertion it
+/// resolves to, the algorithm it names (absent means the claim's `alg`, which
+/// is the same for every reference in one claim), and the digest it expects.
+/// References sharing this key are interchangeable during validation.
+fn hashed_uri_binding_key<'a>(
+    value: &'a Value,
+    label: &'a str,
+) -> Option<(&'a str, Option<&'a str>, &'a [u8])> {
+    let hash = value.get("hash").and_then(Value::as_bytes)?;
+    Some((label, value.get("alg").and_then(Value::as_text), hash))
+}
+
 fn visit_generator_icon_references<'a>(
     claim: &'a Value,
     generation: ClaimGeneration,
@@ -2444,6 +2456,10 @@ fn visit_generator_icon_references<'a>(
 /// assertion-store boxes are decoded or exposed to semantic validation.
 struct ClaimAssertionRefs<'a> {
     complete: bool,
+    /// A label declared more than once by the claim's assertion lists
+    /// (`assertions` / `created_assertions` / `gathered_assertions`). A
+    /// `claim_generator_info` icon pointing at an already-declared assertion is
+    /// not a second declaration and never lands here.
     duplicate_label: Option<&'a str>,
     references: Vec<ClaimAssertionReference<'a>>,
     binding_labels: Vec<&'a str>,
@@ -2490,7 +2506,17 @@ impl<'a> ClaimAssertionRefs<'a> {
         }
 
         let mut references = Vec::with_capacity(total);
+        // Coverage set: every assertion label the claim reaches, from either an
+        // assertion list or a `claim_generator_info` icon. Drives payload
+        // indexing, digest-work accounting, and the undeclared-assertion sweep.
         let mut declared_labels = std::collections::HashSet::with_capacity(total);
+        // Declaration set: assertion lists only. A label may be declared once.
+        let mut declaration_labels = std::collections::HashSet::with_capacity(total);
+        // Every distinct hashed-URI binding the claim asserts. Two references
+        // sharing a key resolve the same assertion bytes under the same
+        // algorithm against the same expected digest, so the second can only
+        // restate the first's verdict.
+        let mut binding_keys = std::collections::HashSet::with_capacity(total);
         let mut duplicate_label = None;
         let mut binding_labels = Vec::new();
         for field in ref_fields(generation) {
@@ -2510,9 +2536,13 @@ impl<'a> ClaimAssertionRefs<'a> {
                     }
                 }
                 if let Some(label) = label {
-                    if !declared_labels.insert(label) {
+                    if !declaration_labels.insert(label) {
                         duplicate_label.get_or_insert(label);
                         continue;
+                    }
+                    declared_labels.insert(label);
+                    if let Some(key) = hashed_uri_binding_key(value, label) {
+                        binding_keys.insert(key);
                     }
                 }
                 references.push(ClaimAssertionReference {
@@ -2522,15 +2552,23 @@ impl<'a> ClaimAssertionRefs<'a> {
                 });
             }
         }
+        // A `claim_generator_info` icon is a hashed-URI *pointer* to an assertion,
+        // not an assertion declaration: C2PA requires the icon assertion to also
+        // appear in the claim's assertion list, and claim v1 allows several
+        // `claim_generator_info` entries to share one icon. Both shapes are
+        // lawful, so an icon reference never raises `duplicate_label`. Each icon
+        // hashed-URI is still resolved and hash-verified on its own.
         visit_generator_icon_references(claim, generation, |value| {
             let label = value
                 .get("url")
                 .and_then(Value::as_text)
                 .and_then(|url| assertion_label_for_manifest(url, &manifest.label));
             if let Some(label) = label {
-                if !declared_labels.insert(label) {
-                    duplicate_label.get_or_insert(label);
-                    return;
+                declared_labels.insert(label);
+                if let Some(key) = hashed_uri_binding_key(value, label) {
+                    if !binding_keys.insert(key) {
+                        return;
+                    }
                 }
             }
             references.push(ClaimAssertionReference {
@@ -2564,7 +2602,13 @@ impl<'a> ClaimAssertionRefs<'a> {
         let mut decode_budget_exhausted = false;
         let mut assertions = std::collections::HashMap::with_capacity(declared_labels.len());
         let mut invalid_cbor_labels = Vec::new();
+        // Index (and decode) each label once even when two references reach it.
+        // A `claim_generator_info` icon and its assertion-list declaration share
+        // one payload, so the decoder budget is charged for it once.
         for reference in references.iter().filter_map(|reference| reference.label) {
+            if assertions.contains_key(reference) {
+                continue;
+            }
             let payload = payloads.get(reference).copied();
             let decoded = if decode_payloads && !decode_budget_exhausted {
                 match payload {
@@ -8405,6 +8449,261 @@ mod tests {
         );
         assert!(fatal);
         assert!(results.has_failure(CLAIM_MALFORMED));
+    }
+
+    // Regression fixtures for the `claim_generator_info` icon: the generator
+    // icon is a hashed-URI *pointer* to an assertion the claim also declares,
+    // never a second declaration of it.
+    const ICON_LABEL: &str = "c2pa.icon";
+    const ICON_JUMBF: &[u8] = b"icon assertion jumbf content";
+    const ACTIONS_JUMBF: &[u8] = b"actions assertion jumbf content";
+    const HASH_DATA_JUMBF: &[u8] = b"hash data assertion jumbf content";
+    const ICON_MANIFEST_LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-000000000001";
+    const ICON_SIG_URL: &str =
+        "self#jumbf=/c2pa/urn:c2pa:00000000-0000-4000-8000-000000000001/c2pa.signature";
+
+    /// The one `c2pa.created` actions payload the fixture's semantic phase
+    /// needs. Encoded once so the manifest can borrow it for `'static`.
+    static ICON_ACTIONS_PAYLOAD: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        enc(&vmap(vec![(
+            "actions",
+            Value::Array(vec![vmap(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+                            .into(),
+                    ),
+                ),
+            ])]),
+        )]))
+    });
+
+    fn icon_manifest() -> ParsedManifest<'static> {
+        ParsedManifest {
+            label: ICON_MANIFEST_LABEL.into(),
+            manifest_jumbf: &[],
+            assertions: vec![("c2pa.actions.v2".into(), ICON_ACTIONS_PAYLOAD.as_slice())],
+            assertion_jumbf: vec![
+                (ICON_LABEL.into(), ICON_JUMBF),
+                ("c2pa.actions.v2".into(), ACTIONS_JUMBF),
+                ("c2pa.hash.data".into(), HASH_DATA_JUMBF),
+            ],
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        }
+    }
+
+    fn bound_hashed_uri(label: &str, jumbf: &[u8]) -> Value {
+        vmap(vec![
+            (
+                "url",
+                Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(jumbf))),
+        ])
+    }
+
+    /// Structure gate plus every hashed-URI binding, the two phases the
+    /// generator icon flows through.
+    fn run_icon_manifest(
+        claim: &Value,
+        generation: ClaimGeneration,
+    ) -> (bool, Option<String>, ValidationResults) {
+        let manifests = [icon_manifest()];
+        let hashes = std::collections::HashMap::new();
+        let mut results = ValidationResults::default();
+        let mut claim_refs = ClaimAssertionRefs::build(&manifests[0], claim, generation);
+        let duplicate = claim_refs.duplicate_label.map(str::to_string);
+        let fatal = verify_claim_structure(
+            &manifests[0],
+            StoreContext {
+                manifests: &manifests,
+                manifest_hashes: &hashes,
+            },
+            claim,
+            generation,
+            &claim_refs,
+            AssetFormat::Jpeg,
+            ICON_SIG_URL,
+            &mut results,
+        );
+        verify_assertion_bindings(
+            claim,
+            &mut claim_refs,
+            generation,
+            ICON_MANIFEST_LABEL,
+            &mut results,
+        );
+        (fatal, duplicate, results)
+    }
+
+    fn icon_statuses(results: &ValidationResults) -> (usize, usize) {
+        let matched = results
+            .success
+            .iter()
+            .filter(|status| {
+                status.code == ASSERTION_HASHED_URI_MATCH && status.url.ends_with(ICON_LABEL)
+            })
+            .count();
+        let mismatched = results
+            .failure
+            .iter()
+            .filter(|status| {
+                status.code == ASSERTION_HASHED_URI_MISMATCH && status.url.ends_with(ICON_LABEL)
+            })
+            .count();
+        (matched, mismatched)
+    }
+
+    /// The shape shipped by OpenAI's image service (claim v2, generator icon
+    /// plus three hashed assertions). The icon is declared once in
+    /// `created_assertions` and pointed at once from `claim_generator_info`;
+    /// neither C2PA 2.x nor the icon's own schema forbids that, so the manifest
+    /// must stay valid instead of failing `claim.malformed`.
+    #[test]
+    fn v2_generator_icon_pointing_at_its_own_declaration_is_not_a_duplicate() {
+        let icon = bound_hashed_uri(ICON_LABEL, ICON_JUMBF);
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![
+                    ("name", Value::Text("OpenAI Media Service API".into())),
+                    ("icon", icon.clone()),
+                ]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(vec![
+                    icon,
+                    bound_hashed_uri("c2pa.actions.v2", ACTIONS_JUMBF),
+                    bound_hashed_uri("c2pa.hash.data", HASH_DATA_JUMBF),
+                ]),
+            ),
+        ]);
+
+        let (fatal, duplicate, results) = run_icon_manifest(&claim, ClaimGeneration::V2);
+        assert_eq!(duplicate, None);
+        assert!(!fatal);
+        assert_eq!(results.failure, Vec::new());
+        assert_eq!(icon_statuses(&results), (1, 0));
+        assert!(results.has_success(ASSERTION_HASHED_URI_MATCH));
+    }
+
+    /// Claim v1 carries `claim_generator_info` as an array of 1..* entries,
+    /// each with an optional icon. Nothing requires those icons to differ, so
+    /// two entries reusing one icon assertion is lawful.
+    #[test]
+    fn v1_generator_info_entries_may_share_one_icon() {
+        let icon = bound_hashed_uri(ICON_LABEL, ICON_JUMBF);
+        let generator_entry = |name: &str| {
+            vmap(vec![
+                ("name", Value::Text(name.into())),
+                ("icon", icon.clone()),
+            ])
+        };
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("claim_generator", Value::Text("test/1.0".into())),
+            ("dc:format", Value::Text("image/jpeg".into())),
+            (
+                "claim_generator_info",
+                Value::Array(vec![generator_entry("first"), generator_entry("second")]),
+            ),
+            (
+                "assertions",
+                Value::Array(vec![
+                    icon.clone(),
+                    bound_hashed_uri("c2pa.actions.v2", ACTIONS_JUMBF),
+                    bound_hashed_uri("c2pa.hash.data", HASH_DATA_JUMBF),
+                ]),
+            ),
+        ]);
+
+        let (fatal, duplicate, results) = run_icon_manifest(&claim, ClaimGeneration::V1);
+        assert_eq!(duplicate, None);
+        assert!(!fatal);
+        assert_eq!(results.failure, Vec::new());
+        assert_eq!(icon_statuses(&results), (1, 0));
+    }
+
+    /// The strictness this fix must not spend: declaring one assertion twice in
+    /// the claim's own assertion list stays a fatal `claim.malformed`, icon or
+    /// not, because the two declarations make internal references ambiguous.
+    #[test]
+    fn duplicate_icon_declaration_in_the_assertion_list_is_still_fatal() {
+        let icon = bound_hashed_uri(ICON_LABEL, ICON_JUMBF);
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![
+                    ("name", Value::Text("test".into())),
+                    ("icon", icon.clone()),
+                ]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(vec![
+                    icon.clone(),
+                    icon,
+                    bound_hashed_uri("c2pa.hash.data", HASH_DATA_JUMBF),
+                ]),
+            ),
+        ]);
+
+        let (fatal, duplicate, results) = run_icon_manifest(&claim, ClaimGeneration::V2);
+        assert_eq!(duplicate.as_deref(), Some(ICON_LABEL));
+        assert!(fatal);
+        assert!(results
+            .failure
+            .iter()
+            .any(|status| status.code == CLAIM_MALFORMED
+                && status.explanation
+                    == format!("claim declares assertion '{ICON_LABEL}' more than once")));
+    }
+
+    /// An icon reference is only interchangeable with a declaration that binds
+    /// the same bytes. A generator icon whose signed digest diverges from the
+    /// declared one is still resolved and still fails.
+    #[test]
+    fn generator_icon_with_a_divergent_hash_is_still_verified() {
+        let declared_icon = bound_hashed_uri(ICON_LABEL, ICON_JUMBF);
+        let substituted_icon = vmap(vec![
+            (
+                "url",
+                Value::Text(format!("self#jumbf=c2pa.assertions/{ICON_LABEL}")),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(vec![0xab; 32])),
+        ]);
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![
+                    ("name", Value::Text("test".into())),
+                    ("icon", substituted_icon),
+                ]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(vec![
+                    declared_icon,
+                    bound_hashed_uri("c2pa.hash.data", HASH_DATA_JUMBF),
+                    bound_hashed_uri("c2pa.actions.v2", ACTIONS_JUMBF),
+                ]),
+            ),
+        ]);
+
+        let (_, duplicate, results) = run_icon_manifest(&claim, ClaimGeneration::V2);
+        assert_eq!(duplicate, None);
+        assert_eq!(icon_statuses(&results), (1, 1));
     }
 
     #[test]
