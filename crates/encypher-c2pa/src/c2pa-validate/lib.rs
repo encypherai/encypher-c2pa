@@ -699,10 +699,10 @@ fn verify_with_fragments(
         }
         return Ok(out);
     };
-    // In regular mode every data-hash exclusion must describe bytes inside the
-    // resolved manifest carrier. This prevents a signed assertion from making
-    // host bytes mutable while retaining spec-compatible additional-exclusion
-    // behavior in conformance mode.
+    // Regular verification only permits mutable host bytes for the signed
+    // dual-layer text profile. Those exclusions must be UTF-8 variation
+    // selectors and their count must match the signed v3 commitment. Every
+    // other format keeps the carrier-only policy.
     if input.profile.mode == OperatingMode::Regular
         && crate::c2pa_formats::supports_hash_mode(input.mime)
     {
@@ -714,7 +714,25 @@ fn verify_with_fragments(
                     spans.len()
                 )));
             };
-            validate_regular_exclusion_geometry(&exclusions, carrier.start, carrier.length)?;
+            if matches!(format, AssetFormat::TextUnstructured) {
+                if let Some(run_count) = dual_text_insertion_run_count(manifest) {
+                    validate_regular_dual_text_exclusion_geometry(
+                        &exclusions,
+                        carrier.start,
+                        carrier.length,
+                        input.data,
+                        run_count,
+                    )?;
+                } else {
+                    validate_regular_exclusion_geometry(
+                        &exclusions,
+                        carrier.start,
+                        carrier.length,
+                    )?;
+                }
+            } else {
+                validate_regular_exclusion_geometry(&exclusions, carrier.start, carrier.length)?;
+            }
         }
     }
     let additional_exclusions_present = input.profile.mode == OperatingMode::Conformance
@@ -1267,6 +1285,88 @@ fn has_conformance_additional_exclusions(
             .checked_add(*length)
             .is_none_or(|end| *start < carrier.start || end > carrier_end)
     })
+}
+
+fn dual_text_insertion_run_count(manifest: &ParsedManifest<'_>) -> Option<usize> {
+    let commitments = manifest
+        .assertions
+        .iter()
+        .filter(|(label, _)| label == "com.encypher.fragment_pointers.v3")
+        .collect::<Vec<_>>();
+    let [commitment] = commitments.as_slice() else {
+        return None;
+    };
+    let data = decode(commitment.1).ok()?;
+    let version = match data.get("version")? {
+        Value::Integer(value) => *value,
+        _ => return None,
+    };
+    let engine = data.get("engine")?.as_text()?;
+    let profile = data.get("profile")?.as_text()?;
+    let run_count = match data.get("insertion_run_count")? {
+        Value::Integer(value) => usize::try_from(*value).ok()?,
+        _ => return None,
+    };
+    (version == 3 && engine == "encypher-c2pa" && profile == "leaf-pointer-v2").then_some(run_count)
+}
+
+fn is_variation_selector(character: char) -> bool {
+    matches!(character as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+}
+
+fn validate_regular_dual_text_exclusion_geometry(
+    exclusions: &[(usize, usize)],
+    carrier_start: usize,
+    carrier_length: usize,
+    data: &[u8],
+    insertion_run_count: usize,
+) -> Result<(), ValidateError> {
+    let carrier_end = carrier_start.checked_add(carrier_length).ok_or_else(|| {
+        ValidateError::HardBinding("resolved carrier output span overflows".into())
+    })?;
+    let mut sorted = exclusions.to_vec();
+    sorted.sort_unstable_by_key(|(start, _)| *start);
+    let mut previous_end = None;
+    let mut carrier_count = 0usize;
+    let mut pointer_count = 0usize;
+    for (start, length) in sorted {
+        let end = start.checked_add(length).ok_or_else(|| {
+            ValidateError::HardBinding("signed dual-text exclusion range overflows".into())
+        })?;
+        if previous_end.is_some_and(|prior| start < prior) || end > data.len() {
+            return Err(ValidateError::HardBinding(
+                "signed dual-text exclusions overlap or exceed the asset".into(),
+            ));
+        }
+        previous_end = Some(end);
+        if start == carrier_start && end == carrier_end {
+            carrier_count += 1;
+            continue;
+        }
+        if start < carrier_end && end > carrier_start {
+            return Err(ValidateError::HardBinding(
+                "signed dual-text exclusion intersects the manifest carrier".into(),
+            ));
+        }
+        let selectors = std::str::from_utf8(&data[start..end]).map_err(|_| {
+            ValidateError::HardBinding(
+                "signed dual-text pointer exclusion is not valid UTF-8".into(),
+            )
+        })?;
+        if selectors.is_empty() || !selectors.chars().all(is_variation_selector) {
+            return Err(ValidateError::HardBinding(
+                "signed dual-text pointer exclusion contains non-selector bytes".into(),
+            ));
+        }
+        pointer_count += 1;
+    }
+    if carrier_count != 1 || pointer_count != insertion_run_count {
+        return Err(ValidateError::HardBinding(
+            "signed dual-text exclusions do not match the manifest carrier and pointer commitment"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_regular_exclusion_geometry(
@@ -10234,5 +10334,65 @@ mod tests {
         let view = certificate_status_payloads(std::slice::from_ref(&manifest));
         assert!(view.rejected);
         assert!(view.payloads.is_empty());
+    }
+    fn dual_text_geometry_fixture(pointer: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>, usize, usize) {
+        let mut data = b"A".to_vec();
+        let pointer_start = data.len();
+        data.extend_from_slice(pointer);
+        data.extend_from_slice(b" visible");
+        let carrier_start = data.len();
+        data.extend_from_slice(b"manifest-carrier");
+        let carrier_length = data.len() - carrier_start;
+        (
+            data,
+            vec![
+                (pointer_start, pointer.len()),
+                (carrier_start, carrier_length),
+            ],
+            carrier_start,
+            carrier_length,
+        )
+    }
+
+    #[test]
+    fn regular_dual_text_accepts_selector_runs_bound_by_commitment_count() {
+        let (data, exclusions, carrier_start, carrier_length) =
+            dual_text_geometry_fixture("\u{e0100}".as_bytes());
+        validate_regular_dual_text_exclusion_geometry(
+            &exclusions,
+            carrier_start,
+            carrier_length,
+            &data,
+            1,
+        )
+        .expect("valid dual-text geometry");
+    }
+
+    #[test]
+    fn regular_dual_text_rejects_non_selector_host_exclusions() {
+        let (data, exclusions, carrier_start, carrier_length) =
+            dual_text_geometry_fixture(b"mutable");
+        assert!(validate_regular_dual_text_exclusion_geometry(
+            &exclusions,
+            carrier_start,
+            carrier_length,
+            &data,
+            1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn regular_dual_text_rejects_pointer_count_mismatch() {
+        let (data, exclusions, carrier_start, carrier_length) =
+            dual_text_geometry_fixture("\u{fe01}".as_bytes());
+        assert!(validate_regular_dual_text_exclusion_geometry(
+            &exclusions,
+            carrier_start,
+            carrier_length,
+            &data,
+            2,
+        )
+        .is_err());
     }
 }
