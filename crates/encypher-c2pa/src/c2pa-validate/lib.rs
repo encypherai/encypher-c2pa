@@ -5344,12 +5344,17 @@ fn verify_collection_hash(
         return;
     };
 
-    // Parse the central directory up front, both as a structural check and to
-    // obtain the exact A.6.2.2 byte slices.
-    let Ok(cd_parts) = crate::c2pa_formats::zip_central_directory_hash_parts(data) else {
-        malformed(results, "asset is not a readable ZIP archive".into());
-        return;
+    let index = match crate::c2pa_formats::zip_index(data) {
+        Ok(index) => index,
+        Err(error) => {
+            malformed(
+                results,
+                format!("asset is not a readable ZIP archive: {error}"),
+            );
+            return;
+        }
     };
+    let cd_parts = index.central_directory_hash_parts();
     let Some(expected_cd) = map
         .get("zip_central_directory_hash")
         .and_then(Value::as_bytes)
@@ -5357,6 +5362,37 @@ fn verify_collection_hash(
         malformed(results, "zip_central_directory_hash missing".into());
         return;
     };
+    const MANIFEST_ENTRY: &str = "META-INF/content_credential.c2pa";
+    let actual_members = index.members();
+    let mut actual = std::collections::HashSet::with_capacity(actual_members.len());
+    for member in actual_members {
+        let raw_name = member.raw_name();
+        if raw_name == MANIFEST_ENTRY.as_bytes() || raw_name.ends_with(b"/") {
+            continue;
+        }
+        let name = match std::str::from_utf8(raw_name) {
+            Ok(name) => name,
+            Err(_) => {
+                results.push_failure(
+                    ASSERTION_COLLECTION_HASH_INVALID_URI,
+                    url,
+                    "archive member name is not valid UTF-8".into(),
+                );
+                return;
+            }
+        };
+        let Some(member_uri) = canonical_collection_member_uri(name) else {
+            results.push_failure(
+                ASSERTION_COLLECTION_HASH_INVALID_URI,
+                url,
+                format!("archive member '{name}' cannot be represented as a canonical URI"),
+            );
+            return;
+        };
+        actual.insert(member_uri);
+    }
+
+    let mut declared = std::collections::HashSet::with_capacity(uris.len());
 
     for u in uris {
         let (Some(uri), Some(expected)) = (
@@ -5366,50 +5402,57 @@ fn verify_collection_hash(
             malformed(results, "uri entry missing uri or hash".into());
             return;
         };
-        if uri.split('/').any(|seg| seg == "." || seg == "..") {
+        let Some(member_name) = canonical_collection_uri_member(uri) else {
             results.push_failure(
                 ASSERTION_COLLECTION_HASH_INVALID_URI,
                 url,
-                format!("uri '{uri}' contains a relative path segment"),
+                format!("uri '{uri}' is not a canonical relative collection URI"),
             );
             return;
-        }
-        // Primary: exact A.6.2.1 header-plus-content span. Compatibility:
-        // c2pa-org's published ZIP vector includes the trailing descriptor.
-        let span = match crate::c2pa_formats::zip_entry_hash_span(data, uri) {
-            Ok(s) => s,
-            Err(e) => {
-                malformed(results, format!("entry '{uri}' unreadable: {e}"));
-                return;
-            }
         };
-        let Some((es, ee)) = span else {
+        if !declared.insert(uri.to_string()) {
+            malformed(results, format!("duplicate collection URI '{uri}'"));
+            return;
+        }
+        let Some(member) = index.get(member_name.as_bytes()) else {
             results.push_failure(
                 ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT,
                 url,
-                format!("listed file '{uri}' not found in archive"),
+                format!("listed file '{member_name}' not found in archive"),
             );
             return;
         };
-        let exact_match = hash_bytes(alg, &data[es..ee]).is_some_and(|h| h.as_slice() == expected);
-        let public_vector_match = !exact_match
-            && matches!(
-                crate::c2pa_formats::zip_entry_local_span(data, uri),
-                Ok(Some((start, end)))
-                    if hash_bytes(alg, &data[start..end])
-                        .is_some_and(|h| h.as_slice() == expected)
-            );
+        let (start, end) = member.hash_span();
+        let exact_match =
+            hash_bytes(alg, &data[start..end]).is_some_and(|hash| hash.as_slice() == expected);
+        let public_vector_match = !exact_match && {
+            let (local_start, local_end) = member.local_span();
+            hash_bytes(alg, &data[local_start..local_end])
+                .is_some_and(|hash| hash.as_slice() == expected)
+        };
         if !(exact_match || public_vector_match) {
             results.push_failure(
                 ASSERTION_COLLECTION_HASH_MISMATCH,
-                url.clone(),
-                format!("collection entry '{uri}' hash mismatch"),
+                url,
+                format!("collection entry '{member_name}' hash mismatch"),
             );
             return;
         }
     }
+    if declared != actual {
+        let missing = declared.difference(&actual).cloned().collect::<Vec<_>>();
+        let extra = actual.difference(&declared).cloned().collect::<Vec<_>>();
+        results.push_failure(
+            ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT,
+            url,
+            format!(
+                "collection member set differs from assertion (missing: {missing:?}; extra: {extra:?})"
+            ),
+        );
+        return;
+    }
 
-    let cd_ok = hash_parts(alg, &cd_parts).is_some_and(|h| h.as_slice() == expected_cd);
+    let cd_ok = hash_parts(alg, cd_parts).is_some_and(|h| h.as_slice() == expected_cd);
     if !cd_ok {
         results.push_failure(
             ASSERTION_COLLECTION_HASH_MISMATCH,
@@ -5428,6 +5471,61 @@ fn verify_collection_hash(
             ),
         );
     }
+}
+
+fn canonical_collection_member_uri(member: &str) -> Option<String> {
+    if member.is_empty()
+        || member.starts_with('/')
+        || member.contains('\\')
+        || member.bytes().any(|byte| byte.is_ascii_control())
+        || member
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    let mut uri = String::with_capacity(member.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in member.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[(byte >> 4) as usize]));
+            uri.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    Some(uri)
+}
+
+fn canonical_collection_uri_member(uri: &str) -> Option<String> {
+    let bytes = uri.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let high = *bytes.get(index + 1)?;
+                let low = *bytes.get(index + 2)?;
+                let nibble = |byte: u8| match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'A'..=b'F' => Some(byte - b'A' + 10),
+                    _ => None,
+                };
+                decoded.push((nibble(high)? << 4) | nibble(low)?);
+                index += 3;
+            }
+            byte if byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') =>
+            {
+                decoded.push(byte);
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    let member = String::from_utf8(decoded).ok()?;
+    (canonical_collection_member_uri(&member).as_deref() == Some(uri)).then_some(member)
 }
 
 /// Maximum number of `c2pa.hash.data` exclusion ranges the verifier accepts.
@@ -10533,5 +10631,28 @@ mod tests {
         let view = certificate_status_payloads(std::slice::from_ref(&manifest));
         assert!(view.rejected);
         assert!(view.payloads.is_empty());
+    }
+    #[test]
+    fn collection_uri_round_trips_reserved_docx_member_bytes() {
+        let member = "[Content_Types].xml";
+        let uri = canonical_collection_member_uri(member).expect("canonical URI");
+        assert_eq!(uri, "%5BContent_Types%5D.xml");
+        assert_eq!(
+            canonical_collection_uri_member(&uri).as_deref(),
+            Some(member),
+        );
+    }
+
+    #[test]
+    fn collection_uri_rejects_noncanonical_and_traversal_forms() {
+        for uri in [
+            "%5bContent_Types%5d.xml",
+            "%2E%2E/word/document.xml",
+            "%41.xml",
+            "../word/document.xml",
+            "https://example.test/document.xml",
+        ] {
+            assert!(canonical_collection_uri_member(uri).is_none(), "{uri}");
+        }
     }
 }
