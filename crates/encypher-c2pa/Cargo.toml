@@ -46,12 +46,12 @@ rand_core = { workspace = true }
 cms = { workspace = true }
 x509-tsp = { workspace = true }
 unicode-normalization = "0.1"
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
