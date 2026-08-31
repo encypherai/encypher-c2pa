@@ -30,12 +30,12 @@ Every distribution uses the same verification core and report schema.
 
 | Product | Product version | Distribution | C2PA profile | CAWG support |
 |---|---:|---|---|---|
-| Rust SDK | `1.0.5` | [`encypher-c2pa`](https://crates.io/crates/encypher-c2pa) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Command-line interface | `1.0.5` | [`encypher-c2pa-cli`](https://crates.io/crates/encypher-c2pa-cli) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Python SDK | `1.0.5` | [`encypher-c2pa`](https://pypi.org/project/encypher-c2pa/) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Browser JavaScript SDK | `1.0.5` | [`@encypherai/c2pa`](https://www.npmjs.com/package/@encypherai/c2pa) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Go binding | `v1.0.5` source tag | [`bindings/go`](https://github.com/encypherai/encypher-c2pa/tree/v1.0.5/bindings/go) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| C ABI | `v1.0.5` source tag | [`bindings/c`](https://github.com/encypherai/encypher-c2pa/tree/v1.0.5/bindings/c) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
+| Rust SDK | `1.0.6` | [`encypher-c2pa`](https://crates.io/crates/encypher-c2pa) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
+| Command-line interface | `1.0.6` | [`encypher-c2pa-cli`](https://crates.io/crates/encypher-c2pa-cli) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
+| Python SDK | `1.0.6` | [`encypher-c2pa`](https://pypi.org/project/encypher-c2pa/) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
+| Browser JavaScript SDK | `1.0.6` | [`@encypherai/c2pa`](https://www.npmjs.com/package/@encypherai/c2pa) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
+| Go binding | `v1.0.6` source tag | [`bindings/go`](https://github.com/encypherai/encypher-c2pa/tree/v1.0.6/bindings/go) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
+| C ABI | `v1.0.6` source tag | [`bindings/c`](https://github.com/encypherai/encypher-c2pa/tree/v1.0.6/bindings/c) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
 
 The standards columns describe verification compatibility, not a conformance certification claim.
 
@@ -62,7 +62,7 @@ Tagged releases publish the packages below. For an unreleased checkout, use [Bui
 ### CLI
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.5
+cargo install encypher-c2pa-cli --version 1.0.6
 encypher-c2pa verify composition.mp4
 encypher-c2pa verify composition.mp4 --json
 encypher-c2pa formats
@@ -74,7 +74,7 @@ Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupport
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.0.5"
+encypher-c2pa = "1.0.6"
 ```
 
 ```rust

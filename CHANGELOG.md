@@ -4,6 +4,8 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+## 1.0.6 - 2026-08-31
+
 - ZIP collection verification now builds one bounded central-directory index and performs constant-time member lookup, removing a quadratic high-entry archive denial-of-service path while preserving duplicate, ZIP64, traversal, member-set, and hash checks.
 - Collection verification now decodes canonical RFC 3986 member URIs before ZIP lookup and compares the complete declared and presented member sets. DOCX members such as `%5BContent_Types%5D.xml` verify against their raw archive names, while lowercase escapes, over-encoded unreserved bytes, traversal, schemes, queries, fragments, and alternate separators still fail closed.
 - Fixed a `claim.malformed` regression that rejected any manifest carrying a claim-generator icon. A `claim_generator_info` icon is a hashed-URI pointer to an assertion the claim also declares, not a second declaration of it, and claim v1 lets several generator-info entries share one icon. Icon references were being merged into the same set used to detect a label declared twice, so a conforming manifest, such as those written by OpenAI's image service, failed with `claim declares assertion 'c2pa.icon' more than once`. Icon references are still resolved and hash-verified individually; declaring one assertion twice in `assertions`, `created_assertions`, or `gathered_assertions` remains a fatal `claim.malformed`.
