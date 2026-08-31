@@ -8,6 +8,8 @@
 //! Only standard (non-ZIP64) archives are supported; ZIP64 archives return
 //! [`FormatError::UnsupportedVariant`].
 
+use std::collections::HashMap;
+
 use crate::c2pa_formats::util::le_u32;
 use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
 
@@ -18,22 +20,23 @@ const SIG_CENTRAL: u32 = 0x0201_4b50;
 const SIG_EOCD: u32 = 0x0605_4b50;
 const METHOD_STORED: u16 = 0;
 
+#[cfg(test)]
+thread_local! {
+    static CENTRAL_ENTRIES_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn le16(data: &[u8], off: usize) -> Option<u16> {
     data.get(off..off + 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
-/// Parsed end-of-central-directory record.
 struct Eocd {
     total_entries: u16,
-    #[cfg(test)]
     cd_size: u32,
     cd_offset: u32,
-    /// Offset of the EOCD record itself.
     eocd_offset: usize,
 }
 
-/// Locate and parse the EOCD record by scanning backwards from the end.
 fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
     if data.len() < 22 {
         return Err(FormatError::InvalidStructure {
@@ -48,6 +51,17 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
             let total_entries = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
             let cd_size = le_u32(data, pos + 12).ok_or(FormatError::Truncated(FMT))?;
             let cd_offset = le_u32(data, pos + 16).ok_or(FormatError::Truncated(FMT))?;
+            let comment_len = le16(data, pos + 20).ok_or(FormatError::Truncated(FMT))? as usize;
+            if pos.checked_add(22 + comment_len) != Some(data.len()) {
+                if pos == 0 || pos <= max_back {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "no EOCD record",
+                    });
+                }
+                pos -= 1;
+                continue;
+            }
             if cd_offset == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF || total_entries == 0xFFFF {
                 return Err(FormatError::UnsupportedVariant {
                     format: FMT,
@@ -56,7 +70,6 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
             }
             return Ok(Eocd {
                 total_entries,
-                #[cfg(test)]
                 cd_size,
                 cd_offset,
                 eocd_offset: pos,
@@ -72,99 +85,73 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
     }
 }
 
-/// A central-directory entry's salient fields.
-struct CdEntry {
+fn central_directory_bounds(data: &[u8], eocd: &Eocd) -> Result<(usize, usize), FormatError> {
+    let start = eocd.cd_offset as usize;
+    let end = start
+        .checked_add(eocd.cd_size as usize)
+        .filter(|&end| end == eocd.eocd_offset && end <= data.len())
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "central directory bounds do not match EOCD",
+        })?;
+    Ok((start, end))
+}
+
+#[derive(Clone, Copy)]
+pub struct ZipMember<'a> {
+    raw_name: &'a [u8],
     method: u16,
-    comp_size: u32,
-    local_offset: u32,
+    data_span: (usize, usize),
+    hash_span: (usize, usize),
+    local_span: (usize, usize),
+    central_span: (usize, usize),
 }
 
-/// Find a central-directory entry by name. Returns `None` if absent.
-fn find_cd_entry(data: &[u8], eocd: &Eocd, name: &[u8]) -> Result<Option<CdEntry>, FormatError> {
-    let mut pos = eocd.cd_offset as usize;
-    for _ in 0..eocd.total_entries {
-        if le_u32(data, pos) != Some(SIG_CENTRAL) {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "bad central directory signature",
-            });
-        }
-        let method = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
-        let comp_size = le_u32(data, pos + 20).ok_or(FormatError::Truncated(FMT))?;
-        let name_len = le16(data, pos + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-        let extra_len = le16(data, pos + 30).ok_or(FormatError::Truncated(FMT))? as usize;
-        let comment_len = le16(data, pos + 32).ok_or(FormatError::Truncated(FMT))? as usize;
-        let local_offset = le_u32(data, pos + 42).ok_or(FormatError::Truncated(FMT))?;
-        let name_start = pos + 46;
-        let name_end = name_start
-            .checked_add(name_len)
-            .filter(|&e| e <= data.len())
-            .ok_or(FormatError::Truncated(FMT))?;
-        if &data[name_start..name_end] == name {
-            return Ok(Some(CdEntry {
-                method,
-                comp_size,
-                local_offset,
-            }));
-        }
-        pos = name_end + extra_len + comment_len;
+impl<'a> ZipMember<'a> {
+    pub fn raw_name(&self) -> &'a [u8] {
+        self.raw_name
     }
-    Ok(None)
+
+    pub fn hash_span(&self) -> (usize, usize) {
+        self.hash_span
+    }
+
+    pub fn local_span(&self) -> (usize, usize) {
+        self.local_span
+    }
 }
 
-/// Walk every central-directory entry, yielding `(name, method, comp_size,
-/// local_offset)`.
-fn walk_cd(
+/// A bounded, one-pass index of a standard ZIP central directory.
+pub struct ZipIndex<'a> {
+    members: Vec<ZipMember<'a>>,
+    by_name: HashMap<&'a [u8], usize>,
+    central_hash_parts: Vec<&'a [u8]>,
+}
+
+impl<'a> ZipIndex<'a> {
+    pub fn members(&self) -> &[ZipMember<'a>] {
+        &self.members
+    }
+
+    pub fn get(&self, raw_name: &[u8]) -> Option<&ZipMember<'a>> {
+        self.by_name
+            .get(raw_name)
+            .map(|&index| &self.members[index])
+    }
+
+    pub fn central_directory_hash_parts(&self) -> &[&'a [u8]] {
+        &self.central_hash_parts
+    }
+}
+
+fn local_data_span(
     data: &[u8],
     eocd: &Eocd,
-    mut f: impl FnMut(&[u8], u16, u32, u32),
-) -> Result<(), FormatError> {
-    let mut pos = eocd.cd_offset as usize;
-    for _ in 0..eocd.total_entries {
-        if le_u32(data, pos) != Some(SIG_CENTRAL) {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "bad central directory signature",
-            });
-        }
-        let method = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
-        let comp_size = le_u32(data, pos + 20).ok_or(FormatError::Truncated(FMT))?;
-        let name_len = le16(data, pos + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-        let extra_len = le16(data, pos + 30).ok_or(FormatError::Truncated(FMT))? as usize;
-        let comment_len = le16(data, pos + 32).ok_or(FormatError::Truncated(FMT))? as usize;
-        let local_offset = le_u32(data, pos + 42).ok_or(FormatError::Truncated(FMT))?;
-        let name_start = pos + 46;
-        let name_end = name_start
-            .checked_add(name_len)
-            .filter(|&e| e <= data.len())
-            .ok_or(FormatError::Truncated(FMT))?;
-        f(&data[name_start..name_end], method, comp_size, local_offset);
-        pos = name_end + extra_len + comment_len;
-    }
-    Ok(())
-}
-
-/// Every entry name in the archive, in central-directory order.
-pub fn zip_entry_names(data: &[u8]) -> Result<Vec<String>, FormatError> {
-    let eocd = find_eocd(data)?;
-    let mut names = Vec::with_capacity(eocd.total_entries as usize);
-    walk_cd(data, &eocd, |name, _, _, _| {
-        names.push(String::from_utf8_lossy(name).into_owned());
-    })?;
-    Ok(names)
-}
-
-/// The decompressed content of the named entry (`None` when absent).
-///
-/// Supports `stored` (method 0) and `deflate` (method 8) entries — the only
-/// methods in real-world OPC/EPUB archives. Other methods return
-/// [`FormatError::UnsupportedVariant`].
-pub fn zip_entry_data(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, FormatError> {
-    let eocd = find_eocd(data)?;
-    let Some(entry) = find_cd_entry(data, &eocd, name.as_bytes())? else {
-        return Ok(None);
-    };
-    let lh = entry.local_offset as usize;
+    method_size_offset: (u16, u32, u32),
+    expected_name: &[u8],
+) -> Result<(usize, usize), FormatError> {
+    let (_, comp_size, local_offset) = method_size_offset;
+    let lh = local_offset as usize;
     if le_u32(data, lh) != Some(SIG_LOCAL) {
         return Err(FormatError::InvalidStructure {
             format: FMT,
@@ -173,12 +160,177 @@ pub fn zip_entry_data(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, Format
     }
     let name_len = le16(data, lh + 26).ok_or(FormatError::Truncated(FMT))? as usize;
     let extra_len = le16(data, lh + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-    let data_start = lh + 30 + name_len + extra_len;
-    let data_end = data_start
-        .checked_add(entry.comp_size as usize)
-        .filter(|&e| e <= data.len())
+    let name_start = lh
+        .checked_add(30)
+        .filter(|&offset| offset <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
-    let raw = &data[data_start..data_end];
+    let name_end = name_start
+        .checked_add(name_len)
+        .filter(|&offset| offset <= data.len())
+        .ok_or(FormatError::Truncated(FMT))?;
+    if data.get(name_start..name_end) != Some(expected_name) {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "central directory name disagrees with local header",
+        });
+    }
+    let data_start = name_end
+        .checked_add(extra_len)
+        .filter(|&offset| offset <= data.len())
+        .ok_or(FormatError::Truncated(FMT))?;
+    let data_end = data_start
+        .checked_add(comp_size as usize)
+        .filter(|&offset| offset <= eocd.cd_offset as usize)
+        .ok_or(FormatError::Truncated(FMT))?;
+    Ok((data_start, data_end))
+}
+
+fn local_offset_order(members: &[ZipMember<'_>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    let mut scratch = vec![0usize; members.len()];
+    for shift in [0, 8, 16, 24] {
+        let mut counts = [0usize; 256];
+        for &index in &order {
+            counts[(members[index].hash_span.0 >> shift) & 0xff] += 1;
+        }
+        let mut next = 0;
+        for count in &mut counts {
+            let current = *count;
+            *count = next;
+            next += current;
+        }
+        for &index in &order {
+            let bucket = (members[index].hash_span.0 >> shift) & 0xff;
+            scratch[counts[bucket]] = index;
+            counts[bucket] += 1;
+        }
+        std::mem::swap(&mut order, &mut scratch);
+    }
+    order
+}
+
+fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, FormatError> {
+    let (mut pos, cd_end) = central_directory_bounds(data, eocd)?;
+    let mut members = Vec::with_capacity(eocd.total_entries as usize);
+    let mut by_name = HashMap::with_capacity(eocd.total_entries as usize);
+    let mut central_hash_parts = Vec::with_capacity(3);
+    let mut part_start = pos;
+
+    for _ in 0..eocd.total_entries {
+        #[cfg(test)]
+        CENTRAL_ENTRIES_PARSED.with(|count| count.set(count.get() + 1));
+        if pos >= cd_end || le_u32(data, pos) != Some(SIG_CENTRAL) {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "bad central directory signature",
+            });
+        }
+        let method = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
+        let comp_size = le_u32(data, pos + 20).ok_or(FormatError::Truncated(FMT))?;
+        let name_len = le16(data, pos + 28).ok_or(FormatError::Truncated(FMT))? as usize;
+        let extra_len = le16(data, pos + 30).ok_or(FormatError::Truncated(FMT))? as usize;
+        let comment_len = le16(data, pos + 32).ok_or(FormatError::Truncated(FMT))? as usize;
+        let local_offset = le_u32(data, pos + 42).ok_or(FormatError::Truncated(FMT))?;
+        let name_start = pos + 46;
+        let name_end = name_start
+            .checked_add(name_len)
+            .filter(|&end| end <= cd_end)
+            .ok_or(FormatError::Truncated(FMT))?;
+        let entry_end = name_end
+            .checked_add(extra_len)
+            .and_then(|end| end.checked_add(comment_len))
+            .filter(|&end| end <= cd_end)
+            .ok_or(FormatError::Truncated(FMT))?;
+        let raw_name = &data[name_start..name_end];
+        if by_name.contains_key(raw_name) {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "duplicate ZIP entry name",
+            });
+        }
+        let data_span = local_data_span(data, eocd, (method, comp_size, local_offset), raw_name)?;
+        let hash_span = (local_offset as usize, data_span.1);
+        if raw_name == ENTRY_NAME {
+            central_hash_parts.push(&data[part_start..pos + 16]);
+            part_start = pos + 20;
+        }
+        let index = members.len();
+        members.push(ZipMember {
+            raw_name,
+            method,
+            data_span,
+            hash_span,
+            local_span: hash_span,
+            central_span: (pos, entry_end),
+        });
+        by_name.insert(raw_name, index);
+        pos = entry_end;
+    }
+    if pos != cd_end {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "central directory size does not match entries",
+        });
+    }
+    central_hash_parts.push(&data[part_start..]);
+
+    let order = local_offset_order(&members);
+    for (position, &index) in order.iter().enumerate() {
+        let end = order
+            .get(position + 1)
+            .map_or(eocd.cd_offset as usize, |&next| members[next].hash_span.0);
+        if members[index].hash_span.1 > end {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "overlapping ZIP local entries",
+            });
+        }
+        members[index].local_span.1 = end;
+    }
+
+    Ok(ZipIndex {
+        members,
+        by_name,
+        central_hash_parts,
+    })
+}
+
+pub fn zip_index(data: &[u8]) -> Result<ZipIndex<'_>, FormatError> {
+    let eocd = find_eocd(data)?;
+    build_zip_index(data, &eocd)
+}
+
+#[derive(Clone, Copy)]
+struct CdEntry {
+    method: u16,
+    comp_size: u32,
+    local_offset: u32,
+}
+
+fn find_cd_entry(data: &[u8], eocd: &Eocd, name: &[u8]) -> Result<Option<CdEntry>, FormatError> {
+    Ok(build_zip_index(data, eocd)?
+        .get(name)
+        .map(|member| CdEntry {
+            method: member.method,
+            comp_size: (member.data_span.1 - member.data_span.0) as u32,
+            local_offset: member.hash_span.0 as u32,
+        }))
+}
+
+pub fn zip_entry_names(data: &[u8]) -> Result<Vec<String>, FormatError> {
+    Ok(zip_index(data)?
+        .members()
+        .iter()
+        .map(|member| String::from_utf8_lossy(member.raw_name()).into_owned())
+        .collect())
+}
+
+pub fn zip_entry_data(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, FormatError> {
+    let index = zip_index(data)?;
+    let Some(entry) = index.get(name.as_bytes()) else {
+        return Ok(None);
+    };
+    let raw = &data[entry.data_span.0..entry.data_span.1];
     match entry.method {
         METHOD_STORED => Ok(Some(raw.to_vec())),
         8 => {
@@ -206,106 +358,23 @@ pub fn zip_entry_data(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, Format
     }
 }
 
-/// Byte slices hashed in order for `zip_central_directory_hash` (A.6.2.2).
-///
-/// This covers every central-directory header and the complete EOCD record,
-/// while skipping only the four-byte CRC-32 field in the manifest entry's
-/// central header. Returning borrowed slices avoids copying large directories.
 pub fn zip_central_directory_hash_parts(data: &[u8]) -> Result<Vec<&[u8]>, FormatError> {
-    let eocd = find_eocd(data)?;
-    let mut parts = Vec::with_capacity(3);
-    let mut pos = eocd.cd_offset as usize;
-    let mut part_start = pos;
-    for _ in 0..eocd.total_entries {
-        if le_u32(data, pos) != Some(SIG_CENTRAL) {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "bad central directory signature",
-            });
-        }
-        let name_len = le16(data, pos + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-        let extra_len = le16(data, pos + 30).ok_or(FormatError::Truncated(FMT))? as usize;
-        let comment_len = le16(data, pos + 32).ok_or(FormatError::Truncated(FMT))? as usize;
-        let name_start = pos + 46;
-        let name_end = name_start
-            .checked_add(name_len)
-            .filter(|&end| end <= data.len())
-            .ok_or(FormatError::Truncated(FMT))?;
-        let entry_end = name_end
-            .checked_add(extra_len)
-            .and_then(|end| end.checked_add(comment_len))
-            .filter(|&end| end <= eocd.eocd_offset)
-            .ok_or(FormatError::Truncated(FMT))?;
-        if &data[name_start..name_end] == ENTRY_NAME {
-            parts.push(&data[part_start..pos + 16]);
-            part_start = pos + 20;
-        }
-        pos = entry_end;
-    }
-    if pos != eocd.eocd_offset {
-        return Err(FormatError::InvalidStructure {
-            format: FMT,
-            detail: "central directory size does not reach EOCD",
-        });
-    }
-    parts.push(&data[part_start..]);
-    Ok(parts)
+    Ok(zip_index(data)?.central_hash_parts)
 }
 
-/// The named entry's full LOCAL span: from its local file header through the
-/// start of the next local entry (or the central directory) — header, name,
-/// extra field, compressed data, and any data descriptor. This is the byte
-/// range the in-the-wild `c2pa.hash.collection.data` per-URI hashes cover
-/// (empirically: the c2pa-org public-testfiles ZIP vector). `None` if absent.
 pub fn zip_entry_local_span(
     data: &[u8],
     name: &str,
 ) -> Result<Option<(usize, usize)>, FormatError> {
-    let eocd = find_eocd(data)?;
-    let mut offsets: Vec<u32> = Vec::with_capacity(eocd.total_entries as usize);
-    let mut target: Option<u32> = None;
-    walk_cd(data, &eocd, |n, _, _, local_offset| {
-        offsets.push(local_offset);
-        if n == name.as_bytes() {
-            target = Some(local_offset);
-        }
-    })?;
-    let Some(start) = target else { return Ok(None) };
-    let end = offsets
-        .iter()
-        .copied()
-        .filter(|&o| o > start)
-        .min()
-        .map_or(eocd.cd_offset as usize, |o| o as usize);
-    Ok(Some((start as usize, end)))
+    Ok(zip_index(data)?
+        .get(name.as_bytes())
+        .map(ZipMember::local_span))
 }
 
-/// The exact A.6.2.1 hash span for a ZIP member: its complete local file
-/// header, file name and extra field, followed by its compressed/encrypted
-/// content. A trailing data descriptor is not part of the span.
 pub fn zip_entry_hash_span(data: &[u8], name: &str) -> Result<Option<(usize, usize)>, FormatError> {
-    let eocd = find_eocd(data)?;
-    let Some(entry) = find_cd_entry(data, &eocd, name.as_bytes())? else {
-        return Ok(None);
-    };
-    let start = entry.local_offset as usize;
-    if le_u32(data, start) != Some(SIG_LOCAL) {
-        return Err(FormatError::InvalidStructure {
-            format: FMT,
-            detail: "bad local file header signature",
-        });
-    }
-    let name_len = le16(data, start + 26).ok_or(FormatError::Truncated(FMT))? as usize;
-    let extra_len = le16(data, start + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-    let data_start = start
-        .checked_add(30 + name_len + extra_len)
-        .filter(|&offset| offset <= data.len())
-        .ok_or(FormatError::Truncated(FMT))?;
-    let end = data_start
-        .checked_add(entry.comp_size as usize)
-        .filter(|&offset| offset <= eocd.cd_offset as usize)
-        .ok_or(FormatError::Truncated(FMT))?;
-    Ok(Some((start, end)))
+    Ok(zip_index(data)?
+        .get(name.as_bytes())
+        .map(ZipMember::hash_span))
 }
 
 /// Extract the manifest store from the `META-INF/content_credential.c2pa` entry.
@@ -377,72 +446,35 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 #[cfg(test)]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     let eocd = find_eocd(asset)?;
-    if find_cd_entry(asset, &eocd, ENTRY_NAME)?.is_none() {
+    let index = build_zip_index(asset, &eocd)?;
+    if index.get(ENTRY_NAME).is_none() {
         return Ok(asset.to_vec());
     }
 
-    struct CdRec {
-        name: Vec<u8>,
-        record_start: usize,
-        record_end: usize,
-        local_offset: u32,
-    }
-    let mut recs: Vec<CdRec> = Vec::new();
-    let mut pos = eocd.cd_offset as usize;
-    for _ in 0..eocd.total_entries {
-        if le_u32(asset, pos) != Some(SIG_CENTRAL) {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "bad central directory signature",
-            });
-        }
-        let name_len = le16(asset, pos + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-        let extra_len = le16(asset, pos + 30).ok_or(FormatError::Truncated(FMT))? as usize;
-        let comment_len = le16(asset, pos + 32).ok_or(FormatError::Truncated(FMT))? as usize;
-        let local_offset = le_u32(asset, pos + 42).ok_or(FormatError::Truncated(FMT))?;
-        let name_start = pos + 46;
-        let name_end = name_start
-            .checked_add(name_len)
-            .filter(|&e| e <= asset.len())
-            .ok_or(FormatError::Truncated(FMT))?;
-        let record_end = name_end + extra_len + comment_len;
-        recs.push(CdRec {
-            name: asset[name_start..name_end].to_vec(),
-            record_start: pos,
-            record_end,
-            local_offset,
-        });
-        pos = record_end;
-    }
-
-    // Walk local entries in physical order so each kept entry's span runs up
-    // to the next entry's local offset (or the central directory).
-    let mut by_offset: Vec<&CdRec> = recs.iter().collect();
-    by_offset.sort_by_key(|r| r.local_offset);
-    let cd_start = eocd.cd_offset as usize;
-
+    let order = local_offset_order(index.members());
+    let first_local = order.first().map_or(eocd.cd_offset as usize, |&member| {
+        index.members[member].local_span.0
+    });
     let mut out = Vec::with_capacity(asset.len());
-    let mut new_offsets: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for (i, r) in by_offset.iter().enumerate() {
-        let span_end = by_offset
-            .get(i + 1)
-            .map(|n| n.local_offset as usize)
-            .unwrap_or(cd_start);
-        if r.name.as_slice() == ENTRY_NAME {
+    out.extend_from_slice(&asset[..first_local]);
+    let mut new_offsets = HashMap::with_capacity(index.members.len());
+    for member_index in order {
+        let member = &index.members[member_index];
+        if member.raw_name == ENTRY_NAME {
             continue;
         }
-        new_offsets.insert(r.local_offset, out.len() as u32);
-        out.extend_from_slice(&asset[r.local_offset as usize..span_end]);
+        new_offsets.insert(member.local_span.0, out.len() as u32);
+        out.extend_from_slice(&asset[member.local_span.0..member.local_span.1]);
     }
 
     let new_cd_offset = out.len();
-    let mut kept_count: u16 = 0;
-    for r in &recs {
-        if r.name.as_slice() == ENTRY_NAME {
+    let mut kept_count = 0u16;
+    for member in index.members() {
+        if member.raw_name == ENTRY_NAME {
             continue;
         }
-        let mut record = asset[r.record_start..r.record_end].to_vec();
-        let new_local = new_offsets[&r.local_offset];
+        let mut record = asset[member.central_span.0..member.central_span.1].to_vec();
+        let new_local = new_offsets[&member.local_span.0];
         record[42..46].copy_from_slice(&new_local.to_le_bytes());
         out.extend_from_slice(&record);
         kept_count += 1;
@@ -456,8 +488,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     out.extend_from_slice(&kept_count.to_le_bytes());
     out.extend_from_slice(&new_cd_size.to_le_bytes());
     out.extend_from_slice(&(new_cd_offset as u32).to_le_bytes());
-    let comment_off = eocd.eocd_offset + 22;
-    let comment = &asset[comment_off..];
+    let comment = &asset[eocd.eocd_offset + 22..];
     out.extend_from_slice(&(comment.len() as u16).to_le_bytes());
     out.extend_from_slice(comment);
     Ok(out)
@@ -698,6 +729,113 @@ mod tests {
         let mut changed_size = embedded.clone();
         changed_size[central_header + 20] ^= 1;
         assert_ne!(joined(&changed_size), expected_input);
+    }
+
+    fn stored_zip_with_names(names: &[String]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut central = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let content = [(index & 0xff) as u8];
+            let crc = crc32(&content);
+            let size = content.len() as u32;
+            let local_offset = body.len() as u32;
+
+            body.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+            body.extend_from_slice(&20u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&METHOD_STORED.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&crc.to_le_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(&content);
+
+            central.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&METHOD_STORED.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&local_offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = body.len() as u32;
+        let cd_size = central.len() as u32;
+        let count = names.len() as u16;
+        body.extend_from_slice(&central);
+        body.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&count.to_le_bytes());
+        body.extend_from_slice(&count.to_le_bytes());
+        body.extend_from_slice(&cd_size.to_le_bytes());
+        body.extend_from_slice(&cd_offset.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn central_directory_index_walk_and_lookups_are_linear() {
+        const ENTRY_COUNT: usize = 4096;
+        let mut names = (0..ENTRY_COUNT)
+            .map(|index| format!("word/media/image{index:05}.bin"))
+            .collect::<Vec<_>>();
+        names.push("[Content_Types].xml".into());
+        let archive = stored_zip_with_names(&names);
+
+        CENTRAL_ENTRIES_PARSED.with(|count| count.set(0));
+        let index = zip_index(&archive).expect("large ZIP index");
+        assert_eq!(index.members().len(), names.len());
+        assert_eq!(
+            CENTRAL_ENTRIES_PARSED.with(std::cell::Cell::get),
+            names.len(),
+            "index construction must walk each central entry exactly once"
+        );
+        for name in &names {
+            let member = index.get(name.as_bytes()).expect("indexed member");
+            let (start, end) = member.hash_span();
+            assert!(start < end);
+        }
+        assert_eq!(
+            CENTRAL_ENTRIES_PARSED.with(std::cell::Cell::get),
+            names.len(),
+            "O(1) lookups must not reparse the central directory"
+        );
+        assert_eq!(
+            index
+                .get(b"[Content_Types].xml")
+                .expect("DOCX bracket member")
+                .raw_name(),
+            b"[Content_Types].xml"
+        );
+    }
+
+    #[test]
+    fn index_rejects_duplicate_names_and_zip64_sentinel() {
+        let duplicate = stored_zip_with_names(&["same.xml".into(), "same.xml".into()]);
+        assert!(zip_index(&duplicate).is_err());
+
+        let mut zip64 = tiny_zip();
+        let eocd = find_eocd(&zip64).unwrap().eocd_offset;
+        zip64[eocd + 10..eocd + 12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(
+            zip_index(&zip64),
+            Err(FormatError::UnsupportedVariant { .. })
+        ));
     }
 
     #[test]

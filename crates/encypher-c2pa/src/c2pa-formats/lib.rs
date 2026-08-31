@@ -371,7 +371,7 @@ pub fn box_spans(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<BoxSpan>
 /// Re-export ZIP collection helpers for `c2pa.hash.collection.data`.
 pub(crate) use zip::{
     zip_central_directory_hash_parts, zip_entry_data, zip_entry_hash_span, zip_entry_local_span,
-    zip_entry_names,
+    zip_entry_names, zip_index,
 };
 
 /// Re-export: the payload spans of every top-level `mdat` box, in file order
