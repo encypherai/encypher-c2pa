@@ -96,7 +96,7 @@ Each status has:
 }
 ```
 
-A status may additionally carry a `details` object with machine-readable evidence for extension codes; CAWG statuses use it for fields such as `trust_source`, `accepted_eku`, `payload_encoding`, `timestamp_trusted`, and `revocation_status`. Absent means no evidence, not failure.
+A status may additionally carry a `details` object with machine-readable evidence for extension codes; CAWG statuses use it for fields such as `trust_source`, `anchor_fingerprint` (lowercase hex SHA-256 of the configured certificate that accepted a trusted identity), `accepted_eku`, `payload_encoding`, `timestamp_trusted`, and `revocation_status`. Absent means no evidence, not failure.
 
 Callers should branch on `code`, not `explanation`. Explanations are for people and may improve without a schema bump.
 

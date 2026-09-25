@@ -230,6 +230,11 @@ impl TrustAnchor {
         }
     }
 
+    /// Lowercase hex SHA-256 of the anchor certificate's DER.
+    pub fn fingerprint(&self) -> String {
+        fingerprint_hex(&self.certificate)
+    }
+
     /// True when this configuration is in force at `at`.
     pub fn active_at(&self, at: OffsetDateTime) -> bool {
         self.not_before.is_none_or(|start| at >= start)

@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Added
+
+- A trusted CAWG X.509 identity reports `anchor_fingerprint` in its status details: the SHA-256 of the configured certificate that accepted it, which is the anchor its chain ends at or the allowed certificate it matched. `trust_source` names the configuration entry; the fingerprint names the root within it, so an Encypher-root chain can be told apart from another accepted root.
+
 ## 1.1.0 - 2026-09-25
 
 ### Security
