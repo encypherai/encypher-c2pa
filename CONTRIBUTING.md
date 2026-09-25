@@ -63,4 +63,4 @@ Validation consumers branch on status codes. Preserve stable C2PA codes when fix
 
 Keep one concern per pull request. Explain the broken invariant, the chosen fix, and the command that proves it. Run format, lint, and the affected suites before requesting review.
 
-By contributing, you agree that your contribution is licensed under Apache-2.0 or MIT, at the user's option.
+By contributing, you agree that your contribution is licensed under the Apache License, Version 2.0, as described in its Section 5, and that it keeps the copyright and SPDX header at the top of each source file.

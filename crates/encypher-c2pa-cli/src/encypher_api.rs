@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Opt-in Encypher server verification for the `verify` subcommand.
 //!
 //! This is an explicit, per-invocation network call gated behind

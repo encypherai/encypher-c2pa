@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic robustness tests for the format parsers (adversarial input).
 //!
 //! Adversarial input is the #1 C2PA attack surface: a validator must never

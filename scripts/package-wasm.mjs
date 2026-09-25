@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 import { copyFile, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 

@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! COSE_Sign1 verification and header extraction.
 //!
 //! Verification reconstructs the detached RFC 9052 `Sig_structure` from the
@@ -70,6 +73,12 @@ fn map_get_text<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
 /// Verify a `COSE_Sign1_Tagged` signature over `claim_cbor` using the public
 /// key from the supplied end-entity certificate (DER).
 ///
+/// C2PA signs claims in detached content mode, so the `payload` field of the
+/// `COSE_Sign1_Tagged` structure must be `nil` and the `Sig_structure` payload
+/// is reconstructed from `claim_cbor`. A signature that carries any payload —
+/// including an empty byte string — is rejected rather than silently verified
+/// against the external claim bytes.
+///
 /// Returns `Ok(())` only when the signature is valid; any structural problem,
 /// unsupported algorithm, or signature mismatch yields an error.
 pub fn verify_claim(
@@ -80,6 +89,9 @@ pub fn verify_claim(
     let decoded = decode(cose_sign1)?;
     let array = cose_array(&decoded)?;
 
+    if !matches!(array[2], Value::Null) {
+        return Err(CryptoError::PayloadNotDetached);
+    }
     let protected_bytes = array[0]
         .as_bytes()
         .ok_or_else(|| CryptoError::Malformed("protected header is not a byte string".into()))?;
@@ -794,5 +806,69 @@ mod tests {
             vec![(Value::Integer(COSE_HDR_X5CHAIN), over_total_limit)],
         );
         assert!(extract_x5chain(&cose).is_err());
+    }
+
+    /// Build a real ES256 `COSE_Sign1_Tagged` over `claim`, placing `payload`
+    /// in the third array slot. Returns `(cose, leaf_der)`.
+    fn sign_claim_with_payload(claim: &[u8], payload: Value, alg_id: i128) -> (Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::pkcs8::DecodePrivateKey;
+        use rcgen::{CertificateParams, IsCa, KeyPair};
+
+        let key = KeyPair::generate().expect("keypair");
+        let mut params =
+            CertificateParams::new(vec!["signer.example".to_string()]).expect("params");
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::EmailProtection];
+        let certificate = params.self_signed(&key).expect("self-signed leaf");
+        let leaf_der = certificate.der().as_ref().to_vec();
+
+        let protected = encode(
+            &Value::Map(vec![(Value::Integer(COSE_HDR_ALG), Value::Integer(alg_id))]),
+            PROFILE,
+        )
+        .expect("encode protected");
+        let sig_input = sig_structure_bytes(&protected, claim).expect("sig structure");
+        let signing_key =
+            SigningKey::from_pkcs8_der(&key.serialize_der()).expect("load signing key");
+        let signature: Signature = signing_key.sign(&sig_input);
+        let cose = encode(
+            &Value::Tag(
+                COSE_SIGN1_TAG,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(Vec::new()),
+                    payload,
+                    Value::Bytes(signature.to_der().as_bytes().to_vec()),
+                ])),
+            ),
+            PROFILE,
+        )
+        .expect("encode cose");
+        (cose, leaf_der)
+    }
+
+    #[test]
+    fn detached_nil_payload_verifies_and_any_carried_payload_is_rejected() {
+        let claim = b"claim-cbor-bytes".to_vec();
+        // Detached content mode: payload is nil (CBOR major type 7, value 22).
+        let (cose, leaf) = sign_claim_with_payload(&claim, Value::Null, -7);
+        verify_claim(&cose, &claim, &leaf).expect("nil payload is the only conformant form");
+
+        // An embedded payload, and an empty byte string, are both non-nil and
+        // must be rejected even though the reconstructed Sig_structure would
+        // still verify against the claim bytes.
+        for carried in [Value::Bytes(claim.clone()), Value::Bytes(Vec::new())] {
+            let (cose, leaf) = sign_claim_with_payload(&claim, carried, -7);
+            assert!(
+                matches!(
+                    verify_claim(&cose, &claim, &leaf),
+                    Err(CryptoError::PayloadNotDetached)
+                ),
+                "a COSE_Sign1 payload that is not nil must be rejected"
+            );
+        }
     }
 }

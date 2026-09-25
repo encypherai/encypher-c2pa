@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! FLAC: JUMBF in an ID3v2 `GEOB` frame prepended to the native FLAC stream.
 //!
 //! C2PA 2.4 routes FLAC through the common ID3 embedding defined by A.3.4.

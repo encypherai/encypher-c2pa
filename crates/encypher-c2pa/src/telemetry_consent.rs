@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -6,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-const CONFIG_DIR_ENV: &str = "ENCYPHER_C2PA_CONFIG_DIR";
 const TELEMETRY_ENV: &str = "ENCYPHER_C2PA_TELEMETRY";
 const CONFIG_FILE_NAME: &str = "c2pa.json";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -105,27 +107,9 @@ fn parse_environment_preference(value: &str) -> Option<bool> {
 }
 
 fn preference_path() -> Result<PathBuf, TelemetryPreferenceError> {
-    if let Some(directory) = env::var_os(CONFIG_DIR_ENV) {
-        return Ok(PathBuf::from(directory).join(CONFIG_FILE_NAME));
-    }
-    if let Some(directory) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(directory)
-            .join("encypher")
-            .join(CONFIG_FILE_NAME));
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(directory) = env::var_os("APPDATA") {
-        return Ok(PathBuf::from(directory)
-            .join("Encypher")
-            .join(CONFIG_FILE_NAME));
-    }
-    if let Some(directory) = env::var_os("HOME") {
-        return Ok(PathBuf::from(directory)
-            .join(".config")
-            .join("encypher")
-            .join(CONFIG_FILE_NAME));
-    }
-    Err(TelemetryPreferenceError::ConfigDirectoryUnavailable)
+    crate::config_dir::config_directory()
+        .map(|directory| directory.join(CONFIG_FILE_NAME))
+        .ok_or(TelemetryPreferenceError::ConfigDirectoryUnavailable)
 }
 
 fn read_preference(path: &Path) -> Result<Option<bool>, TelemetryPreferenceError> {

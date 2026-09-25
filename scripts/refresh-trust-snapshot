@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+# Copyright 2026 Encypher Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+"""Refresh or check the trust material compiled into encypher-c2pa."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parent.parent
+TRUST_DIR = ROOT / "crates" / "encypher-c2pa" / "src" / "default_trust"
+SOURCES_PATH = TRUST_DIR / "sources.json"
+DEFAULT_TRUST_RS = TRUST_DIR.parent / "default_trust.rs"
+GITHUB_REPOSITORY = ("c2pa-org", "conformance-public")
+CERTIFICATE_RE = re.compile(
+    rb"-----BEGIN CERTIFICATE-----\s+.*?-----END CERTIFICATE-----\s*",
+    re.DOTALL,
+)
+SNAPSHOT_DATE_RE = re.compile(
+    r'pub const SNAPSHOT_DATE: &str = "\d{4}-\d{2}-\d{2}";'
+)
+
+
+def request_bytes(url: str, *, github_api: bool = False) -> bytes:
+    headers = {"User-Agent": "encypher-c2pa-trust-refresh/1"}
+    if github_api:
+        headers["Accept"] = "application/vnd.github+json"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def resolve_c2pa_source(url: str) -> tuple[str, bytes]:
+    parsed = urlparse(url)
+    parts = parsed.path.lstrip("/").split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "raw.githubusercontent.com"
+        or len(parts) < 4
+        or tuple(parts[:2]) != GITHUB_REPOSITORY
+    ):
+        raise ValueError(f"C2PA source is not a conformance-public raw URL: {url}")
+
+    owner, repository = GITHUB_REPOSITORY
+    source_path = "/".join(parts[3:])
+    api_url = (
+        f"https://api.github.com/repos/{owner}/{repository}/commits"
+        f"?path={quote(source_path, safe='/')}&per_page=1"
+    )
+    commits = json.loads(request_bytes(api_url, github_api=True))
+    if not isinstance(commits, list) or not commits or not isinstance(commits[0], dict):
+        raise ValueError(f"GitHub returned no commit for {source_path}")
+    commit = commits[0].get("sha")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError(f"GitHub returned an invalid commit for {source_path}")
+
+    resolved = (
+        f"https://raw.githubusercontent.com/{owner}/{repository}/{commit}/{source_path}"
+    )
+    return resolved, request_bytes(resolved)
+
+
+def fetch_source(name: str, entry: dict[str, object]) -> tuple[str, bytes]:
+    url = entry.get("url")
+    if not isinstance(url, str):
+        raise ValueError(f"{name}: missing string url")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(f"{name}: source URL must be HTTPS")
+    if name in {"c2pa", "c2paTsa"}:
+        return resolve_c2pa_source(url)
+    return url, request_bytes(url)
+
+
+def certificate_subjects(data: bytes, source: str) -> Counter[str]:
+    certificates = CERTIFICATE_RE.findall(data)
+    if not certificates:
+        if data.strip():
+            raise ValueError(f"{source}: response is neither PEM certificates nor empty")
+        return Counter()
+
+    subjects: Counter[str] = Counter()
+    for certificate in certificates:
+        result = subprocess.run(
+            ["openssl", "x509", "-noout", "-subject", "-nameopt", "RFC2253"],
+            input=certificate,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise ValueError(f"{source}: OpenSSL could not parse a certificate: {error}")
+        subject = result.stdout.decode("utf-8", errors="strict").strip()
+        subject = re.sub(r"^subject\s*=\s*", "", subject)
+        subjects[subject] += 1
+    return subjects
+
+
+def format_subjects(subjects: Counter[str]) -> list[str]:
+    lines: list[str] = []
+    for subject in sorted(subjects):
+        count = subjects[subject]
+        lines.append(f"{subject} (x{count})" if count > 1 else subject)
+    return lines
+
+
+def print_drift(
+    name: str,
+    old_data: bytes,
+    new_data: bytes,
+    old_digest: str,
+    new_digest: str,
+    old_url: str,
+    new_url: str,
+) -> None:
+    old_subjects = certificate_subjects(old_data, f"stored {name}")
+    new_subjects = certificate_subjects(new_data, f"live {name}")
+    added = new_subjects - old_subjects
+    removed = old_subjects - new_subjects
+
+    print(f"{name}: drift detected")
+    if old_digest != new_digest:
+        print(f"  sha256: {old_digest} -> {new_digest}")
+    if old_url != new_url:
+        print(f"  url: {old_url} -> {new_url}")
+    print("  added certificate subjects:")
+    for subject in format_subjects(added):
+        print(f"    + {subject}")
+    if not added:
+        print("    (none)")
+    print("  removed certificate subjects:")
+    for subject in format_subjects(removed):
+        print(f"    - {subject}")
+    if not removed:
+        print("    (none)")
+
+
+def update_snapshot_date_constant(snapshot_date: str) -> None:
+    source = DEFAULT_TRUST_RS.read_text(encoding="utf-8")
+    updated, count = SNAPSHOT_DATE_RE.subn(
+        f'pub const SNAPSHOT_DATE: &str = "{snapshot_date}";', source, count=1
+    )
+    if count != 1:
+        raise ValueError("could not locate default_trust::SNAPSHOT_DATE")
+    DEFAULT_TRUST_RS.write_text(updated, encoding="utf-8")
+
+
+def run(check: bool) -> int:
+    sources = json.loads(SOURCES_PATH.read_text(encoding="utf-8"))
+    lists = sources.get("lists")
+    if not isinstance(lists, dict) or not lists:
+        raise ValueError("sources.json has no trust lists")
+
+    fetched: dict[str, tuple[Path, str, bytes, str]] = {}
+    drifted: list[str] = []
+    for name, raw_entry in lists.items():
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"{name}: source entry must be an object")
+        filename = raw_entry.get("file")
+        recorded_digest = raw_entry.get("sha256")
+        recorded_url = raw_entry.get("url")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise ValueError(f"{name}: invalid trust-list filename")
+        if not isinstance(recorded_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", recorded_digest
+        ):
+            raise ValueError(f"{name}: invalid sha256")
+        if not isinstance(recorded_url, str):
+            raise ValueError(f"{name}: invalid url")
+
+        path = TRUST_DIR / filename
+        old_data = path.read_bytes()
+        resolved_url, new_data = fetch_source(name, raw_entry)
+        certificate_subjects(new_data, f"live {name}")
+        new_digest = hashlib.sha256(new_data).hexdigest()
+        local_digest = hashlib.sha256(old_data).hexdigest()
+        changed = (
+            old_data != new_data
+            or recorded_digest != new_digest
+            or local_digest != recorded_digest
+            or recorded_url != resolved_url
+        )
+        if changed:
+            drifted.append(name)
+            if check:
+                print_drift(
+                    name,
+                    old_data,
+                    new_data,
+                    recorded_digest,
+                    new_digest,
+                    recorded_url,
+                    resolved_url,
+                )
+        fetched[name] = (path, resolved_url, new_data, new_digest)
+
+    if check:
+        if drifted:
+            print(f"Trust snapshot drifted in {len(drifted)} source(s).", file=sys.stderr)
+            return 1
+        print("Trust snapshot is current.")
+        return 0
+
+    snapshot_date = datetime.now(timezone.utc).date().isoformat()
+    for name, (path, resolved_url, data, digest) in fetched.items():
+        path.write_bytes(data)
+        entry = lists[name]
+        entry["url"] = resolved_url
+        entry["sha256"] = digest
+    sources["snapshot_date"] = snapshot_date
+    SOURCES_PATH.write_text(json.dumps(sources, indent=2) + "\n", encoding="utf-8")
+    update_snapshot_date_constant(snapshot_date)
+    print(f"Refreshed {len(fetched)} trust sources for {snapshot_date}.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="report upstream certificate changes without writing files",
+    )
+    args = parser.parse_args()
+    try:
+        return run(args.check)
+    except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"refresh-trust-snapshot: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

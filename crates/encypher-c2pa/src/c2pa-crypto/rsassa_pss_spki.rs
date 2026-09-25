@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Regression: COSE verification with an id-RSASSA-PSS SubjectPublicKeyInfo.
 //!
 //! 1.x-era C2PA signing certificates in the wild carry an id-RSASSA-PSS

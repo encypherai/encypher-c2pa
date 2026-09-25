@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Lightweight, dependency-free verification metrics.
 //!
 //! A process-wide [`Metrics`] of atomic counters the host (sidecar/PyO3 shim)

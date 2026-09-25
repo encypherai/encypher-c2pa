@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Certificate trust validation for C2PA claim-signing certificates.
 //!
 //! The defining feature over the upstream `c2pa-rs` validator is that
@@ -8,19 +11,30 @@
 //! timestamp token) even after the signing certificate has expired.
 //!
 //! # Components
-//! - [`TrustList`] — a set of trusted anchor certificates (DER).
+//! - [`TrustList`] — a set of [`TrustAnchor`] configurations (DER certificate,
+//!   trust window, and [`AnchorPurpose`]).
 //! - [`EkuPolicy`] — Extended Key Usage enforcement for leaf certificates.
-//! - [`validate_chain`] — walk a leaf certificate up to a trusted anchor.
+//! - [`validate_chain`] — build and validate a path from a leaf certificate to
+//!   a trust anchor configured for the requested purpose.
 //! - [`RevocationDenylist`] — internal serial/fingerprint revocation set.
 
 pub(crate) mod ocsp;
+mod profile;
+pub(crate) use ocsp::online::{
+    build_request as build_ocsp_request, evaluate as evaluate_ocsp_online,
+    responder_url as ocsp_responder_url, OnlineVerdict as OnlineOcspVerdict,
+};
 pub(crate) use ocsp::{
     evaluate_verified as evaluate_ocsp_verified, OcspStatus, MAX_OCSP_RESPONSE_BYTES,
 };
 mod timestamp;
-use std::collections::HashSet;
+/// Test-only RFC 3161 fixture minting. Compiled out of the published library.
+#[cfg(test)]
+pub(crate) mod timestamp_fixture;
+use std::collections::{HashMap, HashSet};
 pub(crate) use timestamp::{
-    inspect_timestamp_token, token_from_timestamp_response, verify_timestamp_token, TimestampResult,
+    describe_timestamp_token, inspect_timestamp_token, token_from_timestamp_response,
+    verify_timestamp_token, TimestampResult, TokenDescription,
 };
 
 use const_oid::ObjectIdentifier;
@@ -46,11 +60,12 @@ pub const OID_EMAIL_PROTECTION: &str = "1.3.6.1.5.5.7.3.4";
 pub const OID_ADOBE_DOCUMENT_SIGNING: &str = "1.2.840.113583.1.1.5";
 /// IETF `id-kp-documentSigning` EKU.
 pub const OID_IETF_DOCUMENT_SIGNING: &str = "1.3.6.1.5.5.7.3.36";
-/// `id-kp-timeStamping` — required EKU for a TSA certificate. Acceptable for a
-/// claim signer only as the certificate's SOLE EKU (upstream combination rule).
+/// `id-kp-timeStamping` - required EKU for a TSA certificate, and a purpose a
+/// C2PA claim signer is never authorized for (see
+/// [`leaf_is_acceptable_claim_signer`]).
 pub const OID_KP_TIME_STAMPING: &str = "1.3.6.1.5.5.7.3.8";
-/// `id-kp-OCSPSigning` — delegated OCSP responder EKU. Acceptable for a claim
-/// signer only as the certificate's SOLE EKU (upstream combination rule).
+/// `id-kp-OCSPSigning` - delegated OCSP responder EKU, and a purpose a C2PA
+/// claim signer is never authorized for.
 pub const OID_KP_OCSP_SIGNING: &str = "1.3.6.1.5.5.7.3.9";
 /// Microsoft C2PA manifest-signing EKU.
 pub const OID_MICROSOFT_C2PA: &str = "1.3.6.1.4.1.311.76.59.1.9";
@@ -80,6 +95,9 @@ const OID_RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 
 /// Maximum certificates walked while building a chain, guarding against loops.
 const MAX_CHAIN_DEPTH: usize = 20;
+/// Maximum issuer candidates expanded across the whole path search, bounding
+/// the work an adversarial bag of cross-signed intermediates can force.
+const MAX_PATH_NODES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -116,23 +134,133 @@ fn digest_bytes(hash: SigHash, msg: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Trust anchors
+// ---------------------------------------------------------------------------
+
+/// The signing purpose a trust-anchor configuration authorizes.
+///
+/// The Trust Model keeps one list of trust-anchor configurations per accepted
+/// EKU, requires the time-stamping list to be "separate from the lists for
+/// C2PA signers", and requires a validator to "use only the trust anchors it
+/// associates with EKUs present in the certificate". Purposes are therefore
+/// not interchangeable: a claim signer never chains to a time-stamping anchor,
+/// and a CAWG named-actor credential never chains to a claim-signing anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorPurpose {
+    /// C2PA claim signing.
+    ClaimSigning,
+    /// RFC 3161 time-stamping (`id-kp-timeStamping`).
+    TimeStamping,
+    /// CAWG named-actor (identity) credentials.
+    CawgIdentity,
+}
+
+/// Which entry of the CAWG trust configuration an anchor belongs to.
+///
+/// CAWG Identity 1.3 has a validator keep a *CAWG trust configuration*: a list
+/// of accepted EKUs, each with its own accepted certificate policies and trust
+/// anchors. Its "interim trust model additions" are not a property of the EKU
+/// but of two named sources - the Mozilla root store with the email trust bit
+/// and the IPTC Verified News Publishers lists - and they carry extra
+/// conditions, a trusted time stamp and the 31 March 2027 cutoff, that no
+/// other configured anchor is subject to. An anchor therefore has to say which
+/// entry configured it.
+///
+/// Only [`AnchorPurpose::CawgIdentity`] anchors are read through this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CawgTrustSource {
+    /// One of the two sources the interim S/MIME additions name. The interim
+    /// conditions bind, and this is the default for any anchor that does not
+    /// declare otherwise, so an unlabeled source is held to the stricter rule.
+    SmimeInterim,
+    /// The bundled Encypher Verified Organizations identity root.
+    EncypherVerifiedOrganizations,
+    /// An anchor or end-entity certificate the caller configured.
+    CallerSupplied,
+}
+
+impl CawgTrustSource {
+    /// The `trust_source` detail reported for a credential this entry accepted.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SmimeInterim => "smime_interim",
+            Self::EncypherVerifiedOrganizations => "encypher_verified_organizations",
+            Self::CallerSupplied => "caller_supplied",
+        }
+    }
+
+    /// True when the interim S/MIME conditions apply to this entry.
+    pub fn interim(self) -> bool {
+        matches!(self, Self::SmimeInterim)
+    }
+}
+
+/// One trust-anchor configuration: the anchor certificate plus the window in
+/// which the configuration is trusted and the purpose it authorizes.
+///
+/// VAL-CRYP-0010/0011: a configuration carrying a `not_before` must not
+/// validate claim signatures whose signing time precedes it, and one carrying a
+/// `not_after` must not validate signatures after it. These bounds belong to
+/// the configuration and are independent of the anchor certificate's own
+/// `notBefore`/`notAfter`.
+#[derive(Debug, Clone)]
+pub struct TrustAnchor {
+    /// DER-encoded anchor certificate.
+    pub certificate: Vec<u8>,
+    /// The purpose this configuration authorizes.
+    pub purpose: AnchorPurpose,
+    /// Configured start of trust. `None` leaves the start unbounded.
+    pub not_before: Option<OffsetDateTime>,
+    /// Configured end of trust. `None` leaves the end unbounded.
+    pub not_after: Option<OffsetDateTime>,
+    /// The CAWG trust configuration entry that supplied this anchor. Read only
+    /// for [`AnchorPurpose::CawgIdentity`].
+    pub cawg_source: CawgTrustSource,
+}
+
+impl TrustAnchor {
+    /// An unbounded configuration authorizing `purpose`.
+    pub fn new(certificate: Vec<u8>, purpose: AnchorPurpose) -> Self {
+        Self {
+            certificate,
+            purpose,
+            not_before: None,
+            not_after: None,
+            cawg_source: CawgTrustSource::SmimeInterim,
+        }
+    }
+
+    /// True when this configuration is in force at `at`.
+    pub fn active_at(&self, at: OffsetDateTime) -> bool {
+        self.not_before.is_none_or(|start| at >= start)
+            && self.not_after.is_none_or(|end| at <= end)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TrustList
 // ---------------------------------------------------------------------------
 
-/// A set of trusted anchor certificates, stored as DER.
+/// A set of trust-anchor configurations.
 #[derive(Debug, Clone, Default)]
 pub struct TrustList {
-    /// DER-encoded anchor certificates.
-    pub anchors: Vec<Vec<u8>>,
+    /// The configured anchors.
+    pub anchors: Vec<TrustAnchor>,
 }
 
 impl TrustList {
-    /// Build a trust list from a PEM bundle containing one or more certificates.
+    /// Build a claim-signing trust list from a PEM bundle.
+    pub fn from_pem(pem: &str) -> Result<Self, TrustError> {
+        Self::from_pem_for(AnchorPurpose::ClaimSigning, pem)
+    }
+
+    /// Build a trust list for `purpose` from a PEM bundle containing one or
+    /// more certificates.
     ///
     /// Each `CERTIFICATE` block is parsed and re-encoded to canonical DER.
     /// Returns [`TrustError::NoCertificates`] when the bundle yields no
     /// certificates and [`TrustError::Decode`] when a block cannot be decoded.
-    pub fn from_pem(pem: &str) -> Result<Self, TrustError> {
+    pub fn from_pem_for(purpose: AnchorPurpose, pem: &str) -> Result<Self, TrustError> {
         // Guard before x509-cert: `Certificate::load_pem_chain` PANICS
         // (subtract with overflow) on input containing no PEM block at all —
         // observed in the wild with the IPTC VNPL anchor list, which is served
@@ -151,9 +279,64 @@ impl TrustList {
             let der = cert
                 .to_der()
                 .map_err(|e| TrustError::Decode(e.to_string()))?;
-            anchors.push(der);
+            anchors.push(TrustAnchor::new(der, purpose));
         }
         Ok(Self { anchors })
+    }
+
+    /// An unbounded trust list for `purpose` over already-decoded DER.
+    pub fn from_certificates(
+        purpose: AnchorPurpose,
+        certificates: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self {
+        Self {
+            anchors: certificates
+                .into_iter()
+                .map(|der| TrustAnchor::new(der, purpose))
+                .collect(),
+        }
+    }
+
+    /// Apply configured trust bounds to every anchor in this list.
+    pub fn with_bounds(
+        mut self,
+        not_before: Option<OffsetDateTime>,
+        not_after: Option<OffsetDateTime>,
+    ) -> Self {
+        for anchor in &mut self.anchors {
+            anchor.not_before = not_before;
+            anchor.not_after = not_after;
+        }
+        self
+    }
+
+    /// Declare which CAWG trust configuration entry supplied every anchor in
+    /// this list.
+    pub fn with_cawg_source(mut self, source: CawgTrustSource) -> Self {
+        for anchor in &mut self.anchors {
+            anchor.cawg_source = source;
+        }
+        self
+    }
+
+    /// The configured certificate equal to `der`, whatever its purpose or
+    /// window. Used by the private-credential ("allowed") store, which trusts
+    /// an end-entity certificate directly rather than as an anchor, and which
+    /// still needs the entry that configured it.
+    pub fn find_certificate(&self, der: &[u8]) -> Option<&TrustAnchor> {
+        self.anchors.iter().find(|anchor| anchor.certificate == der)
+    }
+
+    /// True when `der` is one of the configured certificates.
+    pub fn contains_certificate(&self, der: &[u8]) -> bool {
+        self.find_certificate(der).is_some()
+    }
+
+    /// Every configured certificate, in configuration order.
+    pub fn certificates(&self) -> impl Iterator<Item = &[u8]> {
+        self.anchors
+            .iter()
+            .map(|anchor| anchor.certificate.as_slice())
     }
 
     /// Return the Common Name (`CN`) of each anchor certificate.
@@ -161,8 +344,7 @@ impl TrustList {
     /// Anchors without a `CN` attribute are skipped, mirroring the enterprise
     /// `get_trust_anchor_subjects` behavior.
     pub fn anchor_subjects(&self) -> Vec<String> {
-        self.anchors
-            .iter()
+        self.certificates()
             .filter_map(|der| {
                 let cert = Certificate::from_der(der).ok()?;
                 common_name(&cert)
@@ -170,11 +352,18 @@ impl TrustList {
             .collect()
     }
 
-    /// Set of SHA-256 fingerprints (lowercase hex) of all anchors.
-    fn anchor_fingerprints(&self) -> HashSet<String> {
+    /// The anchors that authorize `purpose` and are in force at `at`, each
+    /// with its index in this list so a completed path can name the anchor it
+    /// terminated at.
+    fn active_anchors(
+        &self,
+        purpose: AnchorPurpose,
+        at: OffsetDateTime,
+    ) -> Vec<(usize, &TrustAnchor)> {
         self.anchors
             .iter()
-            .map(|der| fingerprint_hex(der))
+            .enumerate()
+            .filter(|(_, anchor)| anchor.purpose == purpose && anchor.active_at(at))
             .collect()
     }
 }
@@ -193,13 +382,13 @@ pub struct EkuPolicy {
 
 impl Default for EkuPolicy {
     /// Default policy: the full C2PA claim-signing EKU set the reference
-    /// validator (c2pa-rs `check_certificate_profile`) accepts — the C2PA
+    /// validator (c2pa-rs `check_certificate_profile`) accepts - the C2PA
     /// claim-signing OID, both document-signing OIDs, `emailProtection`
     /// (still the most widely deployed claim-signer EKU, e.g. the IPTC
     /// newsroom guide's GlobalSign certificates), and the Microsoft C2PA OID.
-    /// `timeStamping`/`OCSPSigning` are handled separately: they are
-    /// acceptable only as a certificate's sole EKU
-    /// (see [`leaf_acceptable_der`]).
+    /// `timeStamping` and `OCSPSigning` are never in this set: they authorize
+    /// a different purpose, and the profile forbids a certificate from being
+    /// valid for more than one (see [`leaf_acceptable_der`]).
     fn default() -> Self {
         Self {
             allowed_oids: vec![
@@ -297,6 +486,13 @@ pub struct ChainResult {
     /// The instant the chain was evaluated against — the supplied
     /// `validation_time` when provided, otherwise the current UTC time.
     pub validated_at: OffsetDateTime,
+    /// Index, in the trust list that was searched, of the anchor the trusted
+    /// path terminated at. `None` unless `trusted`.
+    ///
+    /// A trust list can hold anchors configured under different rules - the
+    /// CAWG trust configuration is exactly that - so the caller has to be able
+    /// to tell which one accepted the credential.
+    pub anchor: Option<usize>,
 }
 
 impl ChainResult {
@@ -307,29 +503,56 @@ impl ChainResult {
             leaf_acceptable: true,
             reason: Some(reason.into()),
             validated_at: at,
+            anchor: None,
         }
+    }
+
+    /// The anchor the trusted path terminated at, resolved against the trust
+    /// list that produced this result.
+    pub fn terminating_anchor<'a>(&self, trust: &'a TrustList) -> Option<&'a TrustAnchor> {
+        trust.anchors.get(self.anchor?)
     }
 }
 
-/// Validate `leaf_der` against `trust`, optionally using `intermediates_der`
-/// to bridge the chain.
+/// How a candidate certification path ended.
+///
+/// Ordered worst to best so the path builder can keep the most favorable
+/// outcome it found across every candidate path it explored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PathOutcome {
+    /// No candidate path reached an anchor in force for the purpose.
+    NoPath,
+    /// A path reached an anchor but failed the profile or a path constraint.
+    Rejected(&'static str),
+    /// A path reached an anchor, but a certificate on it was outside its
+    /// validity window at the validation instant.
+    OutsideValidity,
+    /// A path reached an anchor and satisfied every check.
+    Trusted,
+}
+
+/// Validate `leaf_der` against the anchors in `trust` that authorize `purpose`,
+/// optionally using `intermediates_der` to bridge the chain.
 ///
 /// When `validation_time` is `Some`, all `notBefore`/`notAfter` checks use that
 /// instant instead of the system clock — this is the key capability that lets a
 /// signature remain verifiable after its certificate expires, provided the
 /// validation time falls within the certificate's original validity window.
+/// The same instant selects which trust-anchor configurations are in force
+/// (VAL-CRYP-0010/0011).
 ///
-/// The chain is considered `trusted` only when some certificate walked from the
-/// leaf (inclusive) matches a trust anchor by SHA-256 fingerprint, and every
-/// issuer link verified its signature, carried CA basic constraints, and was
-/// itself valid at `validation_time`.
-// `intermediates_below` is a deliberate walk counter (chain-depth accounting
-// documented against MAX_CHAIN_DEPTH); an enumerate() would obscure it.
-#[allow(clippy::explicit_counter_loop)]
+/// Path building searches the caller-supplied intermediates and the in-force
+/// anchors as an unordered bag, backtracking when a candidate issuer leads
+/// nowhere, and the completed path is checked against the C2PA certificate
+/// profile and the RFC 5280 section 6 constraints ([`profile::path_violation`]).
+/// The end-entity certificate's own profile compliance is reported separately
+/// in `leaf_acceptable`, because a TSA or CAWG leaf is validated against a
+/// different purpose's EKU set by its own caller.
 pub fn validate_chain(
     leaf_der: &[u8],
     intermediates_der: &[Vec<u8>],
     trust: &TrustList,
+    purpose: AnchorPurpose,
     validation_time: Option<OffsetDateTime>,
 ) -> ChainResult {
     let at = validation_time.unwrap_or_else(OffsetDateTime::now_utc);
@@ -339,125 +562,148 @@ pub fn validate_chain(
         Err(e) => return ChainResult::untrusted(format!("invalid leaf certificate: {e}"), at),
     };
 
-    // Leaf acceptability for claim signing: it must carry a permitted
-    // claim-signing EKU (and not anyExtendedKeyUsage), must not be a CA, and
-    // must not assert keyCertSign. These are independent of trust-anchor
-    // chaining — an otherwise-trusted chain with an unacceptable leaf is still
-    // not a valid claim signer.
+    // Leaf acceptability for claim signing: the C2PA certificate profile plus
+    // a permitted claim-signing EKU. Independent of trust-anchor chaining — an
+    // otherwise-trusted chain with an unacceptable leaf is still not a valid
+    // claim signer.
     let leaf_acceptable = leaf_is_acceptable_claim_signer(&leaf);
 
-    // Track whether every certificate in the walked chain is valid at `at`.
-    // The leaf being expired/not-yet-valid is the most common case.
-    let mut chain_validity_ok = valid_at(&leaf, at);
-
-    // Candidate issuers: caller-supplied intermediates followed by anchors.
+    // Only anchors configured for this purpose, and in force at `at`, may
+    // terminate a path. The same certificate configured twice keeps its first
+    // entry, so a duplicate cannot silently relabel an anchor.
+    let mut anchor_indices: HashMap<String, usize> = HashMap::new();
     let mut candidates: Vec<Certificate> = Vec::new();
     for der in intermediates_der {
         if let Ok(c) = Certificate::from_der(der) {
             candidates.push(c);
         }
     }
-    for der in &trust.anchors {
-        if let Ok(c) = Certificate::from_der(der) {
+    for (index, anchor) in trust.active_anchors(purpose, at) {
+        if let Ok(c) = Certificate::from_der(&anchor.certificate) {
+            anchor_indices
+                .entry(fingerprint_hex(&anchor.certificate))
+                .or_insert(index);
             candidates.push(c);
         }
     }
 
-    let anchor_fps = trust.anchor_fingerprints();
+    let mut path = vec![leaf];
+    let mut seen: HashSet<String> = HashSet::from([fingerprint_hex(leaf_der)]);
+    let mut budget = MAX_PATH_NODES;
+    let mut anchor = None;
+    let outcome = extend_path(
+        &mut path,
+        &candidates,
+        &anchor_indices,
+        at,
+        &mut seen,
+        &mut budget,
+        &mut anchor,
+    );
 
-    let mut chain_fps: HashSet<String> = HashSet::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut current = leaf;
-    let mut current_der: Vec<u8> = leaf_der.to_vec();
-    // Number of non-self-signed CA certs between the leaf and the current cert,
-    // used to enforce each issuer's BasicConstraints pathLenConstraint.
-    let mut intermediates_below: usize = 0;
-
-    // Construct an untrusted result capturing the current validity/acceptability
-    // flags. Defined as a closure over only the immutable `leaf_acceptable`/`at`;
-    // `chain_validity_ok` is passed explicitly so it can still be reassigned.
-    let untrusted_with = |reason: &str, validity_ok: bool| ChainResult {
-        trusted: false,
-        chain_validity_ok: validity_ok,
-        leaf_acceptable,
-        reason: Some(reason.to_string()),
-        validated_at: at,
+    let (trusted, chain_validity_ok, reason) = match outcome {
+        PathOutcome::Trusted => (true, true, None),
+        PathOutcome::OutsideValidity => (
+            false,
+            false,
+            Some("a certificate in the chain was outside its validity window".to_string()),
+        ),
+        PathOutcome::Rejected(reason) => (false, true, Some(reason.to_string())),
+        PathOutcome::NoPath => (
+            false,
+            valid_at(path.first().expect("path holds the leaf"), at),
+            Some("certificate does not chain to a trusted anchor".to_string()),
+        ),
     };
-
-    for _ in 0..MAX_CHAIN_DEPTH {
-        let fp = fingerprint_hex(&current_der);
-        chain_fps.insert(fp.clone());
-        if seen.contains(&fp) {
-            break;
-        }
-        seen.insert(fp);
-
-        // Self-signed: verify its own signature and stop walking.
-        if current.tbs_certificate.subject == current.tbs_certificate.issuer {
-            if !verify_signature(&current, &current) {
-                return untrusted_with("chain root signature invalid", chain_validity_ok);
-            }
-            break;
-        }
-
-        // Subject names are not unique. Trust lists can contain distinct CAs
-        // with the same name, so choose the candidate that actually signed
-        // this certificate rather than failing on the first name match.
-        let issuer = candidates
-            .iter()
-            .find(|candidate| {
-                candidate.tbs_certificate.subject == current.tbs_certificate.issuer
-                    && verify_signature(&current, candidate)
-            })
-            .cloned();
-        let Some(issuer) = issuer else {
-            break; // Cannot walk further; trust decision falls to fingerprint set.
-        };
-
-        if !is_ca_certificate(&issuer) {
-            return untrusted_with("issuer certificate is not a CA", chain_validity_ok);
-        }
-        // pathLenConstraint: the number of intermediate CAs allowed below this
-        // issuer. `intermediates_below` counts CAs already walked beneath it.
-        if let Some(max) = path_len_constraint(&issuer) {
-            if intermediates_below > max {
-                return untrusted_with("issuer pathLenConstraint violated", chain_validity_ok);
-            }
-        }
-        if !valid_at(&issuer, at) {
-            chain_validity_ok = false;
-        }
-
-        intermediates_below += 1;
-        current_der = match issuer.to_der() {
-            Ok(d) => d,
-            Err(e) => {
-                return untrusted_with(&format!("failed to encode issuer: {e}"), chain_validity_ok)
-            }
-        };
-        current = issuer;
-    }
-
-    let chains_to_anchor = chain_fps.intersection(&anchor_fps).next().is_some();
-    // A trusted verdict requires chaining to an anchor with the whole chain
-    // valid at `at`. Leaf claim-signer acceptability (EKU/keyUsage/CA) is
-    // reported separately in `leaf_acceptable` and applied by the caller only on
-    // the claim-signing path — it must NOT gate TSA/timestamp chains, whose
-    // leaves carry a timestamping EKU rather than a claim-signing one.
-    let trusted = chains_to_anchor && chain_validity_ok;
     ChainResult {
         trusted,
         chain_validity_ok,
         leaf_acceptable,
-        reason: if trusted {
-            None
-        } else if !chains_to_anchor {
-            Some("certificate does not chain to a trusted anchor".into())
-        } else {
-            Some("a certificate in the chain was outside its validity window".into())
-        },
+        reason,
         validated_at: at,
+        anchor: trusted.then_some(anchor).flatten(),
     }
+}
+
+/// Depth-first path building from `path.last()` towards an in-force anchor.
+///
+/// Subject names are not unique and trust stores routinely hold cross-signed
+/// CAs with identical names, so a single greedy step up the chain can dead-end
+/// on a certificate that never reaches an anchor. Every issuer that actually
+/// signed the current certificate is therefore tried, and the best outcome
+/// across the explored paths is returned. `seen` breaks loops; `budget` bounds
+/// the search against an adversarial bag of intermediates.
+///
+/// `anchor` receives the index of the anchor a trusted path terminated at. The
+/// search stops at the first trusted path, so the value cannot be overwritten
+/// by a later, worse one.
+fn extend_path(
+    path: &mut Vec<Certificate>,
+    candidates: &[Certificate],
+    anchor_indices: &HashMap<String, usize>,
+    at: OffsetDateTime,
+    seen: &mut HashSet<String>,
+    budget: &mut usize,
+    anchor: &mut Option<usize>,
+) -> PathOutcome {
+    let current = path.last().expect("path is never empty").clone();
+    let Ok(current_der) = current.to_der() else {
+        return PathOutcome::NoPath;
+    };
+    if let Some(&index) = anchor_indices.get(&fingerprint_hex(&current_der)) {
+        let outcome = evaluate_path(path, at);
+        if outcome == PathOutcome::Trusted {
+            *anchor = Some(index);
+        }
+        return outcome;
+    }
+    if path.len() >= MAX_CHAIN_DEPTH
+        || current.tbs_certificate.subject == current.tbs_certificate.issuer
+    {
+        // A self-signed certificate that is not an anchor terminates the path
+        // without reaching one.
+        return PathOutcome::NoPath;
+    }
+
+    let mut best = PathOutcome::NoPath;
+    for candidate in candidates {
+        if *budget == 0 {
+            break;
+        }
+        if candidate.tbs_certificate.subject != current.tbs_certificate.issuer
+            || !verify_signature(&current, candidate)
+        {
+            continue;
+        }
+        let Ok(der) = candidate.to_der() else {
+            continue;
+        };
+        let fingerprint = fingerprint_hex(&der);
+        if !seen.insert(fingerprint.clone()) {
+            continue;
+        }
+        *budget -= 1;
+        path.push(candidate.clone());
+        let outcome = extend_path(path, candidates, anchor_indices, at, seen, budget, anchor);
+        path.pop();
+        seen.remove(&fingerprint);
+        best = best.max(outcome);
+        if best == PathOutcome::Trusted {
+            break;
+        }
+    }
+    best
+}
+
+/// Check a complete path, end entity first and anchor last.
+fn evaluate_path(path: &[Certificate], at: OffsetDateTime) -> PathOutcome {
+    if let Some(reason) = profile::path_violation(path) {
+        return PathOutcome::Rejected(reason);
+    }
+    if path.iter().any(|cert| !valid_at(cert, at)) {
+        return PathOutcome::OutsideValidity;
+    }
+    PathOutcome::Trusted
 }
 
 /// Find the certificate that issued `leaf_der`, searching `candidates` (e.g. the
@@ -666,52 +912,46 @@ fn allows_digital_signature(cert: &Certificate) -> bool {
         .unwrap_or(false)
 }
 
-/// True when a DER certificate satisfies the C2PA leaf structural profile,
-/// independent of the application-specific permitted EKU set.
+/// True when a DER certificate satisfies the C2PA end-entity certificate
+/// profile, independent of the application-specific permitted EKU set.
 ///
 /// CAWG imports the C2PA credential profile but defines its own accepted EKUs
 /// (IETF document signing and interim S/MIME email protection), so it uses
 /// this predicate before applying its own EKU policy.
 pub fn leaf_profile_acceptable_der(leaf_der: &[u8]) -> bool {
-    let Ok(leaf) = Certificate::from_der(leaf_der) else {
-        return false;
-    };
-    if is_ca_certificate(&leaf) || has_key_cert_sign(&leaf) || !allows_digital_signature(&leaf) {
-        return false;
-    }
-    certificate_eku_oids(&leaf).is_some_and(|ekus| !ekus.iter().any(|oid| oid == OID_ANY_EKU))
+    Certificate::from_der(leaf_der)
+        .is_ok_and(|leaf| profile::profile_violation(&leaf, profile::CertRole::EndEntity).is_none())
 }
 
 /// True when `leaf` is an acceptable C2PA claim-signing certificate.
 ///
 /// Per the C2PA trust model the leaf MUST:
-/// - carry at least one permitted claim-signing EKU ([`EkuPolicy::default`]),
-/// - NOT carry `anyExtendedKeyUsage`,
-/// - NOT be a CA certificate, and NOT assert `keyCertSign`,
-/// - assert `digitalSignature` (or omit keyUsage entirely).
+/// - satisfy the end-entity certificate profile ([`profile::profile_violation`]):
+///   v3, no unique IDs, an Authority Key Identifier, a Key Usage extension
+///   asserting `digitalSignature` and not `keyCertSign`, no `cA` basic
+///   constraint, a non-empty EKU without `anyExtendedKeyUsage`, an allowed
+///   signature algorithm and public key, and no unrecognized critical extension;
+/// - NOT be valid for `timeStamping` or `OCSPSigning`, which are separate
+///   purposes a claim signer is never authorized for;
+/// - carry at least one permitted claim-signing EKU ([`EkuPolicy::default`]).
 fn leaf_is_acceptable_claim_signer(leaf: &Certificate) -> bool {
-    // Reject CA / keyCertSign leaves outright.
-    if is_ca_certificate(leaf) || has_key_cert_sign(leaf) {
+    if profile::profile_violation(leaf, profile::CertRole::EndEntity).is_some() {
         return false;
     }
-    if !allows_digital_signature(leaf) {
-        return false;
-    }
-    // EKU: must declare one, must not include anyExtendedKeyUsage, and must
-    // satisfy the reference profile's combination rules: `timeStamping` and
-    // `OCSPSigning` are each acceptable only as the certificate's SOLE EKU;
-    // otherwise the certificate must carry a permitted claim-signing OID.
     let Some(ekus) = certificate_eku_oids(leaf) else {
         return false;
     };
-    if ekus.iter().any(|oid| oid == OID_ANY_EKU) {
-        return false;
-    }
-    let special = ekus
+    // Purpose isolation (Trust Model, Certificate Trust Chain): a certificate
+    // is authorized for at most one of C2PA signing, time-stamp signing, and
+    // OCSP response signing, and "a validator shall ensure a signing
+    // certificate is authorized for the purpose for which it is being used".
+    // A certificate valid for timeStamping or OCSPSigning is therefore never a
+    // valid claim signer - whether or not that is its only EKU.
+    if ekus
         .iter()
-        .any(|oid| oid == OID_KP_TIME_STAMPING || oid == OID_KP_OCSP_SIGNING);
-    if special {
-        return ekus.len() == 1;
+        .any(|oid| oid == OID_KP_TIME_STAMPING || oid == OID_KP_OCSP_SIGNING)
+    {
+        return false;
     }
     let policy = EkuPolicy::default();
     ekus.iter()

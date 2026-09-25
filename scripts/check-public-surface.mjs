@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 // Public-API surface lock for the published crates.
 //
 // WHAT THIS GUARDS
@@ -65,16 +68,18 @@ const PUBLISHED_LIB = ["encypher-c2pa", "encypher_c2pa"];
 // `#[cfg(target_arch = "wasm32")]`, which a host-only run never emits. The
 // published surface is the UNION over this whole matrix.
 //
-// It is not a full cross-product. `telemetry` pulls in `ureq`, which does not
-// build for wasm32, and the browser binding sets `default-features = false`
-// accordingly - so wasm consumers can only ever select the feature-less
-// configuration. Listing a combination nobody can build would just fail the
-// gate on a build error rather than telling anyone anything.
+// It is not a full cross-product. `telemetry` and `online` both pull in
+// `ureq`, which does not build for wasm32, and the browser binding sets
+// `default-features = false` accordingly - so wasm consumers can only ever
+// select the feature-less configuration. Listing a combination nobody can
+// build would just fail the gate on a build error rather than telling anyone
+// anything.
 //
 // An empty target string means the host.
 const SURFACE_MATRIX = [
   ["", "no features", ["--no-default-features"]],
   ["", "telemetry only", ["--no-default-features", "--features", "telemetry"]],
+  ["", "online only", ["--no-default-features", "--features", "online"]],
   ["", "default", []],
   ["wasm32-unknown-unknown", "no features", ["--no-default-features"]],
 ];
@@ -85,7 +90,8 @@ const SURFACE_MATRIX = [
 // past a hand-written manifest parser. `dep:` syntax suppresses the implicit
 // feature, which is why `telemetry` is spelled the way it is.
 const APPROVED_FEATURES = {
-  default: ["telemetry"],
+  default: ["online", "telemetry"],
+  online: ["dep:ureq"],
   telemetry: ["dep:ureq"],
 };
 
@@ -457,6 +463,7 @@ const WRITE_CAPABLE = [
 // Modules permitted to hold a write capability, with the reason.
 const WRITE_ALLOWED = new Map([
   ["telemetry_consent.rs", "persists the user's opt-in telemetry choice"],
+  ["online_consent.rs", "persists the user's opt-in online-checks choice"],
 ]);
 
 // `read_path_asset` opens once with O_NONBLOCK before inspecting the handle, so
@@ -478,6 +485,9 @@ function checkNoWriteCapability() {
     if (WRITE_ALLOWED.has(base)) continue;
 
     const lines = readFileSync(file, "utf8").split("\n");
+    // A file whose first item is the inner attribute `#![cfg(test)]` is a
+    // test module in its own file and never compiles into the artifact.
+    if (lines.some((line) => /^\s*#!\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/.test(line))) continue;
 
     // Skip `#[cfg(test)] mod ... { ... }` regions by brace balance.
     const skip = new Set();

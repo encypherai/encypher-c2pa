@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! CBOR data model preserving byte-string/text distinction and map order.
 
 /// A CBOR value. Unlike `serde_json::Value`, this distinguishes byte strings

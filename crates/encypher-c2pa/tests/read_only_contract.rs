@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Verification never modifies what it is given.
 //!
 //! This is the SDK's central promise and, unlike everything else about it, the

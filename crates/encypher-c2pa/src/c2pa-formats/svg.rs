@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! SVG: JUMBF base64-encoded in a `<c2pa:manifest>` metadata element.
 //!
 //! SVG has no binary container, so the manifest store is base64-encoded inside
@@ -69,6 +72,115 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         return Ok(Some(bytes));
     }
 
+    Ok(None)
+}
+
+fn xml_tag_end(text: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in text[start..].char_indices() {
+        match (quote, character) {
+            (Some(expected), actual) if actual == expected => quote = None,
+            (None, '"' | '\'') => quote = Some(character),
+            (None, '>') => return Some(start + offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn placement_error(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    let text = as_str(data)?;
+    let mut stack: Vec<&str> = Vec::new();
+    let mut cursor = 0usize;
+    let mut saw_manifest_element = false;
+    while let Some(relative) = text[cursor..].find('<') {
+        let start = cursor + relative;
+        if text[start..].starts_with("<!--") {
+            let end = text[start + 4..]
+                .find("-->")
+                .map(|offset| start + 4 + offset + 3)
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "unterminated SVG comment",
+                })?;
+            cursor = end;
+            continue;
+        }
+        if text[start..].starts_with("<?") {
+            let end = text[start + 2..]
+                .find("?>")
+                .map(|offset| start + 2 + offset + 2)
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "unterminated SVG processing instruction",
+                })?;
+            cursor = end;
+            continue;
+        }
+        if text[start..].starts_with("<!") {
+            cursor = xml_tag_end(text, start + 2).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "unterminated SVG declaration",
+            })?;
+            continue;
+        }
+
+        let closing = text.as_bytes().get(start + 1) == Some(&b'/');
+        let name_start = start + if closing { 2 } else { 1 };
+        let name_end = text[name_start..]
+            .char_indices()
+            .find(|(_, character)| {
+                !character.is_ascii_alphanumeric() && !matches!(character, ':' | '_' | '-' | '.')
+            })
+            .map(|(offset, _)| name_start + offset)
+            .unwrap_or(text.len());
+        if name_end == name_start {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "SVG contains an empty element name",
+            });
+        }
+        let name = &text[name_start..name_end];
+        let end = xml_tag_end(text, name_end).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "unterminated SVG element",
+        })?;
+        if closing {
+            if stack.pop() != Some(name) {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "SVG element nesting is malformed",
+                });
+            }
+        } else {
+            if stack.is_empty() && name != "svg" {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "SVG root element is not svg",
+                });
+            }
+            if name == "c2pa:manifest" {
+                saw_manifest_element = true;
+                if text.find(ELEM_OPEN_TAG) != Some(start) {
+                    return Ok(Some(
+                        "SVG extractor-selected manifest carrier is not an XML element",
+                    ));
+                }
+                if stack.as_slice() != ["svg", "metadata"] {
+                    return Ok(Some("SVG c2pa:manifest is not in root svg metadata"));
+                }
+            }
+            if !text[start..end - 1].trim_end().ends_with('/') {
+                stack.push(name);
+            }
+        }
+        cursor = end;
+    }
+    if !saw_manifest_element && (text.contains(ELEM_OPEN_TAG) || text.contains(PI_OPEN)) {
+        return Ok(Some(
+            "SVG manifest carrier is not a c2pa:manifest element in root metadata",
+        ));
+    }
     Ok(None)
 }
 
@@ -240,6 +352,7 @@ mod tests {
             extract(svg.as_bytes()).unwrap().as_deref(),
             Some(store.as_slice())
         );
+        assert_eq!(placement_error(svg.as_bytes()).unwrap(), None);
     }
 
     #[test]
@@ -296,6 +409,15 @@ mod tests {
         let span = &svg.as_bytes()[start..start + length];
         assert!(span.starts_with(b"<?c2pa-manifest "));
         assert!(span.ends_with(b"?>"));
+    }
+
+    #[test]
+    fn strict_placement_requires_root_metadata_parent() {
+        let b64 = base64_encode(&dummy_manifest_store());
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><g><metadata><c2pa:manifest>{b64}</c2pa:manifest></metadata></g></svg>"
+        );
+        assert!(placement_error(svg.as_bytes()).unwrap().is_some());
     }
 
     #[test]

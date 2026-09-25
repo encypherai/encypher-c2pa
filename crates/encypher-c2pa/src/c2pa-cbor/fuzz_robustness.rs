@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic robustness tests for the CBOR decoder (adversarial input).
 //!
 //! The CBOR decoder parses untrusted claim/assertion/COSE bytes. It must never

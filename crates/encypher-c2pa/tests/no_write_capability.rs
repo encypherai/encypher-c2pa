@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Verification runs with the ability to write taken away by the kernel.
 //!
 //! The other controls in this repository reason about source text. The

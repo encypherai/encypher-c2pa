@@ -1,9 +1,18 @@
 Encypher C2PA
 Copyright 2026 Encypher Corporation (https://encypher.com)
 
-This product includes software developed by Encypher Corporation
-Redistributions of this software or derivative works must retain this
-NOTICE file, as required by the Apache License, Version 2.0, Section 4(d).
+This product includes software developed by Encypher Corporation.
+
+Redistributions of this software or of derivative works must retain this
+NOTICE file and its attribution to Encypher Corporation, as required by the
+Apache License, Version 2.0, Section 4(d). Source files must retain their
+copyright and license headers, as required by Section 4(c).
+
+"Encypher" and the Encypher logo are trademarks of Encypher Corporation. The
+Apache License does not grant permission to use them (Section 6). A modified
+version may state that it is based on Encypher C2PA, but must not use the
+Encypher name or logo to suggest that Encypher Corporation made, reviewed, or
+endorses it.
 
 This product implements parts of the C2PA Technical Specification. C2PA,
 Content Credentials, and related marks belong to their respective owners. Use

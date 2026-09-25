@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! GIF: JUMBF in an Application Extension block.
 //!
 //! After the header, logical screen descriptor, and optional global color
@@ -136,6 +139,50 @@ fn find_c2pa_extensions(data: &[u8]) -> Result<Vec<(usize, usize, Vec<u8>)>, For
     Ok(found)
 }
 
+fn first_image_descriptor(data: &[u8]) -> Result<Option<usize>, FormatError> {
+    let mut position = first_block_offset(data)?;
+    while position < data.len() {
+        match data[position] {
+            IMAGE_SEPARATOR => return Ok(Some(position)),
+            TRAILER => return Ok(None),
+            EXTENSION_INTRODUCER => {
+                let label = *data.get(position + 1).ok_or(FormatError::Truncated(FMT))?;
+                let subblocks = position + 2;
+                if label == APP_EXTENSION_LABEL {
+                    let identifier_length =
+                        *data.get(subblocks).ok_or(FormatError::Truncated(FMT))? as usize;
+                    position = skip_subblocks(
+                        data,
+                        subblocks
+                            .checked_add(1 + identifier_length)
+                            .filter(|end| *end <= data.len())
+                            .ok_or(FormatError::Truncated(FMT))?,
+                    )?;
+                } else {
+                    position = skip_subblocks(data, subblocks)?;
+                }
+            }
+            _ => {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "unexpected GIF block",
+                })
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn placement_error(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    let Some(first_image) = first_image_descriptor(data)? else {
+        return Ok(None);
+    };
+    Ok(find_c2pa_extensions(data)?
+        .iter()
+        .any(|(start, _, _)| *start > first_image)
+        .then_some("GIF C2PA Application Extension follows the first image descriptor"))
+}
+
 /// Extract the manifest store from the C2PA Application Extension.
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     Ok(find_c2pa_extensions(data)?
@@ -209,6 +256,110 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
         .collect())
 }
 
+/// A minimal GIF89a (header, LSD without a global color table, one frame,
+/// trailer) for tests in other modules of this crate.
+#[cfg(test)]
+pub(crate) fn sample_asset() -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"GIF89a");
+    // LSD: 1x1, packed=0 (no GCT), bg=0, aspect=0.
+    v.extend_from_slice(&[1, 0, 1, 0, 0x00, 0x00, 0x00]);
+    // Image descriptor: separator, left/top/w/h, packed=0.
+    v.push(IMAGE_SEPARATOR);
+    v.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0, 0x00]);
+    // LZW min code size + one data sub-block + terminator.
+    v.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]);
+    v.push(TRAILER);
+    v
+}
+
+/// Segment a GIF into the named boxes of C2PA 2.4 BoxesHash "GIF-specific
+/// Handling": the 6-byte header is `GIF89a`, the Logical Screen Descriptor is
+/// `LSD` and absorbs the Global Color Table, an Image Descriptor is `2C` and
+/// absorbs the Local Color Table, its Table Based Image Data is `TBID`, an
+/// extension block is `<introducer><label>` in upper-case hex (e.g. `21FE`),
+/// and the trailer is `3B`. The Application Extension carrying the manifest
+/// store is named `C2PA`.
+///
+/// Every byte is covered: bytes after the trailer become a `c2pa.after` box
+/// (BoxesHash "Special handling of multi-part assets"), which an assertion
+/// that does not list it rejects as an unknown box rather than leaving the
+/// trailing bytes unhashed.
+pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
+    use crate::c2pa_formats::BoxSpan;
+
+    let first_block = first_block_offset(data)?;
+    let mut spans = vec![
+        BoxSpan::contiguous("GIF89a", 0, 6),
+        BoxSpan::contiguous("LSD", 6, first_block),
+    ];
+    let mut pos = first_block;
+    let mut trailer_seen = false;
+    while pos < data.len() {
+        match data[pos] {
+            TRAILER => {
+                spans.push(BoxSpan::contiguous("3B", pos, pos + 1));
+                pos += 1;
+                trailer_seen = true;
+                break;
+            }
+            IMAGE_SEPARATOR => {
+                let packed = *data.get(pos + 9).ok_or(FormatError::Truncated(FMT))?;
+                let mut descriptor_end = pos + 10;
+                if packed & 0x80 != 0 {
+                    descriptor_end += 3 * (1usize << ((packed & 0x07) + 1));
+                }
+                // The LZW minimum code size byte opens the image data.
+                let data_start = descriptor_end
+                    .checked_add(1)
+                    .filter(|&end| end <= data.len())
+                    .ok_or(FormatError::Truncated(FMT))?;
+                let end = skip_subblocks(data, data_start)?;
+                spans.push(BoxSpan::contiguous("2C", pos, descriptor_end));
+                spans.push(BoxSpan::contiguous("TBID", descriptor_end, end));
+                pos = end;
+            }
+            EXTENSION_INTRODUCER => {
+                let label = *data.get(pos + 1).ok_or(FormatError::Truncated(FMT))?;
+                let sub_start = pos + 2;
+                let (name, end) = if label == APP_EXTENSION_LABEL {
+                    let id_len = *data.get(sub_start).ok_or(FormatError::Truncated(FMT))? as usize;
+                    let id_start = sub_start + 1;
+                    let id_end = id_start
+                        .checked_add(id_len)
+                        .filter(|&end| end <= data.len())
+                        .ok_or(FormatError::Truncated(FMT))?;
+                    let is_c2pa =
+                        id_len == APP_BLOCK_SIZE as usize && &data[id_start..id_end] == APP_ID;
+                    let name = if is_c2pa {
+                        "C2PA".to_string()
+                    } else {
+                        "21FF".to_string()
+                    };
+                    (name, skip_subblocks(data, id_end)?)
+                } else {
+                    (format!("21{label:02X}"), skip_subblocks(data, sub_start)?)
+                };
+                spans.push(BoxSpan::contiguous(name, pos, end));
+                pos = end;
+            }
+            _ => {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "unexpected GIF block",
+                })
+            }
+        }
+    }
+    if !trailer_seen {
+        return Err(FormatError::Truncated(FMT));
+    }
+    if pos < data.len() {
+        spans.push(BoxSpan::contiguous("c2pa.after", pos, data.len()));
+    }
+    Ok(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,20 +367,7 @@ mod tests {
 
     /// Minimal GIF89a: header + LSD (no GCT) + image + trailer.
     fn tiny_gif() -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(b"GIF89a");
-        // LSD: 1x1, packed=0 (no GCT), bg=0, aspect=0.
-        v.extend_from_slice(&[1, 0, 1, 0, 0x00, 0x00, 0x00]);
-        // Image descriptor: separator, left/top/w/h, packed=0.
-        v.push(IMAGE_SEPARATOR);
-        v.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0, 0x00]);
-        // LZW min code size + one data sub-block + terminator.
-        v.push(0x02);
-        v.push(0x02);
-        v.extend_from_slice(&[0x44, 0x01]);
-        v.push(0x00);
-        v.push(TRAILER);
-        v
+        sample_asset()
     }
 
     #[test]
@@ -240,6 +378,7 @@ mod tests {
             extract(&embedded).unwrap().as_deref(),
             Some(store.as_slice())
         );
+        assert_eq!(placement_error(&embedded).unwrap(), None);
     }
 
     #[test]
@@ -339,7 +478,97 @@ mod tests {
     }
 
     #[test]
+    fn strict_placement_rejects_extension_after_first_image() {
+        let mut asset = tiny_gif();
+        let extension = build_application_extension(&dummy_manifest_store());
+        let trailer = asset.pop().unwrap();
+        asset.extend_from_slice(&extension);
+        asset.push(trailer);
+        assert!(placement_error(&asset).unwrap().is_some());
+    }
+
+    #[test]
     fn exclusions_empty_without_manifest() {
         assert!(exclusions(&tiny_gif()).unwrap().is_empty());
+    }
+
+    /// A GIF with a Global Color Table, a comment extension, and one frame.
+    fn gif_with_extras() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"GIF89a");
+        // LSD: 1x1, packed=0x80 (GCT of 2 entries), bg=0, aspect=0.
+        v.extend_from_slice(&[1, 0, 1, 0, 0x80, 0x00, 0x00]);
+        // Global Color Table: 2 entries of 3 bytes.
+        v.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        // Comment extension with one sub-block.
+        v.extend_from_slice(&[EXTENSION_INTRODUCER, 0xFE, 0x03]);
+        v.extend_from_slice(b"hi!");
+        v.push(0x00);
+        // Image descriptor with no local color table.
+        v.push(IMAGE_SEPARATOR);
+        v.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0, 0x00]);
+        // LZW min code size + one data sub-block + terminator.
+        v.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]);
+        v.push(TRAILER);
+        v
+    }
+
+    #[test]
+    fn box_spans_name_every_gif_block_per_spec() {
+        let asset = gif_with_extras();
+        let embedded = embed(&asset, &dummy_manifest_store()).unwrap();
+        let spans = box_spans(&embedded).unwrap();
+        assert_eq!(
+            crate::c2pa_formats::tests::span_names(&spans),
+            ["GIF89a", "LSD", "C2PA", "21FE", "2C", "TBID", "3B"],
+        );
+        crate::c2pa_formats::tests::assert_box_coverage(&spans, embedded.len());
+        // The LSD box absorbs the Global Color Table: 7 + 6 bytes.
+        assert_eq!(spans[1].byte_len(), 13);
+        // The C2PA box is exactly the manifest carrier the data hash excludes.
+        let carrier = exclusions(&embedded).unwrap();
+        assert_eq!(carrier.len(), 1);
+        assert_eq!(spans[2].start(), carrier[0].start);
+        assert_eq!(spans[2].byte_len(), carrier[0].length);
+    }
+
+    #[test]
+    fn box_spans_absorb_the_local_color_table_into_the_image_descriptor() {
+        let mut asset = Vec::new();
+        asset.extend_from_slice(b"GIF89a");
+        asset.extend_from_slice(&[1, 0, 1, 0, 0x00, 0x00, 0x00]);
+        asset.push(IMAGE_SEPARATOR);
+        // packed=0x80: a local color table of 2 entries follows the descriptor.
+        asset.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0, 0x80]);
+        asset.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        asset.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]);
+        asset.push(TRAILER);
+
+        let spans = box_spans(&asset).unwrap();
+        assert_eq!(
+            crate::c2pa_formats::tests::span_names(&spans),
+            ["GIF89a", "LSD", "2C", "TBID", "3B"],
+        );
+        assert_eq!(spans[2].byte_len(), 10 + 6);
+        crate::c2pa_formats::tests::assert_box_coverage(&spans, asset.len());
+    }
+
+    #[test]
+    fn bytes_after_the_trailer_become_an_explicit_after_box() {
+        let mut asset = tiny_gif();
+        asset.extend_from_slice(b"trailing");
+        let spans = box_spans(&asset).unwrap();
+        assert_eq!(spans.last().unwrap().name, "c2pa.after");
+        crate::c2pa_formats::tests::assert_box_coverage(&spans, asset.len());
+    }
+
+    #[test]
+    fn a_gif_without_a_trailer_is_not_segmentable() {
+        let asset = tiny_gif();
+        let truncated = &asset[..asset.len() - 1];
+        assert!(matches!(
+            box_spans(truncated),
+            Err(FormatError::Truncated(FMT))
+        ));
     }
 }

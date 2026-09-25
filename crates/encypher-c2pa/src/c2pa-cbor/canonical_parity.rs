@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Byte-parity proof: `Profile::CanonicalForHashedSubstructures`
 //! `canonical_sha256` must match Python `cbor2.dumps(value, canonical=True)`.
 //!

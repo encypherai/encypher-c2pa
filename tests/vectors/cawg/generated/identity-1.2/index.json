@@ -357,16 +357,20 @@
           "claimSignature."
         ],
         "forbidden_success_codes": [
-          "cawg.identity.trusted"
+          "cawg.identity.trusted",
+          "cawg.identity.well-formed",
+          "cawg.x509.credential.trusted"
         ],
         "required_codes": [
           "claimSignature.validated",
           "assertion.hashedURI.match",
           "assertion.dataHash.match",
           "signingCredential.trusted",
-          "cawg.identity.well-formed"
+          "cawg.x509.signature.validated"
         ],
-        "required_failure_codes": [],
+        "required_failure_codes": [
+          "cawg.x509.credential.untrusted"
+        ],
         "validation_state": "Trusted"
       },
       "path": "generated/identity-1.2/assets/x509-es256-wrong-eku-jpeg.jpg",
@@ -559,7 +563,9 @@
           "signingCredential.trusted",
           "cawg.identity.trusted"
         ],
-        "required_failure_codes": [],
+        "required_failure_codes": [
+          "com.encypher.cawg.metadata.invalid"
+        ],
         "validation_state": "Trusted"
       },
       "path": "generated/identity-1.2/assets/x509-es256-bestpractice-jpeg.jpg",

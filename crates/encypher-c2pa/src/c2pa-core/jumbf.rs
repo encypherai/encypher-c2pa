@@ -1,9 +1,14 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! JUMBF (ISO 19566-5) box serializer and parser for C2PA manifest stores.
 //!
 //! The parser and serializer are byte-compatible with the C2PA JUMBF layout.
 //! Box format:
 //! `LBox(4 BE) | TBox(4) | payload`, with extended size when total >= 2^32
 //! (LBox=1, then XLBox(8)).
+
+use std::borrow::Cow;
 
 use thiserror::Error;
 
@@ -45,10 +50,25 @@ pub const UUID_CLAIM: [u8; 16] = type_uuid(*b"c2cl");
 pub const UUID_CLAIM_SIGNATURE: [u8; 16] = type_uuid(*b"c2cs");
 /// CBOR-content assertion box UUID (`cbor`).
 pub const UUID_CBOR_CONTENT: [u8; 16] = type_uuid(*b"cbor");
+/// JSON-content assertion box UUID (`json`).
+pub const UUID_JSON_CONTENT: [u8; 16] = type_uuid(*b"json");
+/// The C2PA Redaction UUID (`CAA98EEE-9D4D-F80E-86AD-4DFFCA263973`).
+///
+/// C2PA 2.4 Architecture, Redaction of Assertions: a redaction may retain the
+/// labelled assertion container and replace its JUMBF Content boxes with a
+/// single UUID Content box carrying this ID and an all-zero `DATA` field.
+pub const UUID_REDACTION: [u8; 16] = [
+    0xCA, 0xA9, 0x8E, 0xEE, 0x9D, 0x4D, 0xF8, 0x0E, 0x86, 0xAD, 0x4D, 0xFF, 0xCA, 0x26, 0x39, 0x73,
+];
 
 const TYPE_JUMB: &[u8; 4] = b"jumb";
 const TYPE_JUMD: &[u8; 4] = b"jumd";
 const TYPE_CBOR: &[u8; 4] = b"cbor";
+const TYPE_JSON: &[u8; 4] = b"json";
+const TYPE_BROB: &[u8; 4] = b"brob";
+const TYPE_FREE: &[u8; 4] = b"free";
+const TYPE_UUID: &[u8; 4] = b"uuid";
+const TYPE_SALT: &[u8; 4] = b"c2sh";
 const LABEL_MANIFEST_STORE: &str = "c2pa";
 const LABEL_ASSERTION_STORE: &str = "c2pa.assertions";
 const LABEL_CLAIM_V1: &str = "c2pa.claim";
@@ -66,8 +86,7 @@ const MAX_LABEL_BYTES: usize = 1_024;
 const TOGGLE_REQUESTABLE: u8 = 0x01;
 /// Description box toggle: label present.
 const TOGGLE_LABEL_PRESENT: u8 = 0x02;
-/// Description box toggle: private (salt sub-box present). Write path only.
-#[cfg(test)]
+/// Description box toggle: private (salt sub-box present).
 const TOGGLE_PRIVATE: u8 = 0x10;
 
 /// Error parsing a JUMBF structure.
@@ -90,6 +109,36 @@ pub enum JumbfError {
     /// The superbox UUID did not match the expected C2PA type.
     #[error("unexpected superbox uuid")]
     UnexpectedUuid,
+    /// Brotli decoding of a `brob` payload failed.
+    #[error("brotli decompression failed")]
+    DecompressionFailed,
+    /// A `brob` payload inflated past [`MAX_DECOMPRESSED_MANIFEST_BYTES`].
+    #[error("decompressed manifest exceeds {MAX_DECOMPRESSED_MANIFEST_BYTES} bytes")]
+    DecompressedTooLarge,
+    /// A `c2cm` superbox did not carry exactly one non-empty `brob` box.
+    #[error("malformed compressed manifest: {0}")]
+    CompressedManifestShape(&'static str),
+    /// The `c2cm` label disagreed with the manifest it carries.
+    #[error(
+        "compressed manifest label {compressed:?} does not match carried manifest {manifest:?}"
+    )]
+    CompressedManifestLabelMismatch {
+        /// Label on the `c2cm` superbox.
+        compressed: String,
+        /// Label on the decompressed manifest.
+        manifest: String,
+    },
+    /// A decompressed box was not a standard or update manifest.
+    #[error("not a C2PA manifest superbox")]
+    NotAManifestSuperbox,
+    /// A compressed manifest failed decompression or structural checks.
+    #[error("compressed manifest {label:?} is invalid: {reason}")]
+    CompressedManifestInvalid {
+        /// Label on the rejected `c2cm` superbox.
+        label: String,
+        /// Structural or Brotli error.
+        reason: Box<JumbfError>,
+    },
     /// Bytes remained after the declared top-level box.
     #[error("{0} trailing bytes after top-level JUMBF box")]
     TrailingBytes(usize),
@@ -115,8 +164,7 @@ pub enum JumbfError {
     UnsupportedManifestType(&'static str),
 }
 
-/// Wrap `payload` in an ISOBMFF box with a 4-byte type code. Write path only.
-#[cfg(test)]
+/// Wrap `payload` in an ISOBMFF box with a 4-byte type code.
 fn box_bytes(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let total = 8 + payload.len();
     let mut out = Vec::with_capacity(total + 8);
@@ -182,6 +230,21 @@ pub fn cbor_box(cbor: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 pub fn assertion_box(label: &str, cbor: &[u8], salt: Option<&[u8]>) -> Vec<u8> {
     superbox(&UUID_CBOR_CONTENT, label, &[cbor_box(cbor)], salt)
+}
+
+/// Build a redacted assertion superbox: the labelled container is retained and
+/// its content is a single UUID Content box carrying the C2PA Redaction UUID
+/// and `zeros` zero bytes. Fixture generation only.
+#[cfg(test)]
+pub fn redacted_assertion_box(label: &str, zeros: usize) -> Vec<u8> {
+    let mut content = UUID_REDACTION.to_vec();
+    content.resize(UUID_REDACTION.len() + zeros, 0);
+    superbox(
+        &UUID_CBOR_CONTENT,
+        label,
+        &[box_bytes(TYPE_UUID, &content)],
+        None,
+    )
 }
 
 /// Return the JUMBF *content* of a superbox: its payload after its complete
@@ -264,7 +327,7 @@ pub fn build_manifest_store(manifests: &[Vec<u8>]) -> Vec<u8> {
 /// Extract raw manifest superboxes from a C2PA manifest store, preserving
 /// store order.
 pub fn manifest_superboxes_from_store(data: &[u8]) -> Result<Vec<&[u8]>, JumbfError> {
-    let top = parse_box(data, 0)?;
+    let top = parse_manifest_store_box(data)?;
     if &top.box_type != TYPE_JUMB {
         return Err(JumbfError::UnexpectedType {
             expected: *TYPE_JUMB,
@@ -295,15 +358,16 @@ pub fn manifest_superboxes_from_store(data: &[u8]) -> Result<Vec<&[u8]>, JumbfEr
         let b = parse_box(top.payload, pos)?;
         if b.box_type == *TYPE_JUMB {
             let child = parse_superbox_description(b.payload)?;
-            if matches!(child.type_uuid, UUID_MANIFEST | UUID_LEGACY_MANIFEST) {
+            if matches!(
+                child.type_uuid,
+                UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+            ) {
                 if manifests.len() >= MAX_MANIFESTS_PER_STORE {
                     return Err(JumbfError::ResourceLimit(
                         "manifest count exceeds verifier bound",
                     ));
                 }
                 manifests.push(&top.payload[pos..b.next]);
-            } else if child.type_uuid == UUID_UPDATE_MANIFEST {
-                return Err(JumbfError::UnsupportedManifestType("c2um"));
             } else if child.type_uuid == UUID_COMPRESSED_MANIFEST {
                 return Err(JumbfError::UnsupportedManifestType("c2cm"));
             }
@@ -311,6 +375,272 @@ pub fn manifest_superboxes_from_store(data: &[u8]) -> Result<Vec<&[u8]>, JumbfEr
         pos = b.next;
     }
     Ok(manifests)
+}
+
+/// Present two C2PA Manifest Stores as one, appending `update`'s manifests
+/// after `base`'s.
+///
+/// A BMFF asset whose active manifest is an update manifest carries two
+/// `ContentProvenanceBox`es: the untouched standard store (`box_purpose` of
+/// `original`) and the appended update store (`box_purpose` of `update`).
+/// C2PA 2.4 Validation requires the active update manifest's parent chain to
+/// be traced across both boxes, so the reader hands the validator a single
+/// store. Every manifest superbox is copied verbatim, so manifest digests and
+/// hashed-URI bindings are unaffected; only the enclosing store header is
+/// rebuilt to cover the added bytes.
+pub fn merge_manifest_stores(base: &[u8], update: &[u8]) -> Result<Vec<u8>, JumbfError> {
+    let base_store = parse_manifest_store_box(base)?;
+    let appended = manifest_superboxes_from_store(update)?;
+    let total = appended
+        .iter()
+        .try_fold(base_store.payload.len(), |total, manifest| {
+            total.checked_add(manifest.len())
+        })
+        .filter(|total| *total <= crate::MAX_MANIFEST_STORE_BYTES)
+        .ok_or(JumbfError::ResourceLimit(
+            "merged manifest store exceeds verifier byte bound",
+        ))?;
+    let mut payload = Vec::with_capacity(total);
+    payload.extend_from_slice(base_store.payload);
+    for manifest in appended {
+        payload.extend_from_slice(manifest);
+    }
+    Ok(box_bytes(TYPE_JUMB, &payload))
+}
+
+// ---- Compressed manifests (`c2cm` / `brob`) ----
+
+/// Hard cap on the bytes a single `brob` content box may inflate to.
+pub const MAX_DECOMPRESSED_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+
+struct BoundedSink {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+impl std::io::Write for BoundedSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > MAX_DECOMPRESSED_MANIFEST_BYTES - self.bytes.len() {
+            self.overflowed = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decompressed manifest exceeds bound",
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn brotli_decompress_bounded(stream: &[u8]) -> Result<Vec<u8>, JumbfError> {
+    let mut sink = BoundedSink {
+        bytes: Vec::new(),
+        overflowed: false,
+    };
+    match brotli::BrotliDecompress(&mut std::io::Cursor::new(stream), &mut sink) {
+        Ok(()) => Ok(sink.bytes),
+        Err(_) if sink.overflowed => Err(JumbfError::DecompressedTooLarge),
+        Err(_) => Err(JumbfError::DecompressionFailed),
+    }
+}
+
+#[cfg(test)]
+fn brotli_compress(data: &[u8]) -> Vec<u8> {
+    let mut compressed = Vec::new();
+    let params = brotli::enc::BrotliEncoderParams::default();
+    brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut compressed, &params)
+        .expect("fixture compression");
+    compressed
+}
+
+/// Wrap a standard manifest as a compressed manifest. Fixture generation only.
+#[cfg(test)]
+pub fn compress_manifest(manifest_superbox: &[u8]) -> Result<Vec<u8>, JumbfError> {
+    let parsed = parse_superbox(manifest_superbox)?;
+    if !matches!(parsed.type_uuid, UUID_MANIFEST | UUID_LEGACY_MANIFEST) {
+        return Err(JumbfError::NotAManifestSuperbox);
+    }
+    Ok(superbox(
+        &UUID_COMPRESSED_MANIFEST,
+        &parsed.label,
+        &[box_bytes(TYPE_BROB, &brotli_compress(manifest_superbox))],
+        None,
+    ))
+}
+
+#[cfg(test)]
+fn compress_manifest_kind(manifest_superbox: &[u8]) -> Result<Vec<u8>, JumbfError> {
+    let parsed = parse_superbox(manifest_superbox)?;
+    Ok(superbox(
+        &UUID_COMPRESSED_MANIFEST,
+        &parsed.label,
+        &[box_bytes(TYPE_BROB, &brotli_compress(manifest_superbox))],
+        None,
+    ))
+}
+
+fn decompress_manifest_superbox(parsed: &Superbox<'_>) -> Result<(Vec<u8>, [u8; 16]), JumbfError> {
+    if parsed.type_uuid != UUID_COMPRESSED_MANIFEST {
+        return Err(JumbfError::UnexpectedUuid);
+    }
+    let [(box_type, stream)] = parsed.content.as_slice() else {
+        return Err(JumbfError::CompressedManifestShape(
+            "expected exactly one brob content box",
+        ));
+    };
+    if box_type != TYPE_BROB {
+        return Err(JumbfError::UnexpectedType {
+            expected: *TYPE_BROB,
+            found: *box_type,
+        });
+    }
+    if stream.is_empty() {
+        return Err(JumbfError::CompressedManifestShape("brob box is empty"));
+    }
+    let manifest = brotli_decompress_bounded(stream)?;
+    let inner_type_uuid = {
+        let inner = parse_superbox(&manifest)?;
+        if !matches!(
+            inner.type_uuid,
+            UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+        ) {
+            return Err(JumbfError::NotAManifestSuperbox);
+        }
+        if inner.label != parsed.label {
+            return Err(JumbfError::CompressedManifestLabelMismatch {
+                compressed: parsed.label.clone(),
+                manifest: inner.label,
+            });
+        }
+        inner.type_uuid
+    };
+    Ok((manifest, inner_type_uuid))
+}
+
+/// Return whether a manifest store carries at least one compressed manifest.
+pub fn store_has_compressed_manifest(store: &[u8]) -> bool {
+    let Ok(top) = parse_manifest_store_box(store) else {
+        return false;
+    };
+    let Ok(description) = parse_superbox_description(top.payload) else {
+        return false;
+    };
+    if description.type_uuid != UUID_MANIFEST_STORE {
+        return false;
+    }
+    let mut position = description.content_offset;
+    while position < top.payload.len() {
+        let Ok(child_box) = parse_box(top.payload, position) else {
+            return false;
+        };
+        if child_box.box_type == *TYPE_JUMB
+            && parse_superbox_payload(child_box.payload)
+                .is_ok_and(|child| child.type_uuid == UUID_COMPRESSED_MANIFEST)
+        {
+            return true;
+        }
+        position = child_box.next;
+    }
+    false
+}
+
+/// Return whether a store carries a standard, legacy, update, or compressed manifest.
+pub fn store_carries_manifest(store: &[u8]) -> bool {
+    parse_manifest_store(store).is_ok_and(|parsed| !parsed.manifests.is_empty())
+        || store_has_compressed_manifest(store)
+}
+
+/// A store with compressed manifests expanded for validation.
+pub struct ExpandedStore<'a> {
+    bytes: Cow<'a, [u8]>,
+    stored_contents: Vec<Option<&'a [u8]>>,
+}
+
+impl<'a> ExpandedStore<'a> {
+    /// Expanded store bytes, borrowed unchanged when no `c2cm` was present.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Whether at least one `c2cm` was expanded.
+    pub fn expanded(&self) -> bool {
+        matches!(self.bytes, Cow::Owned(_))
+    }
+
+    /// Stored `c2cm` superbox content for the manifest at `index`.
+    pub fn stored_content(&self, index: usize) -> Option<&'a [u8]> {
+        self.stored_contents.get(index).copied().flatten()
+    }
+}
+
+/// Expand each `c2cm` exactly once, retaining its stored hash domain.
+pub fn expand_store(store: &[u8]) -> Result<ExpandedStore<'_>, JumbfError> {
+    let top = parse_manifest_store_box(store)?;
+    let description = parse_superbox_description(top.payload)?;
+    if description.type_uuid != UUID_MANIFEST_STORE {
+        return Err(JumbfError::UnexpectedUuid);
+    }
+    if description.label != LABEL_MANIFEST_STORE {
+        return Err(JumbfError::UnexpectedLabel {
+            expected: LABEL_MANIFEST_STORE,
+            found: description.label,
+        });
+    }
+
+    let mut compressed_seen = false;
+    let mut rebuilt_payload = top.payload[..description.content_offset].to_vec();
+    let mut stored_contents = Vec::new();
+    let mut position = description.content_offset;
+    while position < top.payload.len() {
+        let child_box = parse_box(top.payload, position)?;
+        if child_box.box_type != *TYPE_JUMB {
+            rebuilt_payload.extend_from_slice(&top.payload[position..child_box.next]);
+            position = child_box.next;
+            continue;
+        }
+        let child = parse_superbox_payload(child_box.payload)?;
+        if child.type_uuid == UUID_COMPRESSED_MANIFEST {
+            compressed_seen = true;
+            let (manifest, manifest_type) =
+                decompress_manifest_superbox(&child).map_err(|reason| {
+                    JumbfError::CompressedManifestInvalid {
+                        label: child.label.clone(),
+                        reason: Box::new(reason),
+                    }
+                })?;
+            if matches!(
+                manifest_type,
+                UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+            ) {
+                stored_contents.push(Some(child_box.payload));
+            }
+            rebuilt_payload.extend_from_slice(&manifest);
+        } else {
+            if matches!(
+                child.type_uuid,
+                UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+            ) {
+                stored_contents.push(None);
+            }
+            rebuilt_payload.extend_from_slice(&top.payload[position..child_box.next]);
+        }
+        position = child_box.next;
+    }
+
+    if !compressed_seen {
+        return Ok(ExpandedStore {
+            bytes: Cow::Borrowed(store),
+            stored_contents: Vec::new(),
+        });
+    }
+    Ok(ExpandedStore {
+        bytes: Cow::Owned(box_bytes(TYPE_JUMB, &rebuilt_payload)),
+        stored_contents,
+    })
 }
 
 // ---- Parser ----
@@ -383,6 +713,27 @@ fn parse_box(data: &[u8], offset: usize) -> Result<ParsedBox<'_>, JumbfError> {
     }
 }
 
+/// Parse a carrier containing one store superbox and, optionally, one trailing
+/// well-formed `free` box. No other trailing bytes are accepted.
+fn parse_manifest_store_box(data: &[u8]) -> Result<ParsedBox<'_>, JumbfError> {
+    let top = parse_box(data, 0)?;
+    if &top.box_type != TYPE_JUMB {
+        return Err(JumbfError::UnexpectedType {
+            expected: *TYPE_JUMB,
+            found: top.box_type,
+        });
+    }
+    if top.next == data.len() {
+        return Ok(top);
+    }
+    let trailing =
+        parse_box(data, top.next).map_err(|_| JumbfError::TrailingBytes(data.len() - top.next))?;
+    if trailing.box_type != *TYPE_FREE || trailing.next != data.len() {
+        return Err(JumbfError::TrailingBytes(data.len() - top.next));
+    }
+    Ok(top)
+}
+
 struct ParsedSuperboxDescription {
     type_uuid: [u8; 16],
     label: String,
@@ -435,6 +786,22 @@ fn parse_superbox_description(payload: &[u8]) -> Result<ParsedSuperboxDescriptio
             "JUMBF label contains a forbidden character",
         ));
     }
+    if toggles & TOGGLE_PRIVATE != 0 {
+        let salt_offset = 17 + null + 1;
+        let salt = parse_box(desc.payload, salt_offset).map_err(|_| {
+            JumbfError::InvalidStructure(
+                "private JUMBF description requires one 16- or 32-byte c2sh box",
+            )
+        })?;
+        if salt.box_type != *TYPE_SALT
+            || salt.next != desc.payload.len()
+            || !matches!(salt.payload.len(), 16 | 32)
+        {
+            return Err(JumbfError::InvalidStructure(
+                "private JUMBF description requires one 16- or 32-byte c2sh box",
+            ));
+        }
+    }
     Ok(ParsedSuperboxDescription {
         type_uuid,
         label: label.to_owned(),
@@ -474,6 +841,15 @@ fn parse_superbox_payload(payload: &[u8]) -> Result<Superbox<'_>, JumbfError> {
     })
 }
 
+/// The serialization carried by an assertion superbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionContentType {
+    /// CBOR JUMBF content box.
+    Cbor,
+    /// JSON or JSON-LD JUMBF content box.
+    Json,
+}
+
 /// Parse a top-level `jumb` superbox from raw bytes.
 pub fn parse_superbox(data: &[u8]) -> Result<Superbox<'_>, JumbfError> {
     let b = parse_box(data, 0)?;
@@ -487,6 +863,15 @@ pub fn parse_superbox(data: &[u8]) -> Result<Superbox<'_>, JumbfError> {
         return Err(JumbfError::TrailingBytes(data.len() - b.next));
     }
     parse_superbox_payload(b.payload)
+}
+
+/// The C2PA manifest form carried by a parsed manifest superbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestKind {
+    /// A standard manifest (`c2ma`, or legacy `c2md`) with its own hard binding.
+    Standard,
+    /// An update manifest (`c2um`) whose hard binding comes from its parent.
+    Update,
 }
 
 /// A parsed C2PA manifest: label, assertions (label -> CBOR bytes), raw
@@ -526,7 +911,8 @@ pub fn parse_manifest_store(data: &[u8]) -> Result<ParsedStore<'_>, JumbfError> 
             "manifest store exceeds verifier byte bound",
         ));
     }
-    let store = parse_superbox(data)?;
+    let top = parse_manifest_store_box(data)?;
+    let store = parse_superbox_payload(top.payload)?;
     if store.type_uuid != UUID_MANIFEST_STORE {
         return Err(JumbfError::UnexpectedUuid);
     }
@@ -540,34 +926,92 @@ pub fn parse_manifest_store(data: &[u8]) -> Result<ParsedStore<'_>, JumbfError> 
     let mut manifest_labels = std::collections::BTreeSet::new();
     for (ctype, cpayload) in &store.content {
         if ctype == TYPE_JUMB {
-            if let Some(m) = parse_manifest(cpayload)? {
+            if let Some(manifest) = parse_manifest(cpayload)? {
                 if manifests.len() >= MAX_MANIFESTS_PER_STORE {
                     return Err(JumbfError::ResourceLimit(
                         "manifest count exceeds verifier bound",
                     ));
                 }
-                if !manifest_labels.insert(m.label.clone()) {
-                    return Err(JumbfError::AmbiguousLabel(m.label));
+                if !manifest_labels.insert(manifest.label.clone()) {
+                    return Err(JumbfError::AmbiguousLabel(manifest.label));
                 }
-                manifests.push(m);
+                manifests.push(manifest);
             }
         }
     }
     Ok(ParsedStore { manifests })
 }
 
+impl ParsedManifest<'_> {
+    /// Return whether this is a standard or update manifest.
+    ///
+    /// Parsed manifests always carry a valid description box. In-crate tests
+    /// also construct empty synthetic manifests directly; those retain the
+    /// historical standard-manifest behavior.
+    pub fn kind(&self) -> ManifestKind {
+        parse_superbox_payload(self.manifest_jumbf)
+            .ok()
+            .filter(|manifest| manifest.type_uuid == UUID_UPDATE_MANIFEST)
+            .map_or(ManifestKind::Standard, |_| ManifestKind::Update)
+    }
+
+    /// Return the JUMBF content type for a stored assertion label.
+    pub fn assertion_content_type(&self, label: &str) -> Option<AssertionContentType> {
+        let (_, payload) = self
+            .assertion_jumbf
+            .iter()
+            .find(|(candidate, _)| candidate == label)?;
+        let assertion = parse_superbox_payload(payload).ok()?;
+        match assertion.type_uuid {
+            UUID_CBOR_CONTENT => Some(AssertionContentType::Cbor),
+            UUID_JSON_CONTENT => Some(AssertionContentType::Json),
+            _ => None,
+        }
+    }
+
+    /// Whether the assertion box labelled `label` is present but carries no
+    /// content other than zeros, i.e. it was redacted in place.
+    ///
+    /// `None` means the manifest carries no such assertion box at all (the
+    /// other lawful redaction form, where the whole box is removed).
+    ///
+    /// C2PA 2.4 Validation, Validate the Ingredients: a redacted assertion is
+    /// "present and any JUMBF Content box or padding box within it contains
+    /// anything other than zero or more `0x00` bytes". The redaction form the
+    /// Architecture clause defines wraps those zeros in a UUID Content box
+    /// whose 16-byte `ID` field is [`UUID_REDACTION`], so that identifier is
+    /// part of the box framing and is not counted as content.
+    pub fn assertion_content_is_zeroed(&self, label: &str) -> Option<bool> {
+        let (_, payload) = self
+            .assertion_jumbf
+            .iter()
+            .find(|(candidate, _)| candidate == label)?;
+        let Ok(assertion) = parse_superbox_payload(payload) else {
+            // Unparseable framing is not a zeroed box.
+            return Some(false);
+        };
+        Some(assertion.content.iter().all(|(box_type, content)| {
+            let data = match (box_type == TYPE_UUID, content.split_at_checked(16)) {
+                (true, Some((id, rest))) if id == UUID_REDACTION => rest,
+                _ => *content,
+            };
+            data.iter().all(|byte| *byte == 0)
+        }))
+    }
+}
+
 fn parse_manifest(payload: &[u8]) -> Result<Option<ParsedManifest<'_>>, JumbfError> {
     let parsed = parse_superbox_payload(payload)?;
-    if parsed.type_uuid == UUID_UPDATE_MANIFEST {
-        return Err(JumbfError::UnsupportedManifestType("c2um"));
-    }
     if parsed.type_uuid == UUID_COMPRESSED_MANIFEST {
         return Err(JumbfError::UnsupportedManifestType("c2cm"));
     }
-    if !matches!(parsed.type_uuid, UUID_MANIFEST | UUID_LEGACY_MANIFEST) {
+    if !matches!(
+        parsed.type_uuid,
+        UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+    ) {
         return Ok(None);
     }
-    let mut m = ParsedManifest {
+    let mut manifest = ParsedManifest {
         label: parsed.label.clone(),
         manifest_jumbf: payload,
         assertions: Vec::new(),
@@ -580,11 +1024,11 @@ fn parse_manifest(payload: &[u8]) -> Result<Option<ParsedManifest<'_>>, JumbfErr
     let mut assertion_labels = std::collections::BTreeSet::new();
     let mut direct_child_labels = std::collections::BTreeSet::new();
     let mut assertion_store_count = 0usize;
-    for (ctype, cpayload) in &parsed.content {
-        if ctype != TYPE_JUMB {
+    for (content_type, content_payload) in &parsed.content {
+        if content_type != TYPE_JUMB {
             continue;
         }
-        let inner = parse_superbox_payload(cpayload)?;
+        let inner = parse_superbox_payload(content_payload)?;
         if inner.type_uuid == UUID_ASSERTION_STORE {
             assertion_store_count += 1;
             if assertion_store_count > 1 {
@@ -616,36 +1060,47 @@ fn parse_manifest(payload: &[u8]) -> Result<Option<ParsedManifest<'_>>, JumbfErr
             return Err(JumbfError::AmbiguousLabel(inner.label));
         }
         if inner.type_uuid == UUID_ASSERTION_STORE {
-            for (atype, apayload) in &inner.content {
-                if atype == TYPE_JUMB {
-                    let assertion = parse_superbox_payload(apayload)?;
-                    if m.assertion_jumbf.len() >= MAX_ASSERTIONS_PER_MANIFEST {
-                        return Err(JumbfError::ResourceLimit(
-                            "assertion count exceeds verifier bound",
-                        ));
-                    }
-                    if !assertion_labels.insert(assertion.label.clone()) {
-                        return Err(JumbfError::AmbiguousLabel(assertion.label));
-                    }
-                    m.assertion_jumbf.push((assertion.label.clone(), apayload));
-                    for (act, acp) in &assertion.content {
-                        if act == TYPE_CBOR {
-                            m.assertions.push((assertion.label.clone(), acp));
-                            break;
-                        }
+            for (assertion_type, assertion_payload) in &inner.content {
+                if assertion_type != TYPE_JUMB {
+                    continue;
+                }
+                let assertion = parse_superbox_payload(assertion_payload)?;
+                if manifest.assertion_jumbf.len() >= MAX_ASSERTIONS_PER_MANIFEST {
+                    return Err(JumbfError::ResourceLimit(
+                        "assertion count exceeds verifier bound",
+                    ));
+                }
+                if !assertion_labels.insert(assertion.label.clone()) {
+                    return Err(JumbfError::AmbiguousLabel(assertion.label));
+                }
+                manifest
+                    .assertion_jumbf
+                    .push((assertion.label.clone(), assertion_payload));
+                let expected_content_type = match assertion.type_uuid {
+                    UUID_CBOR_CONTENT => Some(TYPE_CBOR),
+                    UUID_JSON_CONTENT => Some(TYPE_JSON),
+                    _ => None,
+                };
+                if let Some(expected_content_type) = expected_content_type {
+                    if let Some((_, payload)) = assertion
+                        .content
+                        .iter()
+                        .find(|(box_type, _)| box_type == expected_content_type)
+                    {
+                        manifest.assertions.push((assertion.label.clone(), payload));
                     }
                 }
             }
         } else if inner.type_uuid == UUID_CLAIM {
-            m.claim_count += 1;
+            manifest.claim_count += 1;
             if inner.content.len() != 1 || inner.content[0].0 != *TYPE_CBOR {
                 return Err(JumbfError::InvalidStructure(
                     "claim superbox must contain exactly one CBOR content box",
                 ));
             }
-            if m.claim_box_label.is_none() {
-                m.claim_cbor = Some(inner.content[0].1);
-                m.claim_box_label = Some(inner.label.clone());
+            if manifest.claim_box_label.is_none() {
+                manifest.claim_cbor = Some(inner.content[0].1);
+                manifest.claim_box_label = Some(inner.label.clone());
             }
         } else if inner.type_uuid == UUID_CLAIM_SIGNATURE {
             if inner.content.len() != 1 || inner.content[0].0 != *TYPE_CBOR {
@@ -653,7 +1108,7 @@ fn parse_manifest(payload: &[u8]) -> Result<Option<ParsedManifest<'_>>, JumbfErr
                     "claim signature superbox must contain exactly one CBOR content box",
                 ));
             }
-            m.signature_cose = Some(inner.content[0].1);
+            manifest.signature_cose = Some(inner.content[0].1);
         }
     }
     if assertion_store_count == 0 {
@@ -661,7 +1116,7 @@ fn parse_manifest(payload: &[u8]) -> Result<Option<ParsedManifest<'_>>, JumbfErr
             "manifest is missing required c2pa.assertions assertion store",
         ));
     }
-    Ok(Some(m))
+    Ok(Some(manifest))
 }
 
 #[cfg(test)]
@@ -1088,18 +1543,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_recognized_unimplemented_manifest_types() {
-        for (uuid, expected) in [
-            (UUID_UPDATE_MANIFEST, "c2um"),
-            (UUID_COMPRESSED_MANIFEST, "c2cm"),
-        ] {
-            let manifest = superbox(&uuid, "urn:c2pa:unsupported", &[], None);
-            let store = build_manifest_store(&[manifest]);
-            assert!(matches!(
-                parse_manifest_store(&store),
-                Err(JumbfError::UnsupportedManifestType(kind)) if kind == expected
-            ));
-        }
+    fn parses_update_manifest_and_retains_its_kind() {
+        let standard = build_manifest("urn:c2pa:update", &[], &[0xa0], &[0xd2, 0x84]);
+        let payload = parse_box(&standard, 0).unwrap().payload;
+        let parsed = parse_superbox_payload(payload).unwrap();
+        let update = superbox(
+            &UUID_UPDATE_MANIFEST,
+            "urn:c2pa:update",
+            &parsed
+                .content
+                .iter()
+                .map(|(box_type, payload)| box_bytes(box_type, payload))
+                .collect::<Vec<_>>(),
+            None,
+        );
+        let store = build_manifest_store(&[update]);
+        let parsed = parse_manifest_store(&store).unwrap();
+
+        assert_eq!(parsed.manifests.len(), 1);
+        assert_eq!(parsed.manifests[0].kind(), ManifestKind::Update);
+    }
+
+    #[test]
+    fn rejects_unexpanded_compressed_manifest() {
+        let manifest = superbox(&UUID_COMPRESSED_MANIFEST, "urn:c2pa:unsupported", &[], None);
+        let store = build_manifest_store(&[manifest]);
+        assert!(matches!(
+            parse_manifest_store(&store),
+            Err(JumbfError::UnsupportedManifestType("c2cm"))
+        ));
     }
 
     #[test]
@@ -1217,6 +1689,205 @@ mod tests {
         assert!(matches!(
             parse_manifest_store(&store),
             Err(JumbfError::AmbiguousLabel(label)) if label == "c2pa.actions.v2"
+        ));
+    }
+
+    #[test]
+    fn manifest_store_accepts_exactly_one_trailing_free_box() {
+        let manifest = build_manifest("urn:c2pa:padded", &[], &[0xa0], &[0xd2, 0x84]);
+        let store = build_manifest_store(&[manifest]);
+        let mut padded = store.clone();
+        padded.extend_from_slice(&8u32.to_be_bytes());
+        padded.extend_from_slice(b"free");
+
+        assert_eq!(parse_manifest_store(&padded).unwrap().manifests.len(), 1);
+
+        let mut wrong_type = store.clone();
+        wrong_type.extend_from_slice(&8u32.to_be_bytes());
+        wrong_type.extend_from_slice(b"skip");
+        assert!(parse_manifest_store(&wrong_type).is_err());
+
+        let mut two_free = padded;
+        two_free.extend_from_slice(&8u32.to_be_bytes());
+        two_free.extend_from_slice(b"free");
+        assert!(parse_manifest_store(&two_free).is_err());
+    }
+
+    #[test]
+    fn private_description_requires_one_valid_salt_box() {
+        for salt_len in [0, 15, 17, 31, 33] {
+            let salt = vec![7u8; salt_len];
+            let assertion = assertion_box("c2pa.actions.v2", &[0xa0], Some(&salt));
+            let manifest =
+                build_manifest("urn:c2pa:bad-salt", &[assertion], &[0xa0], &[0xd2, 0x84]);
+            let store = build_manifest_store(&[manifest]);
+            assert!(
+                matches!(
+                    parse_manifest_store(&store),
+                    Err(JumbfError::InvalidStructure(_))
+                ),
+                "salt length {salt_len} must be rejected"
+            );
+        }
+
+        for salt_len in [16, 32] {
+            let salt = vec![7u8; salt_len];
+            let assertion = assertion_box("c2pa.actions.v2", &[0xa0], Some(&salt));
+            let manifest =
+                build_manifest("urn:c2pa:good-salt", &[assertion], &[0xa0], &[0xd2, 0x84]);
+            let store = build_manifest_store(&[manifest]);
+            assert!(
+                parse_manifest_store(&store).is_ok(),
+                "salt length {salt_len} must be accepted"
+            );
+        }
+
+        let assertion = assertion_box("c2pa.actions.v2", &[0xa0], None);
+        let manifest = build_manifest(
+            "urn:c2pa:missing-salt",
+            &[assertion],
+            &[0xa0],
+            &[0xd2, 0x84],
+        );
+        let mut store = build_manifest_store(&[manifest]);
+        let label_offset = store
+            .windows(b"c2pa.actions.v2".len())
+            .position(|bytes| bytes == b"c2pa.actions.v2")
+            .unwrap();
+        store[label_offset - 1] |= TOGGLE_PRIVATE;
+        assert!(matches!(
+            parse_manifest_store(&store),
+            Err(JumbfError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn json_assertion_content_is_exposed_with_its_type() {
+        let json = br#"{"@context":"https://schema.org"}"#;
+        let assertion = superbox(
+            &UUID_JSON_CONTENT,
+            "c2pa.metadata",
+            &[box_bytes(TYPE_JSON, json)],
+            None,
+        );
+        let manifest = build_manifest("urn:c2pa:json", &[assertion], &[0xa0], &[0xd2, 0x84]);
+        let store = build_manifest_store(&[manifest]);
+        let parsed = parse_manifest_store(&store).unwrap();
+        let manifest = &parsed.manifests[0];
+
+        assert_eq!(manifest.assertions[0].1, json);
+        assert_eq!(
+            manifest.assertion_content_type("c2pa.metadata"),
+            Some(AssertionContentType::Json)
+        );
+    }
+
+    #[test]
+    fn compressed_store_expands_raw_brotli_and_preserves_hash_domains() {
+        let manifest = build_manifest("urn:c2pa:compressed", &[], &[0xa0], &[0xd2, 0x84]);
+        let compressed = compress_manifest(&manifest).unwrap();
+        let stored_content = superbox_content(&compressed).unwrap().to_vec();
+        let store = build_manifest_store(&[compressed]);
+
+        let expanded = expand_store(&store).unwrap();
+        assert!(expanded.expanded());
+        assert_eq!(
+            parse_manifest_store(expanded.bytes()).unwrap().manifests[0].label,
+            "urn:c2pa:compressed"
+        );
+        assert_eq!(expanded.stored_content(0), Some(stored_content.as_slice()));
+    }
+
+    #[test]
+    fn compressed_update_follows_the_plain_update_path() {
+        let update = superbox(
+            &UUID_UPDATE_MANIFEST,
+            "urn:c2pa:update",
+            &[superbox(
+                &UUID_ASSERTION_STORE,
+                LABEL_ASSERTION_STORE,
+                &[],
+                None,
+            )],
+            None,
+        );
+        let compressed = compress_manifest_kind(&update).unwrap();
+        let stored_content = superbox_content(&compressed).unwrap().to_vec();
+        let store = build_manifest_store(&[compressed]);
+        let expanded = expand_store(&store).unwrap();
+
+        let parsed = parse_manifest_store(expanded.bytes()).unwrap();
+        assert_eq!(parsed.manifests[0].kind(), ManifestKind::Update);
+        assert_eq!(expanded.stored_content(0), Some(stored_content.as_slice()));
+
+        let plain_store = build_manifest_store(&[update]);
+        let plain = parse_manifest_store(&plain_store).unwrap();
+        assert_eq!(plain.manifests[0].kind(), ManifestKind::Update);
+    }
+
+    #[test]
+    fn corrupt_or_recursive_compressed_manifest_is_rejected_without_recursion() {
+        let corrupt = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:corrupt",
+            &[box_bytes(TYPE_BROB, b"not a brotli stream")],
+            None,
+        );
+        assert!(matches!(
+            expand_store(&build_manifest_store(&[corrupt])),
+            Err(JumbfError::CompressedManifestInvalid { .. })
+        ));
+
+        let inner = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:recursive",
+            &[box_bytes(TYPE_BROB, b"nested")],
+            None,
+        );
+        let recursive = compress_manifest_kind(&inner).unwrap();
+        assert!(matches!(
+            expand_store(&build_manifest_store(&[recursive])),
+            Err(JumbfError::CompressedManifestInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn compressed_manifest_inflate_is_bounded_and_label_bound() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_MANIFEST_BYTES + 1];
+        let compressed = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:oversized",
+            &[box_bytes(TYPE_BROB, &brotli_compress(&oversized))],
+            None,
+        );
+        let error = match expand_store(&build_manifest_store(&[compressed])) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized expansion must fail"),
+        };
+        assert!(matches!(
+            error,
+            JumbfError::CompressedManifestInvalid { reason, .. }
+                if matches!(reason.as_ref(), JumbfError::DecompressedTooLarge)
+        ));
+
+        let manifest = build_manifest("urn:c2pa:inner", &[], &[0xa0], &[0xd2, 0x84]);
+        let mismatched = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:outer",
+            &[box_bytes(TYPE_BROB, &brotli_compress(&manifest))],
+            None,
+        );
+        let error = match expand_store(&build_manifest_store(&[mismatched])) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched labels must fail"),
+        };
+        assert!(matches!(
+            error,
+            JumbfError::CompressedManifestInvalid { reason, .. }
+                if matches!(
+                    reason.as_ref(),
+                    JumbfError::CompressedManifestLabelMismatch { .. }
+                )
         ));
     }
 }

@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! ISOBMFF (MP4/MOV/M4A/AVIF/HEIC/HEIF): JUMBF in a top-level C2PA `uuid` box.
 //!
 //! C2PA reserves the user-type UUID `d8fec3d6-1b0e-483c-9297-5828877ec481`. The
@@ -12,8 +15,8 @@ use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Bmff;
 const TYPE_UUID: &[u8; 4] = b"uuid";
-#[cfg(test)]
 const TYPE_FTYP: &[u8; 4] = b"ftyp";
+const TYPE_STYP: &[u8; 4] = b"styp";
 
 /// Sanity-check that `data` looks like ISOBMFF: a parseable first box, and the
 /// presence of an `ftyp` is conventional but `mdat`/`moov`-first files exist, so
@@ -41,6 +44,40 @@ fn is_c2pa_uuid(data: &[u8], b: &IsoBox) -> bool {
         && data[b.payload_start..b.payload_start + 16] == crate::c2pa_formats::C2PA_BMFF_UUID
 }
 
+pub(crate) fn placement_error(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    check_bmff(data)?;
+    let mut boxes = Vec::new();
+    walk_iso_boxes(data, FMT, |box_| {
+        let purpose = is_c2pa_uuid(data, box_)
+            .then(|| data.get(box_.payload_start + 16..box_.end))
+            .flatten()
+            .and_then(c2pa_box_purpose)
+            .and_then(|(label, _)| std::str::from_utf8(label).ok());
+        boxes.push((box_.box_type, purpose));
+    })?;
+    let first_ftyp = boxes.iter().position(|(box_type, _)| box_type == TYPE_FTYP);
+    for (index, (_, purpose)) in boxes.iter().enumerate() {
+        match *purpose {
+            Some("manifest" | "original") => {
+                if first_ftyp.is_none_or(|ftyp| index <= ftyp)
+                    || boxes[..index]
+                        .iter()
+                        .any(|(box_type, _)| box_type == b"mdat" || box_type == b"moov")
+                {
+                    return Ok(Some(
+                        "BMFF manifest carrier is not after ftyp and before moov/mdat",
+                    ));
+                }
+            }
+            Some("update") if index + 1 != boxes.len() => {
+                return Ok(Some("BMFF update manifest carrier is not the last box"));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 fn xpath_box_types(xpaths: &[String]) -> Vec<[u8; 4]> {
     xpaths
         .iter()
@@ -49,6 +86,46 @@ fn xpath_box_types(xpaths: &[String]) -> Vec<[u8; 4]> {
             (b.len() == 4).then_some([b[0], b[1], b[2], b[3]])
         })
         .collect()
+}
+
+/// Longest `box_purpose` label this reader will scan for (the registered
+/// labels are `manifest`, `original`, `update`, and `merkle`).
+const MAX_BOX_PURPOSE_BYTES: usize = 64;
+
+/// What a C2PA `ContentProvenanceBox` carries, from its `box_purpose` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoxPurpose {
+    /// `manifest` or `original`: a C2PA Manifest Store carrier. An absent or
+    /// unregistered label reads as this too, which is how every carrier was
+    /// read before update selection existed.
+    Store,
+    /// `update`: the appended store carrying the active update manifests.
+    Update,
+    /// `merkle`: an auxiliary box, never a manifest store.
+    Auxiliary,
+}
+
+/// Split a C2PA `uuid` box payload (the bytes after the 16-byte UUID) into its
+/// `box_purpose` label and the purpose-specific data that follows.
+///
+/// Layout per C2PA 2.4 `ContentProvenanceBox`: a 4-byte version+flags field,
+/// then the null-terminated `box_purpose` string, then `data`.
+fn c2pa_box_purpose(payload_after_uuid: &[u8]) -> Option<(&[u8], &[u8])> {
+    let after_version_flags = payload_after_uuid.get(4..)?;
+    let nul = after_version_flags
+        .iter()
+        .take(MAX_BOX_PURPOSE_BYTES)
+        .position(|byte| *byte == 0)?;
+    Some((&after_version_flags[..nul], &after_version_flags[nul + 1..]))
+}
+
+/// Classify one C2PA `uuid` box by its `box_purpose` label.
+fn box_purpose(payload_after_uuid: &[u8]) -> BoxPurpose {
+    match c2pa_box_purpose(payload_after_uuid) {
+        Some((b"update", _)) => BoxPurpose::Update,
+        Some((b"merkle", _)) => BoxPurpose::Auxiliary,
+        _ => BoxPurpose::Store,
+    }
 }
 
 /// Extract the manifest store from the C2PA `uuid` box payload.
@@ -60,25 +137,54 @@ fn xpath_box_types(xpaths: &[String]) -> Vec<[u8; 4]> {
 /// this layout. Rather than hard-code the prefix length (which varies with the
 /// presence of merkle data), we locate the start of the `jumb` box by its
 /// `LBox + "jumb"` header within the payload.
+///
+/// When the asset carries a `box_purpose` of `update`, that store holds the
+/// active manifest: C2PA 2.4 Validation says "the active manifest is first
+/// searched in the C2PA ContentProvenanceBox with `box_purpose` set to
+/// `update` then in the C2PA ContentProvenanceBox with `box_purpose` set to
+/// `original`", and the parent chain is traced through either box. Both stores
+/// are therefore returned as one, update manifests last, so the active
+/// manifest is the update and its `parentOf` chain resolves into the original
+/// store. An update store that is not a readable manifest store is returned
+/// alone rather than discarded: falling back to the superseded original would
+/// report the asset valid against a manifest that is no longer active.
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     check_bmff(data)?;
-    let mut found = None;
-    let mut oversized = None;
+    let mut original: Option<&[u8]> = None;
+    let mut update: Option<&[u8]> = None;
     walk_iso_boxes(data, FMT, |b| {
-        if found.is_none() && oversized.is_none() && is_c2pa_uuid(data, b) {
-            let payload = &data[b.payload_start + 16..b.end];
-            if let Some(store) = jumbf_from_uuid_payload(payload) {
-                match super::ensure_manifest_store_size(FMT, store.len()) {
-                    Ok(()) => found = Some(store.to_vec()),
-                    Err(error) => oversized = Some(error),
-                }
-            }
+        if !is_c2pa_uuid(data, b) {
+            return;
+        }
+        let payload = &data[b.payload_start + 16..b.end];
+        let purpose = box_purpose(payload);
+        if purpose == BoxPurpose::Auxiliary {
+            return;
+        }
+        let Some(store) = jumbf_from_uuid_payload(payload) else {
+            return;
+        };
+        match purpose {
+            // The updated store "shall exist as the last box of the file", so
+            // a later update box supersedes an earlier one.
+            BoxPurpose::Update => update = Some(store),
+            BoxPurpose::Store => original = original.or(Some(store)),
+            BoxPurpose::Auxiliary => {}
         }
     })?;
-    if let Some(error) = oversized {
-        return Err(error);
+    for store in [original, update].into_iter().flatten() {
+        super::ensure_manifest_store_size(FMT, store.len())?;
     }
-    Ok(found)
+    let selected = match (original, update) {
+        (Some(original), Some(update)) => {
+            crate::c2pa_core::jumbf::merge_manifest_stores(original, update)
+                .unwrap_or_else(|_| update.to_vec())
+        }
+        (None, Some(store)) | (Some(store), None) => store.to_vec(),
+        (None, None) => return Ok(None),
+    };
+    super::ensure_manifest_store_size(FMT, selected.len())?;
+    Ok(Some(selected))
 }
 
 /// Locate the top-level `jumb` manifest store within a C2PA `uuid` box payload
@@ -228,24 +334,16 @@ pub fn bmff_merkle_boxes(
         if too_many || limit_error.is_some() || !is_c2pa_uuid(data, b) {
             return;
         }
-        // Payload after the 16-byte UUID: 4-byte version+flags, then the
-        // null-terminated purpose label, then the purpose-specific data.
-        let p = &data[b.payload_start + 16..b.end];
-        if p.len() < 4 {
-            return;
-        }
-        let after_vf = &p[4..];
-        let Some(nul) = after_vf.iter().position(|&c| c == 0) else {
+        let Some((purpose, cbor)) = c2pa_box_purpose(&data[b.payload_start + 16..b.end]) else {
             return;
         };
-        if &after_vf[..nul] != b"merkle" {
+        if purpose != b"merkle" {
             return;
         }
         if found.len() >= MAX_BMFF_MERKLE_BOXES {
             too_many = true;
             return;
         }
-        let cbor = &after_vf[nul + 1..];
         let parsed = parse_merkle_map(cbor);
         if let Ok(merkle_box) = &parsed {
             let next_hashes = total_proof_hashes.checked_add(merkle_box.proof.len());
@@ -1201,18 +1299,25 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// Build the exact top-level C2PA UUID carrier for a manifest store.
 #[cfg(test)]
 pub(crate) fn build_c2pa_uuid_box(manifest_store: &[u8]) -> Vec<u8> {
+    build_c2pa_uuid_box_with_purpose(b"manifest", manifest_store)
+}
+
+/// Build a top-level C2PA UUID carrier with an explicit `box_purpose`
+/// (`manifest`, `original`, or `update`).
+#[cfg(test)]
+pub(crate) fn build_c2pa_uuid_box_with_purpose(purpose: &[u8], manifest_store: &[u8]) -> Vec<u8> {
     // Box payload (c2pa-rs BMFF layout): C2PA UUID (16) + version+flags (4) +
-    // null-terminated purpose label "manifest" (9) + 8 reserved/merkle-offset
-    // bytes + the JUMBF manifest store.
-    const LABEL: &[u8] = b"manifest\0";
-    let prefix_len = 4 + LABEL.len() + 8;
+    // null-terminated purpose label + 8 reserved/merkle-offset bytes + the
+    // JUMBF manifest store.
+    let prefix_len = 4 + purpose.len() + 1 + 8;
     let payload_len = 16 + prefix_len + manifest_store.len();
     let header = iso_box_header(TYPE_UUID, payload_len);
     let mut boxed = Vec::with_capacity(header.len() + payload_len);
     boxed.extend_from_slice(&header);
     boxed.extend_from_slice(&crate::c2pa_formats::C2PA_BMFF_UUID);
     boxed.extend_from_slice(&[0, 0, 0, 0]);
-    boxed.extend_from_slice(LABEL);
+    boxed.extend_from_slice(purpose);
+    boxed.push(0);
     boxed.extend_from_slice(&[0u8; 8]);
     boxed.extend_from_slice(manifest_store);
     boxed
@@ -1603,6 +1708,259 @@ fn patch_absolute_offsets(data: &mut [u8], delta: i64) -> Result<(), FormatError
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Live-stream encapsulation and brand declarations
+// ---------------------------------------------------------------------------
+
+/// The brand declaration in a BMFF file's leading `ftyp` (whole file or stream
+/// init segment) or `styp` (media segment) box: ISO/IEC 14496-12 §4.3 / §8.16.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BmffBrands {
+    /// The declaring box type: `"ftyp"` or `"styp"`.
+    pub box_type: String,
+    /// `major_brand`, e.g. `"isom"`, `"cmfc"`, `"msdh"`.
+    pub major: String,
+    /// `compatible_brands`, in declaration order.
+    pub compatible: Vec<String>,
+}
+
+impl BmffBrands {
+    /// Whether `brand` is the major brand or appears in `compatible_brands`.
+    pub fn declares(&self, brand: &str) -> bool {
+        self.major == brand || self.compatible.iter().any(|b| b == brand)
+    }
+
+    /// Whether any of `wanted` is declared.
+    pub fn declares_any(&self, wanted: &[&str]) -> bool {
+        wanted.iter().any(|brand| self.declares(brand))
+    }
+}
+
+/// Read a BMFF asset's leading brand declaration.
+///
+/// Fails closed rather than guessing: a file whose first top-level box is
+/// neither `ftyp` nor `styp` declares no brands at all, and a truncated or
+/// non-printable brand list is a malformed container. Callers that need a
+/// specific encapsulation use [`bmff_check_stream_brand`].
+pub fn bmff_brands(data: &[u8]) -> Result<BmffBrands, FormatError> {
+    check_bmff(data)?;
+    let mut leading: Option<([u8; 4], usize, usize)> = None;
+    walk_iso_boxes(data, FMT, |b| {
+        if b.start == 0 {
+            leading = Some((b.box_type, b.payload_start, b.end));
+        }
+    })?;
+    let (box_type, payload_start, end) = leading.ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "no leading top-level box",
+    })?;
+    if &box_type != TYPE_FTYP && &box_type != TYPE_STYP {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "leading box is neither ftyp nor styp, so the asset declares no brands",
+        });
+    }
+    let payload = &data[payload_start..end];
+    // major_brand (4) + minor_version (4) + compatible_brands (4 * n).
+    if payload.len() < 8 {
+        return Err(FormatError::Truncated(FMT));
+    }
+    if !(payload.len() - 8).is_multiple_of(4) {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "compatible_brands is not a whole number of 4-byte brand codes",
+        });
+    }
+    let mut compatible = Vec::with_capacity((payload.len() - 8) / 4);
+    for code in payload[8..].chunks_exact(4) {
+        compatible.push(brand_token(code)?);
+    }
+    Ok(BmffBrands {
+        box_type: brand_token(&box_type)?,
+        major: brand_token(&payload[..4])?,
+        compatible,
+    })
+}
+
+/// Decode one 4-character brand code. Brand codes are printable ASCII
+/// (ISO/IEC 14496-12); anything else is a malformed declaration, not a brand
+/// this crate merely fails to recognize.
+fn brand_token(code: &[u8]) -> Result<String, FormatError> {
+    if code.len() != 4 || code.iter().any(|b| !(0x20..=0x7E).contains(b)) {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "brand code is not four printable ASCII bytes",
+        });
+    }
+    Ok(std::str::from_utf8(code)
+        .expect("printable ASCII is valid UTF-8")
+        .to_owned())
+}
+
+/// Init-segment brands that mark fragmented ISOBMFF (fMP4): the ISO base media
+/// versions that define movie fragments (`iso5`..`iso9`), the DASH/segment
+/// brands, and the CMAF track-file brands — CMAF is a strict profile of
+/// fragmented MP4, so a CMAF init segment is a valid fMP4 init segment.
+const FMP4_INIT_BRANDS: &[&str] = &[
+    "iso5", "iso6", "iso7", "iso8", "iso9", "dash", "msdh", "msix", "cmfc", "cmf2", "cmfh",
+];
+
+/// Media-segment brands that mark fragmented ISOBMFF.
+const FMP4_SEGMENT_BRANDS: &[&str] = &[
+    "msdh", "msix", "sisx", "ssss", "lmsg", "iso5", "iso6", "iso7", "iso8", "iso9", "dash", "cmfs",
+    "cmff", "cmfl", "cmfc", "cmf2",
+];
+
+/// CMAF header / track-file brands.
+const CMAF_INIT_BRANDS: &[&str] = &["cmfc", "cmf2", "cmfh"];
+
+/// CMAF segment, fragment, and chunk brands.
+const CMAF_SEGMENT_BRANDS: &[&str] = &["cmfs", "cmff", "cmfl", "cmfc", "cmf2"];
+
+/// The declared encapsulation of a fragmented live/streaming BMFF asset.
+///
+/// [`Self::token`] returns the C2PA Conformance Program 0.2 Generator Product
+/// form spelling (`fMP4`, `CMAF`) so a declaration round-trips through the
+/// conforming-products list unchanged. [`Self::from_token`] is ASCII
+/// case-insensitive, so lowercase CLI flags resolve to the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamEncapsulation {
+    /// Fragmented MP4: ISOBMFF init segment plus movie-fragment media segments
+    /// (DASH/HLS packaging).
+    Fmp4,
+    /// Common Media Application Format, a strict profile of fragmented MP4.
+    Cmaf,
+}
+
+impl StreamEncapsulation {
+    /// Every encapsulation, in declaration order.
+    pub const ALL: [StreamEncapsulation; 2] = [Self::Fmp4, Self::Cmaf];
+
+    /// The live-form declaration token.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Fmp4 => "fMP4",
+            Self::Cmaf => "CMAF",
+        }
+    }
+
+    /// Resolve a declaration token, ASCII case-insensitively.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|value| token.eq_ignore_ascii_case(value.token()))
+    }
+
+    /// Brand alternatives an init/header segment must declare.
+    pub const fn init_brands(self) -> &'static [&'static str] {
+        match self {
+            Self::Fmp4 => FMP4_INIT_BRANDS,
+            Self::Cmaf => CMAF_INIT_BRANDS,
+        }
+    }
+
+    /// Brand alternatives a media segment must declare.
+    pub const fn segment_brands(self) -> &'static [&'static str] {
+        match self {
+            Self::Fmp4 => FMP4_SEGMENT_BRANDS,
+            Self::Cmaf => CMAF_SEGMENT_BRANDS,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamEncapsulation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.token())
+    }
+}
+
+/// The C2PA protection method applied to a fragmented stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamMethod {
+    /// One manifest in the init segment binds every media segment: either the
+    /// `c2pa.hash.bmff.v3` Merkle tree whose fragments carry an auxiliary
+    /// `'merkle'` box (spec A.5.4), or a C2PA 2.4 session-key delivery whose
+    /// segments carry signed `emsg` verifiable segment information.
+    VerifiableSegmentInfo,
+    /// Every segment is an independently signed BMFF asset carrying its own
+    /// manifest, linked to its predecessor by a `c2pa.ingredient.v3` assertion.
+    PerSegment,
+}
+
+impl StreamMethod {
+    /// Every method, in declaration order.
+    pub const ALL: [StreamMethod; 2] = [Self::VerifiableSegmentInfo, Self::PerSegment];
+
+    /// The live-form declaration token.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::VerifiableSegmentInfo => "verifiable-segment-info",
+            Self::PerSegment => "per-segment",
+        }
+    }
+
+    /// Resolve a declaration token, ASCII case-insensitively.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|value| token.eq_ignore_ascii_case(value.token()))
+    }
+}
+
+impl std::fmt::Display for StreamMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.token())
+    }
+}
+
+/// Which half of a fragmented stream a file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFileRole {
+    /// The init/header segment (`ftyp` + `moov`).
+    Init,
+    /// A media segment (`styp` + `moof` + `mdat`).
+    Segment,
+}
+
+/// Fail-closed brand gate for one file of an explicitly declared stream.
+///
+/// Returns the parsed declaration on success. A non-BMFF file, a file with no
+/// leading `ftyp`/`styp`, or a file declaring none of the encapsulation's
+/// brands is rejected: a stream presented as CMAF whose bytes are plain fMP4 is
+/// refused rather than silently verified under a declaration the bytes do not
+/// support.
+pub fn bmff_check_stream_brand(
+    data: &[u8],
+    role: StreamFileRole,
+    encapsulation: StreamEncapsulation,
+) -> Result<BmffBrands, FormatError> {
+    let brands = bmff_brands(data)?;
+    let wanted = match role {
+        StreamFileRole::Init => encapsulation.init_brands(),
+        StreamFileRole::Segment => encapsulation.segment_brands(),
+    };
+    if !brands.declares_any(wanted) {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: match (role, encapsulation) {
+                (StreamFileRole::Init, StreamEncapsulation::Fmp4) => {
+                    "stream init segment declares no fragmented-MP4 brand"
+                }
+                (StreamFileRole::Segment, StreamEncapsulation::Fmp4) => {
+                    "stream media segment declares no fragmented-MP4 brand"
+                }
+                (StreamFileRole::Init, StreamEncapsulation::Cmaf) => {
+                    "stream init segment declares no CMAF brand"
+                }
+                (StreamFileRole::Segment, StreamEncapsulation::Cmaf) => {
+                    "stream media segment declares no CMAF brand"
+                }
+            },
+        });
+    }
+    Ok(brands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1656,6 +2014,102 @@ mod tests {
             extract(&embedded).unwrap().as_deref(),
             Some(store.as_slice())
         );
+    }
+
+    /// An update manifest store with one `parentOf` ingredient pointing at
+    /// `parent_label`.
+    fn update_only_store(parent_label: &str) -> Vec<u8> {
+        use crate::c2pa_core::jumbf::{
+            assertion_box, build_manifest, superbox, UUID_UPDATE_MANIFEST,
+        };
+        let ingredient = assertion_box("c2pa.ingredient.v3", &[0xa0], None);
+        let standard = build_manifest(
+            "urn:c2pa:test:update",
+            &[ingredient],
+            parent_label.as_bytes(),
+            &[0xd2, 0x84],
+        );
+        let parsed = crate::c2pa_core::jumbf::parse_superbox(&standard).unwrap();
+        let children: Vec<Vec<u8>> = parsed
+            .content
+            .iter()
+            .map(|(kind, payload)| {
+                let mut bytes = Vec::with_capacity(payload.len() + 8);
+                bytes.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+                bytes.extend_from_slice(kind);
+                bytes.extend_from_slice(payload);
+                bytes
+            })
+            .collect();
+        let update = superbox(
+            &UUID_UPDATE_MANIFEST,
+            "urn:c2pa:test:update",
+            &children,
+            None,
+        );
+        crate::c2pa_core::jumbf::build_manifest_store(&[update])
+    }
+
+    /// C2PA 2.4 Validating a BMFF-hash: "the active manifest is first searched
+    /// in the C2PA ContentProvenanceBox with `box_purpose` set to `update`".
+    /// Both stores are presented so the update's parent chain still resolves.
+    #[test]
+    fn update_box_supplies_the_active_manifest() {
+        let original = dummy_manifest_store();
+        let update = update_only_store("urn:c2pa:test:0001");
+        let mut asset = embed(&tiny_mp4(), &original).unwrap();
+        asset.extend_from_slice(&build_c2pa_uuid_box_with_purpose(b"update", &update));
+
+        let extracted = extract(&asset).unwrap().expect("manifest store");
+        let parsed = crate::c2pa_core::jumbf::parse_manifest_store(&extracted).unwrap();
+        let labels: Vec<&str> = parsed
+            .manifests
+            .iter()
+            .map(|manifest| manifest.label.as_str())
+            .collect();
+
+        assert_eq!(labels, ["urn:c2pa:test:0001", "urn:c2pa:test:update"]);
+        assert_eq!(
+            parsed.manifests.last().unwrap().kind(),
+            crate::c2pa_core::jumbf::ManifestKind::Update
+        );
+    }
+
+    /// An unreadable update store must not fall back to the superseded
+    /// original: the original is no longer the active manifest.
+    #[test]
+    fn unreadable_update_box_never_falls_back_to_the_original() {
+        let original = dummy_manifest_store();
+        let mut garbage = Vec::from(24u32.to_be_bytes());
+        garbage.extend_from_slice(b"jumb");
+        garbage.extend_from_slice(&[0x5a; 16]);
+        let mut asset = embed(&tiny_mp4(), &original).unwrap();
+        asset.extend_from_slice(&build_c2pa_uuid_box_with_purpose(b"update", &garbage));
+
+        let extracted = extract(&asset).unwrap().expect("manifest store");
+
+        assert_eq!(extracted, garbage);
+    }
+
+    /// The audit reproduction: appending an `update` ContentProvenanceBox that
+    /// carries a garbage store to a signed MP4 must stop reporting the
+    /// original manifest as a valid active manifest.
+    #[test]
+    fn appended_update_box_invalidates_the_original_manifest_verdict() {
+        let signed = include_bytes!("../../../../tests/fixtures/signed_test.mp4");
+        let control = crate::verify(signed, "video/mp4").expect("control verification");
+        assert_eq!(control.integrity, "valid", "fixture must verify as signed");
+
+        let mut garbage = Vec::from(24u32.to_be_bytes());
+        garbage.extend_from_slice(b"jumb");
+        garbage.extend_from_slice(&[0x5a; 16]);
+        let mut crafted = signed.to_vec();
+        crafted.extend_from_slice(&build_c2pa_uuid_box_with_purpose(b"update", &garbage));
+
+        let report = crate::verify(&crafted, "video/mp4").expect("crafted verification");
+
+        assert!(report.present);
+        assert_eq!(report.integrity, "invalid");
     }
 
     #[test]
@@ -1733,6 +2187,14 @@ mod tests {
         walk_iso_boxes(&embedded, FMT, |b| types.push(b.box_type)).unwrap();
         assert_eq!(types[0], *b"ftyp");
         assert_eq!(types[1], *b"uuid");
+        assert_eq!(placement_error(&embedded).unwrap(), None);
+    }
+
+    #[test]
+    fn strict_placement_rejects_manifest_after_mdat() {
+        let mut asset = tiny_mp4();
+        asset.extend_from_slice(&build_c2pa_uuid_box(&dummy_manifest_store()));
+        assert!(placement_error(&asset).unwrap().is_some());
     }
 
     #[test]

@@ -24,11 +24,14 @@
   "vector_count": 34,
   "vectors": [
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
       "fixed_validation_time": "2025-09-01T00:00:00Z",
@@ -37,10 +40,13 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
-      "notes": "Legacy did:web sample issued by Adobe's production connected-identities aggregator; validates offline against the pinned did:web document fetched from the public .well-known endpoint (2026-08-04). Validated at the late clock because the VC validFrom (2025-05-30) postdates the default corpus clock.",
+      "notes": "Legacy Adobe sample. The pinned DID document uses the unsupported JsonWebKey method type, the c2paAsset is not an exact signer_payload conversion, and no ICA issuer trust is configured.",
       "path": "external/contentauth-c2pa-cpp/357f0fc5/assets/C_with_CAWG_data.jpg",
       "sha256": "c7033c5d63e86e5870a6ade3b51e810a7dfd312e925124e7826e2a9b46263fe5",
       "size": 194414,
@@ -63,11 +69,15 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "x509",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.identity.well-formed"
+          "cawg.x509.signature.validated",
+          "cawg.x509.credential.untrusted",
+          "cawg.x509.ocsp.skipped",
+          "com.encypher.cawg.legacyProfile",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -76,10 +86,14 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.identity.well-formed"
+          "cawg.x509.signature.validated",
+          "cawg.x509.credential.untrusted",
+          "cawg.x509.ocsp.skipped",
+          "com.encypher.cawg.legacyProfile",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
-      "notes": "COSE signature verifies over the stored (serde field-order) signer_payload encoding, which the validator accepts alongside canonical CBOR and surfaces via the informational com.encypher.cawg.legacyProfile status (refused under --cawg-strict-encoding). Well-formed rather than trusted: the identity leaf carries no trusted timestamp, so the CAWG 1.2 interim S/MIME policy withholds trust.",
+      "notes": "The COSE signature covers the serde field-order signer_payload encoding that c2pa-rs writes. The default posture accepts it with com.encypher.cawg.legacyProfile, and the signer reaches no configured CAWG trust anchor, so CAWG Identity 1.3 reports cawg.x509.credential.untrusted; --strict-conformance requires the 1.3 deterministic CBOR and reports cawg.x509.signature.mismatch.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/cli__tests__fixtures__C_with_CAWG_data.jpg",
       "sha256": "fa0b257c863cb5b367135a017813ce0c1fbfc690a03e94acdd047c25c2d1ed46",
       "size": 139636,
@@ -90,6 +104,13 @@
         "url": "https://raw.githubusercontent.com/contentauth/c2pa-rs/d7f13829ff4416c9254534885aa6f2ffc71d98f1/cli/tests/fixtures/C_with_CAWG_data.jpg"
       },
       "spec_profile": "legacy non-deterministic signer_payload encoding",
+      "strict_expected": {
+        "required_codes": [
+          "cawg.x509.signature.mismatch",
+          "cawg.x509.ocsp.skipped",
+          "com.encypher.cawg.trainingMining.effectiveUse"
+        ]
+      },
       "trust": {
         "cawg_allowed_list": "trust/c2pa-rs-cawg-trust.pem",
         "claim_allowed_list": "trust/c2pa-rs-claim-trust.pem"
@@ -99,11 +120,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_did_document"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -112,7 +136,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_did_document"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "notes": "did:web issuer resolved through the pinned DID document published at cawg-test-data.github.io; the document deliberately lacks an assertionMethod.",
@@ -140,11 +167,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -153,10 +183,13 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
-      "notes": "Issued by Adobe's stage connected-identities aggregator; validates offline against the pinned did:web document fetched from the public .well-known endpoint (2026-08-04). Use the fixed validation clock so the enclosing C2PA claim is inside certificate validity.",
+      "notes": "Issued by Adobe's stage aggregator. The pinned DID document uses the unsupported JsonWebKey method type, the c2paAsset is not an exact signer_payload conversion, and no ICA issuer trust is configured.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__adobe_connected_identities.jpg",
       "sha256": "d17c8bf620a2d1bff2395e2b7c597d17aaf7b823dc30f1521aa777813da43aa4",
       "size": 249364,
@@ -179,11 +212,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -192,10 +228,13 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.invalid_did_document",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
-      "notes": "Issued by Adobe's stage connected-identities aggregator; validates offline against the pinned did:web document fetched from the public .well-known endpoint (2026-08-04). Use the fixed validation clock so the enclosing C2PA claim is inside certificate validity.",
+      "notes": "Issued by Adobe's stage aggregator. The pinned DID document uses the unsupported JsonWebKey method type, the c2paAsset is not an exact signer_payload conversion, and no ICA issuer trust is configured.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ims_multiple_manifests.jpg",
       "sha256": "6d03e1dd6a941b352784731a03b580378c5d38738a7a7a2fab85041ebb643128",
       "size": 194342,
@@ -218,11 +257,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_content_type"
+          "cawg.ica.invalid_content_type",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -231,7 +273,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_content_type"
+          "cawg.ica.invalid_content_type",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_content_type.jpg",
@@ -255,11 +300,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_content_type"
+          "cawg.ica.invalid_content_type",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -268,7 +316,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_content_type"
+          "cawg.ica.invalid_content_type",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_content_type_assigned.jpg",
@@ -292,11 +343,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_alg"
+          "cawg.ica.invalid_alg",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -305,7 +359,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_alg"
+          "cawg.ica.invalid_alg",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_cose_sign_alg.jpg",
@@ -366,11 +423,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_issuer"
+          "cawg.ica.invalid_issuer",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -379,7 +439,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_issuer"
+          "cawg.ica.invalid_issuer",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_issuer_did.jpg",
@@ -403,11 +466,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.time_stamp.invalid"
+          "cawg.ica.time_stamp.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -416,7 +482,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.time_stamp.invalid"
+          "cawg.ica.time_stamp.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__invalid_time_stamp.jpg",
@@ -477,11 +546,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_content_type"
+          "cawg.ica.invalid_content_type",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -490,7 +562,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_content_type"
+          "cawg.ica.invalid_content_type",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__missing_content_type.jpg",
@@ -514,11 +589,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.invalid_alg"
+          "cawg.ica.invalid_alg",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -527,7 +605,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.invalid_alg"
+          "cawg.ica.invalid_alg",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__missing_cose_sign_alg.jpg",
@@ -588,11 +669,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.signature_mismatch"
+          "cawg.ica.signature_mismatch",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -601,7 +685,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.signature_mismatch"
+          "cawg.ica.signature_mismatch",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__signature_mismatch.jpg",
@@ -625,11 +712,13 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.signer_payload.mismatch"
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -638,7 +727,9 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.signer_payload.mismatch"
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__signer_payload_mismatch.jpg",
@@ -662,11 +753,13 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -675,10 +768,12 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
-      "notes": "Legacy CAWG 1.1 context; c2paAsset hashes are JSON byte arrays of the base64 text rather than the base64 strings required by CAWG Identity 1.2; both encodings decode to the same digest. The validator surfaces both legacy aspects via the informational com.encypher.cawg.legacyProfile status (refused under --cawg-strict-encoding).",
+      "notes": "Uses the required CAWG 1.1 ICA context, but the c2paAsset hashes are JSON byte arrays rather than RFC 4648 strings, its verified identity entries do not meet the 1.3 schema, and no ICA issuer trust is configured. CAWG Identity 1.3 therefore rejects it.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__success.jpg",
       "sha256": "2d82904a32ee77e887382a1170ad2682a1f3d6978a79f837a3eba9976ea3527d",
       "size": 258982,
@@ -700,11 +795,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.did_unavailable"
+          "cawg.identity.network_traffic_blocked",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-09-01T00:00:00Z",
@@ -713,10 +811,13 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.did_unavailable"
+          "cawg.identity.network_traffic_blocked",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
-      "notes": "VC validFrom (2025-08-04) postdates the default corpus clock; validated at the late clock so only the DID-resolution failure is observed.",
+      "notes": "VC validFrom (2025-08-04) postdates the default corpus clock; validated at the late clock so the 1.3 failures are not obscured by a clock artifact. The did:web issuer has no pinned DID document and this verifier performs no network resolution, which 1.3 reports as cawg.identity.network_traffic_blocked.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__unresolvable_did.jpg",
       "sha256": "2d4bde7a1059673cc13d91d207dbd9966fa992baf4bc1b9fc7a3ae4e3c4c49f6",
       "size": 258982,
@@ -738,11 +839,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.did_unsupported_method"
+          "cawg.ica.did_unsupported_method",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -751,7 +855,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.did_unsupported_method"
+          "cawg.ica.did_unsupported_method",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "notes": "Present in the pinned fixture tree but not consumed by the pinned upstream test module.",
@@ -776,12 +883,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.time_stamp.validated",
-          "cawg.ica.valid_from.invalid"
+          "cawg.ica.time_stamp.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -790,8 +899,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.time_stamp.validated",
-          "cawg.ica.valid_from.invalid"
+          "cawg.ica.time_stamp.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_from_after_time_stamp.jpg",
@@ -816,11 +927,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.valid_from.invalid"
+          "cawg.ica.valid_from.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -829,7 +943,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.valid_from.invalid"
+          "cawg.ica.valid_from.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_from_in_future.jpg",
@@ -853,11 +970,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.valid_from.missing"
+          "cawg.ica.valid_from.missing",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -866,7 +986,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.valid_from.missing"
+          "cawg.ica.valid_from.missing",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_from_missing.jpg",
@@ -890,12 +1013,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.time_stamp.validated",
-          "cawg.ica.credential_valid"
+          "cawg.ica.time_stamp.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -904,8 +1029,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.time_stamp.validated",
-          "cawg.ica.credential_valid"
+          "cawg.ica.time_stamp.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_time_stamp.jpg",
@@ -930,11 +1057,13 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -943,7 +1072,9 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.credential_valid"
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_until_in_future.jpg",
@@ -967,11 +1098,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "ica",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.ica.valid_until.invalid"
+          "cawg.ica.valid_until.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -980,7 +1114,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.ica.valid_until.invalid"
+          "cawg.ica.valid_until.invalid",
+          "cawg.ica.signer_payload.mismatch",
+          "cawg.ica.untrusted_issuer",
+          "cawg.ica.verified_identities.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__valid_until_in_past.jpg",
@@ -1078,11 +1215,14 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "x509",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.identity.well-formed"
+          "cawg.x509.signature.validated",
+          "cawg.x509.credential.untrusted",
+          "cawg.x509.ocsp.skipped",
+          "com.encypher.cawg.legacyProfile"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -1091,10 +1231,13 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.identity.well-formed"
+          "cawg.x509.signature.validated",
+          "cawg.x509.credential.untrusted",
+          "cawg.x509.ocsp.skipped",
+          "com.encypher.cawg.legacyProfile"
         ]
       },
-      "notes": "Top-level extra field is tolerated per CAWG 1.2 \u00a75.2; the COSE signature verifies over the stored (serde field-order, definite-length) signer_payload bytes. No failure codes; well-formed rather than trusted because the emailProtection-EKU test leaf lacks the trusted timestamp required by the CAWG 1.2 interim S/MIME policy.",
+      "notes": "Top-level extra fields remain tolerated. Its COSE signature covers the serde field-order signer_payload encoding that c2pa-rs writes, which the default posture accepts with com.encypher.cawg.legacyProfile. The signer certificate reaches no configured CAWG trust anchor, which CAWG Identity 1.3 reports as cawg.x509.credential.untrusted. Under --strict-conformance the v1 claim already fails the 2.4 target, so CAWG is not evaluated.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__extra_field.jpg",
       "sha256": "e62265aa94dc71aaff10224356d868d6958208f47ddc73f271aaa1a01ecaf0a5",
       "size": 252940,
@@ -1188,11 +1331,11 @@
       }
     },
     {
-      "audit_state": "imported",
+      "audit_state": "known-upstream-divergence",
       "credential_type": "x509",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.identity.hard_binding_missing"
+          "cawg.identity.cbor.invalid"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -1201,7 +1344,7 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.identity.hard_binding_missing"
+          "cawg.identity.cbor.invalid"
         ]
       },
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__no_hard_binding.jpg",

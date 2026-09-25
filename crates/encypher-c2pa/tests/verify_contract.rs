@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -30,6 +33,55 @@ fn signed_jpeg_uses_bundled_trust_without_implying_integrity() {
     assert_eq!(report.trust.status, "not_valid_for_supplied_material");
     assert_eq!(report.trust.basis, "bundled_static_material");
     assert_eq!(report.trust.revocation.status, "not_checked");
+}
+
+/// `cawg_strict_encoding` refuses the CAWG field-order `signer_payload` that
+/// c2pa-rs writes, without taking on the rest of the conformance posture. The
+/// default accepts it and says so with `com.encypher.cawg.legacyProfile`.
+#[test]
+fn cawg_strict_encoding_refuses_field_order_identity_payloads() {
+    let asset = fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../tests/vectors/cawg/external/contentauth-c2pa-rs/d7f13829/assets/cli__tests__fixtures__C_with_CAWG_data.jpg",
+    ))
+    .expect("CAWG vector must be readable");
+    let run = |cawg_strict_encoding: bool| {
+        let options = VerifyOptions {
+            cawg_strict_encoding,
+            validation_time: Some("2025-05-01T00:00:00Z".into()),
+            telemetry: TelemetryOptions {
+                enabled: Some(false),
+                ..TelemetryOptions::default()
+            },
+            ..VerifyOptions::default()
+        };
+        let report = verify_with_options(&asset, "image/jpeg", &options).unwrap();
+        let codes = |bucket: &[encypher_c2pa::VerificationStatus]| {
+            bucket.iter().map(|s| s.code.clone()).collect::<Vec<_>>()
+        };
+        (
+            codes(&report.validation_results.success),
+            codes(&report.validation_results.informational),
+            codes(&report.validation_results.failure),
+        )
+    };
+
+    let (success, informational, _) = run(false);
+    assert!(success.contains(&"cawg.x509.signature.validated".to_string()));
+    assert!(informational.contains(&"com.encypher.cawg.legacyProfile".to_string()));
+
+    let (success, informational, failure) = run(true);
+    assert!(!success.contains(&"cawg.x509.signature.validated".to_string()));
+    assert!(!informational.contains(&"com.encypher.cawg.legacyProfile".to_string()));
+    assert!(
+        failure.iter().any(|code| code.starts_with("cawg.")),
+        "the identity signature fails: {failure:?}"
+    );
+    assert!(
+        !failure
+            .iter()
+            .any(|code| code.starts_with("com.encypher.conformance.")),
+        "only the encoding rule applies, not the conformance program: {failure:?}"
+    );
 }
 
 #[test]

@@ -20,8 +20,9 @@ Only the latest stable release receives security fixes. Release candidates and o
 
 ## Security properties
 
-- Asset parsing, trust resolution, and validation make no network requests. With saved or explicit consent, post-verification failure telemetry may send one bounded HTTPS request. Disable the default `telemetry` feature or set the per-call telemetry option to `false` for no egress.
-- No embedded URL is fetched.
+- Asset parsing, trust resolution, and validation make no network requests unless online checks are allowed. Libraries require an explicit `online` option or `ENCYPHER_C2PA_ONLINE`; only the command line reads a saved choice or asks. Allowed fetches go to public addresses only, with size, time, redirect, and request-count limits, and never carry asset bytes. With saved or explicit consent, post-verification failure telemetry may send one bounded HTTPS request. Disable the default `online` and `telemetry` features for a library build with no egress.
+- The command line checks the crates.io index for a newer release once a day, only when a person is at the terminal. The request carries no file, path, or identifier. An update installs only when the person answers yes, and only through `cargo install` from crates.io. Turn it off with `encypher-c2pa update-check off`, `{"check": false}` in `update.json`, or `ENCYPHER_C2PA_UPDATE_CHECK=off`.
+- No embedded URL is fetched unless online checks are allowed, and trust lists are never fetched.
 - No default operating-system or Encypher trust store is consulted.
 - Trust requires explicit caller-supplied PEM material.
 - Malformed trust material fails closed.

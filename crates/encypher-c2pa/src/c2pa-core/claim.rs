@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! C2PA Claim v2 construction (CBOR).
 //!
 //! Claim v2 allows only these fields:

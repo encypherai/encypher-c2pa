@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Content-addressed verification result cache.
 //!
 //! At billions/day, verification is read-heavy and highly cacheable: the same
@@ -200,23 +203,31 @@ impl VerifyCache {
     }
 }
 
-/// Hash the trust-list anchor set (claim + TSA) into a fingerprint so a
+/// Hash the trust-anchor configurations (claim + TSA) into a fingerprint so a
 /// trust-config change busts cache entries. Empty when no trust is configured.
+///
+/// The configured purpose and trust window are part of the key: the same
+/// certificate bounded to a different window is a different trust decision.
 fn trust_fingerprint(input: &crate::c2pa_validate::VerifyInput) -> Vec<u8> {
+    fn absorb(h: &mut Sha256, trust: Option<&crate::c2pa_trust::TrustList>) {
+        let Some(trust) = trust else { return };
+        for anchor in &trust.anchors {
+            h.update((anchor.certificate.len() as u64).to_be_bytes());
+            h.update(&anchor.certificate);
+            h.update([anchor.purpose as u8]);
+            for bound in [anchor.not_before, anchor.not_after] {
+                match bound {
+                    Some(instant) => h.update(instant.unix_timestamp().to_be_bytes()),
+                    None => h.update([0xfe]),
+                }
+            }
+        }
+    }
+
     let mut h = Sha256::new();
-    if let Some(t) = input.claim_signer_trust {
-        for a in &t.anchors {
-            h.update((a.len() as u64).to_be_bytes());
-            h.update(a);
-        }
-    }
+    absorb(&mut h, input.claim_signer_trust);
     h.update([0xff]);
-    if let Some(t) = input.tsa_trust {
-        for a in &t.anchors {
-            h.update((a.len() as u64).to_be_bytes());
-            h.update(a);
-        }
-    }
+    absorb(&mut h, input.tsa_trust);
     h.finalize().to_vec()
 }
 
@@ -324,6 +335,8 @@ mod tests {
             allowed_certs: None,
             validation_time: None,
             profile: crate::c2pa_validate::EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
         };
         let (first, hit1) = c.verify_cached(&input).expect("verify");
         assert!(!hit1, "first call is a miss");

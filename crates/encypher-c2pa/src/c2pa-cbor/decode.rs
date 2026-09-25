@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! CBOR decoder handling both definite and indefinite length items.
 //!
 //! Used for verification: parsing claims/assertions/signatures regardless of

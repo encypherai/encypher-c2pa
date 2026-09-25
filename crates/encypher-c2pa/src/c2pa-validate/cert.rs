@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Certificate and COSE header inspection used to populate the validation
 //! report's `signature_info` block and to evaluate the signing certificate's
 //! validity window.

@@ -16,6 +16,7 @@
       "fixed_validation_time": "2026-08-11T00:00:00Z",
       "size": 3157,
       "sha256": "17213dd19421e287658018a6dfc0cec35aea9ce12ef4ff8b969ace74d3cd26f6",
+      "note": "The generated vector carries no c2pa.actions assertion, so its v2 standard manifest has no c2pa.created or c2pa.opened action. C2PA 2.4 Validation, Standard Manifest Assertions, requires the inception action in exactly one actions assertion, and c2patool 0.27.21 reports assertion.action.malformed on this same file. The earlier Valid expectation recorded this SDK's own omission.",
       "expected": {
         "exit_code": 2,
         "validation_state": "Invalid",
@@ -32,6 +33,7 @@
       "fixed_validation_time": "2026-08-11T00:00:00Z",
       "size": 3089,
       "sha256": "77ed33504e1bb1aaf760e4ba61fa535ecd6864c33ffff687af302ae3ae7263eb",
+      "note": "Same inception-action gap as suite-valid-jpeg-es256; c2patool 0.27.21 also reports assertion.action.malformed on this file.",
       "expected": {
         "exit_code": 2,
         "validation_state": "Invalid",

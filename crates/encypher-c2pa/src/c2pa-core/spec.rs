@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Engine profile and the per-version format registry.
 //!
 //! Three orthogonal axes describe how the engine operates:

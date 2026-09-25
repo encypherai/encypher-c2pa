@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
@@ -8,12 +11,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
-    detached_manifest_evidence, mime_from_path, set_telemetry_enabled, supported_mime_types,
-    telemetry_preference, verify_file, verify_fragmented_with_options, verify_with_options, Error,
-    TelemetryOptions, VerifyOptions,
+    allow_interactive_online_consent, detached_manifest_evidence, mime_from_path,
+    online_preference, set_online_preference, set_telemetry_enabled, supported_mime_types,
+    telemetry_preference, verify_file, verify_fragmented_with_options, verify_stream_with_options,
+    verify_with_manifest_store, verify_with_options, Error, OnlinePreference, StreamEncapsulation,
+    StreamMethod, TelemetryOptions, VerifyOptions,
 };
 
 mod encypher_api;
+mod update;
 
 const MAX_PATH_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -31,6 +37,28 @@ enum TelemetrySetting {
     Status,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum UpdateCheckSetting {
+    /// Check for a newer release once a day (the default).
+    On,
+    /// Never check.
+    Off,
+    /// Print the setting and where it is saved.
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OnlineSetting {
+    /// Fetch what a verification needs, without asking again.
+    On,
+    /// Never fetch.
+    Off,
+    /// Ask each time a verification would fetch something.
+    Ask,
+    /// Print the saved choice.
+    Status,
+}
+
 // `Verify` carries every CLI flag inline, which clap's derive requires: a
 // boxed or flattened args struct cannot be parsed into a subcommand variant.
 // The enum is built once, from argv, and dropped at the end of main, so the
@@ -43,9 +71,35 @@ enum Command {
         asset: PathBuf,
         #[arg(long)]
         mime: Option<String>,
+        /// External C2PA Manifest Store (`.c2pa`) to verify the asset against.
+        /// Use when the manifest is a sidecar, or was fetched from the URI the
+        /// asset declares. This tool never fetches it for you.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["fragment", "encapsulation", "encypher_api"]
+        )]
+        manifest: Option<PathBuf>,
         /// Fragmented BMFF media segment (`.m4s`). Repeat for each available segment.
         #[arg(long, value_name = "FILE", conflicts_with = "encypher_api")]
         fragment: Vec<PathBuf>,
+        /// Zero-based fragment/segment index where the player expects a seek.
+        /// Repeat for each discontinuity.
+        #[arg(long, value_name = "N", requires = "fragment")]
+        expected_seek: Vec<usize>,
+        /// Encapsulation the stream was packaged as. With `--fragment`, turns
+        /// on stream verification: brands are gated and the binding is read
+        /// from the init manifest.
+        #[arg(long, value_name = "fmp4|cmaf", requires = "fragment")]
+        encapsulation: Option<String>,
+        /// C2PA protection method the stream was signed under. Requires
+        /// `--encapsulation`.
+        #[arg(
+            long,
+            value_name = "verifiable-segment-info|per-segment",
+            requires = "encapsulation"
+        )]
+        segment_mode: Option<String>,
         /// Claim-signer trust anchors (PEM bundle). Repeatable; bundles merge.
         #[arg(long, value_name = "PEM")]
         trust: Vec<PathBuf>,
@@ -61,6 +115,12 @@ enum Command {
         /// Directly allowed CAWG end-entity certificates (PEM). Repeatable.
         #[arg(long, value_name = "PEM")]
         cawg_allowed: Vec<PathBuf>,
+        /// RFC 3339 start of trust for the caller-supplied trust anchors above.
+        #[arg(long, value_name = "RFC3339")]
+        trust_anchor_not_before: Option<String>,
+        /// RFC 3339 end of trust for the caller-supplied trust anchors above.
+        #[arg(long, value_name = "RFC3339")]
+        trust_anchor_not_after: Option<String>,
         /// Verify with caller-supplied trust only; ignore bundled snapshots.
         #[arg(long)]
         no_default_trust: bool,
@@ -69,10 +129,25 @@ enum Command {
         /// a DID -> document map. Without it did:web resolution fails closed.
         #[arg(long, value_name = "JSON")]
         cawg_did_documents: Vec<PathBuf>,
-        /// Refuse CAWG 1.1-era legacy encodings; accept only CAWG 1.2
-        /// canonical shapes.
+        /// Trust an ICA issuer DID directly. Repeatable.
+        #[arg(long, value_name = "DID")]
+        cawg_ica_trusted_issuer: Vec<String>,
+        /// Trust an ICA DID controller anchor. Repeatable.
+        #[arg(long, value_name = "DID")]
+        cawg_ica_trust_anchor: Vec<String>,
+        /// Offline ICA revocation bitstrings as a JSON URI -> base64 map.
+        /// Repeatable; later files override earlier entries.
+        #[arg(long, value_name = "JSON")]
+        cawg_ica_status_lists: Vec<PathBuf>,
+        /// Refuse the CAWG field-order signer payload that c2pa-rs writes,
+        /// without the rest of the conformance posture.
         #[arg(long)]
         cawg_strict_encoding: bool,
+        /// Apply the C2PA 2.4 Conformance Program posture: SHOULD requirements
+        /// the program raises become failures, and CAWG signer payloads must
+        /// use CAWG Identity 1.3 deterministic CBOR.
+        #[arg(long)]
+        strict_conformance: bool,
         /// RFC 3339 validation instant (default: current UTC time).
         #[arg(long, visible_alias = "validation-time", value_name = "RFC3339")]
         time: Option<String>,
@@ -85,6 +160,21 @@ enum Command {
         /// Override the failure telemetry endpoint.
         #[arg(long, value_name = "URL")]
         telemetry_endpoint: Option<String>,
+        /// Allow this run to fetch what the asset references: a manifest store
+        /// held elsewhere, certificate revocation status, a did:web document,
+        /// externally stored content. Nothing is fetched without this flag,
+        /// the saved choice, or the ENCYPHER_C2PA_ONLINE environment variable.
+        #[arg(long)]
+        online: bool,
+        /// Keep this run offline whatever is saved or set in the environment.
+        #[arg(long, conflicts_with = "online")]
+        offline: bool,
+        /// Let online checks reach loopback, private, and link-local addresses
+        /// and accept plaintext http. For an intranet deployment whose
+        /// manifest repository or OCSP responder is on an internal host. Do
+        /// not set it where files arrive from strangers.
+        #[arg(long)]
+        online_allow_private_networks: bool,
         #[arg(long)]
         json: bool,
         /// Ask Encypher to validate the raw C2PA manifest and match its signed
@@ -101,6 +191,18 @@ enum Command {
     Telemetry {
         #[arg(value_enum)]
         setting: TelemetrySetting,
+    },
+    /// Read or change the saved choice about online checks.
+    Online {
+        #[arg(value_enum)]
+        setting: OnlineSetting,
+    },
+    /// Check for a newer release and install it with cargo.
+    Update,
+    /// Turn the daily update check on or off, or print its setting.
+    UpdateCheck {
+        #[arg(value_enum)]
+        setting: UpdateCheckSetting,
     },
     /// List canonical MIME types covered by the C2PA 2.4 profile.
     Formats {
@@ -126,23 +228,47 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, Error> {
+    // Offer a newer release before working. Commands that change settings
+    // skip it, so turning the check off never starts with an update prompt.
+    if matches!(
+        cli.command,
+        Command::Verify { .. } | Command::Formats { .. } | Command::Explain { .. }
+    ) {
+        let offline = matches!(cli.command, Command::Verify { offline: true, .. });
+        if let Some(code) = update::check_on_start(offline) {
+            return Ok(code);
+        }
+    }
     match cli.command {
         Command::Verify {
             asset,
             mime,
+            manifest,
             fragment,
+            expected_seek,
+            encapsulation,
+            segment_mode,
             trust,
             tsa_trust,
             allowed,
             cawg_trust,
             cawg_allowed,
+            trust_anchor_not_before,
+            trust_anchor_not_after,
             no_default_trust,
             cawg_did_documents,
+            cawg_ica_trusted_issuer,
+            cawg_ica_trust_anchor,
+            cawg_ica_status_lists,
             cawg_strict_encoding,
+            strict_conformance,
             time,
             telemetry,
             no_telemetry,
             telemetry_endpoint,
+            online,
+            offline,
+            online_allow_private_networks,
             json,
             encypher_api,
             encypher_api_endpoint,
@@ -167,23 +293,63 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     );
                 }
             }
+            // This is a terminal, so the saved choice applies and the operator
+            // can be asked. A library embedding this SDK never does either.
+            allow_interactive_online_consent();
             let options = VerifyOptions {
                 trust_pem: read_merged_pem(&trust)?,
                 tsa_trust_pem: read_merged_pem(&tsa_trust)?,
                 allowed_list_pem: read_merged_pem(&allowed)?,
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
+                trust_anchor_not_before,
+                trust_anchor_not_after,
                 no_default_trust,
                 cawg_did_documents: read_did_documents(&cawg_did_documents)?,
+                cawg_ica_trusted_issuers: nonempty(cawg_ica_trusted_issuer),
+                cawg_ica_trust_anchors: nonempty(cawg_ica_trust_anchor),
+                cawg_ica_status_lists: read_string_map(
+                    &cawg_ica_status_lists,
+                    "cawg ICA status lists",
+                )?,
+                // Online evidence is supplied by the fetch layer, never by
+                // these flags.
+                ocsp_responses: None,
+                ocsp_unreachable: None,
+                external_data: None,
+                expected_seek_positions: expected_seek,
                 cawg_strict_encoding,
-                strict_conformance: false,
+                strict_conformance,
                 validation_time: time,
                 telemetry: TelemetryOptions {
                     enabled: explicit_telemetry,
                     endpoint: telemetry_endpoint,
                     sdk_name: Some("cli".to_string()),
                 },
+                online: if online {
+                    Some(true)
+                } else if offline {
+                    Some(false)
+                } else {
+                    None
+                },
+                online_allow_private_networks,
             };
+            // Declared stream verification is a different question with a
+            // different answer shape (per-segment results, a chain verdict), so
+            // it returns its own report rather than being squeezed into the
+            // single-asset one.
+            if let Some(encapsulation) = encapsulation {
+                return run_stream_verify(
+                    &asset,
+                    mime.as_deref(),
+                    &fragment,
+                    &encapsulation,
+                    segment_mode.as_deref(),
+                    &options,
+                    json,
+                );
+            }
             let (report, encypher_api_result) = if encypher_api {
                 let mime = match mime {
                     Some(value) => value,
@@ -208,6 +374,19 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     evidence.as_ref(),
                 );
                 (report, Some(result))
+            } else if let Some(manifest) = manifest {
+                let mime = match mime {
+                    Some(value) => value,
+                    None => mime_from_path(&asset)
+                        .ok_or_else(|| Error::UnsupportedMime(asset.display().to_string()))?
+                        .to_string(),
+                };
+                let bytes = read_path_asset(&asset)?;
+                let store = read_path_asset(&manifest)?;
+                (
+                    verify_with_manifest_store(&bytes, &store, &mime, &options)?,
+                    None,
+                )
             } else if fragment.is_empty() {
                 (verify_file(&asset, mime.as_deref(), &options)?, None)
             } else {
@@ -260,6 +439,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                         println!("  {}: {}", status.code, status.explanation);
                     }
                 }
+                render_network(&report.network);
                 println!("docs: https://encypher.com/c2pa/codes");
                 if let Some(lookup) = &encypher_api_result {
                     encypher_api::render_human(lookup);
@@ -289,6 +469,37 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Online { setting } => {
+            match setting {
+                OnlineSetting::On => {
+                    set_online_preference(OnlinePreference::On)?;
+                    println!("Online checks allowed.");
+                }
+                OnlineSetting::Off => {
+                    set_online_preference(OnlinePreference::Off)?;
+                    println!("Online checks refused.");
+                }
+                OnlineSetting::Ask => {
+                    set_online_preference(OnlinePreference::Ask)?;
+                    println!("Online checks will be offered each time one is needed.");
+                }
+                OnlineSetting::Status => match online_preference()? {
+                    Some(OnlinePreference::On) => println!("Online checks are allowed."),
+                    Some(OnlinePreference::Off) => println!("Online checks are refused."),
+                    Some(OnlinePreference::Ask) => {
+                        println!("Online checks are offered each time one is needed.");
+                    }
+                    None => println!("No choice about online checks is saved. Nothing is fetched."),
+                },
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Update => Ok(update::run_update()),
+        Command::UpdateCheck { setting } => Ok(update::run_update_check_setting(match setting {
+            UpdateCheckSetting::On => Some(true),
+            UpdateCheckSetting::Off => Some(false),
+            UpdateCheckSetting::Status => None,
+        })),
         Command::Formats { json } => {
             let formats = supported_mime_types();
             if json {
@@ -311,6 +522,129 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             println!("details: https://encypher.com/c2pa/codes/{code}");
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Verify a declared fMP4/CMAF stream: `asset` is the init segment and each
+/// `--fragment` is a media segment in playback order.
+///
+/// `--segment-mode` defaults to `verifiable-segment-info`, the method where one
+/// init manifest binds the whole stream. Which binding it used - C2PA 2.4
+/// session keys or a Merkle tree - is read off that manifest, so the caller
+/// never gets to pick the integrity check.
+#[allow(clippy::too_many_arguments)]
+fn run_stream_verify(
+    asset: &Path,
+    mime: Option<&str>,
+    fragments: &[PathBuf],
+    encapsulation: &str,
+    segment_mode: Option<&str>,
+    options: &VerifyOptions,
+    json: bool,
+) -> Result<ExitCode, Error> {
+    let encapsulation = StreamEncapsulation::from_token(encapsulation).ok_or_else(|| {
+        Error::Verification(format!(
+            "unknown --encapsulation: {encapsulation} (expected fmp4 or cmaf)"
+        ))
+    })?;
+    let method = match segment_mode {
+        None => StreamMethod::VerifiableSegmentInfo,
+        Some(token) => StreamMethod::from_token(token).ok_or_else(|| {
+            Error::Verification(format!(
+                "unknown --segment-mode: {token} \
+                 (expected verifiable-segment-info or per-segment)"
+            ))
+        })?,
+    };
+    let mime = match mime {
+        Some(value) => value.to_string(),
+        None => mime_from_path(asset)
+            .ok_or_else(|| Error::UnsupportedMime(asset.display().to_string()))?
+            .to_string(),
+    };
+    let init_segment = read_path_asset(asset)?;
+    let segment_bytes: Vec<Vec<u8>> = fragments
+        .iter()
+        .map(|path| read_path_asset(path))
+        .collect::<Result<_, _>>()?;
+    let segment_refs: Vec<&[u8]> = segment_bytes.iter().map(Vec::as_slice).collect();
+    let report = verify_stream_with_options(
+        &init_segment,
+        &segment_refs,
+        &mime,
+        encapsulation,
+        method,
+        options,
+    )?;
+
+    if json {
+        println!("{}", report.to_pretty_json()?);
+    } else {
+        println!("init segment: {}", asset.display());
+        println!("encapsulation: {encapsulation}");
+        println!("method: {method}");
+        println!("integrity: {}", report.integrity);
+        if let Some(stream) = &report.stream {
+            println!("signature: {}", stream.signature);
+            println!("hard binding: {}", stream.hard_binding);
+            println!("trust: {} ({})", stream.trust.status, stream.trust.basis);
+            if !stream.validation_results.failure.is_empty() {
+                println!("failures:");
+                for status in &stream.validation_results.failure {
+                    println!("  {}: {}", status.code, status.explanation);
+                }
+            }
+        }
+        for segment in &report.segments {
+            println!(
+                "segment {}: integrity {} trust {} ({})",
+                segment.sequence_number,
+                segment.report.integrity,
+                segment.report.trust.status,
+                segment.manifest_label
+            );
+            for status in &segment.report.validation_results.failure {
+                println!("    {}: {}", status.code, status.explanation);
+            }
+        }
+        if let Some(chain_valid) = report.chain_valid {
+            println!("chain: {}", if chain_valid { "valid" } else { "broken" });
+            for failure in &report.chain_failures {
+                println!("    {failure}");
+            }
+        }
+        render_network(&report.network);
+        println!("docs: https://encypher.com/c2pa/codes");
+    }
+    Ok(if report.integrity == "valid" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+/// Say what the run did on the network, and what it would do if allowed.
+///
+/// A verification that stayed offline still names the checks it could have
+/// made, so the reader can decide whether to allow them rather than having to
+/// guess that there was anything to allow.
+fn render_network(network: &encypher_c2pa::NetworkReport) {
+    if network.needed.is_empty() && network.requests.is_empty() {
+        return;
+    }
+    if !network.enabled {
+        println!(
+            "online checks: off, {} available (re-run with --online)",
+            network.needed.len()
+        );
+        return;
+    }
+    println!("online checks: allowed");
+    for request in &network.requests {
+        println!(
+            "  {} {}: {} ({})",
+            request.purpose, request.url, request.outcome, request.detail
+        );
     }
 }
 
@@ -439,6 +773,29 @@ fn read_did_documents(
     Ok(Some(store))
 }
 
+fn nonempty<T>(values: Vec<T>) -> Option<Vec<T>> {
+    (!values.is_empty()).then_some(values)
+}
+
+fn read_string_map(
+    paths: &[PathBuf],
+    label: &str,
+) -> Result<Option<HashMap<String, String>>, Error> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut output = HashMap::new();
+    for path in paths {
+        let contents = fs::read_to_string(path)?;
+        let entries: HashMap<String, String> =
+            serde_json::from_str(&contents).map_err(|error| {
+                Error::Verification(format!("{label}: {}: {error}", path.display()))
+            })?;
+        output.extend(entries);
+    }
+    Ok(Some(output))
+}
+
 fn explain(code: &str) -> Option<&'static str> {
     Some(match code {
         "claimSignature.validated" => "The active claim signature is cryptographically valid.",
@@ -459,6 +816,18 @@ fn explain(code: &str) -> Option<&'static str> {
         "signingCredential.untrusted" => "The signer does not chain to configured trust material.",
         "signingCredential.ocsp.revoked" => {
             "Supplied revocation evidence marks the signer as revoked."
+        }
+        "manifest.inaccessible" => {
+            "The asset names a remote manifest. Fetch it and pass --manifest."
+        }
+        "assertion.inaccessible" => {
+            "An assertion is stored remotely and was not retrieved. Not a rejection."
+        }
+        "assertion.cloud-data.malformed" => {
+            "A cloud data assertion is incomplete or names a type that may not be remote."
+        }
+        "assertion.external-reference.malformed" => {
+            "An external reference is incomplete or names a type that may not be external."
         }
         "claim.missing" => "No readable active C2PA claim is present.",
         "ingredient.manifest.missing" => {

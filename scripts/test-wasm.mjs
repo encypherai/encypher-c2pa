@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile } from "node:fs/promises";
@@ -50,6 +53,8 @@ const {
   telemetryEnabled,
   verify,
   verifyFragmented,
+  verifyStream,
+  verifyWithManifestStore,
   supportedMimeTypes,
 } = await import(pathToFileURL(resolve(pkg, "encypher_c2pa_wasm.js")).href);
 const wasm = await readFile(resolve(pkg, "encypher_c2pa_wasm_bg.wasm"));
@@ -85,6 +90,25 @@ assert.ok(Object.keys(report.manifest_report.manifests).length > 0);
 assert.ok(report.manifest_report.active_manifest);
 const customTrustOnly = verify(asset, "image/jpeg", { no_default_trust: true });
 assert.equal(customTrustOnly.trust.status, "not_evaluated");
+
+// An external (sidecar) manifest store verifies against its asset, and refuses
+// an altered one. Nothing is fetched: the store is handed in by the caller.
+const sidecar = await readFile(resolve(root, "tests/fixtures/signed_test.c2pa"));
+const detachedOptions = { telemetry: { enabled: false } };
+const detached = verifyWithManifestStore(asset, sidecar, "image/jpeg", detachedOptions);
+assert.equal(detached.integrity, "valid");
+assert.equal(detached.signature, "valid");
+assert.equal(detached.hard_binding, "match");
+const detachedTampered = new Uint8Array(asset);
+detachedTampered[detachedTampered.length - 32] ^= 0x01;
+const detachedFailure = verifyWithManifestStore(
+  detachedTampered,
+  sidecar,
+  "image/jpeg",
+  detachedOptions,
+);
+assert.notEqual(detachedFailure.integrity, "valid");
+assert.notEqual(detachedFailure.hard_binding, "match");
 assert.ok(supportedMimeTypes().includes("video/mp4"));
 assert.ok(supportedMimeTypes().includes("text/tab-separated-values"));
 assert.ok(supportedMimeTypes().includes("application/vnd.oasis.opendocument.graphics"));
@@ -117,6 +141,67 @@ assert.ok(
 assert.throws(
   () => verifyFragmented(asset, [new Uint8Array([1])], "image/jpeg"),
   /unsupported_mime/,
+);
+
+// Live-stream verification: the binding is read from the init manifest, and a
+// mutated media segment must sink the stream rather than be ignored.
+const streamDir = resolve(
+  root,
+  "crates/encypher-c2pa/tests/fixtures/live-video/fmp4-verifiable-segment-info",
+);
+const initSegment = await readFile(resolve(streamDir, "init.mp4"));
+const mediaSegments = await Promise.all(
+  ["seg-0.m4s", "seg-1.m4s", "seg-2.m4s"].map(async (file) =>
+    new Uint8Array(await readFile(resolve(streamDir, file))),
+  ),
+);
+const streamOptions = { telemetry: { enabled: false } };
+const stream = verifyStream(
+  initSegment,
+  mediaSegments,
+  "video/mp4",
+  "fMP4",
+  "verifiable-segment-info",
+  streamOptions,
+);
+assert.equal(stream.schema_version, "1.0");
+assert.equal(stream.integrity, "valid");
+assert.equal(stream.encapsulation, "fMP4");
+assert.equal(stream.method, "verifiable-segment-info");
+assert.equal(stream.stream.hard_binding, "match");
+
+const tamperedSegments = mediaSegments.map((segment) => new Uint8Array(segment));
+tamperedSegments[1][tamperedSegments[1].length - 1] ^= 0x01;
+const tamperedStream = verifyStream(
+  initSegment,
+  tamperedSegments,
+  "video/mp4",
+  "fMP4",
+  "verifiable-segment-info",
+  streamOptions,
+);
+assert.equal(tamperedStream.integrity, "invalid");
+assert.ok(
+  tamperedStream.stream.validation_results.failure.some(
+    ({ code }) => code === "livevideo.segment.invalid",
+  ),
+);
+assert.throws(
+  () =>
+    verifyStream(
+      initSegment,
+      mediaSegments,
+      "video/mp4",
+      "CMAF",
+      "verifiable-segment-info",
+      streamOptions,
+    ),
+  /CMAF/,
+);
+assert.throws(
+  () =>
+    verifyStream(initSegment, mediaSegments, "video/mp4", "mpeg-ts", "per-segment", streamOptions),
+  /invalid_argument/,
 );
 
 let telemetryRequest;
