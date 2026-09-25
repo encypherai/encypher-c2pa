@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unit tests for trust-list, EKU policy, chain validation, and revocation.
 
 use super::*;
@@ -99,13 +102,22 @@ fn claim_signer_profile_accepts_the_full_reference_eku_set() {
 }
 
 #[test]
-fn timestamping_and_ocsp_ekus_are_acceptable_only_when_sole() {
-    // Sole timeStamping / OCSPSigning: acceptable (upstream combination rule).
-    assert!(leaf_acceptable_der(&leaf_with_ekus(&[
+fn timestamping_and_ocsp_ekus_never_authorize_claim_signing() {
+    // Trust Model, Certificate Trust Chain: "A validator shall ensure a signing
+    // certificate is authorized for the purpose for which it is being used, and
+    // reject certificates used for an unauthorized purpose", with a certificate
+    // "authorized for no more than one of the three purposes: C2PA signing,
+    // time-stamp signing, or OCSP response signing". A sole timeStamping or
+    // OCSPSigning EKU authorizes that other purpose, never claim signing.
+    assert!(!leaf_acceptable_der(&leaf_with_ekus(&[
         OID_KP_TIME_STAMPING
     ])));
-    assert!(leaf_acceptable_der(&leaf_with_ekus(&[OID_KP_OCSP_SIGNING])));
-    // Combined with any other EKU — even a permitted one — they are rejected.
+    assert!(!leaf_acceptable_der(&leaf_with_ekus(&[
+        OID_KP_OCSP_SIGNING
+    ])));
+    // Combining either with a claim-signing EKU breaks the profile's
+    // "valid for exactly one of those two purposes, and not valid for any
+    // other purpose" rule, so it is rejected as well.
     assert!(!leaf_acceptable_der(&leaf_with_ekus(&[
         OID_KP_TIME_STAMPING,
         OID_EMAIL_PROTECTION
@@ -113,6 +125,11 @@ fn timestamping_and_ocsp_ekus_are_acceptable_only_when_sole() {
     assert!(!leaf_acceptable_der(&leaf_with_ekus(&[
         OID_KP_OCSP_SIGNING,
         OID_C2PA_CLAIM_SIGNING
+    ])));
+    // Both together is likewise unauthorized.
+    assert!(!leaf_acceptable_der(&leaf_with_ekus(&[
+        OID_KP_TIME_STAMPING,
+        OID_KP_OCSP_SIGNING
     ])));
 }
 
@@ -146,15 +163,18 @@ fn from_pem_rejects_empty_input() {
     ));
 }
 
+/// Claim-signing anchors with no configured window.
+fn claim_signing_anchors(certificates: impl IntoIterator<Item = Vec<u8>>) -> TrustList {
+    TrustList::from_certificates(AnchorPurpose::ClaimSigning, certificates)
+}
+
 #[test]
 fn self_signed_cert_chains_to_itself_as_anchor() {
     let (der, _) = make_cert(|_| {});
-    let trust = TrustList {
-        anchors: vec![der.clone()],
-    };
+    let trust = claim_signing_anchors([der.clone()]);
     // Validate within the cert's validity window.
     let at = Some(datetime!(2026-01-01 0:00 UTC));
-    let result = validate_chain(&der, &[], &trust, at);
+    let result = validate_chain(&der, &[], &trust, AnchorPurpose::ClaimSigning, at);
     assert!(
         result.trusted,
         "self-signed anchor should be trusted: {:?}",
@@ -168,7 +188,7 @@ fn untrusted_when_anchor_not_present() {
     let (der, _) = make_cert(|_| {});
     let empty = TrustList::default();
     let at = Some(datetime!(2026-01-01 0:00 UTC));
-    let result = validate_chain(&der, &[], &empty, at);
+    let result = validate_chain(&der, &[], &empty, AnchorPurpose::ClaimSigning, at);
     assert!(!result.trusted);
     assert!(result.reason.unwrap().contains("does not chain"));
 }
@@ -181,22 +201,23 @@ fn chain_builder_skips_same_subject_ca_with_wrong_key() {
     let mut params = CertificateParams::new(vec!["leaf.example".to_string()]).expect("leaf params");
     params.not_before = datetime!(2025-01-01 0:00 UTC);
     params.not_after = datetime!(2027-01-01 0:00 UTC);
-    params.is_ca = IsCa::NoCa;
+    params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+    params.use_authority_key_identifier_extension = true;
     let leaf = params
         .signed_by(&leaf_key, &issuer, &issuer_key)
         .expect("issued leaf");
-    let trust = TrustList {
-        anchors: vec![
-            wrong_issuer.der().as_ref().to_vec(),
-            issuer.der().as_ref().to_vec(),
-        ],
-    };
+    let trust = claim_signing_anchors([
+        wrong_issuer.der().as_ref().to_vec(),
+        issuer.der().as_ref().to_vec(),
+    ]);
 
     let result = validate_chain(
         leaf.der().as_ref(),
         &[],
         &trust,
+        AnchorPurpose::ClaimSigning,
         Some(datetime!(2026-01-01 0:00 UTC)),
     );
     assert!(result.trusted, "{:?}", result.reason);
@@ -205,12 +226,10 @@ fn chain_builder_skips_same_subject_ca_with_wrong_key() {
 #[test]
 fn validation_time_before_not_before_is_untrusted() {
     let (der, _) = make_cert(|_| {});
-    let trust = TrustList {
-        anchors: vec![der.clone()],
-    };
+    let trust = claim_signing_anchors([der.clone()]);
     // 2020 is before the cert's notBefore (2025) -> not valid at that instant.
     let before = Some(datetime!(2020-06-01 0:00 UTC));
-    let result = validate_chain(&der, &[], &trust, before);
+    let result = validate_chain(&der, &[], &trust, AnchorPurpose::ClaimSigning, before);
     assert!(!result.trusted);
     assert!(result
         .reason
@@ -222,11 +241,9 @@ fn validation_time_before_not_before_is_untrusted() {
 #[test]
 fn validation_time_within_window_is_trusted() {
     let (der, _) = make_cert(|_| {});
-    let trust = TrustList {
-        anchors: vec![der.clone()],
-    };
+    let trust = claim_signing_anchors([der.clone()]);
     let within = Some(datetime!(2026-06-01 0:00 UTC));
-    let result = validate_chain(&der, &[], &trust, within);
+    let result = validate_chain(&der, &[], &trust, AnchorPurpose::ClaimSigning, within);
     assert!(
         result.trusted,
         "should be trusted within validity: {:?}",
@@ -238,11 +255,9 @@ fn validation_time_within_window_is_trusted() {
 #[test]
 fn validation_time_after_not_after_is_untrusted() {
     let (der, _) = make_cert(|_| {});
-    let trust = TrustList {
-        anchors: vec![der.clone()],
-    };
+    let trust = claim_signing_anchors([der.clone()]);
     let after = Some(datetime!(2030-01-01 0:00 UTC));
-    let result = validate_chain(&der, &[], &trust, after);
+    let result = validate_chain(&der, &[], &trust, AnchorPurpose::ClaimSigning, after);
     assert!(!result.trusted);
     assert!(result
         .reason

@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! JSON report construction matching the reader report SSOT shape.
 //!
 //! The report mirrors the c2pa-python `Reader` output: an `active_manifest`
@@ -52,7 +55,7 @@ fn key_to_string(key: &Value) -> String {
 }
 
 /// Standard base64 (RFC 4648) encoder with padding.
-fn base64_encode(input: &[u8]) -> String {
+pub fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {

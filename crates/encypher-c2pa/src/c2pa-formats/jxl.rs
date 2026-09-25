@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! JPEG XL: JUMBF as a top-level `jumb` box in the ISOBMFF container.
 //!
 //! JXL has two framings. The ISOBMFF *container* form begins with the 12-byte
@@ -7,7 +10,7 @@
 //! form (starting `FF 0A`) has no box structure; embedding into it would require
 //! wrapping the codestream into a container, which is not supported here.
 
-use crate::c2pa_core::jumbf::parse_manifest_store;
+use crate::c2pa_core::jumbf::store_carries_manifest;
 use crate::c2pa_formats::util::walk_iso_boxes;
 use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
 
@@ -41,7 +44,7 @@ fn check_jxl(data: &[u8]) -> Result<(), FormatError> {
 
 /// Return true if a top-level `jumb` box is a complete C2PA manifest store.
 fn is_manifest_store(box_bytes: &[u8]) -> bool {
-    parse_manifest_store(box_bytes).is_ok_and(|store| !store.manifests.is_empty())
+    store_carries_manifest(box_bytes)
 }
 
 /// Extract the manifest store: the top-level `jumb` box whose superbox UUID is
@@ -58,6 +61,22 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         }
     })?;
     Ok(found)
+}
+
+pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
+    check_jxl(data)?;
+    let mut spans = Vec::new();
+    walk_iso_boxes(data, FMT, |b| {
+        let name = if &b.box_type == TYPE_JUMB && is_manifest_store(&data[b.start..b.end]) {
+            "C2PA".into()
+        } else {
+            String::from_utf8_lossy(&b.box_type).into_owned()
+        };
+        spans.push(crate::c2pa_formats::BoxSpan::contiguous(
+            name, b.start, b.end,
+        ));
+    })?;
+    Ok(spans)
 }
 
 /// Remove every existing manifest-store `jumb` box, leaving all other
@@ -144,6 +163,24 @@ mod tests {
     }
 
     #[test]
+    fn box_hash_spans_cover_top_level_jxl_boxes() {
+        let store = dummy_manifest_store();
+        let mut asset = tiny_jxl();
+        asset.splice(32..32, iso_box(b"jumb", b"not a manifest"));
+        let embedded = embed(&asset, &store).unwrap();
+        let spans = box_spans(&embedded).unwrap();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.name.as_str())
+                .collect::<Vec<_>>(),
+            ["JXL ", "ftyp", "C2PA", "jumb", "jxlc"]
+        );
+        assert_eq!(spans.first().unwrap().start(), 0);
+        assert_eq!(spans.last().unwrap().end(), embedded.len());
+    }
+
+    #[test]
     fn exclusions_cover_jumb_box() {
         let store = dummy_manifest_store();
         let embedded = embed(&tiny_jxl(), &store).unwrap();
@@ -168,6 +205,23 @@ mod tests {
                 .manifests
                 .len(),
             1
+        );
+    }
+    #[test]
+    fn c2cm_only_store_extracts_from_jxl() {
+        let manifest = crate::c2pa_core::jumbf::build_manifest(
+            "urn:c2pa:compressed-jxl",
+            &[],
+            &[0xa0],
+            &[0xd2, 0x84],
+        );
+        let compressed = crate::c2pa_core::jumbf::compress_manifest(&manifest).unwrap();
+        let store = crate::c2pa_core::jumbf::build_manifest_store(&[compressed]);
+        let embedded = embed(&tiny_jxl(), &store).unwrap();
+
+        assert_eq!(
+            extract(&embedded).unwrap().as_deref(),
+            Some(store.as_slice())
         );
     }
 

@@ -1,0 +1,36 @@
+{
+  "encapsulation": "CMAF",
+  "method": "verifiable-segment-info",
+  "stream_id": null,
+  "spec_version": "2.4",
+  "init": {
+    "path": "init.mp4",
+    "bytes": 2952,
+    "sha256": "d1c1870e4788e3f12b8729d25091392be3bc4ee22c44be4cd67a2b284fa3a1d8",
+    "sequence_number": null,
+    "manifest_label": null
+  },
+  "segments": [
+    {
+      "path": "seg-0.m4s",
+      "bytes": 417,
+      "sha256": "7f0aabb2da6ef9cc9d4c8d06e150e6f4a750d8e70450c17a06b267aa225d54bf",
+      "sequence_number": null,
+      "manifest_label": null
+    },
+    {
+      "path": "seg-1.m4s",
+      "bytes": 417,
+      "sha256": "551cbf76b78eec44641279c7a70ad8e5254017cbd17dbf3ac551933e46648825",
+      "sequence_number": null,
+      "manifest_label": null
+    },
+    {
+      "path": "seg-2.m4s",
+      "bytes": 417,
+      "sha256": "2063b47e9e545cdb5d9853de246a2e628c23535d40bf0eb0653f2ef08a0bfdc5",
+      "sequence_number": null,
+      "manifest_label": null
+    }
+  ]
+}

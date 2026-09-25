@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -231,6 +234,7 @@ mod tests {
             },
             manifest_report: Value::Null,
             content_credentials: None,
+            network: crate::NetworkReport::default(),
         }
     }
 

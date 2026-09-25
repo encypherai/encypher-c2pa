@@ -1,10 +1,14 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 use encypher_c2pa::{
     set_telemetry_enabled, telemetry_preference, verify_fragmented_with_options,
-    verify_with_options, VerifyOptions,
+    verify_stream_with_options, verify_with_manifest_store, verify_with_options,
+    StreamEncapsulation, StreamMethod, VerifyOptions,
 };
 use serde_json::json;
 
@@ -70,6 +74,90 @@ pub unsafe extern "C" fn encypher_c2pa_verify(
         };
 
         match verify_with_options(bytes, mime, &options) {
+            Ok(report) => json!({ "ok": true, "report": report }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "verification aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Verify one in-memory asset against a manifest store supplied separately.
+///
+/// Use this when the C2PA Manifest Store does not travel inside the asset: a
+/// `.c2pa` sidecar, or a store the caller fetched from the URI the asset
+/// declares. This library never fetches it. The envelope and ownership rules
+/// match [`encypher_c2pa_verify`].
+///
+/// # Safety
+/// `asset` must point to `asset_len` readable bytes and `manifest_store` to
+/// `manifest_store_len` readable bytes. String pointers follow
+/// [`encypher_c2pa_verify`].
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_verify_with_manifest_store(
+    asset: *const u8,
+    asset_len: usize,
+    manifest_store: *const u8,
+    manifest_store_len: usize,
+    mime_type: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = if asset_len == 0 {
+            &[]
+        } else if asset.is_null() {
+            return error_json(
+                "invalid_argument",
+                "asset is null but asset_len is non-zero",
+            );
+        } else {
+            // SAFETY: The caller contract above guarantees this pointer range.
+            unsafe { slice::from_raw_parts(asset, asset_len) }
+        };
+        if manifest_store.is_null() || manifest_store_len == 0 {
+            return error_json("invalid_argument", "manifest_store is null or empty");
+        }
+        // SAFETY: The caller contract above guarantees this pointer range.
+        let store = unsafe { slice::from_raw_parts(manifest_store, manifest_store_len) };
+        if mime_type.is_null() {
+            return error_json("invalid_argument", "mime_type is null");
+        }
+        // SAFETY: The caller guarantees a NUL-terminated string.
+        let mime = match unsafe { CStr::from_ptr(mime_type) }.to_str() {
+            Ok(value) => value,
+            Err(error) => {
+                return error_json(
+                    "invalid_argument",
+                    &format!("mime_type is not UTF-8: {error}"),
+                )
+            }
+        };
+        let options = if options_json.is_null() {
+            VerifyOptions::default()
+        } else {
+            // SAFETY: The caller guarantees a NUL-terminated string.
+            let raw = match unsafe { CStr::from_ptr(options_json) }.to_str() {
+                Ok(value) => value,
+                Err(error) => {
+                    return error_json(
+                        "invalid_options",
+                        &format!("options_json is not UTF-8: {error}"),
+                    )
+                }
+            };
+            match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            }
+        };
+
+        match verify_with_manifest_store(bytes, store, mime, &options) {
             Ok(report) => json!({ "ok": true, "report": report }).to_string(),
             Err(error) => error_json(error.code(), &error.to_string()),
         }
@@ -192,6 +280,173 @@ pub unsafe extern "C" fn encypher_c2pa_verify_fragmented(
     CString::new(payload)
         .expect("JSON serialization never emits an interior NUL")
         .into_raw()
+}
+
+/// Verify a declared fMP4/CMAF stream and return an allocated UTF-8 JSON envelope.
+///
+/// `asset` is the initialization segment; `segments` and `segment_lengths` are
+/// parallel arrays with `segment_count` entries, in playback order.
+/// `encapsulation` is `"fMP4"` or `"CMAF"`; `method` is
+/// `"verifiable-segment-info"` or `"per-segment"`. Both are matched ASCII
+/// case-insensitively, and both may be null to take the defaults (`"fMP4"`,
+/// `"verifiable-segment-info"`).
+///
+/// The report is the stream report, not the single-asset one: it carries a
+/// top-level `integrity`, the init manifest's report under `stream`, and, for
+/// a per-segment stream, `segments` plus `chain_valid`.
+///
+/// # Safety
+/// All non-empty byte ranges must be readable. When `segment_count` is
+/// non-zero, both arrays must be non-null and each non-empty segment pointer
+/// must be non-null. String pointers follow [`encypher_c2pa_verify`].
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_verify_stream(
+    asset: *const u8,
+    asset_len: usize,
+    segments: *const *const u8,
+    segment_lengths: *const usize,
+    segment_count: usize,
+    mime_type: *const c_char,
+    encapsulation: *const c_char,
+    method: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = if asset_len == 0 {
+            &[]
+        } else if asset.is_null() {
+            return error_json(
+                "invalid_argument",
+                "asset is null but asset_len is non-zero",
+            );
+        } else {
+            // SAFETY: The caller contract guarantees this pointer range.
+            unsafe { slice::from_raw_parts(asset, asset_len) }
+        };
+        if segment_count != 0 && (segments.is_null() || segment_lengths.is_null()) {
+            return error_json(
+                "invalid_argument",
+                "segment arrays are null but segment_count is non-zero",
+            );
+        }
+        let pointers = if segment_count == 0 {
+            &[][..]
+        } else {
+            // SAFETY: The caller contract guarantees both parallel arrays.
+            unsafe { slice::from_raw_parts(segments, segment_count) }
+        };
+        let lengths = if segment_count == 0 {
+            &[][..]
+        } else {
+            // SAFETY: The caller contract guarantees both parallel arrays.
+            unsafe { slice::from_raw_parts(segment_lengths, segment_count) }
+        };
+        let mut segment_refs = Vec::with_capacity(segment_count);
+        for (&pointer, &length) in pointers.iter().zip(lengths) {
+            if length == 0 {
+                segment_refs.push(&[][..]);
+            } else if pointer.is_null() {
+                return error_json(
+                    "invalid_argument",
+                    "segment is null but its length is non-zero",
+                );
+            } else {
+                // SAFETY: The caller contract guarantees this segment range.
+                segment_refs.push(unsafe { slice::from_raw_parts(pointer, length) });
+            }
+        }
+        if mime_type.is_null() {
+            return error_json("invalid_argument", "mime_type is null");
+        }
+        // SAFETY: The caller guarantees a NUL-terminated string.
+        let mime = match unsafe { CStr::from_ptr(mime_type) }.to_str() {
+            Ok(value) => value,
+            Err(error) => {
+                return error_json(
+                    "invalid_argument",
+                    &format!("mime_type is not UTF-8: {error}"),
+                )
+            }
+        };
+        // SAFETY: The caller guarantees a NUL-terminated string when non-null.
+        let encapsulation = match unsafe { optional_str(encapsulation) } {
+            Ok(value) => value.unwrap_or("fMP4"),
+            Err(message) => return error_json("invalid_argument", &message),
+        };
+        let Some(encapsulation) = StreamEncapsulation::from_token(encapsulation) else {
+            return error_json(
+                "invalid_argument",
+                &format!("unknown encapsulation: {encapsulation} (expected fMP4 or CMAF)"),
+            );
+        };
+        // SAFETY: The caller guarantees a NUL-terminated string when non-null.
+        let method = match unsafe { optional_str(method) } {
+            Ok(value) => value.unwrap_or("verifiable-segment-info"),
+            Err(message) => return error_json("invalid_argument", &message),
+        };
+        let Some(method) = StreamMethod::from_token(method) else {
+            return error_json(
+                "invalid_argument",
+                &format!(
+                    "unknown method: {method} \
+                     (expected verifiable-segment-info or per-segment)"
+                ),
+            );
+        };
+        let options = if options_json.is_null() {
+            VerifyOptions::default()
+        } else {
+            // SAFETY: The caller guarantees a NUL-terminated string.
+            let raw = match unsafe { CStr::from_ptr(options_json) }.to_str() {
+                Ok(value) => value,
+                Err(error) => {
+                    return error_json(
+                        "invalid_options",
+                        &format!("options_json is not UTF-8: {error}"),
+                    )
+                }
+            };
+            match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            }
+        };
+
+        match verify_stream_with_options(
+            bytes,
+            &segment_refs,
+            mime,
+            encapsulation,
+            method,
+            &options,
+        ) {
+            Ok(report) => json!({ "ok": true, "report": report }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "verification aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Borrow an optional NUL-terminated argument as UTF-8.
+///
+/// # Safety
+/// `value` must be null or point to a NUL-terminated string.
+unsafe fn optional_str<'a>(value: *const c_char) -> Result<Option<&'a str>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: The caller guarantees a NUL-terminated string.
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map(Some)
+        .map_err(|error| format!("argument is not UTF-8: {error}"))
 }
 
 /// Persist failure telemetry consent for all native bindings used by this user.

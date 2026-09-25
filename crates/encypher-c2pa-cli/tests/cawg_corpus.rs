@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Offline interoperability gate for the pinned and generated CAWG corpus.
 //!
 //! Rust port of the engine's `test_cawg_interop_corpus.py` gate, driving this
@@ -62,10 +65,11 @@ fn verify(vector: &Value, mode: CawgTrustMode) -> Value {
         vector,
         mode,
         vector["fixed_validation_time"].as_str().expect("time"),
+        false,
     )
 }
 
-fn verify_at(vector: &Value, mode: CawgTrustMode, validation_time: &str) -> Value {
+fn verify_at(vector: &Value, mode: CawgTrustMode, validation_time: &str, strict: bool) -> Value {
     let corpus = corpus_dir();
     let mut command = Command::new(env!("CARGO_BIN_EXE_encypher-c2pa"));
     command
@@ -79,6 +83,9 @@ fn verify_at(vector: &Value, mode: CawgTrustMode, validation_time: &str) -> Valu
         // inputs, not the SDK's independently refreshed packaged snapshot.
         .arg("--no-default-trust")
         .arg("--json");
+    if strict {
+        command.arg("--strict-conformance");
+    }
     let trust = &vector["trust"];
     if let Some(path) = trust["claim_allowed_list"].as_str() {
         command.arg("--allowed").arg(corpus.join(path));
@@ -144,12 +151,17 @@ fn codes(report: &Value) -> BTreeSet<String> {
     all
 }
 
-/// The CAWG interop contract: every `cawg.*` code plus the one C2PA code a
-/// broken identity COSE surfaces through.
+/// The CAWG interop contract: registered CAWG codes, Encypher's CAWG-scoped
+/// extension codes, plus the one C2PA code a broken identity COSE surfaces
+/// through.
 fn cawg_contract_codes(report: &Value) -> BTreeSet<String> {
     codes(report)
         .into_iter()
-        .filter(|code| code.starts_with("cawg.") || code == "claimSignature.mismatch")
+        .filter(|code| {
+            code.starts_with("cawg.")
+                || code.starts_with("com.encypher.cawg.")
+                || code == "claimSignature.mismatch"
+        })
         .collect()
 }
 
@@ -225,18 +237,30 @@ fn external_corpus_observation_is_stable() {
 
 /// Every pinned external vector must satisfy its spec-derived CAWG expectation.
 /// `current_sdk_observation` separately records implementation drift, but a
-/// normative disagreement fails CI rather than being logged and skipped.
+/// normative disagreement fails CI rather than being logged and skipped. A
+/// vector whose verdict differs under `--strict-conformance` also carries
+/// `strict_expected`.
 #[test]
 fn external_normative_expectations() {
     let mut mismatches = Vec::new();
     for vector in vectors(&external_index()) {
-        let observed = cawg_contract_codes(&verify(vector, CawgTrustMode::Allowed));
-        let expected = required_codes(vector, "normative_expected");
-        if observed != expected {
-            mismatches.push(format!(
-                "{}: observed={observed:?}, normative={expected:?}",
-                vector["id"]
+        for (strict, section) in [(false, "normative_expected"), (true, "strict_expected")] {
+            if vector[section].is_null() {
+                continue;
+            }
+            let observed = cawg_contract_codes(&verify_at(
+                vector,
+                CawgTrustMode::Allowed,
+                vector["fixed_validation_time"].as_str().expect("time"),
+                strict,
             ));
+            let expected = required_codes(vector, section);
+            if observed != expected {
+                mismatches.push(format!(
+                    "{} ({section}): observed={observed:?}, expected={expected:?}",
+                    vector["id"]
+                ));
+            }
         }
     }
     assert!(
@@ -424,7 +448,7 @@ fn generated_time_shift_outside_validity_is_never_trusted() {
     let index = generated_index();
     let vector = vector_by_id(&index, "x509-es256-jpeg");
     for shifted_time in ["2040-01-01T00:00:00Z", "2020-01-01T00:00:00Z"] {
-        let report = verify_at(vector, CawgTrustMode::Allowed, shifted_time);
+        let report = verify_at(vector, CawgTrustMode::Allowed, shifted_time, false);
         let failures = bucket_codes(&report, "failure");
         let expected: BTreeSet<String> = [
             "claimSignature.outsideValidity",

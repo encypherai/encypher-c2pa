@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Contract guards for opt-in `--encypher-api` server verification.
 //!
 //! These pin the privacy and stability contract: default verification makes no

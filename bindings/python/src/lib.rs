@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
 
 use encypher_c2pa::{
     set_telemetry_enabled, supported_mime_types, telemetry_preference,
-    verify_fragmented_with_options, verify_with_options, VerifyOptions, SUPPORTED_EXTENSIONS,
+    verify_fragmented_with_options, verify_stream_with_options, verify_with_manifest_store,
+    verify_with_options, StreamEncapsulation, StreamMethod, VerifyOptions, SUPPORTED_EXTENSIONS,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -24,6 +27,23 @@ fn verify_bytes(
 }
 
 #[pyfunction]
+fn verify_detached_bytes(
+    py: Python<'_>,
+    asset: Vec<u8>,
+    manifest_store: Vec<u8>,
+    mime_type: String,
+    options_json: String,
+) -> PyResult<String> {
+    let options: VerifyOptions = serde_json::from_str(&options_json)
+        .map_err(|error| PyValueError::new_err(format!("invalid_options: {error}")))?;
+    py.detach(|| {
+        verify_with_manifest_store(&asset, &manifest_store, &mime_type, &options)
+            .and_then(|report| report.to_json())
+            .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
+    })
+}
+
+#[pyfunction]
 fn verify_fragmented_bytes(
     py: Python<'_>,
     init_segment: Vec<u8>,
@@ -38,6 +58,44 @@ fn verify_fragmented_bytes(
         verify_fragmented_with_options(&init_segment, &fragment_refs, &mime_type, &options)
             .and_then(|report| report.to_json())
             .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
+    })
+}
+
+#[pyfunction]
+fn verify_stream_bytes(
+    py: Python<'_>,
+    init_segment: Vec<u8>,
+    segments: Vec<Vec<u8>>,
+    mime_type: String,
+    encapsulation: String,
+    method: String,
+    options_json: String,
+) -> PyResult<String> {
+    let options: VerifyOptions = serde_json::from_str(&options_json)
+        .map_err(|error| PyValueError::new_err(format!("invalid_options: {error}")))?;
+    let encapsulation = StreamEncapsulation::from_token(&encapsulation).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "invalid_argument: unknown encapsulation {encapsulation:?} (expected fMP4 or CMAF)"
+        ))
+    })?;
+    let method = StreamMethod::from_token(&method).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "invalid_argument: unknown method {method:?} \
+             (expected verifiable-segment-info or per-segment)"
+        ))
+    })?;
+    py.detach(|| {
+        let segment_refs: Vec<&[u8]> = segments.iter().map(Vec::as_slice).collect();
+        verify_stream_with_options(
+            &init_segment,
+            &segment_refs,
+            &mime_type,
+            encapsulation,
+            method,
+            &options,
+        )
+        .and_then(|report| report.to_json())
+        .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
     })
 }
 
@@ -66,7 +124,9 @@ fn extensions_json() -> PyResult<String> {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(verify_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(verify_detached_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(verify_fragmented_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(verify_stream_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(formats_json, module)?)?;
     module.add_function(wrap_pyfunction!(extensions_json, module)?)?;
     module.add_function(wrap_pyfunction!(set_telemetry_preference, module)?)?;

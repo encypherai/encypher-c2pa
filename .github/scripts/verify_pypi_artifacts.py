@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Encypher Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare local Python distributions with one PyPI version response."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! RIFF (WAV/AVI/WebP): JUMBF in a `C2PA` chunk.
 //!
 //! A RIFF file is `RIFF | size(4 LE) | form-type(4)` followed by chunks, each
@@ -155,6 +158,91 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
     Ok(ex)
 }
 
+/// A minimal WAV (`RIFF`/`WAVE` with one `fmt ` chunk) for tests in other
+/// modules of this crate.
+#[cfg(test)]
+pub(crate) fn sample_asset() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"WAVE");
+    body.extend_from_slice(b"fmt ");
+    body.extend_from_slice(&16u32.to_le_bytes());
+    body.extend_from_slice(&[1, 0, 1, 0, 0x44, 0xAC, 0, 0, 0x88, 0x58, 1, 0, 2, 0, 16, 0]);
+    let mut v = Vec::from(*RIFF);
+    v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v.extend_from_slice(&body);
+    v
+}
+
+/// Segment a RIFF asset into the named boxes of C2PA 2.4 BoxesHash
+/// "RIFF-specific Handling": each *L0* `RIFF` chunk is a box of exactly 12
+/// bytes named by its media type identifier (bytes 8-11); each non-`LIST`
+/// *L1* chunk is a box named by its chunk identifier, running from the
+/// identifier through its padding byte; each `LIST` *L1* chunk is a box named
+/// by its list type identifier and absorbs every chunk nested inside it.
+/// The manifest carrier is the `C2PA` chunk, which that rule already names
+/// `C2PA`.
+///
+/// Bytes trailing the last chunk become a `c2pa.after` box so no byte of the
+/// asset escapes hashing.
+pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
+    use crate::c2pa_formats::BoxSpan;
+
+    check_riff(data)?;
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    // The root is one or more L0 `RIFF` chunks.
+    while pos + 12 <= data.len() && &data[pos..pos + 4] == RIFF {
+        let declared = le_u32(data, pos + 4).ok_or(FormatError::Truncated(FMT))? as usize;
+        let riff_end = pos
+            .checked_add(8)
+            .and_then(|start| start.checked_add(declared))
+            .filter(|&end| end <= data.len())
+            .ok_or(FormatError::Truncated(FMT))?;
+        let name = String::from_utf8_lossy(&data[pos + 8..pos + 12]).into_owned();
+        spans.push(BoxSpan::contiguous(name, pos, pos + 12));
+        let mut child = pos + 12;
+        while child + 8 <= riff_end {
+            let id = &data[child..child + 4];
+            let len = le_u32(data, child + 4).ok_or(FormatError::Truncated(FMT))? as usize;
+            let data_end = child
+                .checked_add(8)
+                .and_then(|start| start.checked_add(len))
+                .filter(|&end| end <= riff_end)
+                .ok_or(FormatError::Truncated(FMT))?;
+            // RIFF chunks are word-aligned; the pad byte belongs to the chunk.
+            let end = if len % 2 == 1 && data_end < riff_end {
+                data_end + 1
+            } else {
+                data_end
+            };
+            let name = if id == b"LIST" {
+                let type_end = child.checked_add(12).filter(|&end| end <= data_end).ok_or(
+                    FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "LIST chunk shorter than its list type identifier",
+                    },
+                )?;
+                String::from_utf8_lossy(&data[child + 8..type_end]).into_owned()
+            } else {
+                String::from_utf8_lossy(id).into_owned()
+            };
+            spans.push(BoxSpan::contiguous(name, child, end));
+            child = end;
+        }
+        if child != riff_end {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "RIFF chunk content does not divide into whole sub-chunks",
+            });
+        }
+        pos = riff_end;
+    }
+    if pos < data.len() {
+        spans.push(BoxSpan::contiguous("c2pa.after", pos, data.len()));
+    }
+    Ok(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,15 +250,7 @@ mod tests {
 
     /// Minimal WAV: RIFF/WAVE with a tiny fmt chunk.
     fn tiny_wav() -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(b"WAVE");
-        body.extend_from_slice(b"fmt ");
-        body.extend_from_slice(&16u32.to_le_bytes());
-        body.extend_from_slice(&[1, 0, 1, 0, 0x44, 0xAC, 0, 0, 0x88, 0x58, 1, 0, 2, 0, 16, 0]);
-        let mut v = Vec::from(*RIFF);
-        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        v.extend_from_slice(&body);
-        v
+        sample_asset()
     }
 
     #[test]
@@ -220,6 +300,66 @@ mod tests {
     fn rejects_non_riff() {
         assert!(matches!(
             extract(b"NOTRIFFNOTRIFF"),
+            Err(FormatError::InvalidStructure { .. })
+        ));
+    }
+
+    /// A WAV carrying a `LIST`/`INFO` chunk and an odd-length `data` chunk,
+    /// which exercises list-type naming and the word-alignment pad byte.
+    fn wav_with_list_and_padding() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WAVE");
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(&[1, 0, 1, 0, 0x44, 0xAC, 0, 0, 0x88, 0x58, 1, 0, 2, 0, 16, 0]);
+        // LIST/INFO holding one nested INAM chunk.
+        body.extend_from_slice(b"LIST");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(b"INFO");
+        body.extend_from_slice(b"INAM");
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(b"name");
+        // Odd-length data chunk plus its pad byte.
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0x00]);
+        let mut v = Vec::from(*RIFF);
+        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn box_spans_follow_the_riff_chunk_tree() {
+        let asset = wav_with_list_and_padding();
+        let embedded = embed(&asset, &dummy_manifest_store()).unwrap();
+        let spans = box_spans(&embedded).unwrap();
+        assert_eq!(
+            crate::c2pa_formats::tests::span_names(&spans),
+            ["WAVE", "fmt ", "INFO", "data", "C2PA"],
+        );
+        // The L0 chunk is exactly 12 bytes; the LIST box absorbs its children.
+        assert_eq!(spans[0].byte_len(), 12);
+        assert_eq!(spans[2].byte_len(), 24);
+        // The odd-length data chunk carries its pad byte: 8 + 3 + 1.
+        assert_eq!(spans[3].byte_len(), 12);
+        crate::c2pa_formats::tests::assert_box_coverage(&spans, embedded.len());
+
+        let carrier = exclusions(&embedded).unwrap();
+        assert_eq!(carrier.len(), 1);
+        assert_eq!(spans[4].start(), carrier[0].start);
+        assert_eq!(spans[4].byte_len(), carrier[0].length);
+    }
+
+    #[test]
+    fn a_riff_chunk_that_does_not_divide_into_sub_chunks_is_not_segmentable() {
+        let mut asset = tiny_wav();
+        // Declare a fmt chunk one byte longer than the sub-chunks account for.
+        asset.extend_from_slice(&[0x00]);
+        let riff_size = (asset.len() - 8) as u32;
+        asset[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(matches!(
+            box_spans(&asset),
             Err(FormatError::InvalidStructure { .. })
         ));
     }

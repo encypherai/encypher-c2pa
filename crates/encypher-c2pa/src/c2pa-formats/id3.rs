@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! MP3: JUMBF in an ID3v2 `GEOB` (General Encapsulated Object) frame.
 //!
 //! C2PA stores the manifest store in a `GEOB` frame whose MIME type is

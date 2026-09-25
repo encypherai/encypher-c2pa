@@ -1,9 +1,16 @@
-//! OCSP response evaluation for stapled revocation status (RFC 6960).
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+//! OCSP revocation status (RFC 6960).
 //!
 //! Embedded OCSP evidence can come from the COSE `rVals` header or a
 //! `c2pa.certificate-status` assertion. This module parses DER OCSP responses,
 //! verifies the full RFC 6960 certificate identity and responder authority,
 //! and applies the C2PA historical-signing-time policy.
+//!
+//! [`online`] adds the request side and the separate C2PA 2.4 / CAWG 1.3
+//! online-response policy, which shares this module's parsing and responder
+//! authorization but applies its own freshness window.
 
 use const_oid::ObjectIdentifier;
 use der::{Decode, Encode};
@@ -14,6 +21,13 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use time::OffsetDateTime;
 use x509_cert::ext::pkix::ExtendedKeyUsage;
 use x509_cert::Certificate;
+
+/// Test-only RFC 6960 response minting. Compiled out of the published library.
+#[cfg(test)]
+pub(crate) mod fixture;
+
+/// Request construction and online-response policy (RFC 6960 §3.1, §4.1).
+pub(crate) mod online;
 
 // ---------------------------------------------------------------------------
 // OID constants (local to this module; mirror the values in `lib.rs`).
@@ -238,6 +252,39 @@ pub fn evaluate_verified(
     signed_at: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
 ) -> Option<OcspStatus> {
+    let accepted = accept(der, issuer_der, subject_der, verification_time)?;
+    matching_single_response_status(
+        accepted.responses,
+        &accepted.issuer,
+        &accepted.subject,
+        accepted.produced_at,
+        signed_at,
+        verification_time,
+    )
+}
+
+/// An OCSP response that passed {6960} section 3.2 requirements 1 through 4:
+/// the `CertID` identifies this subject and issuer, the signature verifies,
+/// and the signer is an authorized responder at `producedAt`.
+///
+/// Requirements 5 and 6 - the freshness of `thisUpdate` and `nextUpdate` - are
+/// deliberately left to the caller, because the stapled and online procedures
+/// apply different time windows to the same accepted response.
+pub(crate) struct AcceptedResponse<'a> {
+    /// The DER body of the `responses` SEQUENCE OF `SingleResponse`.
+    pub(crate) responses: &'a [u8],
+    pub(crate) produced_at: OffsetDateTime,
+    pub(crate) issuer: Certificate,
+    pub(crate) subject: Certificate,
+}
+
+/// Parse a DER `OCSPResponse` and apply {6960} section 3.2 requirements 1-4.
+pub(crate) fn accept<'a>(
+    der: &'a [u8],
+    issuer_der: &[u8],
+    subject_der: &[u8],
+    verification_time: OffsetDateTime,
+) -> Option<AcceptedResponse<'a>> {
     if der.len() > MAX_OCSP_RESPONSE_BYTES {
         return None;
     }
@@ -311,14 +358,12 @@ pub fn evaluate_verified(
     }
 
     let subject_cert = Certificate::from_der(subject_der).ok()?;
-    matching_single_response_status(
+    Some(AcceptedResponse {
         responses,
-        &issuer_cert,
-        &subject_cert,
         produced_at,
-        signed_at,
-        verification_time,
-    )
+        issuer: issuer_cert,
+        subject: subject_cert,
+    })
 }
 
 fn bounded_responder_certificates(certs_explicit: Option<&[u8]>) -> Option<Vec<&[u8]>> {
@@ -521,6 +566,32 @@ fn trim_unsigned(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[1..];
     }
     bytes
+}
+
+/// DER length octets for `len`.
+fn der_len(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        return vec![len as u8];
+    }
+    let mut bytes = Vec::new();
+    let mut remaining = len;
+    while remaining > 0 {
+        bytes.push((remaining & 0xff) as u8);
+        remaining >>= 8;
+    }
+    bytes.reverse();
+    let mut encoded = vec![0x80 | bytes.len() as u8];
+    encoded.extend(bytes);
+    encoded
+}
+
+/// One DER tag-length-value triple.
+fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(2 + content.len());
+    encoded.push(tag);
+    encoded.extend(der_len(content.len()));
+    encoded.extend_from_slice(content);
+    encoded
 }
 
 fn sha1_digest(input: &[u8]) -> [u8; 20] {

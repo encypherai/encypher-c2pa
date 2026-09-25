@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Spec-version classification of a parsed manifest — the version ladder.
 //!
 //! Given a parsed manifest and its decoded claim, [`evaluate`] determines, for
@@ -80,32 +83,182 @@ pub fn claim_generation(manifest: &ParsedManifest, claim: &Value) -> ClaimGenera
 /// `claim_generator_info.specVersion`. Handles both shapes: a single map (the
 /// v2 claim) and an array of maps (the v1 claim).
 pub fn declared_spec_version(claim: &Value) -> Option<String> {
+    declared_spec_version_text(claim).map(str::to_string)
+}
+
+fn declared_spec_version_text(claim: &Value) -> Option<&str> {
     let info = claim.get("claim_generator_info")?;
     let entry = match info {
         Value::Array(items) => items.first()?,
         other => other,
     };
-    entry
-        .get("specVersion")
-        .and_then(Value::as_text)
-        .map(str::to_string)
+    entry.get("specVersion").and_then(Value::as_text)
+}
+
+/// Return a declared generator spec version that is text but not valid SemVer.
+pub fn non_semver_declared_spec_version(claim: &Value) -> Option<&str> {
+    declared_spec_version_text(claim).filter(|version| !semver_is_valid(version))
 }
 
 fn optional_text_member_is_valid(map: &Value, key: &str) -> bool {
     map.get(key).is_none() || map.get(key).and_then(Value::as_text).is_some()
 }
+fn semver_identifier_is_valid(identifier: &str, reject_numeric_leading_zero: bool) -> bool {
+    !identifier.is_empty()
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !(reject_numeric_leading_zero
+            && identifier.len() > 1
+            && identifier.bytes().all(|byte| byte.is_ascii_digit())
+            && identifier.starts_with('0'))
+}
 
-fn hashed_uri_map_is_valid(value: &Value) -> bool {
+fn semver_is_valid(version: &str) -> bool {
+    let mut build_split = version.split('+');
+    let version_and_prerelease = match build_split.next() {
+        Some(value) if !value.is_empty() => value,
+        _ => return false,
+    };
+    if let Some(build) = build_split.next() {
+        if build_split.next().is_some()
+            || !build
+                .split('.')
+                .all(|identifier| semver_identifier_is_valid(identifier, false))
+        {
+            return false;
+        }
+    }
+
+    let mut prerelease_split = version_and_prerelease.split('-');
+    let core = match prerelease_split.next() {
+        Some(value) => value,
+        None => return false,
+    };
+    if let Some(prerelease) = prerelease_split.next() {
+        if prerelease_split.next().is_some()
+            || !prerelease
+                .split('.')
+                .all(|identifier| semver_identifier_is_valid(identifier, true))
+        {
+            return false;
+        }
+    }
+
+    let components = core.split('.').collect::<Vec<_>>();
+    components.len() == 3
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (component == &"0" || !component.starts_with('0'))
+        })
+}
+fn declared_spec_revision(version: &str) -> Option<SpecVersion> {
+    let core = version.split(['-', '+']).next()?;
+    let mut components = core.split('.');
+    let major = components.next()?;
+    let minor = components.next()?;
+    let patch = components.next()?;
+    if components.next().is_some() || patch != "0" {
+        return None;
+    }
+    SpecVersion::from_str(&format!("{major}.{minor}"))
+}
+fn external_url_is_valid(url: &str) -> bool {
+    let Some(remainder) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    let Some((domain, suffix)) = host.rsplit_once('.') else {
+        return false;
+    };
+    domain.len() >= 2
+        && (2..=6).contains(&suffix.len())
+        && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
+fn format_string_is_valid(format: &str) -> bool {
+    let Some((kind, subtype)) = format.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'.'))
+}
+
+fn asset_type_map_is_valid(value: &Value) -> bool {
     matches!(value, Value::Map(_))
         && value
-            .get("url")
+            .get("type")
             .and_then(Value::as_text)
-            .is_some_and(|url| !url.is_empty())
+            .is_some_and(|asset_type| {
+                asset_type.contains('.')
+                    && asset_type.split('.').all(|component| {
+                        !component.is_empty()
+                            && component.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                            })
+                    })
+            })
         && value
+            .get("version")
+            .is_none_or(|version| version.as_text().is_some_and(semver_is_valid))
+}
+
+fn hashed_uri_map_is_valid(value: &Value) -> bool {
+    let Some(url) = value.get("url").and_then(Value::as_text) else {
+        return false;
+    };
+    if url.is_empty()
+        || value
             .get("hash")
             .and_then(Value::as_bytes)
-            .is_some_and(|hash| !hash.is_empty())
-        && optional_text_member_is_valid(value, "alg")
+            .is_none_or(|hash| hash.is_empty())
+    {
+        return false;
+    }
+    let local = url.starts_with("self#jumbf=");
+    let external = external_url_is_valid(url);
+    if !local && !external {
+        return false;
+    }
+    if external
+        && value
+            .get("alg")
+            .and_then(Value::as_text)
+            .is_none_or(|algorithm| algorithm.is_empty())
+    {
+        return false;
+    }
+    optional_text_member_is_valid(value, "alg")
+        && value
+            .get("dc:format")
+            .is_none_or(|format| format.as_text().is_some_and(format_string_is_valid))
+        && value
+            .get("size")
+            .is_none_or(|size| matches!(size, Value::Integer(value) if *value > 0))
+        && value.get("data_types").is_none_or(|data_types| {
+            matches!(
+                data_types,
+                Value::Array(items)
+                    if !items.is_empty() && items.iter().all(asset_type_map_is_valid)
+            )
+        })
 }
 
 fn generator_info_map_is_valid(value: &Value) -> bool {
@@ -123,7 +276,11 @@ fn generator_info_map_is_valid(value: &Value) -> bool {
 /// Required claim-v1 fields absent from `claim` (empty = well-formed v1).
 pub fn v1_missing_fields(claim: &Value) -> Vec<&'static str> {
     let mut missing = Vec::new();
-    if claim.get("instanceID").and_then(Value::as_text).is_none() {
+    if claim
+        .get("instanceID")
+        .and_then(Value::as_text)
+        .is_none_or(|instance_id| instance_id.is_empty())
+    {
         missing.push("instanceID");
     }
     if claim
@@ -138,6 +295,13 @@ pub fn v1_missing_fields(claim: &Value) -> Vec<&'static str> {
     }
     if !matches!(claim.get("assertions"), Some(Value::Array(a)) if !a.is_empty()) {
         missing.push("assertions");
+    }
+    if claim
+        .get("signature")
+        .and_then(Value::as_text)
+        .is_none_or(|signature| signature.is_empty())
+    {
+        missing.push("signature");
     }
     if !matches!(
         claim.get("claim_generator_info"),
@@ -157,7 +321,11 @@ pub fn v1_missing_fields(claim: &Value) -> Vec<&'static str> {
 /// including the required non-empty text `name` and optional hashed-URI icon.
 pub fn v2_missing_fields(claim: &Value) -> Vec<&'static str> {
     let mut missing = Vec::new();
-    if claim.get("instanceID").and_then(Value::as_text).is_none() {
+    if claim
+        .get("instanceID")
+        .and_then(Value::as_text)
+        .is_none_or(|instance_id| instance_id.is_empty())
+    {
         missing.push("instanceID");
     }
     if !claim
@@ -168,6 +336,13 @@ pub fn v2_missing_fields(claim: &Value) -> Vec<&'static str> {
     }
     if !matches!(claim.get("created_assertions"), Some(Value::Array(a)) if !a.is_empty()) {
         missing.push("created_assertions");
+    }
+    if claim
+        .get("signature")
+        .and_then(Value::as_text)
+        .is_none_or(|signature| signature.is_empty())
+    {
+        missing.push("signature");
     }
     missing
 }
@@ -350,7 +525,7 @@ pub fn evaluate(manifest: &ParsedManifest, claim: &Value, format: AssetFormat) -
         })
         .collect();
 
-    let declared_version = declared.as_deref().and_then(SpecVersion::from_str);
+    let declared_version = declared.as_deref().and_then(declared_spec_revision);
     let passes = |v: SpecVersion| {
         evaluations
             .iter()
@@ -398,6 +573,10 @@ mod tests {
         map_from_pairs([
             ("instanceID".to_string(), Value::Text("urn:uuid:x".into())),
             (
+                "signature".to_string(),
+                Value::Text("self#jumbf=c2pa.signature".into()),
+            ),
+            (
                 "created_assertions".to_string(),
                 Value::Array(vec![map_from_pairs([(
                     "url".to_string(),
@@ -408,7 +587,7 @@ mod tests {
                 "claim_generator_info".to_string(),
                 map_from_pairs([
                     ("name".to_string(), Value::Text("t".into())),
-                    ("specVersion".to_string(), Value::Text("2.2".into())),
+                    ("specVersion".to_string(), Value::Text("2.2.0".into())),
                 ]),
             ),
         ])
@@ -417,6 +596,10 @@ mod tests {
     fn v1_claim() -> Value {
         map_from_pairs([
             ("instanceID".to_string(), Value::Text("xmp:iid:x".into())),
+            (
+                "signature".to_string(),
+                Value::Text("self#jumbf=c2pa.signature".into()),
+            ),
             (
                 "claim_generator".to_string(),
                 Value::Text("legacy/1.0".into()),
@@ -443,6 +626,10 @@ mod tests {
         let mut fields = vec![
             ("instanceID".to_string(), Value::Text("urn:uuid:x".into())),
             (
+                "signature".to_string(),
+                Value::Text("self#jumbf=c2pa.signature".into()),
+            ),
+            (
                 "created_assertions".to_string(),
                 Value::Array(vec![map_from_pairs([(
                     "url".to_string(),
@@ -461,7 +648,7 @@ mod tests {
         let generator = ClaimGeneratorInfo {
             name: "Encypher Engine".into(),
             version: "1.0".into(),
-            spec_version: Some("2.4".into()),
+            spec_version: Some("2.4.0".into()),
             c2pa_rs: None,
         };
         let options = ClaimOptions {
@@ -565,7 +752,7 @@ mod tests {
                 "operating_system".to_string(),
                 Value::Text("Example OS".into()),
             ),
-            ("specVersion".to_string(), Value::Text("2.4".into())),
+            ("specVersion".to_string(), Value::Text("2.4.0".into())),
             ("icon".to_string(), valid_icon),
         ]);
         assert!(v2_missing_fields(&v2_claim_with_generator_info(Some(valid))).is_empty());
@@ -688,8 +875,8 @@ mod tests {
     fn v2_claim_prefers_declared_version() {
         let m = manifest_with_label(Some("c2pa.claim.v2"));
         let v = evaluate(&m, &v2_claim(), AssetFormat::Jpeg);
-        assert_eq!(v.declared_spec_version.as_deref(), Some("2.2"));
-        // Declared 2.2 is conformant, so it wins over the highest (2.4).
+        assert_eq!(v.declared_spec_version.as_deref(), Some("2.2.0"));
+        // Declared 2.2.0 is conformant, so it wins over the highest (2.4).
         assert_eq!(v.validated_under, Some(SpecVersion::V2_2));
         // 1.4 must fail (claim v2 didn't exist); 2.0..2.4 pass.
         let v14 = v
@@ -719,7 +906,7 @@ mod tests {
                 if matches!(k, Value::Text(t) if t == "claim_generator_info") {
                     *val = map_from_pairs([
                         ("name".to_string(), Value::Text("t".into())),
-                        ("specVersion".to_string(), Value::Text("2.0".into())),
+                        ("specVersion".to_string(), Value::Text("2.0.0".into())),
                     ]);
                 }
             }
@@ -773,5 +960,70 @@ mod tests {
             .push(("c2pa.ingredient.v3".to_string(), &[0xa0][..]));
         let v3 = evaluate(&m3, &v2_claim(), AssetFormat::Jpeg);
         assert!(v3.evaluations.iter().all(|e| e.deprecations.is_empty()));
+    }
+
+    #[test]
+    fn claim_completeness_rejects_empty_ids_and_missing_signature() {
+        let mut claim = v2_claim();
+        if let Value::Map(fields) = &mut claim {
+            let instance = fields
+                .iter_mut()
+                .find(|(key, _)| key.as_text() == Some("instanceID"))
+                .unwrap();
+            instance.1 = Value::Text(String::new());
+        }
+        assert!(v2_missing_fields(&claim).contains(&"instanceID"));
+
+        let mut missing_signature = v2_claim();
+        if let Value::Map(fields) = &mut missing_signature {
+            fields.retain(|(key, _)| key.as_text() != Some("signature"));
+        }
+        assert!(v2_missing_fields(&missing_signature).contains(&"signature"));
+        if let Value::Map(fields) = &mut missing_signature {
+            let info = fields
+                .iter_mut()
+                .find(|(key, _)| key.as_text() == Some("claim_generator_info"))
+                .unwrap();
+            if let Value::Map(info_fields) = &mut info.1 {
+                let version = info_fields
+                    .iter_mut()
+                    .find(|(key, _)| key.as_text() == Some("specVersion"))
+                    .unwrap();
+                version.1 = Value::Text("2.4".into());
+            }
+        }
+        assert!(!v2_missing_fields(&missing_signature).contains(&"claim_generator_info"));
+        assert_eq!(
+            non_semver_declared_spec_version(&missing_signature),
+            Some("2.4")
+        );
+    }
+
+    #[test]
+    fn generator_icon_accepts_embedded_or_external_hashed_uri() {
+        let external = map_from_pairs([
+            (
+                "url".to_string(),
+                Value::Text("https://example.test/icon.svg".into()),
+            ),
+            ("alg".to_string(), Value::Text("sha256".into())),
+            ("hash".to_string(), Value::Bytes(vec![7; 32])),
+            ("dc:format".to_string(), Value::Text("image/svg+xml".into())),
+            ("size".to_string(), Value::Integer(1024.into())),
+            (
+                "data_types".to_string(),
+                Value::Array(vec![map_from_pairs([
+                    ("type".to_string(), Value::Text("c2pa.types.icon".into())),
+                    ("version".to_string(), Value::Text("1.0.0".into())),
+                ])]),
+            ),
+        ]);
+        let info = map_from_pairs([
+            ("name".to_string(), Value::Text("generator".into())),
+            ("specVersion".to_string(), Value::Text("2.4.0".into())),
+            ("icon".to_string(), external),
+        ]);
+        let claim = v2_claim_with_generator_info(Some(info));
+        assert!(v2_missing_fields(&claim).is_empty());
     }
 }

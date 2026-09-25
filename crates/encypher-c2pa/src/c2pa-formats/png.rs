@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! PNG: JUMBF carried in a `caBX` chunk.
 //!
 //! A PNG file is the 8-byte signature followed by a sequence of chunks, each
@@ -74,11 +77,8 @@ fn walk_chunks(data: &[u8], mut f: impl FnMut(&Chunk)) -> Result<(), FormatError
 /// bytes after `IEND` extend the final span so coverage stays total.
 pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
     check_signature(data)?;
-    let mut spans: Vec<crate::c2pa_formats::BoxSpan> = vec![crate::c2pa_formats::BoxSpan {
-        name: "PNGh".into(),
-        start: 0,
-        end: 8,
-    }];
+    let mut spans: Vec<crate::c2pa_formats::BoxSpan> =
+        vec![crate::c2pa_formats::BoxSpan::contiguous("PNGh", 0, 8)];
     walk_chunks(data, |c| {
         let name = if &c.type_code == TYPE_CABX {
             "C2PA".to_string()
@@ -87,21 +87,19 @@ pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>
         };
         if name == "C2PA" {
             if let Some(last) = spans.last_mut() {
-                if last.name == "C2PA" && last.end == c.start {
-                    last.end = c.end;
+                if last.name == "C2PA" && last.end() == c.start {
+                    last.extend_to(c.end);
                     return;
                 }
             }
         }
-        spans.push(crate::c2pa_formats::BoxSpan {
-            name,
-            start: c.start,
-            end: c.end,
-        });
+        spans.push(crate::c2pa_formats::BoxSpan::contiguous(
+            name, c.start, c.end,
+        ));
     })?;
     if let Some(last) = spans.last_mut() {
-        if last.end < data.len() && last.name == "IEND" {
-            last.end = data.len();
+        if last.end() < data.len() && last.name == "IEND" {
+            last.extend_to(data.len());
         }
     }
     Ok(spans)

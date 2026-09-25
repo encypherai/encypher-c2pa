@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! CBOR encoder supporting definite and indefinite length per profile.
 //!
 //! Hand-rolled per RFC 8949 because `ciborium` does not expose control over

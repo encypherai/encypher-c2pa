@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Ogg Vorbis: C2PA JUMBF in a dedicated logical bitstream.
 //!
 //! The first packet in the C2PA stream is `\x00c2pa` followed immediately by
@@ -361,14 +364,71 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
         .collect())
 }
 
+/// A minimal single-page Ogg logical bitstream (serial 7) for tests in other
+/// modules of this crate.
+#[cfg(test)]
+pub(crate) fn sample_asset() -> Vec<u8> {
+    let packet = b"\x01vorbisfixture";
+    build_page(BOS | EOS, 0, 7, 0, &[packet.len() as u8], packet)
+}
+
+/// Flip the byte at `offset` and repair the enclosing page's checksum, so the
+/// result is a well-framed Ogg file with edited content: what a content hash
+/// has to catch, rather than what the page parser rejects on its own.
+#[cfg(test)]
+pub(crate) fn tamper_page_byte(data: &mut [u8], offset: usize) {
+    let pages = validate_ogg(data).expect("valid Ogg asset").pages;
+    let page = pages
+        .iter()
+        .find(|page| offset >= page.start && offset < page.end)
+        .expect("offset lies inside a page");
+    let (start, end) = (page.start, page.end);
+    data[offset] ^= 0xFF;
+    let checksum = ogg_crc_page(&data[start..end]);
+    data[start + 22..start + 26].copy_from_slice(&checksum.to_le_bytes());
+}
+
+/// Segment an Ogg asset into the boxes of C2PA 2.4 BoxesHash "Ogg-specific
+/// Handling": each logical bitstream is one box holding every page with that
+/// `bitstream_serial_number`, in order. The manifest bitstream is named
+/// `C2PA`; every other stream is `Stream-[bitstream_serial_number]` with the
+/// serial written as a base-10 ASCII value.
+///
+/// Streams may interleave, so a box is a list of page ranges rather than one
+/// contiguous span. Boxes are returned in order of each stream's first page.
+pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
+    use crate::c2pa_formats::BoxSpan;
+
+    let validated = validate_ogg(data)?;
+    let mut order: Vec<u32> = Vec::new();
+    let mut ranges: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    for page in &validated.pages {
+        let stream = ranges.entry(page.serial).or_insert_with(|| {
+            order.push(page.serial);
+            Vec::new()
+        });
+        stream.push((page.start, page.end));
+    }
+    Ok(order
+        .into_iter()
+        .map(|serial| {
+            let name = if Some(serial) == validated.manifest_serial {
+                "C2PA".to_string()
+            } else {
+                format!("Stream-{serial}")
+            };
+            BoxSpan::scattered(name, ranges.remove(&serial).unwrap_or_default())
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::c2pa_formats::tests::dummy_manifest_store;
 
     fn bare_ogg() -> Vec<u8> {
-        let packet = b"\x01vorbisfixture";
-        build_page(BOS | EOS, 0, 7, 0, &[packet.len() as u8], packet)
+        sample_asset()
     }
 
     fn update_page_crc(data: &mut [u8], start: usize) {
@@ -395,6 +455,67 @@ mod tests {
             .into_iter()
             .filter(|page| page.serial == serial)
             .collect()
+    }
+
+    /// Two logical bitstreams whose pages alternate in the file.
+    fn interleaved_ogg() -> Vec<u8> {
+        let mut out = Vec::new();
+        for (serial, payload) in [(1u32, &b"\x01one"[..]), (2u32, &b"\x01two"[..])] {
+            out.extend_from_slice(&build_page(
+                BOS,
+                0,
+                serial,
+                0,
+                &[payload.len() as u8],
+                payload,
+            ));
+        }
+        for (serial, payload) in [(1u32, &b"tail-one"[..]), (2u32, &b"tail-two"[..])] {
+            out.extend_from_slice(&build_page(
+                EOS,
+                1,
+                serial,
+                1,
+                &[payload.len() as u8],
+                payload,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn box_spans_treat_each_logical_bitstream_as_one_box() {
+        let embedded = embed(&bare_ogg(), &dummy_manifest_store()).unwrap();
+        let spans = box_spans(&embedded).unwrap();
+        assert_eq!(
+            crate::c2pa_formats::tests::span_names(&spans),
+            ["Stream-7", "C2PA"],
+        );
+        crate::c2pa_formats::tests::assert_box_coverage(&spans, embedded.len());
+
+        // The C2PA box is exactly the carrier the data hash excludes.
+        let carrier: usize = exclusions(&embedded)
+            .unwrap()
+            .iter()
+            .map(|range| range.length)
+            .sum();
+        assert_eq!(spans[1].byte_len(), carrier);
+    }
+
+    #[test]
+    fn interleaved_streams_each_form_one_scattered_box() {
+        let asset = interleaved_ogg();
+        let spans = box_spans(&asset).unwrap();
+        assert_eq!(
+            crate::c2pa_formats::tests::span_names(&spans),
+            ["Stream-1", "Stream-2"],
+        );
+        assert!(
+            !spans[0].is_contiguous(),
+            "an interleaved stream is one box of several page ranges"
+        );
+        assert_eq!(spans[0].ranges().len(), 2);
+        crate::c2pa_formats::tests::assert_box_coverage(&spans, asset.len());
     }
 
     #[test]

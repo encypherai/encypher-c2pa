@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! C2PA unstructured-text variation-selector codec.
 //!
 //! C2PA Technical Specification A.8 encodes wrapper bytes with the 256

@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! C2PA manifest verification pipeline.
 //!
 //! Given asset bytes, a MIME type, optional trust configuration, and an optional
@@ -31,16 +34,26 @@
 //! OCSP, timestamp, and conformance-policy codes) is treated as surfaced
 //! caveats, so only a construction-integrity failure yields `Invalid`.
 
+mod assertion_semantics;
 mod cache;
 mod cawg;
+mod cawg_metadata;
+mod cawg_training_mining;
+mod exclusions;
 pub(crate) use cawg::{
     CAWG_ICA_DID_UNAVAILABLE, CAWG_IDENTITY_ASSERTION_DUPLICATE, CAWG_IDENTITY_ASSERTION_MISMATCH,
-    CAWG_IDENTITY_CBOR_INVALID, CAWG_IDENTITY_EXPECTED_CLAIM_GENERATOR_MISMATCH,
-    CAWG_IDENTITY_EXPECTED_COUNTERSIGNER_MISMATCH, CAWG_IDENTITY_EXPECTED_COUNTERSIGNER_MISSING,
-    CAWG_IDENTITY_EXPECTED_PARTIAL_CLAIM_MISMATCH, CAWG_IDENTITY_HARD_BINDING_INCORRECT,
-    CAWG_IDENTITY_HARD_BINDING_MISSING, CAWG_IDENTITY_PAD_INVALID, CAWG_IDENTITY_SIG_TYPE_UNKNOWN,
-    CAWG_IDENTITY_TRUSTED, CAWG_IDENTITY_UNEXPECTED_COUNTERSIGNER, CAWG_IDENTITY_WELL_FORMED,
-    CAWG_LEGACY_PROFILE,
+    CAWG_IDENTITY_CBOR_INVALID, CAWG_IDENTITY_CREDENTIAL_REVOKED,
+    CAWG_IDENTITY_HARD_BINDING_INCORRECT, CAWG_IDENTITY_HARD_BINDING_MISSING,
+    CAWG_IDENTITY_NETWORK_TRAFFIC_BLOCKED, CAWG_IDENTITY_PAD_INVALID,
+    CAWG_IDENTITY_SIG_TYPE_UNKNOWN, CAWG_IDENTITY_TRUSTED, CAWG_IDENTITY_WELL_FORMED,
+    CAWG_LEGACY_PROFILE, CAWG_X509_ALGORITHM_UNSUPPORTED, CAWG_X509_CREDENTIAL_TRUSTED,
+    CAWG_X509_CREDENTIAL_UNTRUSTED, CAWG_X509_OCSP_NOT_REVOKED, CAWG_X509_OCSP_SKIPPED,
+    CAWG_X509_SIGNATURE_INSIDE_VALIDITY, CAWG_X509_SIGNATURE_MISMATCH,
+    CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY, CAWG_X509_SIGNATURE_VALIDATED,
+    CAWG_X509_TIME_OF_SIGNING_INSIDE_VALIDITY, CAWG_X509_TIME_OF_SIGNING_OUTSIDE_VALIDITY,
+    CAWG_X509_TIME_STAMP_CREDENTIAL_INVALID, CAWG_X509_TIME_STAMP_MALFORMED,
+    CAWG_X509_TIME_STAMP_MISMATCH, CAWG_X509_TIME_STAMP_OUTSIDE_VALIDITY,
+    CAWG_X509_TIME_STAMP_TRUSTED, CAWG_X509_TIME_STAMP_UNTRUSTED, CAWG_X509_TIME_STAMP_VALIDATED,
 };
 mod cawg_ica;
 pub(crate) use cawg_ica::{
@@ -52,10 +65,26 @@ pub(crate) use cawg_ica::{
 };
 mod cert;
 mod crjson;
+mod ingredient_graph;
+pub(crate) mod live_video;
+mod network_needs;
+pub(crate) use network_needs::{NetworkNeed, OcspPurpose};
 mod observe;
+mod pdf_history;
+mod program;
+pub(crate) use program::{apply_compliance_upgrades, PROGRAM_FAILURE_CODES};
+pub(crate) use program::{CONFORMANCE_OUT_OF_SCOPE, CONFORMANCE_SPEC_VERSION_NONCONFORMANT};
+mod redaction;
+mod refs;
 mod report;
+mod revocation;
+#[cfg(test)]
+mod signature_conformance_tests;
+pub(crate) mod stream;
+mod timestamp_assertion;
+mod update_manifest;
 pub(crate) mod versions;
-pub(crate) use crjson::{crjson_from_asset, to_crjson};
+pub(crate) use crjson::CrjsonContext;
 pub(crate) use versions::{ClaimGeneration, VersionEvaluation, VersionVerdict};
 
 pub(crate) use cache::{CachedResult, VerifyCache};
@@ -63,21 +92,19 @@ pub(crate) use observe::{global as global_metrics, Metrics, MetricsSnapshot};
 
 use crate::c2pa_cbor::{decode, DecodeError, Value};
 use crate::c2pa_core::jumbf::{
-    manifest_superboxes_from_store, parse_manifest_store, superbox_content, JumbfError,
-    ParsedManifest, ParsedStore,
+    expand_store, manifest_superboxes_from_store, parse_manifest_store, superbox_content,
+    AssertionContentType, ExpandedStore, JumbfError, ManifestKind, ParsedManifest, ParsedStore,
 };
 pub(crate) use crate::c2pa_core::{ComplianceLevel, EngineProfile, OperatingMode, SpecVersion};
-use crate::c2pa_crypto::{
-    extract_claim_tsa_tokens, extract_x5chain, timestamp_input, timestamp_input_v1, verify_claim,
-    visit_ocsp_staples, ClaimTimestampVersion,
-};
+use crate::c2pa_crypto::{extract_x5chain, verify_claim, visit_ocsp_staples, CryptoError};
 use crate::c2pa_formats::{text_standard, AssetFormat};
-use crate::c2pa_trust::{validate_chain, TrustList, MAX_OCSP_RESPONSE_BYTES};
+use crate::c2pa_trust::{validate_chain, OnlineOcspVerdict, TrustList, MAX_OCSP_RESPONSE_BYTES};
 use serde::Serialize;
 use serde_json::{json, Map, Value as Json};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use thiserror::Error;
 use time::OffsetDateTime;
+use unicode_normalization::UnicodeNormalization;
 
 // ---------------------------------------------------------------------------
 // Status code constants (C2PA 2.x validation status codes)
@@ -102,10 +129,15 @@ pub const ASSERTION_HASHED_URI_MISMATCH: &str = "assertion.hashedURI.mismatch";
 pub const ASSERTION_DATA_HASH_MATCH: &str = "assertion.dataHash.match";
 /// `c2pa.hash.data` hard binding did not match the asset.
 pub const ASSERTION_DATA_HASH_MISMATCH: &str = "assertion.dataHash.mismatch";
+/// `c2pa.hash.data` exclusion structure is invalid.
+pub const ASSERTION_DATA_HASH_MALFORMED: &str = "assertion.dataHash.malformed";
 /// Informational: a C2PA 2.4 data-hash binding excludes bytes beyond its
 /// manifest carrier.
 pub const ASSERTION_DATA_HASH_ADDITIONAL_EXCLUSIONS_PRESENT: &str =
     "assertion.dataHash.additionalExclusionsPresent";
+/// Informational: a BMFF binding excludes non-required boxes.
+pub const ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT: &str =
+    "assertion.bmffHash.additionalExclusionsPresent";
 /// Success: a `c2pa.hash.bmff.v2` or `c2pa.hash.bmff.v3` box-based hard binding matched the asset.
 pub const ASSERTION_BMFF_HASH_MATCH: &str = "assertion.bmffHash.match";
 /// Failure: a `c2pa.hash.bmff.v2` or `c2pa.hash.bmff.v3` box-based hard binding did not match.
@@ -121,6 +153,19 @@ pub const ASSERTION_BOXES_HASH_MISMATCH: &str = "assertion.boxesHash.mismatch";
 pub const ASSERTION_BOXES_HASH_MALFORMED: &str = "assertion.boxesHash.malformed";
 /// Failure: the asset contains boxes not covered by the assertion.
 pub const ASSERTION_BOXES_HASH_UNKNOWN_BOX: &str = "assertion.boxesHash.unknownBox";
+/// Informational: a general box hash uses additional byte exclusions.
+pub const ASSERTION_BOXES_HASH_ADDITIONAL_EXCLUSIONS_PRESENT: &str =
+    "assertion.boxesHash.additionalExclusionsPresent";
+/// Informational: default posture accepted the historical c2pa-rs JPEG layout
+/// in which `SOS` overlaps separately hashed two-byte restart markers.
+pub const ASSERTION_BOXES_HASH_OVERLAPPING_RESTART_SEGMENTS: &str =
+    "com.encypher.assertion.boxesHash.overlappingRestartSegments";
+/// Failure extension: the sole hard binding is a general box hash over a
+/// container for which C2PA 2.4 defines no box segmentation, so the binding
+/// could not be evaluated. No registered code says "unevaluable binding", and
+/// a manifest whose content binding was never checked must not read as valid,
+/// so the verifier fails closed under this extension code.
+pub const ASSERTION_BOXES_HASH_UNEVALUATED: &str = "com.encypher.assertion.boxesHash.unevaluated";
 /// Success: every collection URI hash (and the ZIP central directory) matched.
 pub const ASSERTION_COLLECTION_HASH_MATCH: &str = "assertion.collectionHash.match";
 /// Failure: a collection entry's bytes (or the ZIP central directory) did not
@@ -150,12 +195,16 @@ pub const SIGNING_CREDENTIAL_TRUSTED: &str = "signingCredential.trusted";
 pub const SIGNING_CREDENTIAL_UNTRUSTED: &str = "signingCredential.untrusted";
 /// Signing certificate structurally invalid or absent.
 pub const SIGNING_CREDENTIAL_INVALID: &str = "signingCredential.invalid";
-/// Stapled OCSP response says the signing certificate is not revoked.
+/// A verified OCSP response says the signing certificate is not revoked.
 pub const SIGNING_CREDENTIAL_OCSP_NOT_REVOKED: &str = "signingCredential.ocsp.notRevoked";
-/// Stapled OCSP response says the signing certificate is revoked.
+/// A verified OCSP response says the signing certificate is revoked.
 pub const SIGNING_CREDENTIAL_OCSP_REVOKED: &str = "signingCredential.ocsp.revoked";
-/// No usable OCSP staple; revocation check skipped (informational).
+/// No usable OCSP evidence and no online check; revocation check skipped.
 pub const SIGNING_CREDENTIAL_OCSP_SKIPPED: &str = "signingCredential.ocsp.skipped";
+/// An online OCSP check was attempted but no usable response came back.
+pub const SIGNING_CREDENTIAL_OCSP_INACCESSIBLE: &str = "signingCredential.ocsp.inaccessible";
+/// An OCSP response reported `unknown` for the signing certificate.
+pub const SIGNING_CREDENTIAL_OCSP_UNKNOWN: &str = "signingCredential.ocsp.unknown";
 /// RFC 3161 timestamp token present and message digest matched.
 pub const TIME_STAMP_VALIDATED: &str = "timeStamp.validated";
 /// RFC 3161 timestamp present but the TSA certificate is untrusted.
@@ -164,12 +213,9 @@ pub const TIME_STAMP_UNTRUSTED: &str = "timeStamp.untrusted";
 pub const TIME_STAMP_TRUSTED: &str = "timeStamp.trusted";
 /// RFC 3161 timestamp genTime fell outside the TSA certificate's validity window.
 pub const TIME_STAMP_OUTSIDE_VALIDITY: &str = "timeStamp.outsideValidity";
-/// A `sigTst2` header is present but does not contain exactly one usable token.
+/// A timestamp header is present but does not contain exactly one usable token,
+/// or a token is structurally malformed.
 pub const TIME_STAMP_MALFORMED: &str = "timeStamp.malformed";
-/// No trusted RFC 3161 timestamp present. Informational under the core spec
-/// (timestamping is a SHOULD); a hard failure under the conformance program,
-/// which upgrades it to a SHALL.
-pub const TIME_STAMP_MISSING: &str = "timeStamp.missing";
 /// No claim (or no manifest) found.
 pub const CLAIM_MISSING: &str = "claim.missing";
 /// Claim CBOR could not be decoded.
@@ -178,20 +224,100 @@ pub const CLAIM_CBOR_INVALID: &str = "claim.cbor.invalid";
 pub const CLAIM_MULTIPLE: &str = "claim.multiple";
 /// Claim is missing a required v2 field (e.g. `instanceID`, `created_assertions`).
 pub const CLAIM_MALFORMED: &str = "claim.malformed";
+/// Advisory: a legacy claim-v1 claim supplies `claim_generator` but omits the
+/// later `claim_generator_info` array.
+pub const CLAIM_GENERATOR_INFO_MISSING: &str = "com.encypher.claim.generatorInfoMissing";
+/// A manifest contains more than one ingredient with a `parentOf` relationship.
+pub const MANIFEST_MULTIPLE_PARENTS: &str = "manifest.multipleParents";
+/// A compressed manifest cannot be decoded or violates the compressed-manifest shape.
+pub const MANIFEST_COMPRESSED_INVALID: &str = "manifest.compressed.invalid";
+/// An update manifest contains a disallowed assertion or malformed parent link.
+pub const MANIFEST_UPDATE_INVALID: &str = "manifest.update.invalid";
+/// An update manifest does not contain exactly one `parentOf` ingredient.
+pub const MANIFEST_UPDATE_WRONG_PARENTS: &str = "manifest.update.wrongParents";
+/// A manifest store declared by its container cannot be accessed.
+pub const MANIFEST_INACCESSIBLE: &str = "manifest.inaccessible";
+/// Advisory: `claim_generator_info.specVersion` is not a SemVer value.
+pub const CLAIM_SPEC_VERSION_NOT_SEMVER: &str = "com.encypher.claim.specVersionNotSemver";
 /// Claim references no hard-binding (`c2pa.hash.*`) assertion.
 pub const CLAIM_HARD_BINDINGS_MISSING: &str = "claim.hardBindings.missing";
 /// More than one supported hard binding is declared by the claim.
 pub const ASSERTION_MULTIPLE_HARD_BINDINGS: &str = "assertion.multipleHardBindings";
 /// A referenced assertion uses an unsupported hash algorithm.
 pub const ALGORITHM_UNSUPPORTED: &str = "algorithm.unsupported";
+/// A deprecated hash algorithm was verified.
+pub const ALGORITHM_DEPRECATED: &str = "algorithm.deprecated";
 /// An assertion's CBOR could not be decoded.
 pub const ASSERTION_CBOR_INVALID: &str = "assertion.cbor.invalid";
+/// A JSON or JSON-LD assertion cannot be parsed as JSON.
+pub const ASSERTION_JSON_INVALID: &str = "assertion.json.invalid";
+/// JUMBF framing or structure is malformed before a more specific code applies.
+pub const GENERAL_ERROR: &str = "general.error";
 /// An assertion-store box is not declared by any claim assertion reference.
 pub const ASSERTION_UNDECLARED: &str = "assertion.undeclared";
 /// An actions assertion is absent or violates the required action ordering.
 pub const ASSERTION_ACTION_MALFORMED: &str = "assertion.action.malformed";
+/// An action's required ingredient cannot be resolved.
+pub const ASSERTION_ACTION_INGREDIENT_MISMATCH: &str = "assertion.action.ingredientMismatch";
+/// A redacted action does not resolve the named assertion.
+pub const ASSERTION_ACTION_REDACTION_MISMATCH: &str = "assertion.action.redactionMismatch";
+/// A watermark action has no accompanying `c2pa.soft-binding` assertion.
+pub const ASSERTION_ACTION_SOFT_BINDING_MISSING: &str = "assertion.action.softBindingMissing";
+/// An ingredient assertion violates its required structure.
+pub const ASSERTION_INGREDIENT_MALFORMED: &str = "assertion.ingredient.malformed";
+/// A cloud data assertion omits `label`, `size`, or `location`, or names an
+/// assertion type the spec forbids referencing remotely.
+pub const ASSERTION_CLOUD_DATA_MALFORMED: &str = "assertion.cloud-data.malformed";
+/// A cloud data assertion references a hard-binding assertion.
+pub const ASSERTION_CLOUD_DATA_HARD_BINDING: &str = "assertion.cloud-data.hardBinding";
+/// An update manifest's cloud data assertion references an actions assertion.
+pub const ASSERTION_CLOUD_DATA_ACTIONS: &str = "assertion.cloud-data.actions";
+/// An external reference assertion omits `location`/`url`, carries half a hash
+/// pair, or names an assertion type the spec forbids referencing externally.
+pub const ASSERTION_EXTERNAL_REFERENCE_MALFORMED: &str = "assertion.external-reference.malformed";
+/// An external reference assertion was declared in `created_assertions`.
+pub const ASSERTION_EXTERNAL_REFERENCE_CREATED: &str = "assertion.external-reference.created";
+/// A non-embedded (remote) assertion was accessible at validation time.
+pub const ASSERTION_ACCESSIBLE: &str = "assertion.accessible";
+/// A remotely stored assertion could not be read at validation time.
+pub const ASSERTION_INACCESSIBLE: &str = "assertion.inaccessible";
+/// Advisory: externally referenced non-assertion data was not retrieved.
+pub const EXTERNAL_REFERENCE_NOT_RETRIEVED: &str =
+    "com.encypher.assertion.externalReference.notRetrieved";
+/// Advisory: a cloud data `location` repeats `size` or `dc:format`, which the
+/// C2PA 2.4 cloud data assertion definition says shall not be present there.
+pub const CLOUD_DATA_REDUNDANT_LOCATION_FIELD: &str =
+    "com.encypher.assertion.cloudData.redundantLocationField";
+/// An alternative-content representation is malformed.
+pub const ASSERTION_ALTERNATIVE_CONTENT_MALFORMED: &str =
+    "assertion.alternativeContentRepresentation.malformed";
+/// An embedded alternative-content representation hash mismatched.
+pub const ASSERTION_ALTERNATIVE_CONTENT_HASH_MISMATCH: &str =
+    "assertion.alternativeContentRepresentation.hashMismatch";
+/// An alternative-content representation validated.
+pub const ASSERTION_ALTERNATIVE_CONTENT_MATCH: &str =
+    "assertion.alternativeContentRepresentation.match";
 /// A claim referenced an assertion that is not present in the manifest store.
 pub const HASHED_URI_MISSING: &str = "hashedURI.missing";
+/// The destination of a nested `hashed_uri` field does not hash to the value
+/// the reference records (or the reference carries no `hash` at all). Distinct
+/// from [`ASSERTION_HASHED_URI_MISMATCH`], which is the claim's own binding to
+/// an assertion box.
+pub const HASHED_URI_MISMATCH: &str = "hashedURI.mismatch";
+/// A claim declared one of its own assertions redacted.
+pub const ASSERTION_SELF_REDACTED: &str = "assertion.selfRedacted";
+/// An assertion declared redacted is still present, with content, in the
+/// manifest it was supposedly removed from.
+pub const ASSERTION_NOT_REDACTED: &str = "assertion.notRedacted";
+/// An actions assertion was redacted, which C2PA forbids.
+pub const ASSERTION_ACTION_REDACTED: &str = "assertion.action.redacted";
+/// A hard binding assertion was redacted, which C2PA forbids. Supersedes the
+/// deprecated `assertion.dataHash.redacted`.
+pub const ASSERTION_HARD_BINDING_REDACTED: &str = "assertion.hardBinding.redacted";
+/// A claim assertion URI names a location outside its own manifest.
+pub const ASSERTION_OUTSIDE_MANIFEST: &str = "assertion.outsideManifest";
+/// A locally addressed assertion was absent.
+pub const ASSERTION_MISSING: &str = "assertion.missing";
 /// An ingredient references a manifest not present in the manifest store.
 pub const INGREDIENT_MANIFEST_MISSING: &str = "ingredient.manifest.missing";
 /// An ingredient's active-manifest hash matched the referenced manifest box.
@@ -204,22 +330,13 @@ pub const INGREDIENT_CLAIM_SIGNATURE_VALIDATED: &str = "ingredient.claimSignatur
 pub const INGREDIENT_CLAIM_SIGNATURE_MISSING: &str = "ingredient.claimSignature.missing";
 /// An ingredient's claim-signature hash did not match the referenced signature box.
 pub const INGREDIENT_CLAIM_SIGNATURE_MISMATCH: &str = "ingredient.claimSignature.mismatch";
-/// Informational (conformance mode only): the asset's format is outside the
-/// certified conformance scope for the active spec version. Verification still
-/// proceeds and reports normally; this records the scope observation for
-/// conformance evidence. Never emitted in regular/generous verification.
-pub const CONFORMANCE_OUT_OF_SCOPE: &str = "conformanceScope.outOfScope";
-/// Conformance-mode-only: the manifest's structure does not conform to the
-/// profile's *target* spec revision (per the version ladder). Informational
-/// under [`ComplianceLevel::CoreSpec`] (records the observation), a hard
-/// failure under [`ComplianceLevel::ConformanceProgram`] (the strict internal
-/// conformance-analysis bar). Never emitted in regular/generous verification —
-/// the public verify posture reports the ladder via `version_verdict` without
-/// judging against a target. A policy code: it does not clear
-/// `version_verdict.validated_under` (the manifest may conform perfectly to a
-/// *different* revision — that is exactly the diagnostic).
-pub const CONFORMANCE_SPEC_VERSION_NONCONFORMANT: &str =
-    "conformanceScope.specVersion.nonConformant";
+/// Informational: an ingredient assertion carries no manifest link, so the
+/// ingredient's provenance is unknown.
+pub const INGREDIENT_UNKNOWN_PROVENANCE: &str = "ingredient.unknownProvenance";
+/// Informational extension: a legacy `c2pa_manifest` ingredient link matched
+/// the C2PA 1.0 hash over the ingredient's claim bytes rather than the
+/// manifest-box hash. Accepted in the default posture only.
+pub const INGREDIENT_LEGACY_CLAIM_HASH: &str = "com.encypher.ingredient.legacyClaimHash";
 /// EXPERIMENTAL (PR #2058 compound): the host-less `c2pa.compound.content`
 /// binding verified — every component's `ingredientRef` hashed-URI resolved to a
 /// present `c2pa.ingredient.v3` assertion whose JUMBF content hash matched.
@@ -257,6 +374,11 @@ pub enum ValidateError {
     /// The active manifest's hard-binding assertion is malformed or unsupported.
     #[error("hard binding invalid: {0}")]
     HardBinding(String),
+    /// A declared fragmented stream could not be verified as presented: a file
+    /// does not declare the encapsulation's brands, or the init segment does
+    /// not carry the binding the requested method needs.
+    #[error("stream verification failed: {0}")]
+    Stream(String),
     /// Verification panicked internally; contained at the API boundary so it
     /// never crosses an FFI/gRPC edge as an abort.
     #[error("internal verification panic (contained)")]
@@ -314,12 +436,20 @@ pub struct ValidationResults {
     /// Codes for checks that passed.
     pub success: Vec<StatusCode>,
     /// Advisory codes that do not affect validity (e.g. `timeStamp.untrusted`,
-    /// `signingCredential.ocsp.skipped`). Reserved: emitting these requires RFC
-    /// 3161 timestamp-token and OCSP verification, which the workspace crates do
-    /// not yet provide, so this bucket is currently always empty.
+    /// `signingCredential.ocsp.skipped`).
     pub informational: Vec<StatusCode>,
     /// Codes for checks that failed.
     pub failure: Vec<StatusCode>,
+    /// Requests that would settle a check this verification could not make
+    /// offline, recorded wherever the corresponding status code is emitted.
+    ///
+    /// It travels with the status codes because it is produced at exactly the
+    /// same points and by the same evidence, and threading a second sink
+    /// through every emitter would let the two drift apart. It is moved out
+    /// into [`VerifyOutput::network_needs`] when the output is assembled, and
+    /// is never serialized as part of the status codes.
+    #[serde(skip)]
+    pub(crate) network_needs: Vec<NetworkNeed>,
 }
 
 impl ValidationResults {
@@ -366,12 +496,41 @@ impl ValidationResults {
             details: None,
         });
     }
+    fn push_failure_with_details(
+        &mut self,
+        code: &str,
+        url: String,
+        explanation: String,
+        details: Json,
+    ) {
+        self.failure.push(StatusCode {
+            code: code.into(),
+            url,
+            explanation,
+            details: Some(details),
+        });
+    }
     fn push_informational(&mut self, code: &str, url: String, explanation: String) {
         self.informational.push(StatusCode {
             code: code.into(),
             url,
             explanation,
             details: None,
+        });
+    }
+
+    fn push_informational_with_details(
+        &mut self,
+        code: &str,
+        url: String,
+        explanation: String,
+        details: Json,
+    ) {
+        self.informational.push(StatusCode {
+            code: code.into(),
+            url,
+            explanation,
+            details: Some(details),
         });
     }
 }
@@ -400,39 +559,121 @@ pub struct VerifyInput<'a> {
     /// [`EngineProfile::CONFORMANCE_V2_2`]; a MIME type outside the profile's
     /// scope is rejected with [`ValidateError::UnsupportedMime`].
     pub profile: crate::c2pa_core::EngineProfile,
+    /// Material a caller obtained over the network and is supplying as
+    /// evidence. Empty by default: the kernel itself never fetches.
+    pub evidence: OnlineEvidence<'a>,
+    /// Refuse the CAWG field-order `signer_payload` encoding even under the
+    /// generous posture. The conformance posture refuses it regardless.
+    pub cawg_strict_encoding: bool,
+}
+
+/// Network-obtained material a caller supplies to a verification.
+///
+/// The kernel opens no sockets. Everything here was fetched by someone else -
+/// the SDK's own consent-gated fetcher, or a caller with its own network
+/// policy - and is verified here exactly as any other untrusted input is: an
+/// OCSP response must still be signed by an authorized responder, and external
+/// data must still hash to the value its assertion declares.
+///
+/// Keys come from the [`NetworkNeed`] values the previous offline pass
+/// recorded, so a caller never has to derive them.
+#[derive(Clone, Copy, Default)]
+pub struct OnlineEvidence<'a> {
+    /// OCSP responses, keyed by the lowercase hex SHA-256 of the subject
+    /// certificate's DER, with the DER `OCSPResponse` as the value.
+    pub ocsp_responses: Option<&'a std::collections::HashMap<String, Vec<u8>>>,
+    /// Certificates whose responder was queried without a usable answer, by
+    /// the same hex SHA-256 key. Each one registers the `ocsp.inaccessible`
+    /// informational code instead of `ocsp.skipped`.
+    pub ocsp_unreachable: Option<&'a [String]>,
+    /// External assertion content, keyed by the URI the assertion declares.
+    pub external_data: Option<&'a std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl OnlineEvidence<'_> {
+    /// True when nothing was supplied, which is the offline default.
+    fn is_empty(&self) -> bool {
+        self.ocsp_responses.is_none_or(|map| map.is_empty())
+            && self.ocsp_unreachable.is_none_or(|list| list.is_empty())
+            && self.external_data.is_none_or(|map| map.is_empty())
+    }
+
+    /// The OCSP response supplied for `certificate_sha256_hex`, if any.
+    fn ocsp_response(&self, certificate_sha256_hex: &str) -> Option<&[u8]> {
+        self.ocsp_responses?
+            .get(certificate_sha256_hex)
+            .map(Vec::as_slice)
+    }
+
+    /// True when the responder for `certificate_sha256_hex` was tried and gave
+    /// no usable answer.
+    fn ocsp_is_unreachable(&self, certificate_sha256_hex: &str) -> bool {
+        self.ocsp_unreachable
+            .is_some_and(|list| list.iter().any(|entry| entry == certificate_sha256_hex))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
-struct CawgTrustInputs<'a> {
+pub(crate) struct CawgTrustInputs<'a> {
     trust: Option<&'a TrustList>,
     allowed_certs: Option<&'a TrustList>,
     document_signing_require_anchor: bool,
-    /// Pinned offline `did:web` DID-document store for ICA issuers, keyed by
-    /// primary DID (no fragment). `None` fails did:web resolution closed.
+    /// Pinned offline DID-document store for ICA issuers, keyed by primary DID.
     did_documents: Option<&'a std::collections::HashMap<String, Json>>,
-    /// Refuse CAWG 1.1-era legacy shapes (field-order `signer_payload`
-    /// encoding, 1.1 ICA context, byte-array `c2paAsset` hashes): only the
-    /// CAWG 1.2 canonical shapes are attempted.
-    strict_encoding: bool,
+    ica_trusted_issuers: Option<&'a [String]>,
+    ica_trust_anchors: Option<&'a [String]>,
+    /// Offline decompressed bitstrings, standard-base64 encoded and keyed by
+    /// the credentialStatus statusListCredential URI.
+    ica_status_lists: Option<&'a std::collections::HashMap<String, String>>,
 }
 /// The store-wide facts one manifest's verification needs: its sibling
 /// manifests and the per-manifest hashed-URI digests. Both are derived from the
 /// same parsed store, so they travel together rather than as separate parameters.
+struct ManifestDigests {
+    expanded_sha256: Vec<u8>,
+    stored: Option<[Vec<u8>; 3]>,
+}
+
+impl ManifestDigests {
+    fn expanded(expanded_sha256: Vec<u8>) -> Self {
+        Self {
+            expanded_sha256,
+            stored: None,
+        }
+    }
+
+    fn matches(&self, algorithm_index: usize, expanded: &[u8], expected: &[u8]) -> bool {
+        expanded == expected
+            || self
+                .stored
+                .as_ref()
+                .is_some_and(|digests| digests[algorithm_index].as_slice() == expected)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct StoreContext<'a> {
     manifests: &'a [ParsedManifest<'a>],
-    manifest_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+    manifest_hashes: &'a std::collections::HashMap<String, ManifestDigests>,
 }
+
 fn manifest_hashes(
-    store_bytes: &[u8],
+    store: &ExpandedStore<'_>,
     manifests: &[ParsedManifest<'_>],
-) -> Result<std::collections::HashMap<String, Vec<u8>>, JumbfError> {
-    let boxes = manifest_superboxes_from_store(store_bytes)?;
+) -> Result<std::collections::HashMap<String, ManifestDigests>, JumbfError> {
+    let boxes = manifest_superboxes_from_store(store.bytes())?;
     let mut hashes = std::collections::HashMap::with_capacity(boxes.len().min(manifests.len()));
-    for (manifest_box, manifest) in boxes.into_iter().zip(manifests) {
-        if let Some(hash) = hash_bytes("sha256", superbox_content(manifest_box)?) {
-            hashes.insert(manifest.label.clone(), hash);
+    for (index, (manifest_box, manifest)) in boxes.into_iter().zip(manifests).enumerate() {
+        let expanded = superbox_content(manifest_box)?;
+        let mut digests = ManifestDigests::expanded(Sha256::digest(expanded).to_vec());
+        if let Some(stored) = store.stored_content(index) {
+            digests.stored = Some([
+                Sha256::digest(stored).to_vec(),
+                Sha384::digest(stored).to_vec(),
+                Sha512::digest(stored).to_vec(),
+            ]);
         }
+        hashes.insert(manifest.label.clone(), digests);
     }
     Ok(hashes)
 }
@@ -455,6 +696,10 @@ pub struct VerifyOutput {
     /// structure conforms to and which it validated under. `None` when no
     /// claim could be decoded.
     pub version_verdict: Option<VersionVerdict>,
+    /// Requests that would settle a check this verification could not make
+    /// offline. Always populated, whether or not fetching is enabled, so a
+    /// caller can tell the user what turning it on would contact.
+    pub(crate) network_needs: Vec<NetworkNeed>,
 }
 
 /// Verify the C2PA manifest embedded in an asset.
@@ -499,8 +744,7 @@ pub fn verify_with_cawg_trust_policy(
             trust: cawg_trust,
             allowed_certs: cawg_allowed_certs,
             document_signing_require_anchor,
-            did_documents: None,
-            strict_encoding: false,
+            ..CawgTrustInputs::default()
         },
     )
 }
@@ -527,7 +771,7 @@ pub fn verify_with_cawg_trust_policy_and_did_documents(
             allowed_certs: cawg_allowed_certs,
             document_signing_require_anchor,
             did_documents: cawg_did_documents,
-            strict_encoding: false,
+            ..CawgTrustInputs::default()
         },
     )
 }
@@ -552,29 +796,22 @@ pub fn verify_fragmented_with_cawg_trust_policy_and_did_documents(
             allowed_certs: cawg_allowed_certs,
             document_signing_require_anchor,
             did_documents: cawg_did_documents,
-            strict_encoding: false,
+            ..CawgTrustInputs::default()
         },
     )
 }
 
-/// [`verify_with_cawg_trust_policy_and_did_documents`] plus the CAWG strict
-/// encoding switch.
-///
-/// With `cawg_strict_encoding` set, CAWG 1.1-era legacy shapes are refused:
-/// only the canonical RFC 8949 §4.2 `signer_payload` encoding is attempted for
-/// X.509 identity signatures, and only CAWG 1.2 ICA credential shapes (the 1.2
-/// JSON-LD context, base64-string `c2paAsset` hashes) are accepted. A
-/// 1.1-only asset then fails with the existing mismatch/invalid codes. When
-/// unset, legacy shapes verify as before and are surfaced via the
-/// informational `com.encypher.cawg.legacyProfile` status.
+/// Full CAWG trust and offline-resolution option set used by the public facade.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_with_cawg_trust_policy_did_documents_and_strict_encoding(
+pub fn verify_with_cawg_options(
     input: &VerifyInput,
     cawg_trust: Option<&TrustList>,
     cawg_allowed_certs: Option<&TrustList>,
     document_signing_require_anchor: bool,
     cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
-    cawg_strict_encoding: bool,
+    cawg_ica_trusted_issuers: Option<&[String]>,
+    cawg_ica_trust_anchors: Option<&[String]>,
+    cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<VerifyOutput, ValidateError> {
     verify_with_fragments(
         input,
@@ -584,22 +821,24 @@ pub fn verify_with_cawg_trust_policy_did_documents_and_strict_encoding(
             allowed_certs: cawg_allowed_certs,
             document_signing_require_anchor,
             did_documents: cawg_did_documents,
-            strict_encoding: cawg_strict_encoding,
+            ica_trusted_issuers: cawg_ica_trusted_issuers,
+            ica_trust_anchors: cawg_ica_trust_anchors,
+            ica_status_lists: cawg_ica_status_lists,
         },
     )
 }
 
-/// Fragmented variant of
-/// [`verify_with_cawg_trust_policy_did_documents_and_strict_encoding`].
 #[allow(clippy::too_many_arguments)]
-pub fn verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encoding(
+pub fn verify_fragmented_with_cawg_options(
     input: &VerifyInput,
     fragments: &[&[u8]],
     cawg_trust: Option<&TrustList>,
     cawg_allowed_certs: Option<&TrustList>,
     document_signing_require_anchor: bool,
     cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
-    cawg_strict_encoding: bool,
+    cawg_ica_trusted_issuers: Option<&[String]>,
+    cawg_ica_trust_anchors: Option<&[String]>,
+    cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<VerifyOutput, ValidateError> {
     verify_with_fragments(
         input,
@@ -609,7 +848,9 @@ pub fn verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encodin
             allowed_certs: cawg_allowed_certs,
             document_signing_require_anchor,
             did_documents: cawg_did_documents,
-            strict_encoding: cawg_strict_encoding,
+            ica_trusted_issuers: cawg_ica_trusted_issuers,
+            ica_trust_anchors: cawg_ica_trust_anchors,
+            ica_status_lists: cawg_ica_status_lists,
         },
     )
 }
@@ -617,9 +858,9 @@ pub fn verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encodin
 /// initialization segment carrying the manifest; `fragments` are the fragment
 /// files (`.m4s`) in playback order. Each fragment's leaf hash is recomputed
 /// per spec A.5.4.1.2 and climbed to the stored Merkle row using its auxiliary
-/// C2PA `merkle` box. Duplicate fragment identities or non-increasing
-/// per-track playback locations are rejected. Absent fragments are NOT a
-/// failure (streaming semantics — validate what is available).
+/// C2PA `merkle` box. Duplicate identities and unexpected sequence
+/// discontinuities are rejected. Not-yet-available future fragments remain
+/// non-failures.
 pub fn verify_fragmented(
     input: &VerifyInput,
     fragments: &[&[u8]],
@@ -658,8 +899,7 @@ pub fn verify_fragmented_with_cawg_trust_policy(
             trust: cawg_trust,
             allowed_certs: cawg_allowed_certs,
             document_signing_require_anchor,
-            did_documents: None,
-            strict_encoding: false,
+            ..CawgTrustInputs::default()
         },
     )
 }
@@ -667,6 +907,47 @@ fn verify_with_fragments(
     input: &VerifyInput,
     fragments: &[&[u8]],
     cawg_inputs: CawgTrustInputs<'_>,
+) -> Result<VerifyOutput, ValidateError> {
+    verify_with_fragments_mode_and_expected_seeks(input, fragments, &[], cawg_inputs, true)
+}
+
+fn verify_with_fragments_and_expected_seeks(
+    input: &VerifyInput,
+    fragments: &[&[u8]],
+    expected_seek_positions: &[usize],
+    cawg_inputs: CawgTrustInputs<'_>,
+) -> Result<VerifyOutput, ValidateError> {
+    stream::validate_expected_seek_positions(expected_seek_positions, fragments.len())?;
+    verify_with_fragments_mode_and_expected_seeks(
+        input,
+        fragments,
+        expected_seek_positions,
+        cawg_inputs,
+        true,
+    )
+}
+
+fn verify_with_fragments_mode(
+    input: &VerifyInput,
+    fragments: &[&[u8]],
+    cawg_inputs: CawgTrustInputs<'_>,
+    include_pdf_history: bool,
+) -> Result<VerifyOutput, ValidateError> {
+    verify_with_fragments_mode_and_expected_seeks(
+        input,
+        fragments,
+        &[],
+        cawg_inputs,
+        include_pdf_history,
+    )
+}
+
+fn verify_with_fragments_mode_and_expected_seeks(
+    input: &VerifyInput,
+    fragments: &[&[u8]],
+    expected_seek_positions: &[usize],
+    cawg_inputs: CawgTrustInputs<'_>,
+    include_pdf_history: bool,
 ) -> Result<VerifyOutput, ValidateError> {
     // scope. Unreadable MIME (maps to no format) is the only hard error.
     let format = AssetFormat::from_mime(input.mime)
@@ -677,55 +958,165 @@ fn verify_with_fragments(
     // while still verifying the asset fully.
     let out_of_scope =
         input.profile.mode == OperatingMode::Conformance && !input.profile.permits_mime(input.mime);
+    let (pdf_sections, pdf_inventory_error) = if include_pdf_history && format == AssetFormat::Pdf {
+        match crate::c2pa_formats::pdf_manifest_store_sections(input.data) {
+            Ok(sections) => (sections, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        }
+    } else {
+        (Vec::new(), None)
+    };
 
-    let store_bytes = match crate::c2pa_formats::extract_manifest(format, input.data)? {
-        Some(bytes) => bytes,
-        None => {
+    if let Some(diagnostic) = crate::c2pa_formats::text_diagnostic(format, input.data) {
+        let mut out = container_failure_output(
+            diagnostic.code(),
+            "text manifest carrier is malformed or cannot be resolved",
+            input.profile,
+        );
+        if out_of_scope {
+            note_out_of_scope(&mut out, input.mime, input.profile);
+        }
+        return Ok(out);
+    }
+
+    if input.profile.mode == OperatingMode::Conformance {
+        match crate::c2pa_formats::carrier_placement_error(format, input.data) {
+            Ok(Some(detail)) => {
+                let mut out = container_failure_output(GENERAL_ERROR, detail, input.profile);
+                if out_of_scope {
+                    note_out_of_scope(&mut out, input.mime, input.profile);
+                }
+                return Ok(out);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let mut out =
+                    container_failure_output(GENERAL_ERROR, &error.to_string(), input.profile);
+                if out_of_scope {
+                    note_out_of_scope(&mut out, input.mime, input.profile);
+                }
+                return Ok(out);
+            }
+        }
+    }
+
+    let store_bytes = match crate::c2pa_formats::extract_manifest(format, input.data) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            // C2PA 2.4 Validation, By Reference: with no embedded store, a
+            // documented remote declaration is the next place to look. An
+            // offline validator cannot look there, and the spec names the
+            // outcome: "If a manifest was documented to exist in a remote
+            // location, but is not present there, or the location is not
+            // currently available (such as in an offline scenario), the
+            // `manifest.inaccessible` error code shall be used to report the
+            // situation." The URI travels in `details` so a caller can fetch
+            // the store itself and re-verify it detached, and as a network
+            // need so the SDK can offer to fetch it.
+            if let Ok(Some(remote)) = crate::c2pa_formats::remote_manifest_uri(format, input.data) {
+                let mut out = failure_only_output_with_details(
+                    MANIFEST_INACCESSIBLE,
+                    remote.uri.clone(),
+                    "the asset declares a remote manifest; this verifier does not fetch".into(),
+                    Some(json!({
+                        "remote_manifest_uri": remote.uri,
+                        "declared_in": remote.source,
+                    })),
+                    input.profile,
+                );
+                network_needs::push_unique(
+                    &mut out.network_needs,
+                    NetworkNeed::RemoteManifest { uri: remote.uri },
+                );
+                if out_of_scope {
+                    note_out_of_scope(&mut out, input.mime, input.profile);
+                }
+                return Ok(out);
+            }
             let mut out = no_manifest_output("no C2PA manifest found", input.profile, false);
             if out_of_scope {
-                note_out_of_scope(&mut out, input.mime);
+                note_out_of_scope(&mut out, input.mime, input.profile);
             }
+            pdf_history::attach(
+                &mut out,
+                input,
+                cawg_inputs,
+                &pdf_sections,
+                pdf_inventory_error.as_deref(),
+            )?;
+            return Ok(out);
+        }
+        Err(error) if format == AssetFormat::Pdf => {
+            let mut out = failure_only_output(
+                MANIFEST_INACCESSIBLE,
+                "self#jumbf".into(),
+                error.to_string(),
+                input.profile,
+            );
+            pdf_history::attach(
+                &mut out,
+                input,
+                cawg_inputs,
+                &pdf_sections,
+                pdf_inventory_error.as_deref(),
+            )?;
+            return Ok(out);
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let expanded = match expand_for_validation(&store_bytes, input.profile) {
+        Ok(expanded) => expanded,
+        Err(output) => {
+            let mut out = *output;
+            pdf_history::attach(
+                &mut out,
+                input,
+                cawg_inputs,
+                &pdf_sections,
+                pdf_inventory_error.as_deref(),
+            )?;
             return Ok(out);
         }
     };
-
-    let store = parse_manifest_store(&store_bytes)?;
+    let store = match parse_manifest_store(expanded.bytes()) {
+        Ok(store) => store,
+        Err(error) => {
+            if matches!(&error, JumbfError::UnsupportedManifestType(_)) {
+                return Err(error.into());
+            }
+            let mut out = jumbf_failure_output(&error, &store_bytes, input.profile);
+            pdf_history::attach(
+                &mut out,
+                input,
+                cawg_inputs,
+                &pdf_sections,
+                pdf_inventory_error.as_deref(),
+            )?;
+            return Ok(out);
+        }
+    };
     let Some(manifest) = store.manifests.last() else {
         let mut out =
             no_manifest_output("manifest store contained no manifests", input.profile, true);
         stamp_manifest_store_hash(&mut out, &store_bytes);
         if out_of_scope {
-            note_out_of_scope(&mut out, input.mime);
+            note_out_of_scope(&mut out, input.mime, input.profile);
         }
+        pdf_history::attach(
+            &mut out,
+            input,
+            cawg_inputs,
+            &pdf_sections,
+            pdf_inventory_error.as_deref(),
+        )?;
         return Ok(out);
     };
-    // In regular mode every data-hash exclusion must describe bytes inside the
-    // resolved manifest carrier. This prevents a signed assertion from making
-    // host bytes mutable while retaining spec-compatible additional-exclusion
-    // behavior in conformance mode.
-    if input.profile.mode == OperatingMode::Regular
-        && crate::c2pa_formats::supports_hash_mode(input.mime)
-    {
-        if let Some(exclusions) = regular_data_hash_exclusions(manifest)? {
-            let spans = crate::c2pa_formats::compute_data_hash_exclusions(format, input.data)?;
-            let [carrier] = spans.as_slice() else {
-                return Err(ValidateError::HardBinding(format!(
-                    "expected one resolved manifest carrier, found {}",
-                    spans.len()
-                )));
-            };
-            validate_regular_exclusion_geometry(&exclusions, carrier.start, carrier.length)?;
-        }
-    }
-    let additional_exclusions_present = input.profile.mode == OperatingMode::Conformance
-        && input.profile.version_str() == "2.4"
-        && crate::c2pa_formats::supports_hash_mode(input.mime)
-        && has_conformance_additional_exclusions(manifest, format, input.data);
 
     let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
     // SHA-256 over each manifest JUMBF superbox, used to authenticate
     // ingredient links and compound child bindings.
-    let manifest_hashes = manifest_hashes(&store_bytes, &store.manifests)?;
+    let manifest_hashes = manifest_hashes(&expanded, &store.manifests)?;
     let mut out = verify_manifest(
         manifest,
         StoreContext {
@@ -748,20 +1139,48 @@ fn verify_with_fragments(
         &mut report_decode_nodes,
     );
     stamp_manifest_store_hash(&mut out, &store_bytes);
-    if additional_exclusions_present {
-        note_additional_exclusions(&mut out, &manifest.label);
-    }
     if out_of_scope {
-        note_out_of_scope(&mut out, input.mime);
+        note_out_of_scope(&mut out, input.mime, input.profile);
     }
-    // crJSON is emitted only in strict-debug mode. Attach the active
-    // manifest's validation results so the document can be evaluated directly
-    // by the C2PA conformance-program rubrics.
+    // crJSON is emitted only in strict-debug mode. It carries the validation
+    // results so the document can be evaluated directly by the C2PA
+    // conformance-program rubrics.
     if input.profile.debug {
-        out.crjson = Some(crjson::to_crjson_with_report(&store, &out.report_json));
+        let crjson = crjson::to_crjson(&store, &crjson_context(input, &out));
+        out.crjson = Some(crjson);
     }
     stamp_profile(&mut out, input.profile);
+    pdf_history::attach(
+        &mut out,
+        input,
+        cawg_inputs,
+        &pdf_sections,
+        pdf_inventory_error.as_deref(),
+    )?;
+    // Fail closed on unbound fragments. Must run after the report exists and
+    // after `stamp_profile`, because it restates every validity-derived field.
+    stream::require_fragments_bound(&mut out, manifest, fragments, input.profile);
+    stream::validate_fragment_sequence(
+        &mut out,
+        manifest,
+        fragments,
+        expected_seek_positions,
+        input.profile,
+    );
     Ok(out)
+}
+
+/// Bundle what the crJSON renderer needs from this verification: the report it
+/// carries into `validationResults`, the instant the engine validated against,
+/// and the profile naming the spec revision that validation ran under.
+fn crjson_context<'a>(input: &VerifyInput<'_>, out: &'a VerifyOutput) -> CrjsonContext<'a> {
+    CrjsonContext {
+        report: &out.report_json,
+        validation_time: input
+            .validation_time
+            .unwrap_or_else(OffsetDateTime::now_utc),
+        profile: input.profile,
+    }
 }
 
 /// Record the active engine profile (spec version, mode, compliance level) in
@@ -803,7 +1222,7 @@ fn stamp_manifest_store_hash(out: &mut VerifyOutput, manifest_store: &[u8]) {
 
 /// Record the conformance out-of-scope observation as an informational code on
 /// both the structured results and the report JSON.
-fn note_out_of_scope(out: &mut VerifyOutput, mime: &str) {
+fn note_out_of_scope(out: &mut VerifyOutput, mime: &str, profile: EngineProfile) {
     out.results.push_informational(
         CONFORMANCE_OUT_OF_SCOPE,
         String::new(),
@@ -813,10 +1232,7 @@ fn note_out_of_scope(out: &mut VerifyOutput, mime: &str) {
     // informational code appears in the report JSON too. `validation_results`
     // is a pure function of `results`, so this stays consistent with finish().
     if let Some(obj) = out.report_json.as_object_mut() {
-        obj.insert(
-            "validation_results".to_string(),
-            validation_results_json(&out.results),
-        );
+        restate_validation_results(obj, &out.results);
         // The out-of-scope code is also a surfaced caveat, so recompute the
         // structured verdict too, preserving the existing `present` value.
         let present = obj
@@ -826,21 +1242,7 @@ fn note_out_of_scope(out: &mut VerifyOutput, mime: &str) {
             .unwrap_or(true);
         obj.insert(
             "provenance_verdict".to_string(),
-            provenance_verdict_json(&out.results, present),
-        );
-    }
-}
-
-fn note_additional_exclusions(out: &mut VerifyOutput, manifest_label: &str) {
-    out.results.push_informational(
-        ASSERTION_DATA_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
-        format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/c2pa.hash.data"),
-        "extra data hash exclusions found".into(),
-    );
-    if let Some(obj) = out.report_json.as_object_mut() {
-        obj.insert(
-            "validation_results".to_string(),
-            validation_results_json(&out.results),
+            provenance_verdict_json(&out.results, present, profile),
         );
     }
 }
@@ -893,24 +1295,28 @@ pub fn verify_with_cawg_trust_policy_safe(
 }
 
 /// Panic-containment wrapper for
-/// [`verify_with_cawg_trust_policy_did_documents_and_strict_encoding`].
+/// [`verify_with_cawg_options`].
 #[allow(clippy::too_many_arguments)]
-pub fn verify_with_cawg_trust_policy_did_documents_and_strict_encoding_safe(
+pub fn verify_with_cawg_options_safe(
     input: &VerifyInput,
     cawg_trust: Option<&TrustList>,
     cawg_allowed_certs: Option<&TrustList>,
     document_signing_require_anchor: bool,
     cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
-    cawg_strict_encoding: bool,
+    cawg_ica_trusted_issuers: Option<&[String]>,
+    cawg_ica_trust_anchors: Option<&[String]>,
+    cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<VerifyOutput, ValidateError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        verify_with_cawg_trust_policy_did_documents_and_strict_encoding(
+        verify_with_cawg_options(
             input,
             cawg_trust,
             cawg_allowed_certs,
             document_signing_require_anchor,
             cawg_did_documents,
-            cawg_strict_encoding,
+            cawg_ica_trusted_issuers,
+            cawg_ica_trust_anchors,
+            cawg_ica_status_lists,
         )
     })) {
         Ok(result) => result,
@@ -969,24 +1375,64 @@ pub fn verify_fragmented_with_cawg_trust_policy_safe(
 /// Panic-containment wrapper for fragmented verification with the full CAWG
 /// trust, policy, pinned DID-document, and encoding option set.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encoding_safe(
+pub fn verify_fragmented_with_cawg_options_safe(
     input: &VerifyInput,
     fragments: &[&[u8]],
     cawg_trust: Option<&TrustList>,
     cawg_allowed_certs: Option<&TrustList>,
     document_signing_require_anchor: bool,
     cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
-    cawg_strict_encoding: bool,
+    cawg_ica_trusted_issuers: Option<&[String]>,
+    cawg_ica_trust_anchors: Option<&[String]>,
+    cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<VerifyOutput, ValidateError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        verify_fragmented_with_cawg_trust_policy_did_documents_and_strict_encoding(
+        verify_fragmented_with_cawg_options(
             input,
             fragments,
             cawg_trust,
             cawg_allowed_certs,
             document_signing_require_anchor,
             cawg_did_documents,
-            cawg_strict_encoding,
+            cawg_ica_trusted_issuers,
+            cawg_ica_trust_anchors,
+            cawg_ica_status_lists,
+        )
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(ValidateError::Panic),
+    }
+}
+
+/// Panic-containment wrapper for fragmented verification with explicit seek
+/// boundaries and the full CAWG option set.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fragmented_with_cawg_options_and_expected_seeks_safe(
+    input: &VerifyInput,
+    fragments: &[&[u8]],
+    expected_seek_positions: &[usize],
+    cawg_trust: Option<&TrustList>,
+    cawg_allowed_certs: Option<&TrustList>,
+    document_signing_require_anchor: bool,
+    cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
+    cawg_ica_trusted_issuers: Option<&[String]>,
+    cawg_ica_trust_anchors: Option<&[String]>,
+    cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
+) -> Result<VerifyOutput, ValidateError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_with_fragments_and_expected_seeks(
+            input,
+            fragments,
+            expected_seek_positions,
+            CawgTrustInputs {
+                trust: cawg_trust,
+                allowed_certs: cawg_allowed_certs,
+                document_signing_require_anchor,
+                did_documents: cawg_did_documents,
+                ica_trusted_issuers: cawg_ica_trusted_issuers,
+                ica_trust_anchors: cawg_ica_trust_anchors,
+                ica_status_lists: cawg_ica_status_lists,
+            },
         )
     })) {
         Ok(result) => result,
@@ -1016,6 +1462,27 @@ pub fn verify_detached<'a>(
     content_mime: &'a str,
     input: &VerifyInput<'a>,
 ) -> Result<VerifyOutput, ValidateError> {
+    verify_detached_with_cawg_options(
+        manifest_store,
+        content,
+        content_mime,
+        input,
+        CawgTrustInputs::default(),
+    )
+}
+
+/// [`verify_detached`] with the caller's CAWG identity trust configuration.
+///
+/// A sidecar store carries the same `cawg.identity` assertions an embedded one
+/// would, so it gets the same identity evaluation: verifying out-of-band must
+/// not silently drop a validation axis.
+pub(crate) fn verify_detached_with_cawg_options<'a>(
+    manifest_store: &'a [u8],
+    content: &'a [u8],
+    content_mime: &'a str,
+    input: &VerifyInput<'a>,
+    cawg_inputs: CawgTrustInputs<'_>,
+) -> Result<VerifyOutput, ValidateError> {
     let format = AssetFormat::from_mime(content_mime)
         .ok_or_else(|| ValidateError::UnsupportedMime(content_mime.to_string()))?;
     if format == AssetFormat::C2paStore {
@@ -1026,19 +1493,31 @@ pub fn verify_detached<'a>(
     let out_of_scope = input.profile.mode == OperatingMode::Conformance
         && !input.profile.permits_mime(content_mime);
 
-    let store = parse_manifest_store(manifest_store)?;
+    let expanded = match expand_for_validation(manifest_store, input.profile) {
+        Ok(expanded) => expanded,
+        Err(output) => return Ok(*output),
+    };
+    let store = match parse_manifest_store(expanded.bytes()) {
+        Ok(store) => store,
+        Err(error) => {
+            if matches!(&error, JumbfError::UnsupportedManifestType(_)) {
+                return Err(error.into());
+            }
+            return Ok(jumbf_failure_output(&error, manifest_store, input.profile));
+        }
+    };
     let Some(manifest) = store.manifests.last() else {
         let mut out =
             no_manifest_output("manifest store contained no manifests", input.profile, true);
         stamp_manifest_store_hash(&mut out, manifest_store);
         if out_of_scope {
-            note_out_of_scope(&mut out, content_mime);
+            note_out_of_scope(&mut out, content_mime, input.profile);
         }
         return Ok(out);
     };
 
     let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
-    let manifest_hashes = manifest_hashes(manifest_store, &store.manifests)?;
+    let manifest_hashes = manifest_hashes(&expanded, &store.manifests)?;
 
     // Present the external content as the asset under verification, then run the
     // standard per-manifest pipeline (origin's exact-label hard-binding checks).
@@ -1057,7 +1536,7 @@ pub fn verify_detached<'a>(
         format,
         &[],
         None,
-        CawgTrustInputs::default(),
+        cawg_inputs,
         &mut report_decode_nodes,
     );
     append_store_manifests(
@@ -1068,13 +1547,53 @@ pub fn verify_detached<'a>(
     );
     stamp_manifest_store_hash(&mut out, manifest_store);
     if out_of_scope {
-        note_out_of_scope(&mut out, content_mime);
+        note_out_of_scope(&mut out, content_mime, input.profile);
     }
     if input.profile.debug {
-        out.crjson = Some(crjson::to_crjson_with_report(&store, &out.report_json));
+        let crjson = crjson::to_crjson(&store, &crjson_context(input, &out));
+        out.crjson = Some(crjson);
     }
     stamp_profile(&mut out, input.profile);
     Ok(out)
+}
+
+/// Panic-containment wrapper for detached verification with the full CAWG
+/// trust, policy, pinned DID-document, and status-list option set
+/// (see [`verify_safe`]).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_detached_safe<'a>(
+    manifest_store: &'a [u8],
+    content: &'a [u8],
+    content_mime: &'a str,
+    input: &VerifyInput<'a>,
+    cawg_trust: Option<&TrustList>,
+    cawg_allowed_certs: Option<&TrustList>,
+    document_signing_require_anchor: bool,
+    cawg_did_documents: Option<&std::collections::HashMap<String, Json>>,
+    cawg_ica_trusted_issuers: Option<&[String]>,
+    cawg_ica_trust_anchors: Option<&[String]>,
+    cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
+) -> Result<VerifyOutput, ValidateError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_detached_with_cawg_options(
+            manifest_store,
+            content,
+            content_mime,
+            input,
+            CawgTrustInputs {
+                trust: cawg_trust,
+                allowed_certs: cawg_allowed_certs,
+                document_signing_require_anchor,
+                did_documents: cawg_did_documents,
+                ica_trusted_issuers: cawg_ica_trusted_issuers,
+                ica_trust_anchors: cawg_ica_trust_anchors,
+                ica_status_lists: cawg_ica_status_lists,
+            },
+        )
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(ValidateError::Panic),
+    }
 }
 
 /// Verify a detached manifest against a caller-computed hard-binding digest.
@@ -1097,7 +1616,19 @@ pub fn verify_prehashed_manifest<'a>(
         return Err(ValidateError::UnsupportedMime(content_mime.to_string()));
     }
 
-    let store = parse_manifest_store(manifest_store)?;
+    let expanded = match expand_for_validation(manifest_store, input.profile) {
+        Ok(expanded) => expanded,
+        Err(output) => return Ok(*output),
+    };
+    let store = match parse_manifest_store(expanded.bytes()) {
+        Ok(store) => store,
+        Err(error) => {
+            if matches!(&error, JumbfError::UnsupportedManifestType(_)) {
+                return Err(error.into());
+            }
+            return Ok(jumbf_failure_output(&error, manifest_store, input.profile));
+        }
+    };
     let Some(manifest) = store.manifests.last() else {
         let mut out =
             no_manifest_output("manifest store contained no manifests", input.profile, true);
@@ -1105,7 +1636,7 @@ pub fn verify_prehashed_manifest<'a>(
         return Ok(out);
     };
     let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
-    let manifest_hashes = manifest_hashes(manifest_store, &store.manifests)?;
+    let manifest_hashes = manifest_hashes(&expanded, &store.manifests)?;
     let digest_input = VerifyInput {
         data: &[],
         mime: content_mime,
@@ -1132,171 +1663,11 @@ pub fn verify_prehashed_manifest<'a>(
     );
     stamp_manifest_store_hash(&mut out, manifest_store);
     if input.profile.debug {
-        out.crjson = Some(crjson::to_crjson_with_report(&store, &out.report_json));
+        let crjson = crjson::to_crjson(&store, &crjson_context(input, &out));
+        out.crjson = Some(crjson);
     }
     stamp_profile(&mut out, input.profile);
     Ok(out)
-}
-
-fn claim_declares_sole_data_hash(manifest: &ParsedManifest<'_>) -> bool {
-    let Some(claim_cbor) = manifest.claim_cbor else {
-        return false;
-    };
-    let Ok(claim) = decode(claim_cbor) else {
-        return false;
-    };
-    let generation = versions::claim_generation(manifest, &claim);
-    let mut total = 0usize;
-    let mut supported = 0usize;
-    let mut data_hash = false;
-    for field in ref_fields(generation) {
-        let Some(Value::Array(references)) = claim.get(field) else {
-            continue;
-        };
-        let Some(next) = total.checked_add(references.len()) else {
-            return false;
-        };
-        if next > MAX_CLAIM_ASSERTION_REFERENCES {
-            return false;
-        }
-        total = next;
-        for reference in references {
-            let Some(label) = reference
-                .get("url")
-                .and_then(Value::as_text)
-                .and_then(|url| assertion_label_for_manifest(url, &manifest.label))
-            else {
-                continue;
-            };
-            if is_supported_hard_binding_label(label, false) {
-                supported += 1;
-                data_hash = label == "c2pa.hash.data";
-            }
-        }
-    }
-    supported == 1 && data_hash
-}
-
-// Parse the active data-hash assertion without constraining its exclusion list
-// to a single range.
-fn regular_data_hash_exclusions(
-    manifest: &ParsedManifest<'_>,
-) -> Result<Option<Vec<(usize, usize)>>, ValidateError> {
-    if !claim_declares_sole_data_hash(manifest) {
-        return Ok(None);
-    }
-    let mut bindings = manifest
-        .assertions
-        .iter()
-        .filter(|(label, _)| label == "c2pa.hash.data");
-    let cbor = match (bindings.next(), bindings.next()) {
-        (None, _) => return Ok(None),
-        (Some(binding), None) => binding.1,
-        (Some(_), Some(_)) => {
-            return Err(ValidateError::HardBinding(
-                "regular verification requires exactly one c2pa.hash.data binding".into(),
-            ));
-        }
-    };
-    let assertion = decode(cbor)
-        .map_err(|_| ValidateError::HardBinding("hard-binding assertion CBOR is invalid".into()))?;
-    let exclusions = match assertion.get("exclusions") {
-        Some(Value::Array(exclusions)) if !exclusions.is_empty() => exclusions,
-        _ => {
-            return Err(ValidateError::HardBinding(
-                "signed data-hash exclusion list must contain at least one range".into(),
-            ));
-        }
-    };
-    if exclusions.len() > MAX_DATA_HASH_EXCLUSIONS {
-        return Err(ValidateError::HardBinding(format!(
-            "exclusion list exceeds the verifier cap ({} > {MAX_DATA_HASH_EXCLUSIONS})",
-            exclusions.len()
-        )));
-    }
-
-    exclusions
-        .iter()
-        .map(|exclusion| {
-            let start = exclusion
-                .get("start")
-                .and_then(|value| match value {
-                    Value::Integer(value) => usize::try_from(*value).ok(),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    ValidateError::HardBinding("signed data-hash exclusion start is invalid".into())
-                })?;
-            let length = exclusion
-                .get("length")
-                .and_then(|value| match value {
-                    Value::Integer(value) => usize::try_from(*value).ok(),
-                    _ => None,
-                })
-                .filter(|length| *length > 0)
-                .ok_or_else(|| {
-                    ValidateError::HardBinding(
-                        "signed data-hash exclusion length is invalid".into(),
-                    )
-                })?;
-            Ok((start, length))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
-}
-
-fn has_conformance_additional_exclusions(
-    manifest: &ParsedManifest<'_>,
-    format: AssetFormat,
-    data: &[u8],
-) -> bool {
-    let Some(exclusions) = regular_data_hash_exclusions(manifest).ok().flatten() else {
-        return false;
-    };
-    let Ok(spans) = crate::c2pa_formats::compute_data_hash_exclusions(format, data) else {
-        return false;
-    };
-    let [carrier] = spans.as_slice() else {
-        return false;
-    };
-    let Some(carrier_end) = carrier.start.checked_add(carrier.length) else {
-        return false;
-    };
-    exclusions.iter().any(|(start, length)| {
-        start
-            .checked_add(*length)
-            .is_none_or(|end| *start < carrier.start || end > carrier_end)
-    })
-}
-
-fn validate_regular_exclusion_geometry(
-    exclusions: &[(usize, usize)],
-    carrier_start: usize,
-    carrier_length: usize,
-) -> Result<(), ValidateError> {
-    let carrier_end = carrier_start.checked_add(carrier_length).ok_or_else(|| {
-        ValidateError::HardBinding("resolved carrier output span overflows".into())
-    })?;
-    let mut sorted = exclusions.to_vec();
-    sorted.sort_unstable_by_key(|(start, _)| *start);
-    let mut previous_end = None;
-    for (start, length) in sorted {
-        let end = start.checked_add(length).ok_or_else(|| {
-            ValidateError::HardBinding(
-                "signed exclusion does not fit within resolved carrier output span".into(),
-            )
-        })?;
-        if previous_end.is_some_and(|prior| start < prior)
-            || start < carrier_start
-            || end > carrier_end
-        {
-            return Err(ValidateError::HardBinding(
-                "signed exclusion does not fit within resolved carrier output span".into(),
-            ));
-        }
-        previous_end = Some(end);
-    }
-    Ok(())
 }
 
 const MAX_EMBEDDED_OCSP_RESPONSES: usize = 32;
@@ -1636,11 +2007,11 @@ fn ocsp_chain_pairs<'a>(
     };
     let mut pairs = Vec::with_capacity(chain.len());
     for _ in 0..MAX_EMBEDDED_OCSP_CHAIN_CERTIFICATES {
-        let candidates = chain.iter().skip(1).map(Vec::as_slice).chain(
-            trust
-                .into_iter()
-                .flat_map(|trust| trust.anchors.iter().map(Vec::as_slice)),
-        );
+        let candidates = chain
+            .iter()
+            .skip(1)
+            .map(Vec::as_slice)
+            .chain(trust.into_iter().flat_map(TrustList::certificates));
         let Some(issuer) = crate::c2pa_trust::resolve_issuer(subject, candidates) else {
             break;
         };
@@ -1652,12 +2023,7 @@ fn ocsp_chain_pairs<'a>(
             break;
         }
         pairs.push((subject, issuer));
-        if trust.is_some_and(|trust| {
-            trust
-                .anchors
-                .iter()
-                .any(|anchor| anchor.as_slice() == issuer)
-        }) {
+        if trust.is_some_and(|trust| trust.contains_certificate(issuer)) {
             break;
         }
         subject = issuer;
@@ -1665,6 +2031,34 @@ fn ocsp_chain_pairs<'a>(
     Some(pairs)
 }
 
+/// The resolved embedded-OCSP outcome for a signature.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct EmbeddedOcspOutcome {
+    pub status: EmbeddedOcspStatus,
+    /// A verified revoked response was outranked by a qualifying good one
+    /// (conformance posture only). Reported informationally, never silently.
+    pub conflicting_revoked: bool,
+}
+
+impl EmbeddedOcspOutcome {
+    fn plain(status: EmbeddedOcspStatus) -> Self {
+        Self {
+            status,
+            conflicting_revoked: false,
+        }
+    }
+}
+
+/// Evaluate every stapled OCSP response against each certificate of the chain.
+///
+/// `any_good_wins` selects the conformance reading of VAL-STRU-0027 and
+/// `details` for a revocation status settled by a response fetched online,
+/// so a report can tell it apart from a stapled one.
+pub(crate) fn online_ocsp_details() -> Json {
+    serde_json::json!({ "source": "online_ocsp" })
+}
+
+/// VAL-CRYP-0034 (see [`revocation`]); the default posture stays fail-closed.
 pub(super) fn evaluate_embedded_ocsp(
     signature: &[u8],
     certificate_status_assertions: &[&[u8]],
@@ -1672,36 +2066,48 @@ pub(super) fn evaluate_embedded_ocsp(
     signed_at: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
     trust: Option<&TrustList>,
-) -> EmbeddedOcspStatus {
+    any_good_wins: bool,
+) -> EmbeddedOcspOutcome {
     let preflight = scan_embedded_ocsp_evidence(signature, certificate_status_assertions, |_| {});
     if preflight.rejected {
-        return EmbeddedOcspStatus::Skipped;
+        return EmbeddedOcspOutcome::plain(EmbeddedOcspStatus::Skipped);
     }
     if preflight.responses == 0 {
-        return EmbeddedOcspStatus::NotChecked;
+        return EmbeddedOcspOutcome::plain(EmbeddedOcspStatus::NotChecked);
     }
     let Some(pairs) = ocsp_chain_pairs(chain, trust) else {
-        return EmbeddedOcspStatus::Skipped;
+        return EmbeddedOcspOutcome::plain(EmbeddedOcspStatus::Skipped);
     };
-    let mut statuses = vec![None; pairs.len()];
+    let mut accumulated = vec![revocation::CertificateEvidence::default(); pairs.len()];
     let evidence =
         scan_embedded_ocsp_evidence(signature, certificate_status_assertions, |staple| {
-            for (accumulated, (subject, issuer)) in statuses.iter_mut().zip(&pairs) {
-                let candidate = crate::c2pa_trust::evaluate_ocsp_verified(
+            for (certificate, (subject, issuer)) in accumulated.iter_mut().zip(&pairs) {
+                certificate.absorb(crate::c2pa_trust::evaluate_ocsp_verified(
                     staple,
                     issuer,
                     subject,
                     signed_at,
                     verification_time,
-                );
-                *accumulated = crate::c2pa_trust::OcspStatus::merge(*accumulated, candidate);
+                ));
             }
         });
     if evidence.rejected {
-        return EmbeddedOcspStatus::Skipped;
+        return EmbeddedOcspOutcome::plain(EmbeddedOcspStatus::Skipped);
     }
 
-    embedded_ocsp_status_from_certificate_statuses(&statuses)
+    let mut conflicting_revoked = false;
+    let statuses: Vec<_> = accumulated
+        .into_iter()
+        .map(|certificate| {
+            let (status, outranked) = certificate.resolve(any_good_wins);
+            conflicting_revoked |= outranked;
+            status
+        })
+        .collect();
+    EmbeddedOcspOutcome {
+        status: embedded_ocsp_status_from_certificate_statuses(&statuses),
+        conflicting_revoked,
+    }
 }
 
 fn embedded_ocsp_status_from_certificate_statuses(
@@ -1729,46 +2135,209 @@ fn embedded_ocsp_status_from_certificate_statuses(
     }
 }
 
-fn record_embedded_ocsp_status(
-    status: EmbeddedOcspStatus,
+/// One certificate an OCSP query could ask about, with the issuer whose key
+/// authorizes the answer.
+pub(super) struct OcspTarget<'a> {
+    subject: &'a [u8],
+    issuer: &'a [u8],
+    /// Lowercase hex SHA-256 over `subject`, the evidence key a caller uses.
+    certificate_sha256_hex: String,
+    /// The `id-ad-ocsp` access location from the subject's AIA extension.
+    responder_url: Option<String>,
+}
+
+/// The chain positions an OCSP query is possible for, leaf first.
+///
+/// Certificates with no AIA OCSP entry are kept: C2PA 2.4 treats them as not
+/// revoked, and they still carry evidence keys a caller may supply.
+pub(super) fn ocsp_targets<'a>(
+    chain: &'a [Vec<u8>],
+    trust: Option<&'a TrustList>,
+) -> Vec<OcspTarget<'a>> {
+    ocsp_chain_pairs(chain, trust)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(subject, issuer)| OcspTarget {
+            subject,
+            issuer,
+            certificate_sha256_hex: hex::encode(Sha256::digest(subject)),
+            responder_url: crate::c2pa_trust::ocsp_responder_url(subject),
+        })
+        .collect()
+}
+
+/// Record the OCSP queries that would settle these certificates.
+///
+/// Only certificates whose issuer published a responder produce a need: C2PA
+/// 2.4 says a credential whose issuer "did not provide a method to query its
+/// revocation status" is treated as not revoked, so there is nothing to ask.
+pub(super) fn record_ocsp_needs(
+    targets: &[OcspTarget<'_>],
+    purpose: &OcspPurpose,
+    needs: &mut Vec<NetworkNeed>,
+) {
+    for target in targets {
+        let Some(responder_url) = target.responder_url.as_ref() else {
+            continue;
+        };
+        let Some(request_der) =
+            crate::c2pa_trust::build_ocsp_request(target.issuer, target.subject)
+        else {
+            continue;
+        };
+        network_needs::push_unique(
+            needs,
+            NetworkNeed::Ocsp {
+                purpose: purpose.clone(),
+                responder_url: responder_url.clone(),
+                request_der,
+                certificate_sha256_hex: target.certificate_sha256_hex.clone(),
+            },
+        );
+    }
+}
+
+/// What caller-supplied online OCSP evidence established for a chain.
+#[derive(Default)]
+pub(super) struct OnlineOcspOutcome {
+    /// The leaf's verdict, when online evidence covered the leaf at all.
+    leaf: Option<OnlineOcspVerdict>,
+    /// A CA certificate in the chain was reported revoked.
+    ca_revoked: bool,
+}
+
+impl OnlineOcspOutcome {
+    /// True when nothing online covered any certificate in the chain.
+    fn is_empty(&self) -> bool {
+        self.leaf.is_none() && !self.ca_revoked
+    }
+}
+
+/// Evaluate caller-supplied OCSP evidence for each certificate of a chain
+/// under the C2PA 2.4 / CAWG 1.3 online rules.
+///
+/// `attested` is the time from a trusted time-stamp, or `None` when the
+/// signature has no usable one.
+pub(super) fn evaluate_online_ocsp(
+    targets: &[OcspTarget<'_>],
+    evidence: OnlineEvidence<'_>,
+    attested: Option<OffsetDateTime>,
+    verification_time: OffsetDateTime,
+) -> OnlineOcspOutcome {
+    let mut outcome = OnlineOcspOutcome::default();
+    for (position, target) in targets.iter().enumerate() {
+        let verdict = match evidence.ocsp_response(&target.certificate_sha256_hex) {
+            Some(der) => crate::c2pa_trust::evaluate_ocsp_online(
+                der,
+                target.issuer,
+                target.subject,
+                attested,
+                verification_time,
+            ),
+            None if evidence.ocsp_is_unreachable(&target.certificate_sha256_hex) => {
+                OnlineOcspVerdict::Unusable
+            }
+            None => continue,
+        };
+        if position == 0 {
+            outcome.leaf = Some(verdict);
+        } else if verdict == OnlineOcspVerdict::Revoked {
+            // C2PA 2.4: a CA revoked at the effective time rejects the claim
+            // signature with `signingCredential.untrusted`.
+            outcome.ca_revoked = true;
+        }
+    }
+    outcome
+}
+
+/// Report the claim signer's revocation outcome from embedded and online
+/// evidence, and record the queries that would settle what neither did.
+///
+/// Online evidence wins for a certificate it covers: it is the fresher answer
+/// to the same question, and C2PA 2.4 offers the online check as the
+/// "additional assurance" step after the stapled one.
+fn record_ocsp_status(
+    embedded: EmbeddedOcspOutcome,
+    online: &OnlineOcspOutcome,
+    targets: &[OcspTarget<'_>],
     sig_url: &str,
     results: &mut ValidationResults,
 ) {
-    match status {
-        EmbeddedOcspStatus::NotRevoked => results.push_success(
+    if embedded.conflicting_revoked {
+        results.push_informational(
+            revocation::OCSP_CONFLICTING_REVOKED_RESPONSE,
+            sig_url.into(),
+            "a verified revoked OCSP response was outranked by a qualifying good response \
+             for the same certificate"
+                .into(),
+        );
+    }
+
+    let ca_revoked = online.ca_revoked
+        || matches!(
+            embedded.status,
+            EmbeddedOcspStatus::CaRevoked | EmbeddedOcspStatus::LeafAndCaRevoked
+        );
+    match online.leaf {
+        Some(OnlineOcspVerdict::NotRevoked) => results.push_success_with_details(
             SIGNING_CREDENTIAL_OCSP_NOT_REVOKED,
             sig_url.into(),
-            "embedded OCSP response: signing certificate not revoked at signing".into(),
+            "online OCSP response: signing certificate not revoked at signing".into(),
+            online_ocsp_details(),
         ),
-        EmbeddedOcspStatus::LeafRevoked => results.push_failure(
+        Some(OnlineOcspVerdict::Revoked) => results.push_failure_with_details(
             SIGNING_CREDENTIAL_OCSP_REVOKED,
             sig_url.into(),
-            "embedded OCSP response: signing certificate revoked at signing".into(),
+            "online OCSP response: signing certificate revoked".into(),
+            online_ocsp_details(),
         ),
-        EmbeddedOcspStatus::CaRevoked => results.push_failure(
+        Some(OnlineOcspVerdict::Unknown) => results.push_informational_with_details(
+            SIGNING_CREDENTIAL_OCSP_UNKNOWN,
+            sig_url.into(),
+            "online OCSP response reports an unknown status for the signing certificate".into(),
+            online_ocsp_details(),
+        ),
+        Some(OnlineOcspVerdict::Unusable) => results.push_informational_with_details(
+            SIGNING_CREDENTIAL_OCSP_INACCESSIBLE,
+            sig_url.into(),
+            "the OCSP responder for the signing certificate returned no usable response".into(),
+            online_ocsp_details(),
+        ),
+        None => match embedded.status {
+            EmbeddedOcspStatus::NotRevoked => results.push_success(
+                SIGNING_CREDENTIAL_OCSP_NOT_REVOKED,
+                sig_url.into(),
+                "embedded OCSP response: signing certificate not revoked at signing".into(),
+            ),
+            EmbeddedOcspStatus::LeafRevoked | EmbeddedOcspStatus::LeafAndCaRevoked => results
+                .push_failure(
+                    SIGNING_CREDENTIAL_OCSP_REVOKED,
+                    sig_url.into(),
+                    "embedded OCSP response: signing certificate revoked at signing".into(),
+                ),
+            EmbeddedOcspStatus::CaRevoked => {}
+            EmbeddedOcspStatus::NotChecked | EmbeddedOcspStatus::Skipped => {
+                results.push_informational(
+                    SIGNING_CREDENTIAL_OCSP_SKIPPED,
+                    sig_url.into(),
+                    "no usable embedded OCSP response for the leaf, and no online check was \
+                     performed; revocation check skipped"
+                        .into(),
+                );
+                record_ocsp_needs(
+                    targets,
+                    &OcspPurpose::ClaimSigner,
+                    &mut results.network_needs,
+                );
+            }
+        },
+    }
+    if ca_revoked {
+        results.push_failure(
             SIGNING_CREDENTIAL_UNTRUSTED,
             sig_url.into(),
-            "embedded OCSP response: CA certificate revoked at signing".into(),
-        ),
-        EmbeddedOcspStatus::LeafAndCaRevoked => {
-            results.push_failure(
-                SIGNING_CREDENTIAL_OCSP_REVOKED,
-                sig_url.into(),
-                "embedded OCSP response: signing certificate revoked at signing".into(),
-            );
-            results.push_failure(
-                SIGNING_CREDENTIAL_UNTRUSTED,
-                sig_url.into(),
-                "embedded OCSP response: CA certificate revoked at signing".into(),
-            );
-        }
-        EmbeddedOcspStatus::NotChecked | EmbeddedOcspStatus::Skipped => {
-            results.push_informational(
-                SIGNING_CREDENTIAL_OCSP_SKIPPED,
-                sig_url.into(),
-                "no usable embedded OCSP response for the leaf; revocation check skipped".into(),
-            );
-        }
+            "verified OCSP response: CA certificate revoked".into(),
+        );
     }
 }
 
@@ -1877,8 +2446,40 @@ fn verify_manifest<'a>(
         &claim_refs,
         format,
         &sig_url,
+        input.profile,
         &mut results,
     );
+    // Runs alongside the structural gate rather than inside it: the external
+    // data checks are the only ones that consult caller-supplied network
+    // evidence, which the structural gate has no business knowing about.
+    verify_external_data_assertions(
+        &claim_refs,
+        generation,
+        manifest.kind(),
+        &manifest.label,
+        input.profile,
+        input.evidence,
+        &mut results,
+    );
+    // C2PA 2.4 Validation, Validation of References: every schema-declared
+    // `hashed_uri` FIELD of a standard assertion is resolved and digested, not
+    // only the claim's own assertion list.
+    refs::verify_assertion_references(
+        &claim,
+        &claim_refs,
+        generation,
+        input.profile,
+        &manifest.label,
+        store.manifests,
+        &mut results,
+    );
+    // C2PA 2.4 Validation, Preparing the list of redacted assertions: the
+    // claim's `redacted_assertions` declarations are legal, and the assertions
+    // they name really are gone.
+    redaction::verify_claim_redactions(&manifest.label, &claim, store.manifests, &mut results);
+    if verify_spec_version_metadata(&claim, input.profile, &sig_url, &mut results) {
+        structure_ok = false;
+    }
     if certificate_statuses.rejected {
         results.push_failure(
             CLAIM_MALFORMED,
@@ -1944,136 +2545,54 @@ fn verify_manifest<'a>(
 
     // Step 8 (computed early): a fully verified RFC 3161 token establishes the
     // validation instant for the claim-signing chain. Unverified token bytes
-    // never influence certificate validity.
-    let claim_timestamp = extract_claim_tsa_tokens(cose);
-    let (timestamp_version, timestamp_token) = match claim_timestamp {
-        Some((version, tokens)) if matches!(tokens.as_slice(), [Some(_)]) => {
-            let token = tokens.into_iter().next().flatten();
-            (Some(version), token)
-        }
-        None => (None, None),
-        Some(_) => {
-            results.push_informational(
-                TIME_STAMP_MALFORMED,
-                sig_url.clone(),
-                "timestamp header does not contain exactly one usable RFC 3161 token".into(),
-            );
-            (None, None)
-        }
-    };
-    let trusted_timestamp = timestamp_token.as_ref().and_then(|token| {
-        let timestamp_payload = match timestamp_version {
-            Some(ClaimTimestampVersion::V1) => timestamp_input_v1(cose, claim_cbor),
-            Some(ClaimTimestampVersion::V2) => timestamp_input(cose),
-            None => return None,
-        };
-        let Ok(timestamp_payload) = timestamp_payload else {
-            results.push_informational(
-                TIME_STAMP_MALFORMED,
-                sig_url.clone(),
-                "timestamp token has a malformed C2PA CounterSignature input".into(),
-            );
-            return None;
-        };
-        let normalized_token = match timestamp_version {
-            Some(ClaimTimestampVersion::V1) => {
-                crate::c2pa_trust::token_from_timestamp_response(token)
-            }
-            Some(ClaimTimestampVersion::V2) => Ok(token.clone()),
-            None => return None,
-        };
-        let Ok(normalized_token) = normalized_token else {
-            results.push_informational(
-                TIME_STAMP_MALFORMED,
-                sig_url.clone(),
-                "legacy timestamp response does not contain a usable CMS token".into(),
-            );
-            return None;
-        };
-        if let Err(error) = crate::c2pa_trust::inspect_timestamp_token(
-            &normalized_token,
-            &timestamp_payload,
-            input.validation_time.unwrap_or_else(OffsetDateTime::now_utc),
-        )
-        {
-            results.push_informational(
-                TIME_STAMP_MALFORMED,
-                sig_url.clone(),
-                format!("timestamp token failed structural or cryptographic validation: {error}"),
-            );
-            return None;
-        }
-        let Some(trust) = input.tsa_trust else {
-            results.push_informational(
-                TIME_STAMP_UNTRUSTED,
-                sig_url.clone(),
-                "timestamp token valid but no TSA trust anchors were supplied".into(),
-            );
-            return None;
-        };
-        let verification = crate::c2pa_trust::verify_timestamp_token(
-            &normalized_token,
-            &timestamp_payload,
-            trust,
-            input.validation_time.unwrap_or_else(OffsetDateTime::now_utc),
-        );
-        if matches!(timestamp_version, Some(ClaimTimestampVersion::V1)) && verification.verified {
-            results.push_informational(
-                TIME_STAMP_UNTRUSTED,
-                sig_url.clone(),
-                "legacy claim-v1 timestamp input does not bind the COSE signature and cannot anchor signing-certificate validity"
-                    .into(),
-            );
-            return None;
-        }
-        if verification.verified {
-            results.push_success(
-                TIME_STAMP_VALIDATED,
-                sig_url.clone(),
-                "RFC 3161 timestamp signature and message imprint validated".into(),
-            );
-            results.push_success(
-                TIME_STAMP_TRUSTED,
-                sig_url.clone(),
-                "timestamp authority chains to a supplied TSA trust anchor".into(),
-            );
-            verification.time
-        } else {
-            let error = verification
-                .error
-                .unwrap_or("timestamp_verification_failed");
-            if error == "timestamp_tsa_outside_validity" {
-                results.push_informational(
-                    TIME_STAMP_OUTSIDE_VALIDITY,
-                    sig_url.clone(),
-                    "timestamp authority certificate was outside its validity window at genTime"
-                        .into(),
-                );
-            }
-            results.push_informational(
-                TIME_STAMP_UNTRUSTED,
-                sig_url.clone(),
-                format!("RFC 3161 timestamp verification failed: {error}"),
-            );
-            None
-        }
-    });
-
-    // Step 4: a trusted timestamp takes precedence for certificate validity,
-    // while OCSP freshness still uses the caller's current verification time.
+    // never influence certificate validity. Evidence order (header first, then
+    // the `c2pa.time-stamp` assertion fallback), status placement, and the
+    // legacy-`sigTst` caveat live in [`timestamp_assertion`].
     let ocsp_verification_time = input
         .validation_time
         .unwrap_or_else(OffsetDateTime::now_utc);
-    let at = trusted_timestamp.unwrap_or(ocsp_verification_time);
+    let timestamp_index = timestamp_assertion::index_store_timestamp_assertions(
+        store.manifests,
+        &ingredient_manifest_labels(store.manifests),
+        &mut results,
+    );
+    let trusted_timestamp = timestamp_assertion::validate_timestamp_evidence(
+        cose,
+        claim_cbor,
+        &label,
+        &timestamp_index,
+        input.tsa_trust,
+        ocsp_verification_time,
+        &mut results,
+        &sig_url,
+    );
+    // The claimed time of signing is the generator's own unattested statement;
+    // it is reported informationally and never moves `at`.
+    timestamp_assertion::validate_optional_iat(
+        cose,
+        &chain,
+        trusted_timestamp.as_ref(),
+        &mut results,
+        &sig_url,
+    );
+
+    // Step 4: a trusted timestamp takes precedence for certificate validity,
+    // while OCSP freshness still uses the caller's current verification time.
+    let signing_time = trusted_timestamp.map(|timestamp| timestamp.generated_at);
+    let at = signing_time.unwrap_or(ocsp_verification_time);
 
     // Evaluate the signing-certificate chain up front when a trust list is
     // supplied. The leaf's claim-signing profile (EKU, key usage, and CA
     // constraints) is intrinsic to the credential and is enforced even when
     // no trust policy was supplied.
     let chain_result = match (input.claim_signer_trust, leaf) {
-        (Some(trust), Some(leaf_der)) => {
-            Some(validate_chain(leaf_der, &chain[1..], trust, Some(at)))
-        }
+        (Some(trust), Some(leaf_der)) => Some(validate_chain(
+            leaf_der,
+            &chain[1..],
+            trust,
+            crate::c2pa_trust::AnchorPurpose::ClaimSigning,
+            Some(at),
+        )),
         _ => None,
     };
     // Whole-chain validity at `at`. With a trust list this reflects every cert
@@ -2134,14 +2653,24 @@ fn verify_manifest<'a>(
                     "claim signature valid".into(),
                 );
             } else if !sig_ok {
-                results.push_failure(
-                    CLAIM_SIGNATURE_MISMATCH,
-                    sig_url.clone(),
-                    match &sig_verification {
-                        Some(Err(error)) => format!("claim signature invalid: {error}"),
-                        _ => "claim signature invalid".into(),
-                    },
-                );
+                // VAL-CRYP-0007 gives an algorithm outside the allowed list
+                // its own failure code; VAL-CRYP-0014's
+                // `claimSignature.mismatch` covers every other way the
+                // signature fails to validate, including a payload that is
+                // not `nil` (detached content mode is mandatory for claims,
+                // and no registered code is more specific).
+                let (code, explanation) = match &sig_verification {
+                    Some(Err(CryptoError::UnsupportedAlg(id))) => (
+                        ALGORITHM_UNSUPPORTED,
+                        format!("claim signature algorithm {id} is not on the C2PA allowed list"),
+                    ),
+                    Some(Err(error)) => (
+                        CLAIM_SIGNATURE_MISMATCH,
+                        format!("claim signature invalid: {error}"),
+                    ),
+                    _ => (CLAIM_SIGNATURE_MISMATCH, "claim signature invalid".into()),
+                };
+                results.push_failure(code, sig_url.clone(), explanation);
             }
             // When sig_ok but outside validity, claimSignature.validated is
             // intentionally suppressed; the outsideValidity failure below
@@ -2184,6 +2713,9 @@ fn verify_manifest<'a>(
     // claim-signer acceptability never gates these checks: a
     // credential-profile failure reports its own code and the binding checks
     // still run (matching the reference implementation).
+    // Filled by the ingredient walk below and read when the report is
+    // assembled: the additive per-ingredient deltas.
+    let mut ingredient_deltas = Vec::new();
     let sig_usable = if generous {
         sig_constructed
     } else {
@@ -2191,33 +2723,72 @@ fn verify_manifest<'a>(
     };
     if sig_usable {
         // Step 5: assertion hashed-URI bindings.
-        verify_assertion_bindings(&claim, &mut claim_refs, generation, &label, &mut results);
+        verify_assertion_bindings(
+            &claim,
+            &mut claim_refs,
+            generation,
+            &label,
+            input.profile,
+            &mut results,
+        );
         // Ingredient manifest and signature hashes are semantic work. Defer
         // them until the active claim signature is usable, then cache each
         // child-manifest/algorithm digest for this verification.
         let mut ingredient_digests = IngredientManifestDigestCache::new(store);
         verify_ingredient_references(
+            &label,
             &claim_refs,
             &claim,
             &mut ingredient_digests,
             &sig_url,
+            input.profile,
             &mut results,
         );
-        // Step 6: verify the asset's content. Multi-asset may validate as a
-        // fallback, but it never replaces the manifest's primary hard binding.
-        let _content_binding = if let Some(digest) = prehashed_digest {
-            verify_prehashed_hard_binding(&claim, &claim_refs, digest, &label, &mut results)
+        // Recursive ingredient validation (C2PA 2.4, "Validate the
+        // Ingredients"). The walk reports per-ingredient deltas additively and
+        // contributes only its own informational codes to this manifest's
+        // verdict; an ingredient manifest's defects never invalidate the asset
+        // in hand.
+        let mut graph = ingredient_graph::build(&label, store, input.profile);
+        results.success.append(&mut graph.active.success);
+        results
+            .informational
+            .append(&mut graph.active.informational);
+        results.failure.append(&mut graph.active.failure);
+        ingredient_deltas = graph.deltas;
+        // The claims CAWG identity validation may resolve
+        // `referenced_assertions` against.
+        let reached_ingredients = graph.reached;
+        // Step 6: an update inherits the hard binding from the first standard
+        // manifest in its authenticated parent chain. Standard manifests use
+        // their own binding as before.
+        if manifest.kind() == ManifestKind::Update {
+            verify_update_hard_binding(
+                manifest,
+                store,
+                input.data,
+                format,
+                fragments,
+                prehashed_digest,
+                input.profile,
+                &mut results,
+            );
+        } else if let Some(digest) = prehashed_digest {
+            let _ =
+                verify_prehashed_hard_binding(&claim, &claim_refs, digest, &label, &mut results);
         } else {
-            verify_data_hash(
+            let _ = verify_data_hash(
                 &claim,
                 &claim_refs,
                 input.data,
                 format,
                 fragments,
+                update_manifest::StoreRendition::AsSigned,
                 &label,
+                input.profile,
                 &mut results,
-            )
-        };
+            );
+        }
         // Step 6a (EXPERIMENTAL, PR #2058): host-less compound binding. ONLY for
         // application/c2pa (C2paStore). Ordinary host-bearing formats require a
         // real c2pa.hash.* binding (verify_data_hash) and never treat
@@ -2225,24 +2796,53 @@ fn verify_manifest<'a>(
         if format == AssetFormat::C2paStore {
             verify_compound_content(&claim_refs, &label, store.manifest_hashes, &mut results);
         }
+        // An update manifest carries no hard binding of its own, so an identity
+        // inside one references the binding in the first standard manifest of
+        // its parentOf chain (C2PA 2.4 Validation, "Validate the Asset's
+        // Content").
+        let inherited_binding = inherited_hard_binding(manifest, store);
         // Named-actor trust is evaluated only when this exact asset and claim
-        // are valid and every referenced assertion still matches its stored
-        // bytes. A valid identity COSE inside any invalid manifest must never
-        // produce `cawg.identity.trusted`.
-        if results.failure.is_empty() {
+        // have no C2PA-level failure and every referenced assertion still
+        // matches its stored bytes. CAWG assertion failures are consumer-layer
+        // results and do not invalidate the manifest or suppress identity
+        // validation.
+        if results
+            .failure
+            .iter()
+            .all(|status| is_identity_assertion_scoped(&status.code))
+        {
             cawg::verify_identity_assertions(
                 &mut cawg::IdentityContext {
                     manifest,
                     claim: &claim,
                     validation_time: at,
-                    claim_timestamp: trusted_timestamp,
+                    claim_timestamp: signing_time,
                     cawg_trust: cawg_inputs.trust,
                     cawg_allowed_certs: cawg_inputs.allowed_certs,
                     ocsp_verification_time,
                     document_signing_require_anchor: cawg_inputs.document_signing_require_anchor,
                     tsa_trust: input.tsa_trust,
+                    timestamp_index: &timestamp_index,
                     did_documents: cawg_inputs.did_documents,
-                    strict_encoding: cawg_inputs.strict_encoding,
+                    evidence: input.evidence,
+                    // CAWG 1.3 requires deterministic signer_payload CBOR;
+                    // the generous posture still accepts the CAWG 1.1 field
+                    // order that c2pa-rs writes, with an informational status.
+                    allow_legacy_encoding: is_generous(input.profile)
+                        && !input.cawg_strict_encoding,
+                    ica_trusted_issuers: cawg_inputs.ica_trusted_issuers,
+                    ica_trust_anchors: cawg_inputs.ica_trust_anchors,
+                    ica_status_lists: cawg_inputs.ica_status_lists,
+                    ingredients: cawg::IngredientResolution {
+                        claims: &reached_ingredients,
+                        inherited_binding: inherited_binding.as_ref().map(
+                            |(label, binding, alg)| cawg::InheritedBinding {
+                                manifest: label.as_str(),
+                                reference: binding,
+                                claim_alg: alg.as_deref(),
+                            },
+                        ),
+                    },
                     results: &mut results,
                 },
                 &claim_refs,
@@ -2254,19 +2854,37 @@ fn verify_manifest<'a>(
         }
     }
 
-    // Step 7a: evaluate bounded embedded OCSP evidence before trust so a
-    // revoked leaf or CA certificate cannot be reported trusted. The shared
-    // evaluator also serves CAWG identity validation.
-    let ocsp_status = evaluate_embedded_ocsp(
+    // Step 7a: evaluate OCSP evidence before trust so a revoked leaf or CA
+    // certificate cannot be reported trusted. Embedded staples first (the
+    // shared evaluator also serves CAWG identity validation), then any online
+    // response a caller supplied, which takes precedence for the certificate
+    // it covers.
+    let ocsp_outcome = evaluate_embedded_ocsp(
         cose,
         &certificate_statuses.payloads,
         &chain,
-        trusted_timestamp,
+        signing_time,
         ocsp_verification_time,
         input.claim_signer_trust,
+        !generous,
     );
-    let ocsp_blocks_trust = ocsp_status.blocks_trust();
-    record_embedded_ocsp_status(ocsp_status, &sig_url, &mut results);
+    let ocsp_targets = ocsp_targets(&chain, input.claim_signer_trust);
+    let online_ocsp = evaluate_online_ocsp(
+        &ocsp_targets,
+        input.evidence,
+        signing_time,
+        ocsp_verification_time,
+    );
+    let ocsp_blocks_trust = ocsp_outcome.status.blocks_trust()
+        || online_ocsp.ca_revoked
+        || online_ocsp.leaf == Some(OnlineOcspVerdict::Revoked);
+    record_ocsp_status(
+        ocsp_outcome,
+        &online_ocsp,
+        &ocsp_targets,
+        &sig_url,
+        &mut results,
+    );
 
     // Step 7b: trust evaluation (when a trust list and/or allowed list is
     // supplied). Reuses the chain result computed at `at` in step 4. A revoked
@@ -2276,7 +2894,7 @@ fn verify_manifest<'a>(
     // claim signer and valid at `at`.
     let leaf_allowed = match (input.allowed_certs, leaf) {
         (Some(allowed), Some(leaf_der)) => {
-            allowed.anchors.iter().any(|a| a.as_slice() == leaf_der)
+            allowed.contains_certificate(leaf_der)
                 && crate::c2pa_trust::leaf_acceptable_der(leaf_der)
                 && cert::valid_at(leaf_der, at)
         }
@@ -2300,12 +2918,22 @@ fn verify_manifest<'a>(
                 "signing certificate untrusted".into(),
             );
         }
+    } else if !generous && leaf.is_some() && !results.has_failure(SIGNING_CREDENTIAL_UNTRUSTED) {
+        // No claim-signing anchors or allowed certificates are configured. The
+        // default posture reports trust as not evaluated; the conformance
+        // posture applies the spec literally: a credential absent from the
+        // (empty) trust list is untrusted.
+        results.push_failure(
+            SIGNING_CREDENTIAL_UNTRUSTED,
+            sig_url.clone(),
+            "signing certificate untrusted: no claim-signing trust anchors are configured".into(),
+        );
     }
 
     // Conformance-program SHOULD->SHALL upgrades, applied on the full-evaluation
     // path (structural-failure early exits above are already failures).
     apply_compliance_upgrades(&mut results, input.profile.compliance, &sig_url);
-    finish(
+    let mut output = finish(
         label,
         manifest,
         Some(&claim),
@@ -2316,7 +2944,9 @@ fn verify_manifest<'a>(
         Some(verdict),
         input.profile,
         report_decode_nodes,
-    )
+    );
+    ingredient_graph::attach(&mut output.report_json, &ingredient_deltas);
+    output
 }
 
 /// Structural validation of the claim and assertions: detect malformed or
@@ -2463,10 +3093,19 @@ struct ClaimAssertionRefs<'a> {
     duplicate_label: Option<&'a str>,
     references: Vec<ClaimAssertionReference<'a>>,
     binding_labels: Vec<&'a str>,
+    /// Coverage set: every assertion label the claim reaches, from an assertion
+    /// list or a `claim_generator_info` icon. Drives payload indexing, digest
+    /// work, and report filtering.
     declared_labels: std::collections::HashSet<&'a str>,
+    /// Declaration set: assertion lists only. C2PA 2.4 Validation, Validate the
+    /// Assertions, makes membership of `created_assertions`/`gathered_assertions`
+    /// (or v1 `assertions`) the sole test for `assertion.undeclared`; an icon is
+    /// a pointer, not a declaration.
+    declaration_labels: std::collections::HashSet<&'a str>,
     assertions: std::collections::HashMap<&'a str, IndexedAssertion<'a>>,
     undeclared_labels: Vec<&'a str>,
     invalid_cbor_labels: Vec<&'a str>,
+    invalid_json_labels: Vec<&'a str>,
     hash_work_bytes: Option<usize>,
     decode_budget_exhausted: bool,
     decoded_value_nodes: usize,
@@ -2492,14 +3131,20 @@ impl<'a> ClaimAssertionRefs<'a> {
             total = next;
         }
         let mut icon_overflow = false;
-        visit_generator_icon_references(claim, generation, |_| {
-            total = match total.checked_add(1) {
-                Some(next) if next <= MAX_CLAIM_ASSERTION_REFERENCES => next,
-                _ => {
-                    icon_overflow = true;
-                    total
-                }
-            };
+        visit_generator_icon_references(claim, generation, |value| {
+            let local = value
+                .get("url")
+                .and_then(Value::as_text)
+                .is_some_and(|url| url.starts_with("self#jumbf="));
+            if local {
+                total = match total.checked_add(1) {
+                    Some(next) if next <= MAX_CLAIM_ASSERTION_REFERENCES => next,
+                    _ => {
+                        icon_overflow = true;
+                        total
+                    }
+                };
+            }
         });
         if icon_overflow {
             return Self::incomplete();
@@ -2508,7 +3153,7 @@ impl<'a> ClaimAssertionRefs<'a> {
         let mut references = Vec::with_capacity(total);
         // Coverage set: every assertion label the claim reaches, from either an
         // assertion list or a `claim_generator_info` icon. Drives payload
-        // indexing, digest-work accounting, and the undeclared-assertion sweep.
+        // indexing and digest-work accounting, never the undeclared sweep.
         let mut declared_labels = std::collections::HashSet::with_capacity(total);
         // Declaration set: assertion lists only. A label may be declared once.
         let mut declaration_labels = std::collections::HashSet::with_capacity(total);
@@ -2559,10 +3204,11 @@ impl<'a> ClaimAssertionRefs<'a> {
         // lawful, so an icon reference never raises `duplicate_label`. Each icon
         // hashed-URI is still resolved and hash-verified on its own.
         visit_generator_icon_references(claim, generation, |value| {
-            let label = value
-                .get("url")
-                .and_then(Value::as_text)
-                .and_then(|url| assertion_label_for_manifest(url, &manifest.label));
+            let url = value.get("url").and_then(Value::as_text);
+            let label = url.and_then(|url| assertion_label_for_manifest(url, &manifest.label));
+            if label.is_none() && url.is_some_and(|url| !url.starts_with("self#jumbf=")) {
+                return;
+            }
             if let Some(label) = label {
                 declared_labels.insert(label);
                 if let Some(key) = hashed_uri_binding_key(value, label) {
@@ -2602,6 +3248,7 @@ impl<'a> ClaimAssertionRefs<'a> {
         let mut decode_budget_exhausted = false;
         let mut assertions = std::collections::HashMap::with_capacity(declared_labels.len());
         let mut invalid_cbor_labels = Vec::new();
+        let mut invalid_json_labels = Vec::new();
         // Index (and decode) each label once even when two references reach it.
         // A `claim_generator_info` icon and its assertion-list declaration share
         // one payload, so the decoder budget is charged for it once.
@@ -2611,8 +3258,35 @@ impl<'a> ClaimAssertionRefs<'a> {
             }
             let payload = payloads.get(reference).copied();
             let decoded = if decode_payloads && !decode_budget_exhausted {
-                match payload {
-                    Some(bytes) => match decode((bytes, &mut remaining_nodes)) {
+                match (payload, manifest.assertion_content_type(reference)) {
+                    (Some(bytes), Some(AssertionContentType::Json)) => {
+                        // C2PA 2.4 Validation, Specific Assertion Validation,
+                        // dispatches on the assertion's label, not on the JUMBF
+                        // content type it arrived in. A JSON-serialized
+                        // `c2pa.ingredient.v3` or `c2pa.actions.v2` owes the same
+                        // semantic checks, so JSON is projected into the one
+                        // value model the semantic phase reads, on the same
+                        // decode budget.
+                        match serde_json::from_slice::<Json>(bytes) {
+                            Ok(json) => {
+                                match assertion_semantics::value_from_json(
+                                    &json,
+                                    &mut remaining_nodes,
+                                ) {
+                                    Some(value) => Some(value),
+                                    None => {
+                                        decode_budget_exhausted = true;
+                                        None
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                invalid_json_labels.push(reference);
+                                None
+                            }
+                        }
+                    }
+                    (Some(bytes), _) => match decode((bytes, &mut remaining_nodes)) {
                         Ok(value) => Some(value),
                         Err(DecodeError::NodeLimitExceeded(_)) => {
                             decode_budget_exhausted = true;
@@ -2623,7 +3297,7 @@ impl<'a> ClaimAssertionRefs<'a> {
                             None
                         }
                     },
-                    None => None,
+                    (None, _) => None,
                 }
             } else {
                 None
@@ -2638,11 +3312,15 @@ impl<'a> ClaimAssertionRefs<'a> {
                 },
             );
         }
+        // C2PA 2.4 Validation, Validate the Assertions: an assertion present in
+        // the store but not referenced by an element of the claim's assertion
+        // lists is `assertion.undeclared`. A `claim_generator_info` icon reaches
+        // the assertion without declaring it, so the declaration set decides.
         let undeclared_labels = manifest
             .assertion_jumbf
             .iter()
             .filter_map(|(label, _)| {
-                (!declared_labels.contains(label.as_str())).then_some(label.as_str())
+                (!declaration_labels.contains(label.as_str())).then_some(label.as_str())
             })
             .collect();
 
@@ -2652,9 +3330,11 @@ impl<'a> ClaimAssertionRefs<'a> {
             references,
             binding_labels,
             declared_labels,
+            declaration_labels,
             assertions,
             undeclared_labels,
             invalid_cbor_labels,
+            invalid_json_labels,
             hash_work_bytes,
             decode_budget_exhausted,
             decoded_value_nodes: MAX_ASSERTION_DECODED_VALUE_NODES - remaining_nodes,
@@ -2668,9 +3348,11 @@ impl<'a> ClaimAssertionRefs<'a> {
             references: Vec::new(),
             binding_labels: Vec::new(),
             declared_labels: std::collections::HashSet::new(),
+            declaration_labels: std::collections::HashSet::new(),
             assertions: std::collections::HashMap::new(),
             undeclared_labels: Vec::new(),
             invalid_cbor_labels: Vec::new(),
+            invalid_json_labels: Vec::new(),
             hash_work_bytes: None,
             decode_budget_exhausted: false,
             decoded_value_nodes: 0,
@@ -2679,6 +3361,14 @@ impl<'a> ClaimAssertionRefs<'a> {
 
     fn indexed(&self, label: &str) -> Option<&IndexedAssertion<'a>> {
         self.assertions.get(label)
+    }
+
+    /// Whether the claim declares a `c2pa.soft-binding` assertion, counting the
+    /// multi-instance spellings (`c2pa.soft-binding__1`).
+    fn declares_soft_binding(&self) -> bool {
+        self.declaration_labels
+            .iter()
+            .any(|label| *label == "c2pa.soft-binding" || label.starts_with("c2pa.soft-binding__"))
     }
 
     fn jumbf_digest(&self, label: &str, algorithm: &str) -> Option<&[u8]> {
@@ -2717,6 +3407,29 @@ impl<'a> ClaimAssertionRefs<'a> {
     }
 }
 
+fn verify_spec_version_metadata(
+    claim: &Value,
+    profile: EngineProfile,
+    sig_url: &str,
+    results: &mut ValidationResults,
+) -> bool {
+    let Some(version) = versions::non_semver_declared_spec_version(claim) else {
+        return false;
+    };
+    let explanation = format!("claim_generator_info.specVersion '{version}' is not a SemVer value");
+    if profile.compliance == ComplianceLevel::ConformanceProgram {
+        results.push_failure(CLAIM_MALFORMED, sig_url.to_string(), explanation);
+        true
+    } else {
+        results.push_informational(
+            CLAIM_SPEC_VERSION_NOT_SEMVER,
+            sig_url.to_string(),
+            explanation,
+        );
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // internal structural gate; grouping obscures inputs
 fn verify_claim_structure(
     manifest: &ParsedManifest,
@@ -2726,6 +3439,7 @@ fn verify_claim_structure(
     claim_refs: &ClaimAssertionRefs<'_>,
     format: AssetFormat,
     sig_url: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) -> bool {
     // Returns false when a fatal structural defect (multiple claims / malformed
@@ -2775,14 +3489,35 @@ fn verify_claim_structure(
     }
 
     // claim.malformed: fields required by the detected claim generation must
-    // be present and have their required shape (claim v1:
-    // instanceID/claim_generator/claim_generator_info/dc:format/assertions;
-    // claim v2: instanceID/claim_generator_info/created_assertions). This
-    // includes GeneratorInfoMap optional-member types and hashed-URI icons.
-    let missing = match generation {
+    // be present and have their required shape. A legacy claim-v1 claim that
+    // predates `claim_generator_info` remains readable in the default posture
+    // when its `claim_generator` string is present. Strict conformance applies
+    // the current claim-map CDDL literally.
+    let mut missing = match generation {
         ClaimGeneration::V1 => versions::v1_missing_fields(claim),
         ClaimGeneration::V2 => versions::v2_missing_fields(claim),
     };
+    let generator_info_missing = claim
+        .get("claim_generator_info")
+        .is_none_or(|info| match info {
+            Value::Null => true,
+            Value::Array(entries) => entries.is_empty(),
+            _ => false,
+        });
+    let legacy_generator_only = generation == ClaimGeneration::V1
+        && generator_info_missing
+        && claim
+            .get("claim_generator")
+            .and_then(Value::as_text)
+            .is_some();
+    if legacy_generator_only && profile.compliance == ComplianceLevel::CoreSpec {
+        missing.retain(|field| *field != "claim_generator_info");
+        results.push_informational(
+            CLAIM_GENERATOR_INFO_MISSING,
+            sig_url.to_string(),
+            "legacy claim-v1 supplies claim_generator but omits usable claim_generator_info".into(),
+        );
+    }
     if !missing.is_empty() {
         results.push_failure(
             CLAIM_MALFORMED,
@@ -2854,6 +3589,132 @@ fn verify_claim_structure(
         );
         fatal = true;
     }
+    let is_update = manifest.kind() == ManifestKind::Update;
+    if is_update {
+        let inspection =
+            update_manifest::inspect(manifest, claim_refs.declared_labels.iter().copied());
+        if inspection.wrong_parents {
+            results.push_failure(
+                MANIFEST_UPDATE_WRONG_PARENTS,
+                format!("self#jumbf=/c2pa/{}", manifest.label),
+                "update manifest must declare exactly one parentOf ingredient".into(),
+            );
+            fatal = true;
+        }
+        if inspection.invalid {
+            results.push_failure(
+                MANIFEST_UPDATE_INVALID,
+                format!("self#jumbf=/c2pa/{}", manifest.label),
+                "update manifest contains forbidden content or an incomplete parent link".into(),
+            );
+            fatal = true;
+        }
+        if !inspection.wrong_parents && !inspection.invalid {
+            match update_manifest::resolve_standard(manifest, store.manifests) {
+                Ok(standard) => match standard.claim_cbor.and_then(|bytes| decode(bytes).ok()) {
+                    Some(parent_claim) => {
+                        let parent_generation = versions::claim_generation(standard, &parent_claim);
+                        let parent_refs =
+                            ClaimAssertionRefs::build(standard, &parent_claim, parent_generation);
+                        match parent_refs.binding_plan(false).primary_count {
+                            0 => results.push_failure(
+                                CLAIM_HARD_BINDINGS_MISSING,
+                                sig_url.to_string(),
+                                "update chain does not reach a standard manifest with a hard binding"
+                                    .into(),
+                            ),
+                            1 => {}
+                            _ => {
+                                results.push_failure(
+                                    ASSERTION_MULTIPLE_HARD_BINDINGS,
+                                    format!(
+                                        "self#jumbf=/c2pa/{}/c2pa.assertions",
+                                        standard.label
+                                    ),
+                                    "parent standard manifest declares more than one supported primary hard binding"
+                                        .into(),
+                                );
+                                fatal = true;
+                            }
+                        }
+                    }
+                    None => {
+                        results.push_failure(
+                            CLAIM_HARD_BINDINGS_MISSING,
+                            sig_url.to_string(),
+                            "update chain parent claim could not be decoded".into(),
+                        );
+                        fatal = true;
+                    }
+                },
+                Err(update_manifest::ResolveError::WrongParents(label)) => {
+                    results.push_failure(
+                        MANIFEST_UPDATE_WRONG_PARENTS,
+                        format!("self#jumbf=/c2pa/{label}"),
+                        "update manifest in parent chain must declare exactly one parentOf ingredient"
+                            .into(),
+                    );
+                    fatal = true;
+                }
+                Err(update_manifest::ResolveError::Invalid(label)) => {
+                    results.push_failure(
+                        MANIFEST_UPDATE_INVALID,
+                        format!("self#jumbf=/c2pa/{label}"),
+                        "update manifest in parent chain contains forbidden content or an incomplete parent link"
+                            .into(),
+                    );
+                    fatal = true;
+                }
+                Err(update_manifest::ResolveError::MissingParent(label)) => {
+                    results.push_failure(
+                        CLAIM_HARD_BINDINGS_MISSING,
+                        sig_url.to_string(),
+                        format!("update chain parent manifest '{label}' is absent"),
+                    );
+                    fatal = true;
+                }
+                Err(update_manifest::ResolveError::Cycle(label)) => {
+                    results.push_failure(
+                        CLAIM_HARD_BINDINGS_MISSING,
+                        sig_url.to_string(),
+                        format!("update manifest parent chain cycles at '{label}'"),
+                    );
+                    fatal = true;
+                }
+                Err(update_manifest::ResolveError::TooDeep) => {
+                    results.push_failure(
+                        CLAIM_HARD_BINDINGS_MISSING,
+                        sig_url.to_string(),
+                        "update manifest parent chain exceeds the verifier bound".into(),
+                    );
+                    fatal = true;
+                }
+            }
+        }
+    } else {
+        let parent_count = claim_refs
+            .references
+            .iter()
+            .filter_map(|reference| reference.label)
+            .filter(|label| label.starts_with("c2pa.ingredient"))
+            .filter(|label| {
+                claim_refs
+                    .indexed(label)
+                    .and_then(|assertion| assertion.decoded.as_ref())
+                    .and_then(|ingredient| ingredient.get("relationship"))
+                    .and_then(Value::as_text)
+                    == Some("parentOf")
+            })
+            .count();
+        if parent_count > 1 {
+            results.push_failure(
+                MANIFEST_MULTIPLE_PARENTS,
+                format!("self#jumbf=/c2pa/{}", manifest.label),
+                "manifest declares more than one parent ingredient".into(),
+            );
+            fatal = true;
+        }
+    }
 
     // Every assertion-store box must be declared by exactly one local claim
     // reference. Undeclared payloads are never decoded or exposed to semantic
@@ -2894,50 +3755,37 @@ fn verify_claim_structure(
         fatal = true;
     }
 
-    // The bounded plan separates the one primary binding from the optional
-    // multi-asset fallback. Compound participates as a primary only for a
-    // host-less C2PA store.
-    let binding_plan = claim_refs.binding_plan(format == AssetFormat::C2paStore);
-    match binding_plan.primary_count {
-        0 => results.push_failure(
-            CLAIM_HARD_BINDINGS_MISSING,
-            sig_url.to_string(),
-            "claim references no supported primary hard binding".into(),
-        ),
-        1 => {}
-        _ => {
+    // Update manifests inherit their sole operative binding from the first
+    // standard manifest in their parent chain. Their own assertion set was
+    // checked above for forbidden bindings and multi-asset assertions.
+    if !is_update {
+        let binding_plan = claim_refs.binding_plan(format == AssetFormat::C2paStore);
+        match binding_plan.primary_count {
+            0 => results.push_failure(
+                CLAIM_HARD_BINDINGS_MISSING,
+                sig_url.to_string(),
+                "claim references no supported primary hard binding".into(),
+            ),
+            1 => {}
+            _ => {
+                results.push_failure(
+                    ASSERTION_MULTIPLE_HARD_BINDINGS,
+                    format!("self#jumbf=/c2pa/{}/c2pa.assertions", manifest.label),
+                    "claim declares more than one supported primary hard binding".into(),
+                );
+                fatal = true;
+            }
+        }
+        if binding_plan.multi_asset_count > 1 {
             results.push_failure(
-                ASSERTION_MULTIPLE_HARD_BINDINGS,
-                format!("self#jumbf=/c2pa/{}/c2pa.assertions", manifest.label),
-                "claim declares more than one supported primary hard binding".into(),
+                ASSERTION_MULTI_ASSET_HASH_MALFORMED,
+                format!(
+                    "self#jumbf=/c2pa/{}/c2pa.assertions/c2pa.hash.multi-asset",
+                    manifest.label
+                ),
+                "claim declares more than one c2pa.hash.multi-asset fallback".into(),
             );
             fatal = true;
-        }
-    }
-    if binding_plan.multi_asset_count > 1 {
-        results.push_failure(
-            ASSERTION_MULTI_ASSET_HASH_MALFORMED,
-            format!(
-                "self#jumbf=/c2pa/{}/c2pa.assertions/c2pa.hash.multi-asset",
-                manifest.label
-            ),
-            "claim declares more than one c2pa.hash.multi-asset fallback".into(),
-        );
-        fatal = true;
-    }
-
-    // algorithm.unsupported: every effective referenced-assertion hash
-    // algorithm must be SHA-2.
-    const SUPPORTED_ALGS: [&str; 3] = ["sha256", "sha384", "sha512"];
-    for reference in &claim_refs.references {
-        if let Some(alg) = resolved_hash_algorithm(reference.value, claim) {
-            if !SUPPORTED_ALGS.contains(&alg) {
-                results.push_failure(
-                    ALGORITHM_UNSUPPORTED,
-                    sig_url.to_string(),
-                    format!("unsupported hash algorithm in hashed-URI reference: {alg}"),
-                );
-            }
         }
     }
 
@@ -2952,10 +3800,453 @@ fn verify_claim_structure(
             format!("assertion '{label}' CBOR could not be decoded"),
         );
     }
+    for label in &claim_refs.invalid_json_labels {
+        results.push_failure(
+            ASSERTION_JSON_INVALID,
+            format!(
+                "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
+                manifest.label
+            ),
+            format!("assertion '{label}' JSON could not be decoded"),
+        );
+    }
+    verify_cawg_content_assertions(manifest, claim_refs, results);
 
-    verify_action_assertions(claim_refs, generation, sig_url, results);
+    verify_ingredient_shapes(manifest, claim_refs, results);
+    verify_alternative_content(manifest, claim, claim_refs, results);
 
+    verify_action_assertions(
+        claim_refs,
+        claim,
+        generation,
+        manifest.kind(),
+        store,
+        &manifest.label,
+        sig_url,
+        profile,
+        results,
+    );
     fatal
+}
+fn is_cawg_assertion_instance(label: &str, base: &str) -> bool {
+    if label == base {
+        return true;
+    }
+    let Some(instance) = label
+        .strip_prefix(base)
+        .and_then(|suffix| suffix.strip_prefix("__"))
+    else {
+        return false;
+    };
+    !instance.is_empty()
+        && !instance.starts_with('0')
+        && instance.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn verify_cawg_content_assertions(
+    manifest: &ParsedManifest<'_>,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    results: &mut ValidationResults,
+) {
+    for (label, _) in &manifest.assertion_jumbf {
+        if !claim_refs.declaration_labels.contains(label.as_str()) {
+            continue;
+        }
+        let Some(assertion) = claim_refs.indexed(label) else {
+            continue;
+        };
+        let url = format!(
+            "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
+            manifest.label
+        );
+        if is_cawg_assertion_instance(label, "cawg.metadata") {
+            cawg_metadata::validate_and_report(
+                manifest.assertion_content_type(label),
+                assertion.jumbf,
+                assertion.decoded.as_ref(),
+                url,
+                results,
+            );
+        } else if is_cawg_assertion_instance(label, "cawg.training-mining") {
+            cawg_training_mining::validate_and_report(
+                manifest.assertion_content_type(label),
+                assertion.decoded.as_ref(),
+                url,
+                results,
+            );
+        }
+    }
+}
+
+/// Assertion labels a cloud data assertion may not reference because they are
+/// hard bindings (C2PA 2.4 Validation, `c2pa.cloud-data` validation, step 2).
+/// `c2pa.action` is the spec's spelling: the very first, singular actions
+/// label, distinct from the deprecated `c2pa.actions` caught one step later.
+const CLOUD_DATA_HARD_BINDING_LABELS: &[&str] = &[
+    "c2pa.cloud-data",
+    "c2pa.action",
+    "c2pa.actions.v2",
+    "c2pa.hash.data",
+    "c2pa.hash.boxes",
+    "c2pa.hash.collection.data",
+    "c2pa.hash.bmff.v2",
+    "c2pa.hash.bmff.v3",
+    "c2pa.hash.multi-asset",
+];
+
+/// Assertion labels a cloud data assertion may not reference at all
+/// (C2PA 2.4 Validation, `c2pa.cloud-data` validation, step 4).
+const CLOUD_DATA_FORBIDDEN_LABELS: &[&str] = &[
+    "c2pa.actions",
+    "c2pa.actions.v2",
+    "c2pa.cloud-data",
+    "c2pa.hash.bmff.v2",
+    "c2pa.hash.bmff.v3",
+    "c2pa.hash.boxes",
+    "c2pa.hash.collection.data",
+    "c2pa.hash.data",
+    "c2pa.hash.multi-asset",
+    "c2pa.ingredient",
+    "c2pa.ingredient.v2",
+    "c2pa.ingredient.v3",
+];
+
+/// Assertion labels an external reference assertion may not reference
+/// (C2PA 2.4 Validation, `c2pa.external-reference` validation, step 4).
+const EXTERNAL_REFERENCE_FORBIDDEN_LABELS: &[&str] = &[
+    "c2pa.actions",
+    "c2pa.actions.v2",
+    "c2pa.external-reference",
+    "c2pa.hash.bmff.v2",
+    "c2pa.hash.bmff.v3",
+    "c2pa.hash.boxes",
+    "c2pa.hash.collection.data",
+    "c2pa.hash.data",
+    "c2pa.hash.multi-asset",
+    "c2pa.ingredient",
+    "c2pa.ingredient.v2",
+    "c2pa.ingredient.v3",
+];
+
+/// Strip the `__<n>` disambiguation suffix a manifest adds when it stores more
+/// than one assertion of a type, leaving the assertion type itself.
+fn base_assertion_label(label: &str) -> &str {
+    match label.rsplit_once("__") {
+        Some((base, index)) if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) => {
+            base
+        }
+        _ => label,
+    }
+}
+
+/// C2PA 2.4 Validation, Specific Assertion Validation: `c2pa.cloud-data` and
+/// `c2pa.external-reference`.
+///
+/// Both assertions point at data stored somewhere else. Everything the spec
+/// makes checkable without going to get that data - the required fields, the
+/// shape of the `location` map, and the assertion types the spec forbids
+/// storing remotely - is checked here and rejects the claim exactly as the
+/// spec says. Everything that would need the bytes - the retrieved size, the
+/// `Content-Type`, the hash, the retrieved JUMBF box's label - is not checked,
+/// because this verifier does not fetch on its own.
+///
+/// The distinction is the spec's own, not a shortcut: C2PA 2.4 Validation,
+/// External Data Validation, General, says those references "are not retrieved
+/// and validated as part of standard validation", that retrieval is optional,
+/// and that "the inability to retrieve or validate external data shall not
+/// cause a claim to be rejected". So the unread remote assertion is reported
+/// with the registered `assertion.inaccessible` code and its URI, and that code
+/// is carved out of the integrity verdict in both postures.
+///
+/// When a caller supplies the bytes in [`OnlineEvidence::external_data`], the
+/// procedure in External Data Validation, Validation of External References,
+/// runs for real: the content is hashed against the assertion's own `alg` and
+/// `hash`, producing `assertion.accessible` plus `assertion.hashedURI.match`,
+/// or `assertion.hashedURI.mismatch`.
+#[allow(clippy::too_many_arguments)] // one assertion pass; grouping obscures inputs
+fn verify_external_data_assertions(
+    claim_refs: &ClaimAssertionRefs<'_>,
+    generation: ClaimGeneration,
+    manifest_kind: ManifestKind,
+    manifest_label: &str,
+    profile: EngineProfile,
+    evidence: OnlineEvidence<'_>,
+    results: &mut ValidationResults,
+) {
+    for reference in &claim_refs.references {
+        let Some(label) = reference.label else {
+            continue;
+        };
+        let kind = base_assertion_label(label);
+        if kind != "c2pa.cloud-data" && kind != "c2pa.external-reference" {
+            continue;
+        }
+        let Some(assertion) = claim_refs
+            .indexed(label)
+            .and_then(|indexed| indexed.decoded.as_ref())
+        else {
+            continue;
+        };
+        let url = format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{label}");
+        if kind == "c2pa.cloud-data" {
+            verify_cloud_data_assertion(assertion, manifest_kind, &url, profile, evidence, results);
+        } else {
+            verify_external_reference_assertion(
+                assertion,
+                reference.field,
+                generation,
+                &url,
+                profile,
+                evidence,
+                results,
+            );
+        }
+    }
+}
+
+fn verify_cloud_data_assertion(
+    assertion: &Value,
+    manifest_kind: ManifestKind,
+    url: &str,
+    profile: EngineProfile,
+    evidence: OnlineEvidence<'_>,
+    results: &mut ValidationResults,
+) {
+    let malformed = |results: &mut ValidationResults, detail: &str| {
+        results.push_failure(
+            ASSERTION_CLOUD_DATA_MALFORMED,
+            url.to_string(),
+            detail.to_string(),
+        );
+    };
+    let (Some(referenced), Some(_), Some(location)) = (
+        assertion.get("label").and_then(Value::as_text),
+        assertion.get("size"),
+        assertion.get("location"),
+    ) else {
+        malformed(
+            results,
+            "cloud data assertion omits label, size, or location",
+        );
+        return;
+    };
+    let referenced_kind = base_assertion_label(referenced);
+    if CLOUD_DATA_HARD_BINDING_LABELS.contains(&referenced_kind) {
+        results.push_failure(
+            ASSERTION_CLOUD_DATA_HARD_BINDING,
+            url.to_string(),
+            format!("cloud data assertion references the hard binding {referenced}"),
+        );
+        return;
+    }
+    if manifest_kind == ManifestKind::Update
+        && matches!(referenced_kind, "c2pa.actions" | "c2pa.actions.v2")
+    {
+        results.push_failure(
+            ASSERTION_CLOUD_DATA_ACTIONS,
+            url.to_string(),
+            format!("update manifest's cloud data assertion references {referenced}"),
+        );
+        return;
+    }
+    if CLOUD_DATA_FORBIDDEN_LABELS.contains(&referenced_kind) {
+        malformed(
+            results,
+            &format!("cloud data assertion may not reference {referenced}"),
+        );
+        return;
+    }
+    // `location` is a `hashed-ext-uri-map`, whose `url`, `alg` and `hash` are
+    // all mandatory. Without them nothing could ever resolve or be checked, so
+    // the assertion is incomplete.
+    let Some(uri) = location.get("url").and_then(Value::as_text) else {
+        malformed(results, "cloud data location has no url");
+        return;
+    };
+    if location.get("alg").and_then(Value::as_text).is_none()
+        || location.get("hash").and_then(Value::as_bytes).is_none()
+    {
+        malformed(results, "cloud data location has no alg/hash pair");
+        return;
+    }
+    // C2PA 2.4 Standard Assertions, Cloud Data: because the assertion's own
+    // `size` is required, "the optional `size` field in the hashed external URI
+    // map shall not be present. Similarly, the optional `dc:format` field ...
+    // shall not be present." No failure code is registered for it, so it is a
+    // conformance-posture observation under an Encypher extension code.
+    if !is_generous(profile) {
+        for field in ["size", "dc:format"] {
+            if location.get(field).is_some() {
+                results.push_informational(
+                    CLOUD_DATA_REDUNDANT_LOCATION_FIELD,
+                    url.to_string(),
+                    format!("cloud data location repeats the {field} field"),
+                );
+            }
+        }
+    }
+    resolve_external_assertion(referenced, location, uri, url, evidence, results);
+}
+
+fn verify_external_reference_assertion(
+    assertion: &Value,
+    field: &'static str,
+    generation: ClaimGeneration,
+    url: &str,
+    profile: EngineProfile,
+    evidence: OnlineEvidence<'_>,
+    results: &mut ValidationResults,
+) {
+    let malformed = |results: &mut ValidationResults, detail: &str| {
+        results.push_failure(
+            ASSERTION_EXTERNAL_REFERENCE_MALFORMED,
+            url.to_string(),
+            detail.to_string(),
+        );
+    };
+    let Some(uri) = assertion
+        .get("location")
+        .and_then(|location| location.get("url"))
+        .and_then(Value::as_text)
+    else {
+        malformed(results, "external reference has no location url");
+        return;
+    };
+    let location = assertion.get("location").expect("location was just read");
+    if location.get("alg").is_some() != location.get("hash").is_some() {
+        malformed(
+            results,
+            "external reference location carries alg without hash, or hash without alg",
+        );
+        return;
+    }
+    let referenced = assertion.get("label").and_then(Value::as_text);
+    if let Some(referenced) = referenced {
+        if EXTERNAL_REFERENCE_FORBIDDEN_LABELS.contains(&base_assertion_label(referenced)) {
+            malformed(
+                results,
+                &format!("external reference may not reference {referenced}"),
+            );
+            return;
+        }
+    }
+    // C2PA 2.4 Standard Assertions, External Reference: the assertion "should
+    // appear in `gathered_assertions`", because declaring it in
+    // `created_assertions` is the signer taking responsibility for data it does
+    // not carry. `assertion.external-reference.created` is the registered code
+    // for that, and a SHOULD is raised to a failure only under the conformance
+    // posture. A v1 claim has one undifferentiated list, so the rule cannot
+    // apply to it.
+    if !is_generous(profile) && generation == ClaimGeneration::V2 && field == "created_assertions" {
+        results.push_failure(
+            ASSERTION_EXTERNAL_REFERENCE_CREATED,
+            url.to_string(),
+            "external reference assertion is declared in created_assertions".into(),
+        );
+    }
+    match referenced {
+        Some(referenced) => {
+            resolve_external_assertion(referenced, location, uri, url, evidence, results)
+        }
+        // No `label` means the reference points at arbitrary data, not at an
+        // assertion, so the registered assertion code does not describe it.
+        None => results.push_informational_with_details(
+            EXTERNAL_REFERENCE_NOT_RETRIEVED,
+            url.to_string(),
+            "externally referenced data was not retrieved".into(),
+            json!({ "uri": uri, "retrieval": "not_attempted" }),
+        ),
+    }
+}
+
+/// Report a remotely stored assertion, checking its content when a caller has
+/// supplied it.
+///
+/// Without the bytes this records the registered `assertion.inaccessible`
+/// failure plus the network need that would retrieve them. With the bytes it
+/// runs C2PA 2.4 Validation, External Data Validation, Validation of External
+/// References: the content is hashed with the `location` map's own algorithm
+/// and compared to its `hash`.
+///
+/// Every status carries `external_data: true` in its details. C2PA 2.4 is
+/// explicit that "the inability to retrieve or validate external data shall
+/// not cause a claim to be rejected", and `assertion.hashedURI.mismatch` is
+/// also the code for a claim's own broken binding, which very much does.
+/// [`is_external_data_scoped`] reads the marker to tell the two apart.
+fn resolve_external_assertion(
+    referenced: &str,
+    location: &Value,
+    uri: &str,
+    url: &str,
+    evidence: OnlineEvidence<'_>,
+    results: &mut ValidationResults,
+) {
+    let Some(content) = evidence
+        .external_data
+        .and_then(|supplied| supplied.get(uri))
+    else {
+        results.push_failure_with_details(
+            ASSERTION_INACCESSIBLE,
+            url.to_string(),
+            format!("remotely stored assertion {referenced} was not retrieved"),
+            json!({
+                "assertion_label": referenced,
+                "uri": uri,
+                "retrieval": "not_attempted",
+                "external_data": true,
+            }),
+        );
+        network_needs::push_unique(
+            &mut results.network_needs,
+            NetworkNeed::ExternalData {
+                uri: uri.to_string(),
+                assertion_label: referenced.to_string(),
+            },
+        );
+        return;
+    };
+
+    results.push_success_with_details(
+        ASSERTION_ACCESSIBLE,
+        url.to_string(),
+        format!("remotely stored assertion {referenced} was retrieved"),
+        json!({
+            "assertion_label": referenced,
+            "uri": uri,
+            "retrieval": "caller_supplied",
+            "external_data": true,
+        }),
+    );
+
+    let algorithm = location.get("alg").and_then(Value::as_text);
+    let expected = location.get("hash").and_then(Value::as_bytes);
+    let computed = algorithm
+        .filter(|algorithm| is_allowed_hash_algorithm(algorithm))
+        .and_then(|algorithm| hash_bytes(algorithm, content));
+    let details = json!({
+        "assertion_label": referenced,
+        "uri": uri,
+        "external_data": true,
+    });
+    // Step 4b of the procedure: an absent `hash`, an algorithm this verifier
+    // will not compute, and a real digest disagreement are one outcome - the
+    // retrieved data is not provided to the application.
+    match (computed, expected) {
+        (Some(computed), Some(expected)) if computed == expected => {
+            results.push_success_with_details(
+                ASSERTION_HASHED_URI_MATCH,
+                url.to_string(),
+                format!("retrieved content for {referenced} matches its declared hash"),
+                details,
+            );
+        }
+        _ => results.push_failure_with_details(
+            ASSERTION_HASHED_URI_MISMATCH,
+            url.to_string(),
+            format!("retrieved content for {referenced} does not match its declared hash"),
+            details,
+        ),
+    }
 }
 
 fn referenced_action_assertions<'index, 'claim>(
@@ -2977,91 +4268,560 @@ fn referenced_action_assertions<'index, 'claim>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)] // internal assertion gate; mirrors verify_claim_structure
 fn verify_action_assertions(
     claim_refs: &ClaimAssertionRefs<'_>,
+    claim: &Value,
     generation: ClaimGeneration,
+    manifest_kind: ManifestKind,
+    store: StoreContext<'_>,
+    manifest_label: &str,
     sig_url: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
-    if generation == ClaimGeneration::V1 {
-        return;
-    }
-    let created = referenced_action_assertions(claim_refs, "created_assertions");
-    let gathered = referenced_action_assertions(claim_refs, "gathered_assertions");
-    let fail = |results: &mut ValidationResults, explanation: &str| {
-        results.push_failure(
-            ASSERTION_ACTION_MALFORMED,
-            sig_url.to_string(),
-            explanation.to_string(),
-        );
+    let created = referenced_action_assertions(
+        claim_refs,
+        if generation == ClaimGeneration::V1 {
+            "assertions"
+        } else {
+            "created_assertions"
+        },
+    );
+    let gathered = if generation == ClaimGeneration::V1 {
+        Vec::new()
+    } else {
+        referenced_action_assertions(claim_refs, "gathered_assertions")
     };
-    let Some((_, first_assertion)) = created.first() else {
-        fail(
-            results,
-            "standard manifest has no created actions assertion",
-        );
-        return;
+    let fail = |results: &mut ValidationResults, code: &str, explanation: String| {
+        results.push_failure(code, sig_url.to_string(), explanation);
     };
-    let Some(Value::Array(first_actions)) = first_assertion.get("actions") else {
-        fail(results, "first actions assertion has no actions array");
-        return;
-    };
-    let Some(first_action) = first_actions.first() else {
-        fail(
-            results,
-            "first actions assertion has an empty actions array",
-        );
-        return;
-    };
-    let first_kind = first_action.get("action").and_then(Value::as_text);
-    if !matches!(first_kind, Some("c2pa.created" | "c2pa.opened")) {
-        fail(results, "first action must be c2pa.created or c2pa.opened");
-        return;
-    }
-    if first_kind == Some("c2pa.created")
-        && first_action
-            .get("digitalSourceType")
-            .and_then(Value::as_text)
-            .is_none()
-    {
-        fail(results, "c2pa.created action has no digitalSourceType");
-        return;
-    }
 
-    let mut inception_actions = 0usize;
-    for (assertion_index, (label, assertion)) in created.iter().chain(gathered.iter()).enumerate() {
+    for (label, assertion) in created.iter().chain(gathered.iter()) {
+        let software_agent_count = match assertion.get("softwareAgents") {
+            Some(Value::Array(values)) => values.len(),
+            _ => 0,
+        };
         let Some(Value::Array(actions)) = assertion.get("actions") else {
-            fail(results, &format!("{label} has no actions array"));
-            return;
+            fail(
+                results,
+                ASSERTION_ACTION_MALFORMED,
+                format!("{label} has no actions array"),
+            );
+            continue;
         };
         if actions.is_empty() {
-            fail(results, &format!("{label} has an empty actions array"));
-            return;
+            fail(
+                results,
+                ASSERTION_ACTION_MALFORMED,
+                format!("{label} has an empty actions array"),
+            );
+            continue;
         }
         for (action_index, action) in actions.iter().enumerate() {
             let Some(kind) = action.get("action").and_then(Value::as_text) else {
                 fail(
                     results,
-                    &format!("{label} action {action_index} has no action"),
+                    ASSERTION_ACTION_MALFORMED,
+                    format!("{label} action {action_index} has no action"),
                 );
-                return;
+                continue;
             };
-            if matches!(kind, "c2pa.created" | "c2pa.opened") {
-                inception_actions += 1;
-                if assertion_index != 0 || action_index != 0 {
+            for error in assertion_semantics::action_shape_errors(
+                action,
+                software_agent_count,
+                generation == ClaimGeneration::V2,
+            ) {
+                fail(results, ASSERTION_ACTION_MALFORMED, error);
+            }
+
+            let parameters = action.get("parameters");
+            // 1.x-era v1 claims predate the ingredient-reference rules, so they
+            // are held to them only under strict conformance (c2pa-rs likewise
+            // skips them unless `strict_v1_validation` is set).
+            let ingredient_rule = ActionIngredientRule::for_action(kind)
+                .filter(|_| generation == ClaimGeneration::V2 || !is_generous(profile));
+            if let Some(rule) = ingredient_rule {
+                // `c2pa.actions.v2` names the field `ingredients`. `c2pa.actions`
+                // names it `ingredient`, but c2pa-rs writes `ingredients` there
+                // too; either spelling must still resolve and hash-match. The
+                // assertion label decides, not the claim generation.
+                let field = if label.starts_with("c2pa.actions.v2") {
+                    parameters.and_then(|value| value.get("ingredients"))
+                } else {
+                    parameters.and_then(|value| {
+                        value.get("ingredient").or_else(|| value.get("ingredients"))
+                    })
+                };
+                let references: Vec<&Value> = match field {
+                    Some(Value::Array(values)) => values.iter().collect(),
+                    Some(value @ Value::Map(_)) if !label.starts_with("c2pa.actions.v2") => {
+                        vec![value]
+                    }
+                    _ => Vec::new(),
+                };
+                let count_ok = match rule {
+                    ActionIngredientRule::Opened => references.len() == 1,
+                    ActionIngredientRule::Placed | ActionIngredientRule::Removed => {
+                        !references.is_empty()
+                    }
+                    ActionIngredientRule::Derived => true,
+                };
+                let resolves = references.iter().all(|reference| {
+                    let relationship = if rule == ActionIngredientRule::Removed {
+                        foreign_ingredient_relationship(
+                            reference,
+                            claim,
+                            store,
+                            manifest_label,
+                            profile,
+                            results,
+                        )
+                    } else {
+                        nested_assertion_reference_label(
+                            reference,
+                            claim,
+                            claim_refs,
+                            manifest_label,
+                            profile,
+                            results,
+                        )
+                        .filter(|target| target.starts_with("c2pa.ingredient"))
+                        .and_then(|target| claim_refs.indexed(target))
+                        .and_then(|assertion| assertion.decoded.as_ref())
+                        .and_then(|ingredient| ingredient.get("relationship"))
+                        .and_then(Value::as_text)
+                        .map(str::to_string)
+                    };
+                    relationship.as_deref() == Some(rule.relationship())
+                });
+                if !(count_ok && resolves) {
                     fail(
                         results,
-                        "c2pa.created or c2pa.opened may occur only as the first action",
+                        ASSERTION_ACTION_INGREDIENT_MISMATCH,
+                        format!(
+                            "{kind} does not resolve its {} ingredient",
+                            rule.relationship()
+                        ),
                     );
-                    return;
+                }
+            }
+
+            if kind == "c2pa.redacted" {
+                let has_reason = action
+                    .get("reason")
+                    .and_then(Value::as_text)
+                    .is_some_and(|reason| !reason.is_empty());
+                let redacted_resolves = parameters
+                    .and_then(|value| value.get("redacted"))
+                    .and_then(Value::as_text)
+                    .and_then(|url| assertion_label_for_manifest(url, manifest_label))
+                    .is_some_and(|target| claim_refs.indexed(target).is_some());
+                if !has_reason || !redacted_resolves {
+                    fail(
+                        results,
+                        ASSERTION_ACTION_REDACTION_MISMATCH,
+                        "c2pa.redacted does not resolve its redacted assertion".into(),
+                    );
+                }
+            }
+
+            // C2PA 2.4 Validation, `c2pa.actions` validation: a
+            // `c2pa.watermarked` or `c2pa.watermarked.bound` action requires a
+            // `c2pa.soft-binding` assertion in the same manifest. Presence of
+            // the assertion is the whole test; no watermark is extracted and no
+            // soft binding is compared against asset content.
+            if matches!(kind, "c2pa.watermarked" | "c2pa.watermarked.bound")
+                && !claim_refs.declares_soft_binding()
+            {
+                fail(
+                    results,
+                    ASSERTION_ACTION_SOFT_BINDING_MISSING,
+                    format!("{kind} has no c2pa.soft-binding assertion in this manifest"),
+                );
+            }
+
+            if let Some(related) = parameters.and_then(|value| value.get("relatedAssertions")) {
+                let valid = matches!(related, Value::Array(values) if !values.is_empty()
+                && values.iter().all(|reference| {
+                    nested_assertion_reference_label(
+                        reference,
+                        claim,
+                        claim_refs,
+                        manifest_label,
+                        profile,
+                        results,
+                    )
+                    .is_some_and(|target| {
+                        !target.starts_with("c2pa.actions")
+                            && !target.starts_with("c2pa.ingredient")
+                    })
+                }));
+                if !valid {
+                    fail(
+                        results,
+                        ASSERTION_ACTION_MALFORMED,
+                        "relatedAssertions does not resolve eligible assertions".into(),
+                    );
                 }
             }
         }
     }
-    if inception_actions != 1 {
+
+    // C2PA 2.4 splits the inception rules by audience. Placement and
+    // cardinality are validator requirements: Validation, `c2pa.actions`
+    // validation, rejects a `c2pa.created`/`c2pa.opened` that is not the first
+    // element of the first actions assertion with `assertion.action.malformed`,
+    // and Validation, Standard Manifest Assertions, requires the inception
+    // action in exactly one actions assertion. Both hold in the default posture.
+    // 1.x-era v1 claims predate them and are held to them only under strict
+    // conformance, the same policy the v1 ingredient rules above use.
+    if generation == ClaimGeneration::V1 && is_generous(profile) {
+        return;
+    }
+    let is_inception = |action: &Value| {
+        matches!(
+            action.get("action").and_then(Value::as_text),
+            Some("c2pa.created" | "c2pa.opened")
+        )
+    };
+    let mut inception_assertions = 0usize;
+    let mut inception_action = None;
+    // "the first actions assertion in the `created_assertions` or
+    // `gathered_assertions` array (of a v2 claim), or the first actions
+    // assertion in the `assertions` array of a v1 claim" - each list is
+    // indexed on its own, so either list's first actions assertion may open
+    // the manifest. Carrying one in both is then caught by the cardinality
+    // rule below.
+    for list in [&created, &gathered] {
+        for (assertion_index, (label, assertion)) in list.iter().enumerate() {
+            let Some(Value::Array(actions)) = assertion.get("actions") else {
+                continue;
+            };
+            let mut carries_inception = false;
+            for (action_index, action) in actions.iter().enumerate() {
+                if !is_inception(action) {
+                    continue;
+                }
+                carries_inception = true;
+                if assertion_index == 0 && action_index == 0 {
+                    inception_action = Some(action);
+                } else {
+                    fail(
+                        results,
+                        ASSERTION_ACTION_MALFORMED,
+                        format!(
+                            "{label} places c2pa.created or c2pa.opened outside the first action of the first actions assertion"
+                        ),
+                    );
+                }
+            }
+            if carries_inception {
+                inception_assertions += 1;
+            }
+        }
+    }
+    // Update manifests are exempt. C2PA 2.4 Validation states the inception
+    // requirement under Standard Manifest Assertions only, and Manifests,
+    // Update Manifests, permits an update to carry just `c2pa.edited.metadata`,
+    // `c2pa.opened`, `c2pa.published` or `c2pa.redacted`. Whatever actions an
+    // update does carry are still checked against that allowlist elsewhere.
+    if manifest_kind == ManifestKind::Standard && inception_assertions != 1 {
         fail(
             results,
-            "manifest must contain exactly one c2pa.created or c2pa.opened action",
+            ASSERTION_ACTION_MALFORMED,
+            format!(
+                "standard manifest carries a c2pa.created or c2pa.opened action in {inception_assertions} actions assertions, expected exactly one"
+            ),
+        );
+    }
+
+    // A claim-generator requirement rather than a validator step: C2PA 2.4
+    // Actions requires a `digitalSourceType` on the `c2pa.created` action, and
+    // the Validation chapter never asks a validator to check it. Strict
+    // conformance only.
+    if is_generous(profile) || generation == ClaimGeneration::V1 {
+        return;
+    }
+    if let Some(action) = inception_action {
+        if action.get("action").and_then(Value::as_text) == Some("c2pa.created")
+            && action
+                .get("digitalSourceType")
+                .and_then(Value::as_text)
+                .is_none()
+        {
+            fail(
+                results,
+                ASSERTION_ACTION_MALFORMED,
+                "c2pa.created action has no digitalSourceType".into(),
+            );
+        }
+    }
+}
+
+/// The ingredient an action must (or may) reference, per the C2PA 2.4
+/// `c2pa.actions` validation rules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionIngredientRule {
+    /// Exactly one parentOf ingredient in this manifest.
+    Opened,
+    /// One or more componentOf ingredients in this manifest.
+    Placed,
+    /// One or more componentOf ingredients in another manifest.
+    Removed,
+    /// `c2pa.transcoded`/`c2pa.repackaged`: optional parentOf ingredients.
+    Derived,
+}
+
+impl ActionIngredientRule {
+    fn for_action(kind: &str) -> Option<Self> {
+        match kind {
+            "c2pa.opened" => Some(Self::Opened),
+            "c2pa.placed" => Some(Self::Placed),
+            "c2pa.removed" => Some(Self::Removed),
+            "c2pa.transcoded" | "c2pa.repackaged" => Some(Self::Derived),
+            _ => None,
+        }
+    }
+
+    fn relationship(self) -> &'static str {
+        match self {
+            Self::Opened | Self::Derived => "parentOf",
+            Self::Placed | Self::Removed => "componentOf",
+        }
+    }
+}
+
+/// The `relationship` of the ingredient assertion a hashed URI names in a
+/// manifest other than `manifest_label`, once the URI's hash matches that
+/// assertion's JUMBF content.
+fn foreign_ingredient_relationship(
+    reference: &Value,
+    claim: &Value,
+    store: StoreContext<'_>,
+    manifest_label: &str,
+    _profile: EngineProfile,
+    results: &mut ValidationResults,
+) -> Option<String> {
+    let url = reference.get("url").and_then(Value::as_text)?;
+    let (target_manifest, label) = url
+        .strip_prefix("self#jumbf=/c2pa/")?
+        .split_once("/c2pa.assertions/")?;
+    if target_manifest == manifest_label
+        || !label.starts_with("c2pa.ingredient")
+        || label.contains('/')
+    {
+        return None;
+    }
+    let manifest = store
+        .manifests
+        .iter()
+        .find(|manifest| manifest.label == target_manifest)?;
+    // A label that occurs twice cannot be resolved unambiguously.
+    fn unique<'a>(entries: &[(String, &'a [u8])], label: &str) -> Option<&'a [u8]> {
+        let mut matches = entries.iter().filter(|(name, _)| name == label);
+        let (_, bytes) = matches.next()?;
+        matches.next().is_none().then_some(*bytes)
+    }
+    let content = unique(&manifest.assertion_jumbf, label)?;
+    let expected = reference.get("hash").and_then(Value::as_bytes)?;
+    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            url.to_string(),
+            "nested ingredient reference has no hash algorithm".into(),
+        );
+        return None;
+    };
+    if !is_allowed_hash_algorithm(algorithm) {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            url.to_string(),
+            format!("nested ingredient reference uses unsupported hash algorithm '{algorithm}'"),
+        );
+        return None;
+    }
+    if hash_bytes(algorithm, content)?.as_slice() != expected {
+        return None;
+    }
+    decode(unique(&manifest.assertions, label)?)
+        .ok()?
+        .get("relationship")
+        .and_then(Value::as_text)
+        .map(str::to_string)
+}
+
+fn nested_assertion_reference_label<'a>(
+    reference: &'a Value,
+    claim: &Value,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    manifest_label: &str,
+    _profile: EngineProfile,
+    results: &mut ValidationResults,
+) -> Option<&'a str> {
+    let url = reference.get("url").and_then(Value::as_text)?;
+    let label = assertion_label_for_manifest(url, manifest_label)?;
+    let assertion = claim_refs.indexed(label)?;
+    let content = assertion.jumbf?;
+    let expected = reference.get("hash").and_then(Value::as_bytes)?;
+    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            url.to_string(),
+            "nested assertion reference has no hash algorithm".into(),
+        );
+        return None;
+    };
+    if !is_allowed_hash_algorithm(algorithm) {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            url.to_string(),
+            format!("nested assertion reference uses unsupported hash algorithm '{algorithm}'"),
+        );
+        return None;
+    }
+    hash_bytes(algorithm, content)
+        .is_some_and(|actual| actual.as_slice() == expected)
+        .then_some(label)
+}
+
+fn verify_ingredient_shapes(
+    manifest: &ParsedManifest<'_>,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    results: &mut ValidationResults,
+) {
+    for reference in &claim_refs.references {
+        let Some(label) = reference
+            .label
+            .filter(|label| label.starts_with("c2pa.ingredient"))
+        else {
+            continue;
+        };
+        let Some(ingredient) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+        else {
+            continue;
+        };
+        if let Some(error) = assertion_semantics::ingredient_shape_error(ingredient) {
+            results.push_failure(
+                ASSERTION_INGREDIENT_MALFORMED,
+                format!(
+                    "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
+                    manifest.label
+                ),
+                error,
+            );
+        }
+    }
+}
+
+fn verify_alternative_content(
+    manifest: &ParsedManifest<'_>,
+    claim: &Value,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    results: &mut ValidationResults,
+) {
+    let representations: Vec<(&str, &Value)> = claim_refs
+        .references
+        .iter()
+        .filter_map(|reference| {
+            let label = reference
+                .label
+                .filter(|label| label.starts_with("c2pa.alternative-content-representation"))?;
+            let assertion = claim_refs.indexed(label)?.decoded.as_ref()?;
+            (assertion.get("type").and_then(Value::as_text)
+                == Some("exif.originalPreservationImage"))
+            .then_some((label, assertion))
+        })
+        .collect();
+    if representations.is_empty() {
+        return;
+    }
+    let multi_asset_part_count = claim_refs.references.iter().find_map(|reference| {
+        let label = reference
+            .label
+            .filter(|label| label.starts_with("c2pa.hash.multi-asset"))?;
+        match claim_refs.indexed(label)?.decoded.as_ref()?.get("parts")? {
+            Value::Array(parts) => Some(parts.len()),
+            _ => None,
+        }
+    });
+    for (label, assertion) in &representations {
+        let url = format!(
+            "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
+            manifest.label
+        );
+        if representations.len() > 1 {
+            results.push_failure(
+                ASSERTION_ALTERNATIVE_CONTENT_MALFORMED,
+                url,
+                "manifest contains more than one original preservation representation".into(),
+            );
+            continue;
+        }
+        let Some(parameters) = assertion.get("parameters") else {
+            results.push_failure(
+                ASSERTION_ALTERNATIVE_CONTENT_MALFORMED,
+                url,
+                "alternative content representation has no parameters".into(),
+            );
+            continue;
+        };
+        if let Some(error) =
+            assertion_semantics::alternative_content_shape_error(parameters, multi_asset_part_count)
+        {
+            results.push_failure(ASSERTION_ALTERNATIVE_CONTENT_MALFORMED, url, error);
+            continue;
+        }
+        if let Some(embedded) = parameters.get("embeddedOriginalPreservationImage") {
+            let target = embedded
+                .get("url")
+                .and_then(Value::as_text)
+                .and_then(|target| assertion_label_for_manifest(target, &manifest.label))
+                .and_then(|target| claim_refs.indexed(target));
+            let Some(content) = target.and_then(|assertion| assertion.jumbf) else {
+                results.push_failure(
+                    ASSERTION_ALTERNATIVE_CONTENT_MALFORMED,
+                    url,
+                    "embedded representation does not resolve inside the manifest".into(),
+                );
+                continue;
+            };
+            let expected = embedded.get("hash").and_then(Value::as_bytes);
+            let Some(algorithm) = resolved_hash_algorithm(embedded, claim) else {
+                results.push_failure(
+                    ALGORITHM_UNSUPPORTED,
+                    url,
+                    "embedded representation has no hash algorithm".into(),
+                );
+                continue;
+            };
+            if !is_allowed_hash_algorithm(algorithm) {
+                results.push_failure(
+                    ALGORITHM_UNSUPPORTED,
+                    url,
+                    format!(
+                        "embedded representation uses unsupported hash algorithm '{algorithm}'"
+                    ),
+                );
+                continue;
+            }
+            let actual = hash_bytes(algorithm, content);
+            if !matches!((actual, expected), (Some(actual), Some(expected)) if actual.as_slice() == expected)
+            {
+                results.push_failure(
+                    ASSERTION_ALTERNATIVE_CONTENT_HASH_MISMATCH,
+                    url,
+                    "embedded representation hash does not match".into(),
+                );
+                continue;
+            }
+        }
+        results.push_success(
+            ASSERTION_ALTERNATIVE_CONTENT_MATCH,
+            url,
+            "alternative content representation validated".into(),
         );
     }
 }
@@ -3145,7 +4905,7 @@ impl<'a> IngredientManifestDigestCache<'a> {
                 .store
                 .manifest_hashes
                 .get(&manifest.label)
-                .is_some_and(|digest| digest.as_slice() == expected);
+                .is_some_and(|digests| digests.matches(0, &digests.expanded_sha256, expected));
         }
         let digest = self
             .digests
@@ -3155,7 +4915,10 @@ impl<'a> IngredientManifestDigestCache<'a> {
                 2 => Sha512::digest(manifest.manifest_jumbf).to_vec(),
                 _ => unreachable!("algorithm index prevalidated"),
             });
-        digest.as_slice() == expected
+        self.store
+            .manifest_hashes
+            .get(&manifest.label)
+            .is_some_and(|digests| digests.matches(algorithm_index, digest, expected))
     }
 }
 
@@ -3166,10 +4929,12 @@ impl<'a> IngredientManifestDigestCache<'a> {
 /// the parent claim redacts assertions from that child, the full manifest must
 /// differ and `claimSignature` becomes the required fallback binding.
 fn verify_ingredient_references<'a>(
+    manifest_label: &str,
     claim_refs: &ClaimAssertionRefs<'_>,
     claim: &Value,
     digest_cache: &mut IngredientManifestDigestCache<'a>,
     sig_url: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
     for reference in &claim_refs.references {
@@ -3185,14 +4950,33 @@ fn verify_ingredient_references<'a>(
         else {
             continue;
         };
-        let Some(active_manifest) = ingredient.get("activeManifest") else {
+        let active_manifest = ingredient.get("activeManifest");
+        let legacy_manifest = ingredient.get("c2pa_manifest");
+        let Some(manifest_reference) = active_manifest.or(legacy_manifest) else {
+            // C2PA 2.4, "Performing recursive validation": an ingredient with
+            // no `activeManifest` (or v1/v2 `c2pa_manifest`) link has no
+            // provenance to validate, which is recorded informationally unless
+            // the ingredient is only an input to this manifest.
+            if ingredient.get("relationship").and_then(Value::as_text) != Some("inputTo") {
+                results.push_informational(
+                    INGREDIENT_UNKNOWN_PROVENANCE,
+                    format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{assertion_label}"),
+                    format!("ingredient '{assertion_label}' has no C2PA manifest"),
+                );
+            }
             continue;
         };
+        let supports_signature_fallback = active_manifest.is_some();
+        // Only the legacy `c2pa_manifest` link may carry the C2PA 1.0 claim
+        // hash, and only the default posture reads it (1.x content rule).
+        let accept_legacy_claim_hash = active_manifest.is_none() && is_generous(profile);
         if verify_ingredient_manifest_reference(
-            active_manifest,
+            manifest_reference,
             claim,
             digest_cache,
             sig_url,
+            supports_signature_fallback,
+            accept_legacy_claim_hash,
             results,
         ) {
             if let Some(claim_signature) = ingredient.get("claimSignature") {
@@ -3221,6 +5005,8 @@ fn verify_ingredient_manifest_reference<'a>(
     claim: &Value,
     digest_cache: &mut IngredientManifestDigestCache<'a>,
     fallback_url: &str,
+    allow_signature_fallback: bool,
+    accept_legacy_claim_hash: bool,
     results: &mut ValidationResults,
 ) -> bool {
     let url = reference
@@ -3275,8 +5061,25 @@ fn verify_ingredient_manifest_reference<'a>(
         );
         return false;
     }
-    if claim_redacts_manifest(claim, label) {
+    if allow_signature_fallback && claim_redacts_manifest(claim, label) {
         return true;
+    }
+    // C2PA 1.0 hashed the ingredient link over the ingredient's claim bytes.
+    // Those bytes are authenticated by the ingredient's own claim signature,
+    // which recursive ingredient validation checks, so the weaker link is
+    // accepted and reported, never upgraded to `ingredient.manifest.validated`.
+    if accept_legacy_claim_hash
+        && actual_manifest
+            .claim_cbor
+            .and_then(|claim_bytes| hash_bytes(algorithm, claim_bytes))
+            .is_some_and(|actual| expected == Some(actual.as_slice()))
+    {
+        results.push_informational(
+            INGREDIENT_LEGACY_CLAIM_HASH,
+            url.to_string(),
+            "ingredient link matches the C2PA 1.0 claim hash, not the manifest-box hash".into(),
+        );
+        return false;
     }
     results.push_failure(
         INGREDIENT_MANIFEST_MISMATCH,
@@ -3286,16 +5089,12 @@ fn verify_ingredient_manifest_reference<'a>(
     false
 }
 
+/// Whether a redaction the claim lawfully declared removed an assertion from
+/// `manifest_label`, which selects the claim-signature hash validation method
+/// for that ingredient. Unlawful declarations do not count: see
+/// [`redaction::redacts_manifest`].
 fn claim_redacts_manifest(claim: &Value, manifest_label: &str) -> bool {
-    let Some(Value::Array(references)) = claim.get("redacted_assertions") else {
-        return false;
-    };
-    references.iter().any(|reference| {
-        reference
-            .as_text()
-            .and_then(extract_manifest_label)
-            .is_some_and(|label| label == manifest_label)
-    })
+    redaction::redacts_manifest(claim, manifest_label)
 }
 
 fn verify_ingredient_signature_reference(
@@ -3389,6 +5188,37 @@ fn extract_manifest_label(url: &str) -> Option<&str> {
     (!label.is_empty()).then_some(label)
 }
 
+/// Every manifest label the store's ingredient assertions point at.
+///
+/// Used by VAL-TIME-0008 to decide which manifests sit in an ingredient
+/// position: a time-stamp manifest is never itself an ingredient, while a
+/// time-stamp manifest reached through an ingredient always is.
+fn ingredient_manifest_labels(
+    manifests: &[ParsedManifest<'_>],
+) -> std::collections::HashSet<String> {
+    let mut labels = std::collections::HashSet::new();
+    for manifest in manifests {
+        for (assertion_label, payload) in &manifest.assertions {
+            if !assertion_label.starts_with("c2pa.ingredient") {
+                continue;
+            }
+            let Ok(ingredient) = decode(payload) else {
+                continue;
+            };
+            for field in ["activeManifest", "c2pa_manifest"] {
+                let url = ingredient
+                    .get(field)
+                    .and_then(|reference| reference.get("url"))
+                    .and_then(Value::as_text);
+                if let Some(label) = url.and_then(extract_manifest_label) {
+                    labels.insert(label.to_string());
+                }
+            }
+        }
+    }
+    labels
+}
+
 /// The claim fields that carry hashed-URI assertion references for a claim
 /// generation.
 fn ref_fields(generation: ClaimGeneration) -> &'static [&'static str] {
@@ -3427,6 +5257,7 @@ fn verify_assertion_bindings(
     claim_refs: &mut ClaimAssertionRefs<'_>,
     generation: ClaimGeneration,
     label: &str,
+    _profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
     let references = &claim_refs.references;
@@ -3444,9 +5275,9 @@ fn verify_assertion_bindings(
         };
         let Some(assertion_label) = resolved_label else {
             results.push_failure(
-                HASHED_URI_MISSING,
+                ASSERTION_OUTSIDE_MANIFEST,
                 url.to_string(),
-                "assertion reference does not resolve inside the current manifest".into(),
+                "assertion reference names a location outside the current manifest".into(),
             );
             continue;
         };
@@ -3460,6 +5291,14 @@ fn verify_assertion_bindings(
             );
             continue;
         };
+        if !is_allowed_hash_algorithm(algorithm) {
+            results.push_failure(
+                ALGORITHM_UNSUPPORTED,
+                assertion_url,
+                format!("hashed-URI reference uses unsupported hash algorithm '{algorithm}'"),
+            );
+            continue;
+        }
         let content_matches = match (
             bmff_algorithm_index(algorithm),
             assertions.get_mut(assertion_label),
@@ -3496,7 +5335,7 @@ fn verify_assertion_bindings(
             );
         } else if content.is_none() {
             results.push_failure(
-                HASHED_URI_MISSING,
+                ASSERTION_MISSING,
                 assertion_url,
                 format!("referenced assertion '{assertion_label}' not found in manifest"),
             );
@@ -3532,7 +5371,7 @@ const COMPOUND_CONTENT_LABEL: &str = "c2pa.compound.content";
 fn verify_compound_content(
     claim_refs: &ClaimAssertionRefs<'_>,
     label: &str,
-    manifest_hashes: &std::collections::HashMap<String, Vec<u8>>,
+    manifest_hashes: &std::collections::HashMap<String, ManifestDigests>,
     results: &mut ValidationResults,
 ) {
     let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/{COMPOUND_CONTENT_LABEL}");
@@ -3714,7 +5553,7 @@ fn verify_compound_content(
         }
         let child_ok = extract_manifest_label(child_url)
             .and_then(|cl| manifest_hashes.get(cl))
-            .is_some_and(|computed| computed.as_slice() == child_hash);
+            .is_some_and(|digests| digests.matches(0, &digests.expanded_sha256, child_hash));
         if !child_ok {
             results.push_failure(
                 ASSERTION_COMPOUND_CONTENT_MISMATCH,
@@ -3734,6 +5573,151 @@ fn verify_compound_content(
             components.len()
         ),
     );
+}
+
+fn parent_reference_validated(
+    results: &ValidationResults,
+    success_start: usize,
+    parent_label: &str,
+) -> bool {
+    results.success[success_start..].iter().any(|status| {
+        (status.code == INGREDIENT_MANIFEST_VALIDATED
+            && ingredient_manifest_label(&status.url, None) == Some(parent_label))
+            || (status.code == INGREDIENT_CLAIM_SIGNATURE_VALIDATED
+                && ingredient_manifest_label(&status.url, Some("/c2pa.signature"))
+                    == Some(parent_label))
+    })
+}
+
+/// The hard binding an update manifest is validated against: the one declared
+/// by the first standard manifest in its `parentOf` chain.
+///
+/// C2PA 2.4 Validation, "Validate the Asset's Content": "If the active manifest
+/// is an update manifest, the hard binding shall be found in the `parentOf`
+/// ingredient's manifest, or if that manifest is also an update manifest, by
+/// following the chain of `parentOf` ingredients to the first standard
+/// manifest." A CAWG identity inside an update manifest references that
+/// binding, because the update manifest is forbidden to carry one of its own.
+///
+/// `None` for a standard manifest, and for any update manifest whose chain does
+/// not reach exactly one hard binding; the chain's own defects are reported by
+/// [`verify_claim_structure`] and [`verify_update_hard_binding`].
+fn inherited_hard_binding(
+    active: &ParsedManifest<'_>,
+    store: StoreContext<'_>,
+) -> Option<(String, Value, Option<String>)> {
+    if active.kind() != ManifestKind::Update {
+        return None;
+    }
+    let standard = update_manifest::resolve_standard(active, store.manifests).ok()?;
+    let claim = standard.claim_cbor.and_then(|bytes| decode(bytes).ok())?;
+    let generation = versions::claim_generation(standard, &claim);
+    let claim_refs = ClaimAssertionRefs::build(standard, &claim, generation);
+    let binding = claim_refs.binding_plan(false).primary()?;
+    let claim_alg = claim
+        .get("alg")
+        .and_then(Value::as_text)
+        .map(str::to_string);
+    Some((standard.label.clone(), binding.value.clone(), claim_alg))
+}
+
+/// Validate an update manifest's inherited hard binding.
+///
+/// The active update authenticates its `parentOf` manifest before this runs.
+/// The parent standard claim then authenticates its own hard-binding assertion,
+/// whose exclusions are evaluated against the current asset rendition.
+#[allow(clippy::too_many_arguments)]
+fn verify_update_hard_binding(
+    active: &ParsedManifest<'_>,
+    store: StoreContext<'_>,
+    data: &[u8],
+    format: AssetFormat,
+    fragments: &[&[u8]],
+    prehashed_digest: Option<&[u8]>,
+    profile: EngineProfile,
+    results: &mut ValidationResults,
+) {
+    let Ok(direct_parent) = update_manifest::resolve_parent(active, store.manifests) else {
+        return;
+    };
+    if !parent_reference_validated(results, 0, &direct_parent.label) {
+        return;
+    }
+    let Ok(standard) = update_manifest::resolve_standard(active, store.manifests) else {
+        return;
+    };
+    let mut current = active;
+    let mut digest_cache = IngredientManifestDigestCache::new(store);
+    while let Ok(parent) = update_manifest::resolve_parent(current, store.manifests) {
+        if parent.label == standard.label {
+            break;
+        }
+        let Some(parent_claim) = parent.claim_cbor.and_then(|bytes| decode(bytes).ok()) else {
+            return;
+        };
+        let parent_generation = versions::claim_generation(parent, &parent_claim);
+        let mut parent_refs = ClaimAssertionRefs::build(parent, &parent_claim, parent_generation);
+        let failures_before = results.failure.len();
+        let successes_before = results.success.len();
+        verify_assertion_bindings(
+            &parent_claim,
+            &mut parent_refs,
+            parent_generation,
+            &parent.label,
+            profile,
+            results,
+        );
+        verify_ingredient_references(
+            &parent.label,
+            &parent_refs,
+            &parent_claim,
+            &mut digest_cache,
+            &format!("self#jumbf=/c2pa/{}/c2pa.signature", parent.label),
+            profile,
+            results,
+        );
+        let Ok(next_parent) = update_manifest::resolve_parent(parent, store.manifests) else {
+            return;
+        };
+        if results.failure.len() != failures_before
+            || !parent_reference_validated(results, successes_before, &next_parent.label)
+        {
+            return;
+        }
+        current = parent;
+    }
+    let Some(claim) = standard.claim_cbor.and_then(|bytes| decode(bytes).ok()) else {
+        return;
+    };
+    let generation = versions::claim_generation(standard, &claim);
+    let mut claim_refs = ClaimAssertionRefs::build(standard, &claim, generation);
+    verify_assertion_bindings(
+        &claim,
+        &mut claim_refs,
+        generation,
+        &standard.label,
+        profile,
+        results,
+    );
+    if let Some(digest) = prehashed_digest {
+        let _ =
+            verify_prehashed_hard_binding(&claim, &claim_refs, digest, &standard.label, results);
+    } else {
+        // The active manifest is an update, so the store the standard claim
+        // signed its exclusions against has since grown (C2PA 2.4, Validating
+        // a data hash).
+        let _ = verify_data_hash(
+            &claim,
+            &claim_refs,
+            data,
+            format,
+            fragments,
+            update_manifest::StoreRendition::WithUpdates,
+            &standard.label,
+            profile,
+            results,
+        );
+    }
 }
 
 /// Confirm that a caller-computed digest is the active claim's sole supported
@@ -3870,13 +5854,16 @@ fn is_primary_binding_match(label: &str, status: &StatusCode) -> bool {
 /// fallback, never a peer hard binding: it is evaluated only after an ordinary
 /// byte mismatch. Structural, malformed, missing, and unsupported failures
 /// remain attached to the primary and do not activate the fallback.
+#[allow(clippy::too_many_arguments)]
 fn verify_data_hash<'index, 'claim>(
     claim: &Value,
     claim_refs: &'index ClaimAssertionRefs<'claim>,
     data: &[u8],
     format: AssetFormat,
     fragments: &[&[u8]],
+    rendition: update_manifest::StoreRendition,
     label: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) -> Option<OperativeBinding<'index, 'claim>> {
     let plan = claim_refs.binding_plan(format == AssetFormat::C2paStore);
@@ -3890,7 +5877,9 @@ fn verify_data_hash<'index, 'claim>(
         || results.has_failure(HASHED_URI_MISSING);
     let failure_start = results.failure.len();
     let success_start = results.success.len();
-    verify_primary_hard_binding(claim, claim_refs, data, format, fragments, label, results);
+    verify_primary_hard_binding(
+        claim, claim_refs, data, format, fragments, rendition, label, profile, results,
+    );
     let added_failures = &results.failure[failure_start..];
     if !binding_compromised
         && added_failures.is_empty()
@@ -3918,7 +5907,9 @@ fn verify_data_hash<'index, 'claim>(
     // usable multi-asset fallback applies. All earlier failures stay.
     results.failure.truncate(failure_start);
     let success_start = results.success.len();
-    verify_multi_asset(claim, claim_refs, cbor, data, format, label, results);
+    verify_multi_asset(
+        claim, claim_refs, cbor, data, format, label, profile, results,
+    );
     let fallback_matched = results.failure.len() == failure_start
         && results.success[success_start..]
             .iter()
@@ -3930,13 +5921,16 @@ fn verify_data_hash<'index, 'claim>(
     fallback_matched.then_some(OperativeBinding::MultiAsset(fallback))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_primary_hard_binding(
     claim: &Value,
     claim_refs: &ClaimAssertionRefs<'_>,
     data: &[u8],
     format: AssetFormat,
     fragments: &[&[u8]],
+    rendition: update_manifest::StoreRendition,
     label: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
     // A tampered assertion breaks the claim's hashed-URI binding to it. The
@@ -3970,6 +5964,7 @@ fn verify_primary_hard_binding(
                     data,
                     binding_compromised,
                     label,
+                    profile,
                     results,
                 );
             }
@@ -3977,7 +5972,7 @@ fn verify_primary_hard_binding(
         }
         "c2pa.hash.collection.data" => {
             if let Some(cbor) = indexed.payload {
-                verify_collection_hash(cbor, data, binding_compromised, label, results);
+                verify_collection_hash(cbor, claim, data, binding_compromised, label, results);
             }
             return;
         }
@@ -4033,6 +6028,13 @@ fn verify_primary_hard_binding(
     // assertion also carries a top-level `hash`, that signed value must match
     // before any merkle success can be emitted.
     let merkle_present = is_bmff && hash_data.get("merkle").is_some();
+    if is_bmff && bmff_has_additional_exclusions(&bmff_exclusions, merkle_present) {
+        results.push_informational(
+            ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
+            url.clone(),
+            "BMFF hash assertion contains optional or additional exclusions".into(),
+        );
+    }
     if !merkle_present && expected.is_none() {
         let code = if is_bmff {
             ASSERTION_BMFF_HASH_MALFORMED
@@ -4086,41 +6088,109 @@ fn verify_primary_hard_binding(
     let actual: Option<Vec<u8>> = if is_bmff {
         crate::c2pa_formats::bmff_hash_with_exclusions(data, alg, &bmff_exclusions).ok()
     } else {
-        // Reject pathological exclusion lists before parsing or hashing any
-        // ranges. This is a resource-exhaustion guard, not a policy limit.
-        if let Some(Value::Array(items)) = hash_data.get("exclusions") {
-            if items.len() > MAX_DATA_HASH_EXCLUSIONS {
+        let exclusions = match exclusions::parse_data(hash_data.get("exclusions"), data.len()) {
+            Ok(exclusions) => exclusions,
+            Err(exclusions::RangeError::Malformed) => {
                 results.push_failure(
-                    mismatch_code,
+                    ASSERTION_DATA_HASH_MALFORMED,
                     url,
-                    format!(
-                        "exclusion list exceeds the verifier cap ({} > {MAX_DATA_HASH_EXCLUSIONS}); manifest rejected",
-                        items.len()
-                    ),
+                    "data-hash exclusions are malformed, unsorted, or overlapping".into(),
                 );
                 return;
             }
-        }
-        let mut exclusions = parse_exclusions(hash_data.get("exclusions"));
+            Err(exclusions::RangeError::Mismatch) => {
+                results.push_failure(
+                    ASSERTION_DATA_HASH_MISMATCH,
+                    url,
+                    "data-hash exclusion extends beyond the asset".into(),
+                );
+                return;
+            }
+        };
+        let carrier = crate::c2pa_formats::compute_data_hash_exclusions(format, data).ok();
+        // C2PA 2.4, Validating a data hash: an update manifest grows the store
+        // the standard claim signed around, so the store exclusion takes the
+        // store's current length and later exclusions shift by the difference.
+        let exclusions = match rendition {
+            update_manifest::StoreRendition::AsSigned => exclusions,
+            update_manifest::StoreRendition::WithUpdates => {
+                let adjusted = carrier.as_deref().and_then(|carrier| {
+                    update_manifest::adjust_exclusions_for_updates(&exclusions, carrier, data.len())
+                });
+                let Some(adjusted) = adjusted else {
+                    results.push_failure(
+                        ASSERTION_DATA_HASH_MISMATCH,
+                        url,
+                        "data-hash exclusions cannot be adjusted for the updated manifest store"
+                            .into(),
+                    );
+                    return;
+                };
+                adjusted
+            }
+        };
         if !exclusions.is_empty() {
-            if let Ok(spans) = crate::c2pa_formats::compute_data_hash_exclusions(format, data) {
-                if let [carrier] = spans.as_slice() {
-                    let carrier_end = carrier.start.checked_add(carrier.length);
-                    let all_inside_carrier = carrier_end.is_some_and(|carrier_end| {
-                        exclusions.iter().all(|(start, length)| {
-                            start
-                                .checked_add(*length)
-                                .is_some_and(|end| *start >= carrier.start && end <= carrier_end)
-                        })
-                    });
-                    if all_inside_carrier {
-                        exclusions.clear();
-                        exclusions.push((carrier.start, carrier.length));
+            if let Some(carrier) = carrier.as_deref() {
+                match inspect_data_hash_exclusions(format, data, &exclusions, carrier) {
+                    Ok(has_additional) => {
+                        if has_additional {
+                            results.push_informational(
+                                ASSERTION_DATA_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
+                                url.clone(),
+                                "data-hash assertion excludes bytes outside the manifest carrier"
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(why) => {
+                        results.push_failure(ASSERTION_DATA_HASH_MISMATCH, url, why);
+                        return;
                     }
                 }
             }
         }
-        hash_with_exclusions(alg, data, &exclusions)
+        if format == AssetFormat::TextUnstructured {
+            let wrappers = match crate::c2pa_formats::unstructured_text_wrapper_spans(data) {
+                Ok(wrappers) => wrappers,
+                Err(_) => {
+                    results.push_failure(
+                        ASSERTION_DATA_HASH_MALFORMED,
+                        url,
+                        "unstructured text is not valid UTF-8".into(),
+                    );
+                    return;
+                }
+            };
+            let matching_wrappers = wrappers
+                .iter()
+                .filter(|wrapper| exclusions.contains(&(wrapper.start, wrapper.length)))
+                .count();
+            if matching_wrappers == 0 {
+                results.push_failure(
+                    ASSERTION_DATA_HASH_MALFORMED,
+                    url,
+                    "data-hash exclusions do not exactly match a text manifest wrapper".into(),
+                );
+                return;
+            }
+            if matching_wrappers > 1 {
+                results.push_failure(
+                    "manifest.text.multipleWrappers",
+                    url,
+                    "more than one text manifest wrapper matches the data-hash exclusions".into(),
+                );
+                return;
+            }
+            match hash_normalized_unstructured_text(alg, data, &exclusions) {
+                Ok(hash) => hash,
+                Err(detail) => {
+                    results.push_failure(ASSERTION_DATA_HASH_MALFORMED, url, detail.into());
+                    return;
+                }
+            }
+        } else {
+            hash_with_exclusions(alg, data, &exclusions)
+        }
     };
     let matched = matches!((&actual, expected), (Some(a), Some(e)) if a.as_slice() == e);
     if matched {
@@ -4133,6 +6203,84 @@ fn verify_primary_hard_binding(
     }
     // The sole operative hard binding did not match.
     results.push_failure(mismatch_code, url, "asset hash mismatch".into());
+}
+
+/// Inspect the declared `c2pa.hash.data` exclusion ranges against the asset's
+/// real manifest carrier.
+///
+/// C2PA 2.4 Validation, "Validating a data hash": the exclusion range holding
+/// the C2PA Manifest Store "consists of only the C2PA Manifest Store and any
+/// appropriate padding (e.g., zero'd data)"; anything else rejects the
+/// manifest with `assertion.dataHash.mismatch`. Without this check a signer,
+/// or anyone who can rewrite the file afterwards, can park arbitrary bytes
+/// inside the signed exclusion and still present a matching hard binding.
+///
+/// "Hashing of JPEG 1 files" adds an exact-length rule for that container,
+/// because the `APP11` segment lengths live inside the exclusion: the total
+/// excluded length must equal the total length of the C2PA `APP11` segments.
+///
+/// Ranges that do not touch the carrier are the asset-metadata case and only
+/// raise the informational `assertion.dataHash.additionalExclusionsPresent`,
+/// reported through the `Ok(true)` result.
+fn inspect_data_hash_exclusions(
+    format: AssetFormat,
+    data: &[u8],
+    exclusions: &[(usize, usize)],
+    carrier: &[crate::c2pa_formats::DataHashExclusion],
+) -> Result<bool, String> {
+    let mut carrier_ranges: Vec<(usize, usize)> = carrier
+        .iter()
+        .filter_map(|span| Some((span.start, span.start.checked_add(span.length)?)))
+        .collect();
+    carrier_ranges.sort_unstable();
+    let mut has_additional = false;
+    let mut excluded_carrier_bytes = 0usize;
+    // Every byte of a carrier-overlapping exclusion that the store itself does
+    // not occupy has to be zeroed padding.
+    let padding_only = |from: usize, to: usize| -> Result<(), String> {
+        let Some(window) = data.get(from..to) else {
+            return Ok(());
+        };
+        match window.iter().position(|byte| *byte != 0) {
+            Some(offset) => Err(format!(
+                "data-hash exclusion covering the manifest store contains non-padding data at offset {}",
+                from + offset
+            )),
+            None => Ok(()),
+        }
+    };
+    for &(start, length) in exclusions {
+        let Some(end) = start.checked_add(length) else {
+            return Err("data-hash exclusion range overflows the asset".into());
+        };
+        if !carrier_ranges
+            .iter()
+            .any(|&(carrier_start, carrier_end)| carrier_start < end && start < carrier_end)
+        {
+            has_additional = true;
+            continue;
+        }
+        excluded_carrier_bytes = excluded_carrier_bytes.saturating_add(length);
+        let mut cursor = start;
+        for &(carrier_start, carrier_end) in &carrier_ranges {
+            if carrier_end <= cursor || carrier_start >= end {
+                continue;
+            }
+            padding_only(cursor, carrier_start.min(end))?;
+            cursor = cursor.max(carrier_end);
+        }
+        padding_only(cursor, end)?;
+    }
+    let carrier_bytes: usize = carrier.iter().map(|span| span.length).sum();
+    if format == AssetFormat::Jpeg
+        && excluded_carrier_bytes > 0
+        && excluded_carrier_bytes != carrier_bytes
+    {
+        return Err(format!(
+            "data-hash exclusion length {excluded_carrier_bytes} does not equal the {carrier_bytes}-byte total of the C2PA APP11 segments"
+        ));
+    }
+    Ok(has_additional)
 }
 
 const MAX_BMFF_MERKLE_ENTRIES: usize = 4_096;
@@ -4168,21 +6316,11 @@ fn checked_bmff_merkle_work(
 }
 
 fn bmff_digest_len(alg: &str) -> Option<usize> {
-    match alg {
-        "sha256" => Some(32),
-        "sha384" => Some(48),
-        "sha512" => Some(64),
-        _ => None,
-    }
+    content_hash_algorithm(alg).map(ContentHashAlgorithm::digest_len)
 }
 
 fn bmff_algorithm_index(alg: &str) -> Option<usize> {
-    match alg {
-        "sha256" => Some(0),
-        "sha384" => Some(1),
-        "sha512" => Some(2),
-        _ => None,
-    }
+    content_hash_algorithm(alg).map(ContentHashAlgorithm::cache_index)
 }
 
 fn bmff_merkle_row<'a>(
@@ -4498,6 +6636,28 @@ fn verify_bmff_merkle_init(input: BmffMerkleInput<'_, '_>, results: &mut Validat
         );
         return;
     }
+    for entry in entries {
+        let alg = match entry.get("alg") {
+            None => assertion_alg,
+            Some(Value::Text(alg)) => alg.as_str(),
+            Some(_) => {
+                results.push_failure(
+                    ASSERTION_BMFF_HASH_MALFORMED,
+                    url.to_string(),
+                    "merkle alg is not a string".into(),
+                );
+                return;
+            }
+        };
+        if !is_allowed_hash_algorithm(alg) {
+            results.push_failure(
+                ALGORITHM_UNSUPPORTED,
+                url.to_string(),
+                format!("merkle entry uses unsupported hash algorithm '{alg}'"),
+            );
+            return;
+        }
+    }
 
     let monolithic_plans = match preflight_bmff_monolithic_entries(entries, assertion_alg, data) {
         Ok(plans) => plans,
@@ -4645,11 +6805,14 @@ fn verify_bmff_merkle_init(input: BmffMerkleInput<'_, '_>, results: &mut Validat
                 );
             }
             if fragment_trees > 0 {
+                // NEVER the success code: nothing about these trees was
+                // checked, and `assertion.bmffHash.match` asserts the opposite
+                // (PRD 5.9).
                 results.push_informational(
-                    ASSERTION_BMFF_HASH_MATCH,
+                    stream::BMFF_FRAGMENTS_NOT_EVALUATED,
                     url.to_string(),
                     format!(
-                        "{fragment_trees} fragment merkle tree(s) not evaluated: fragment files not provided (use fragmented verification)"
+                        "{fragment_trees} fragment merkle tree(s) not evaluated: fragment files not provided (use stream verification)"
                     ),
                 );
             }
@@ -4915,8 +7078,6 @@ fn verify_bmff_fragments(
     let mut matched = 0usize;
     let mut seen_identities =
         std::collections::HashSet::<(i128, i128, usize)>::with_capacity(fragments.len());
-    let mut last_locations =
-        std::collections::HashMap::<(i128, i128), usize>::with_capacity(fragments.len());
     for (index, fragment) in fragments.iter().enumerate() {
         let boxes = match crate::c2pa_formats::bmff_merkle_boxes(fragment) {
             Ok(boxes) => boxes,
@@ -4974,20 +7135,6 @@ fn verify_bmff_fragments(
                 ),
             );
             return false;
-        }
-        let order_key = (merkle_box.unique_id, merkle_box.local_id);
-        if let Some(previous) = last_locations.insert(order_key, merkle_box.location) {
-            if merkle_box.location <= previous {
-                results.push_failure(
-                    ASSERTION_BMFF_HASH_MISMATCH,
-                    url.to_string(),
-                    format!(
-                        "fragment {index}: non-increasing playback location {} after {previous} for uniqueId={} localId={}",
-                        merkle_box.location, merkle_box.unique_id, merkle_box.local_id
-                    ),
-                );
-                return false;
-            }
         }
         let Some(entry) = tree_index.get(&(merkle_box.unique_id, merkle_box.local_id)) else {
             results.push_failure(
@@ -5129,6 +7276,144 @@ fn merkle_climb(
     Some((idx, h))
 }
 
+fn update_normalized_box_bytes(
+    hasher: &mut Hasher,
+    data: &[u8],
+    mut start: usize,
+    end: usize,
+    spans: &[crate::c2pa_formats::BoxSpan],
+    format: AssetFormat,
+) {
+    if format != AssetFormat::Font {
+        hasher.update(&data[start..end]);
+        return;
+    }
+    for span in spans.iter().filter(|span| span.name == "head") {
+        let zero_start = span.start().saturating_add(8);
+        let zero_end = zero_start.saturating_add(4).min(span.end());
+        if zero_end <= start || zero_start >= end {
+            continue;
+        }
+        let before_end = zero_start.max(start).min(end);
+        if start < before_end {
+            hasher.update(&data[start..before_end]);
+        }
+        let normalized_start = start.max(zero_start);
+        let normalized_end = end.min(zero_end);
+        if normalized_start < normalized_end {
+            hasher.update(&[0; 4][..normalized_end - normalized_start]);
+        }
+        start = normalized_end;
+    }
+    if start < end {
+        hasher.update(&data[start..end]);
+    }
+}
+
+/// The byte ranges an entry's `names` run hashes, plus the logical offset at
+/// which each named box begins within that run.
+///
+/// For contiguous boxes the run is one range from the first box's start to the
+/// last box's end, so any bytes lying between the named boxes are hashed too,
+/// as C2PA 2.4 BoxesHash requires ("This would include any arbitrary bytes
+/// that may be present between boxes"). An Ogg logical bitstream is a box of
+/// interleaved pages, which has no such envelope: those runs hash each page
+/// range in file order and nothing else.
+struct BoxEntryLayout {
+    ranges: Vec<(usize, usize)>,
+    box_offsets: Vec<usize>,
+    total: usize,
+}
+
+impl BoxEntryLayout {
+    fn new(spans: &[crate::c2pa_formats::BoxSpan]) -> Option<Self> {
+        let first = spans.first()?;
+        if spans
+            .iter()
+            .all(crate::c2pa_formats::BoxSpan::is_contiguous)
+        {
+            let start = first.start();
+            let end = spans.last()?.end();
+            return Some(Self {
+                ranges: vec![(start, end)],
+                box_offsets: spans
+                    .iter()
+                    .map(|span| span.start().saturating_sub(start))
+                    .collect(),
+                total: end.saturating_sub(start),
+            });
+        }
+        let mut ranges = Vec::new();
+        let mut box_offsets = Vec::with_capacity(spans.len());
+        let mut total = 0usize;
+        for span in spans {
+            box_offsets.push(total);
+            for &(start, end) in span.ranges() {
+                total = total.checked_add(end.checked_sub(start)?)?;
+                ranges.push((start, end));
+            }
+        }
+        Some(Self {
+            ranges,
+            box_offsets,
+            total,
+        })
+    }
+
+    /// Hash the logical window `[from, to)` of the run by mapping it back onto
+    /// the asset's byte ranges.
+    fn update(
+        &self,
+        hasher: &mut Hasher,
+        data: &[u8],
+        from: usize,
+        to: usize,
+        spans: &[crate::c2pa_formats::BoxSpan],
+        format: AssetFormat,
+    ) {
+        let mut logical = 0usize;
+        for &(start, end) in &self.ranges {
+            let len = end.saturating_sub(start);
+            let range_from = from.max(logical);
+            let range_to = to.min(logical + len);
+            if range_from < range_to {
+                update_normalized_box_bytes(
+                    hasher,
+                    data,
+                    start + (range_from - logical),
+                    start + (range_to - logical),
+                    spans,
+                    format,
+                );
+            }
+            logical += len;
+        }
+    }
+}
+
+fn hash_box_entry(
+    alg: &str,
+    data: &[u8],
+    spans: &[crate::c2pa_formats::BoxSpan],
+    exclusions: &[exclusions::BoxExclusion],
+    format: AssetFormat,
+) -> Option<Vec<u8>> {
+    let mut hasher = Hasher::new(alg)?;
+    let layout = BoxEntryLayout::new(spans)?;
+    let mut cursor = 0usize;
+    for exclusion in exclusions {
+        let start = layout
+            .box_offsets
+            .get(exclusion.box_index)?
+            .checked_add(exclusion.start)?;
+        let end = start.checked_add(exclusion.length)?;
+        layout.update(&mut hasher, data, cursor, start, spans, format);
+        cursor = cursor.max(end);
+    }
+    layout.update(&mut hasher, data, cursor, layout.total, spans, format);
+    Some(hasher.finalize())
+}
+
 /// Verify a general box hash (`c2pa.hash.boxes`, spec 15.12.3).
 ///
 /// The asset is segmented into named spans ([`crate::c2pa_formats::box_spans`]) and
@@ -5140,6 +7425,22 @@ fn merkle_climb(
 /// manifest run (structurally checked; its hash is the placeholder the
 /// two-pass creation cannot make self-consistent). Asset spans left over
 /// after all entries yields `assertion.boxesHash.unknownBox`.
+fn append_box_hash_results(
+    results: &mut ValidationResults,
+    mut outcome: ValidationResults,
+    binding_compromised: bool,
+) {
+    if binding_compromised {
+        outcome
+            .success
+            .retain(|status| status.code != ASSERTION_BOXES_HASH_MATCH);
+    }
+    results.success.extend(outcome.success);
+    results.informational.extend(outcome.informational);
+    results.failure.extend(outcome.failure);
+}
+
+#[allow(clippy::too_many_arguments)] // binding verifier inputs are independent security context
 fn verify_boxes_hash(
     cbor: &[u8],
     claim: &Value,
@@ -5147,6 +7448,7 @@ fn verify_boxes_hash(
     data: &[u8],
     binding_compromised: bool,
     label: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
     let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/c2pa.hash.boxes");
@@ -5163,26 +7465,107 @@ fn verify_boxes_hash(
         return;
     };
     let default_alg = resolved_hash_algorithm(&box_map, claim);
-
-    let spans = match crate::c2pa_formats::box_spans(format, data) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            results.push_informational(
-                ASSERTION_BOXES_HASH_MATCH,
+    for entry in entries {
+        let Some(alg) = entry.get("alg").and_then(Value::as_text).or(default_alg) else {
+            results.push_failure(
+                ALGORITHM_UNSUPPORTED,
                 url,
-                "general box hash not evaluated: segmentation for this container is not implemented".into(),
+                "no hash algorithm in box entry, box map, or claim".into(),
+            );
+            return;
+        };
+        if !is_allowed_hash_algorithm(alg) {
+            results.push_failure(
+                ALGORITHM_UNSUPPORTED,
+                url,
+                format!("box entry uses unsupported hash algorithm '{alg}'"),
             );
             return;
         }
-        Err(e) => {
+    }
+    let spans = match crate::c2pa_formats::box_spans(format, data) {
+        Ok(Some(spans)) => spans,
+        // The general box hash is the claim's sole hard binding, and C2PA 2.4
+        // has no box convention for this container, so the binding cannot be
+        // evaluated at all. Reporting that informationally left the manifest
+        // Valid with no content binding checked; fail closed instead.
+        Ok(None) => {
+            results.push_failure(
+                ASSERTION_BOXES_HASH_UNEVALUATED,
+                url,
+                "general box hash not evaluated: C2PA 2.4 defines no box segmentation for this container".into(),
+            );
+            return;
+        }
+        Err(error) => {
             results.push_failure(
                 ASSERTION_BOXES_HASH_MALFORMED,
                 url,
-                format!("asset segmentation failed: {e}"),
+                format!("asset segmentation failed: {error}"),
             );
             return;
         }
     };
+
+    let mut strict = ValidationResults::default();
+    verify_boxes_hash_with_spans(
+        entries,
+        default_alg,
+        format,
+        data,
+        &spans,
+        label,
+        &mut strict,
+    );
+    let strict_mismatch = !strict.failure.is_empty()
+        && strict
+            .failure
+            .iter()
+            .all(|status| status.code == ASSERTION_BOXES_HASH_MISMATCH);
+    if format == AssetFormat::Jpeg
+        && profile.compliance == ComplianceLevel::CoreSpec
+        && strict_mismatch
+    {
+        if let Ok(compat_spans) =
+            crate::c2pa_formats::jpeg_box_spans_with_overlapping_restart_segments(data)
+        {
+            let mut compatibility = ValidationResults::default();
+            verify_boxes_hash_with_spans(
+                entries,
+                default_alg,
+                format,
+                data,
+                &compat_spans,
+                label,
+                &mut compatibility,
+            );
+            if compatibility.failure.is_empty()
+                && compatibility.has_success(ASSERTION_BOXES_HASH_MATCH)
+            {
+                compatibility.push_informational(
+                    ASSERTION_BOXES_HASH_OVERLAPPING_RESTART_SEGMENTS,
+                    format!("self#jumbf=/c2pa/{label}/c2pa.assertions/c2pa.hash.boxes"),
+                    "JPEG box hashes use the historical overlapping c2pa-rs restart-marker layout"
+                        .into(),
+                );
+                append_box_hash_results(results, compatibility, binding_compromised);
+                return;
+            }
+        }
+    }
+    append_box_hash_results(results, strict, binding_compromised);
+}
+
+fn verify_boxes_hash_with_spans(
+    entries: &[Value],
+    default_alg: Option<&str>,
+    format: AssetFormat,
+    data: &[u8],
+    spans: &[crate::c2pa_formats::BoxSpan],
+    label: &str,
+    results: &mut ValidationResults,
+) {
+    let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/c2pa.hash.boxes");
 
     let mut idx = 0usize;
     let mut mismatched = false;
@@ -5242,10 +7625,45 @@ fn verify_boxes_hash(
         let is_c2pa_run = names == ["C2PA"];
         if is_c2pa_run {
             c2pa_seen = true;
-            continue; // structurally consumed; hash is the creation placeholder
         }
+        // `excluded` takes precedence: its optional exclusions and hash are not
+        // evaluated.
         if excluded {
             continue;
+        }
+        let selected = &spans[first..idx];
+        let box_lengths: Vec<usize> = selected
+            .iter()
+            .map(crate::c2pa_formats::BoxSpan::byte_len)
+            .collect();
+        let box_exclusions = match exclusions::parse_boxes(entry.get("exclusions"), &box_lengths) {
+            Ok(exclusions) => exclusions,
+            Err(exclusions::RangeError::Malformed) => {
+                results.push_failure(
+                    ASSERTION_BOXES_HASH_MALFORMED,
+                    url,
+                    "box exclusions are malformed, unsorted, or use an invalid boxIndex".into(),
+                );
+                return;
+            }
+            Err(exclusions::RangeError::Mismatch) => {
+                results.push_failure(
+                    ASSERTION_BOXES_HASH_MISMATCH,
+                    url,
+                    "box exclusion extends beyond its named box".into(),
+                );
+                return;
+            }
+        };
+        if is_c2pa_run {
+            continue; // structurally consumed; hash is the creation placeholder
+        }
+        if !box_exclusions.is_empty() {
+            results.push_informational(
+                ASSERTION_BOXES_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
+                url.clone(),
+                "box hash entry contains additional byte exclusions".into(),
+            );
         }
         let Some(expected) = entry.get("hash").and_then(Value::as_bytes) else {
             results.push_failure(
@@ -5255,8 +7673,7 @@ fn verify_boxes_hash(
             );
             return;
         };
-        let range = &data[spans[first].start..spans[idx - 1].end];
-        let Some(actual) = hash_bytes(alg, range) else {
+        let Some(actual) = hash_box_entry(alg, data, selected, &box_exclusions, format) else {
             results.push_failure(
                 ALGORITHM_UNSUPPORTED,
                 url,
@@ -5296,17 +7713,15 @@ fn verify_boxes_hash(
         );
         return;
     }
-    if !binding_compromised {
-        results.push_success(
-            ASSERTION_BOXES_HASH_MATCH,
-            url,
-            format!(
-                "all box hashes valid ({} entries over {} boxes)",
-                entries.len(),
-                spans.len()
-            ),
-        );
-    }
+    results.push_success(
+        ASSERTION_BOXES_HASH_MATCH,
+        url,
+        format!(
+            "all box hashes valid ({} entries over {} boxes)",
+            entries.len(),
+            spans.len()
+        ),
+    );
 }
 
 /// Verify a collection data hash (`c2pa.hash.collection.data`, spec 15.12.5).
@@ -5322,6 +7737,7 @@ fn verify_boxes_hash(
 /// requires. A mismatch is always a hard binding failure.
 fn verify_collection_hash(
     cbor: &[u8],
+    claim: &Value,
     data: &[u8],
     binding_compromised: bool,
     label: &str,
@@ -5339,10 +7755,22 @@ fn verify_collection_hash(
         malformed(results, "no uris field".into());
         return;
     };
-    let Some(alg) = map.get("alg").and_then(Value::as_text) else {
-        malformed(results, "no alg field".into());
+    let Some(alg) = resolved_hash_algorithm(&map, claim) else {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            url,
+            "collection hash assertion and claim have no hash algorithm".into(),
+        );
         return;
     };
+    if !is_allowed_hash_algorithm(alg) {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            url,
+            format!("collection hash assertion uses unsupported hash algorithm '{alg}'"),
+        );
+        return;
+    }
 
     let index = match crate::c2pa_formats::zip_index(data) {
         Ok(index) => index,
@@ -5362,35 +7790,6 @@ fn verify_collection_hash(
         malformed(results, "zip_central_directory_hash missing".into());
         return;
     };
-    const MANIFEST_ENTRY: &str = "META-INF/content_credential.c2pa";
-    let actual_members = index.members();
-    let mut actual = std::collections::HashSet::with_capacity(actual_members.len());
-    for member in actual_members {
-        let raw_name = member.raw_name();
-        if raw_name == MANIFEST_ENTRY.as_bytes() || raw_name.ends_with(b"/") {
-            continue;
-        }
-        let name = match std::str::from_utf8(raw_name) {
-            Ok(name) => name,
-            Err(_) => {
-                results.push_failure(
-                    ASSERTION_COLLECTION_HASH_INVALID_URI,
-                    url,
-                    "archive member name is not valid UTF-8".into(),
-                );
-                return;
-            }
-        };
-        let Some(member_uri) = canonical_collection_member_uri(name) else {
-            results.push_failure(
-                ASSERTION_COLLECTION_HASH_INVALID_URI,
-                url,
-                format!("archive member '{name}' cannot be represented as a canonical URI"),
-            );
-            return;
-        };
-        actual.insert(member_uri);
-    }
 
     let mut declared = std::collections::HashSet::with_capacity(uris.len());
 
@@ -5438,18 +7837,6 @@ fn verify_collection_hash(
             );
             return;
         }
-    }
-    if declared != actual {
-        let missing = declared.difference(&actual).cloned().collect::<Vec<_>>();
-        let extra = actual.difference(&declared).cloned().collect::<Vec<_>>();
-        results.push_failure(
-            ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT,
-            url,
-            format!(
-                "collection member set differs from assertion (missing: {missing:?}; extra: {extra:?})"
-            ),
-        );
-        return;
     }
 
     let cd_ok = hash_parts(alg, cd_parts).is_some_and(|h| h.as_slice() == expected_cd);
@@ -5717,6 +8104,7 @@ fn multi_asset_general_box_format(data: &[u8]) -> Option<AssetFormat> {
         .find(|format| matches!(crate::c2pa_formats::box_spans(*format, data), Ok(Some(_))))
 }
 
+#[allow(clippy::too_many_arguments)] // multi-asset validation carries the parent verification context
 fn verify_multi_asset(
     claim: &Value,
     claim_refs: &ClaimAssertionRefs<'_>,
@@ -5724,6 +8112,7 @@ fn verify_multi_asset(
     data: &[u8],
     format: AssetFormat,
     label: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
     let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/c2pa.hash.multi-asset");
@@ -6007,6 +8396,16 @@ fn verify_multi_asset(
             );
             return;
         };
+        if !is_allowed_hash_algorithm(nested_algorithm) {
+            results.push_failure(
+                ALGORITHM_UNSUPPORTED,
+                url,
+                format!(
+                    "part hashAssertion '{part_label}' uses unsupported hash algorithm '{nested_algorithm}'"
+                ),
+            );
+            return;
+        }
         if bmff_digest_len(nested_algorithm) != Some(nested_hash.len()) {
             results.push_failure(
                 ASSERTION_MULTI_ASSET_HASH_MALFORMED,
@@ -6303,6 +8702,7 @@ fn verify_multi_asset(
                     content,
                     false,
                     label,
+                    profile,
                     &mut part_results,
                 );
                 if part_results.failure.is_empty()
@@ -6356,6 +8756,27 @@ fn verify_multi_asset(
         );
     }
 }
+fn bmff_has_additional_exclusions(
+    exclusions: &[crate::c2pa_formats::BmffExclusionMap],
+    merkle_present: bool,
+) -> bool {
+    exclusions.iter().any(|exclusion| {
+        let path = exclusion.xpath.as_str();
+        let c2pa_uuid = path == "/uuid"
+            || (path.starts_with("/uuid[")
+                && ["type=c2pa", "type='c2pa'", "type=\"c2pa\""]
+                    .iter()
+                    .any(|selector| path.contains(selector)));
+        let mandatory = c2pa_uuid
+            || path == "/ftyp"
+            || path.starts_with("/ftyp[")
+            || path == "/mfra"
+            || path.starts_with("/mfra[")
+            || (merkle_present && (path == "/mdat" || path.starts_with("/mdat[")));
+        !mandatory
+    })
+}
+
 /// Normalize every field of a BMFF v2/v3 exclusion map.
 fn bmff_exclusion_maps(
     hash_data: &Value,
@@ -6523,22 +8944,6 @@ fn parse_local_part_exclusions(
     Ok(ranges)
 }
 
-/// Parse the `exclusions` array into sorted `(start, length)` ranges.
-fn parse_exclusions(value: Option<&Value>) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    if let Some(Value::Array(items)) = value {
-        for item in items {
-            let start = item.get("start").and_then(int_usize);
-            let length = item.get("length").and_then(int_usize);
-            if let (Some(start), Some(length)) = (start, length) {
-                ranges.push((start, length));
-            }
-        }
-    }
-    ranges.sort_by_key(|(s, _)| *s);
-    ranges
-}
-
 /// Interpret a CBOR integer as a `usize`, rejecting negatives.
 fn int_usize(value: &Value) -> Option<usize> {
     match value {
@@ -6547,16 +8952,72 @@ fn int_usize(value: &Value) -> Option<usize> {
     }
 }
 
+fn hash_normalized_unstructured_text(
+    alg: &str,
+    data: &[u8],
+    exclusions: &[(usize, usize)],
+) -> Result<Option<Vec<u8>>, &'static str> {
+    if let [(start, length)] = exclusions {
+        let end = start
+            .checked_add(*length)
+            .ok_or("text wrapper exclusion range overflows")?;
+        let remainder = if *start == 0 {
+            &data[end..]
+        } else if end == data.len() {
+            &data[..*start]
+        } else {
+            &[]
+        };
+        if !remainder.is_empty() || data.len() == *length {
+            let text = std::str::from_utf8(remainder)
+                .map_err(|_| "text outside the wrapper is not valid UTF-8")?;
+            if text.chars().eq(text.nfc()) {
+                return Ok(hash_bytes(alg, remainder));
+            }
+            let normalized: String = text.nfc().collect();
+            return Ok(hash_bytes(alg, normalized.as_bytes()));
+        }
+    }
+
+    let excluded_bytes = exclusions
+        .iter()
+        .try_fold(0usize, |total, (_, length)| total.checked_add(*length))
+        .ok_or("aggregate text exclusion length overflows")?;
+    let mut clean = Vec::with_capacity(data.len().saturating_sub(excluded_bytes));
+    let mut position = 0usize;
+    for &(start, length) in exclusions {
+        let end = start
+            .checked_add(length)
+            .ok_or("text wrapper exclusion range overflows")?;
+        clean.extend_from_slice(
+            data.get(position..start)
+                .ok_or("text wrapper exclusions are out of order")?,
+        );
+        position = end;
+    }
+    clean.extend_from_slice(
+        data.get(position..)
+            .ok_or("text wrapper exclusion extends beyond the asset")?,
+    );
+    let text =
+        std::str::from_utf8(&clean).map_err(|_| "text outside the wrapper is not valid UTF-8")?;
+    if text.chars().eq(text.nfc()) {
+        return Ok(hash_bytes(alg, &clean));
+    }
+    let normalized: String = text.nfc().collect();
+    Ok(hash_bytes(alg, normalized.as_bytes()))
+}
+
 /// Hash `data` skipping the given byte ranges, per the C2PA data-hash binding.
 fn hash_with_exclusions(alg: &str, data: &[u8], exclusions: &[(usize, usize)]) -> Option<Vec<u8>> {
     let mut hasher = Hasher::new(alg)?;
     let mut pos = 0usize;
     for &(start, length) in exclusions {
-        let start = start.min(data.len());
+        let end = start.checked_add(length)?;
         if pos < start {
             hasher.update(&data[pos..start]);
         }
-        pos = start.saturating_add(length).min(data.len()).max(pos);
+        pos = end.max(pos);
     }
     if pos < data.len() {
         hasher.update(&data[pos..]);
@@ -6612,7 +9073,46 @@ fn hash_parts(alg: &str, parts: &[&[u8]]) -> Option<Vec<u8>> {
     Some(hasher.finalize())
 }
 
-/// A dynamically-dispatched SHA-2 hasher selected by algorithm name.
+/// The hash algorithms C2PA 2.4 permits for content hashing.
+#[derive(Clone, Copy)]
+enum ContentHashAlgorithm {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl ContentHashAlgorithm {
+    fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+
+    fn cache_index(self) -> usize {
+        match self {
+            Self::Sha256 => 0,
+            Self::Sha384 => 1,
+            Self::Sha512 => 2,
+        }
+    }
+}
+
+fn content_hash_algorithm(algorithm: &str) -> Option<ContentHashAlgorithm> {
+    match algorithm {
+        "sha256" => Some(ContentHashAlgorithm::Sha256),
+        "sha384" => Some(ContentHashAlgorithm::Sha384),
+        "sha512" => Some(ContentHashAlgorithm::Sha512),
+        _ => None,
+    }
+}
+
+fn is_allowed_hash_algorithm(algorithm: &str) -> bool {
+    content_hash_algorithm(algorithm).is_some()
+}
+
+/// A dynamically-dispatched hash implementation selected by algorithm name.
 enum Hasher {
     Sha256(Sha256),
     Sha384(Sha384),
@@ -6621,25 +9121,26 @@ enum Hasher {
 
 impl Hasher {
     fn new(alg: &str) -> Option<Self> {
-        match alg {
-            "sha256" => Some(Hasher::Sha256(Sha256::new())),
-            "sha384" => Some(Hasher::Sha384(Sha384::new())),
-            "sha512" => Some(Hasher::Sha512(Sha512::new())),
-            _ => None,
-        }
+        Some(match content_hash_algorithm(alg)? {
+            ContentHashAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            ContentHashAlgorithm::Sha384 => Self::Sha384(Sha384::new()),
+            ContentHashAlgorithm::Sha512 => Self::Sha512(Sha512::new()),
+        })
     }
+
     fn update(&mut self, bytes: &[u8]) {
         match self {
-            Hasher::Sha256(h) => h.update(bytes),
-            Hasher::Sha384(h) => h.update(bytes),
-            Hasher::Sha512(h) => h.update(bytes),
+            Self::Sha256(hasher) => hasher.update(bytes),
+            Self::Sha384(hasher) => hasher.update(bytes),
+            Self::Sha512(hasher) => hasher.update(bytes),
         }
     }
+
     fn finalize(self) -> Vec<u8> {
         match self {
-            Hasher::Sha256(h) => h.finalize().to_vec(),
-            Hasher::Sha384(h) => h.finalize().to_vec(),
-            Hasher::Sha512(h) => h.finalize().to_vec(),
+            Self::Sha256(hasher) => hasher.finalize().to_vec(),
+            Self::Sha384(hasher) => hasher.finalize().to_vec(),
+            Self::Sha512(hasher) => hasher.finalize().to_vec(),
         }
     }
 }
@@ -6661,7 +9162,8 @@ const REGULAR_INTEGRITY_CAVEATS: &[&str] = &[
     SIGNING_CREDENTIAL_OCSP_REVOKED,
     TIME_STAMP_UNTRUSTED,
     TIME_STAMP_OUTSIDE_VALIDITY,
-    TIME_STAMP_MISSING,
+    program::PROGRAM_REVOCATION_INFORMATION_MISSING,
+    program::PROGRAM_TRUSTED_TIMESTAMP_MISSING,
     // Conformance-mode policy observations: never emitted in the generous posture,
     // and non-invalidating for the construction/integrity axis (they are spec-version
     // policy signals, not integrity failures). Including them here keeps
@@ -6681,7 +9183,7 @@ fn is_generous(profile: EngineProfile) -> bool {
 
 /// Identity-assertion-scoped failure test: `cawg.*` codes report the outcome of
 /// validating a CAWG identity (or ICA credential) assertion, a consumer role the
-/// CAWG Identity 1.2 specification layers ON TOP of the C2PA Manifest Consumer
+/// CAWG Identity 1.3 specification layers ON TOP of the C2PA Manifest Consumer
 /// (§3.1.7/§3.1.9; §9.4.6 gates identity interpretation on manifest validity,
 /// never the reverse). They therefore NEVER break C2PA manifest integrity in
 /// either posture: a tampered identity assertion still sinks the manifest via
@@ -6690,29 +9192,59 @@ fn is_generous(profile: EngineProfile) -> bool {
 /// reported on the assertion itself. Matches the reference implementation,
 /// which tracks CAWG outcomes in a separate status section.
 fn is_identity_assertion_scoped(code: &str) -> bool {
-    code.starts_with("cawg.")
+    code.starts_with("cawg.") || code.starts_with("com.encypher.cawg.")
 }
 
-/// Construction-integrity failure test (posture-independent): a failure code
+/// External-data-scoped failure test. C2PA 2.4 Validation, External Data
+/// Validation, General is explicit that retrieval is optional and that "the
+/// inability to retrieve or validate external data shall not cause a claim to
+/// be rejected", so these codes are reported at their registered severity but
+/// never invalidate a manifest - in either posture, because the spec draws no
+/// posture distinction here.
+///
+/// `assertion.inaccessible` is external data by definition.
+/// `assertion.hashedURI.mismatch` is not: it is also how a claim's own broken
+/// binding to an embedded assertion is reported, which does invalidate. The
+/// external-data emitters mark their statuses with `external_data: true`, and
+/// only a marked status is carved out.
+fn is_external_data_scoped(status: &StatusCode) -> bool {
+    if status.code == ASSERTION_INACCESSIBLE {
+        return true;
+    }
+    status.code == ASSERTION_HASHED_URI_MISMATCH
+        && status
+            .details
+            .as_ref()
+            .and_then(|details| details.get("external_data"))
+            .and_then(Json::as_bool)
+            == Some(true)
+}
+
+/// Construction-integrity failure test (posture-independent): a failure
 /// breaks construction integrity unless it is one of the surfaced, non-
-/// invalidating caveats ([`REGULAR_INTEGRITY_CAVEATS`]) or an identity-
-/// assertion-scoped `cawg.*` code. Single source of truth behind the generous
-/// `validation_state`, the `provenance_verdict.integrity` axis, and the
-/// `validated_under` clearing, so those cannot drift apart.
-fn is_construction_integrity_invalidating(code: &str) -> bool {
-    !REGULAR_INTEGRITY_CAVEATS.contains(&code) && !is_identity_assertion_scoped(code)
+/// invalidating caveats ([`REGULAR_INTEGRITY_CAVEATS`]), an identity-
+/// assertion-scoped `cawg.*` code, or an external-data outcome. Single source
+/// of truth behind the generous `validation_state`, the
+/// `provenance_verdict.integrity` axis, and the `validated_under` clearing, so
+/// those cannot drift apart.
+fn is_construction_integrity_invalidating(status: &StatusCode) -> bool {
+    !REGULAR_INTEGRITY_CAVEATS.contains(&status.code.as_str())
+        && !is_identity_assertion_scoped(&status.code)
+        && !is_external_data_scoped(status)
 }
 
-/// True when failure `code` invalidates manifest *integrity* under `profile`.
+/// True when `status` invalidates manifest *integrity* under `profile`.
 /// Unknown/new failure codes default to invalidating in both postures.
-fn is_integrity_invalidating(code: &str, profile: EngineProfile) -> bool {
+fn is_integrity_invalidating(status: &StatusCode, profile: EngineProfile) -> bool {
     if is_generous(profile) {
-        is_construction_integrity_invalidating(code)
+        is_construction_integrity_invalidating(status)
     } else {
         // Strict: every failure invalidates except the always-non-invalidating
         // untrusted-signer signal (byte-for-byte the prior rule) and the
         // identity-assertion-scoped CAWG codes.
-        code != SIGNING_CREDENTIAL_UNTRUSTED && !is_identity_assertion_scoped(code)
+        status.code != SIGNING_CREDENTIAL_UNTRUSTED
+            && !is_identity_assertion_scoped(&status.code)
+            && !is_external_data_scoped(status)
     }
 }
 
@@ -6734,7 +9266,7 @@ fn compute_state(results: &ValidationResults, profile: EngineProfile) -> Validat
     let integrity_failure = results
         .failure
         .iter()
-        .any(|s| is_integrity_invalidating(&s.code, profile));
+        .any(|status| is_integrity_invalidating(status, profile));
     if integrity_failure {
         ValidationState::Invalid
     } else if results.has_success(SIGNING_CREDENTIAL_TRUSTED) {
@@ -6756,12 +9288,24 @@ fn compute_state(results: &ValidationResults, profile: EngineProfile) -> Validat
 ///   established AND it was not revoked. `ocsp.revoked` forces `untrusted`.
 /// - `trust=unknown` only when there is no provenance; otherwise a present
 ///   credential that is not positively trusted is `untrusted` (default-deny).
-fn provenance_verdict_json(results: &ValidationResults, present: bool) -> Json {
+fn provenance_verdict_json(
+    results: &ValidationResults,
+    present: bool,
+    profile: EngineProfile,
+) -> Json {
+    let strict_credential_failure = !is_generous(profile)
+        && results.failure.iter().any(|status| {
+            matches!(
+                status.code.as_str(),
+                SIGNING_CREDENTIAL_OCSP_REVOKED | CLAIM_SIGNATURE_OUTSIDE_VALIDITY
+            )
+        });
     let integrity_invalid = !present
+        || strict_credential_failure
         || results
             .failure
             .iter()
-            .any(|s| is_construction_integrity_invalidating(&s.code));
+            .any(is_construction_integrity_invalidating);
     let credential_trusted = results.has_success(SIGNING_CREDENTIAL_TRUSTED)
         && !results.has_failure(SIGNING_CREDENTIAL_OCSP_REVOKED);
     let trust = if !present {
@@ -6787,51 +9331,6 @@ fn provenance_verdict_json(results: &ValidationResults, present: bool) -> Json {
     })
 }
 
-/// Apply the conformance-program SHOULD→SHALL upgrades.
-///
-/// The C2PA core technical specification makes certain checks recommendations
-/// (SHOULDs); the conformance program turns them into requirements (SHALLs).
-/// Under [`ComplianceLevel::ConformanceProgram`] this reclassifies those checks
-/// from informational/absent to hard failures. Under
-/// [`ComplianceLevel::CoreSpec`] it is a no-op, so core-spec validation is
-/// strictly more permissive — the two levels are directly comparable on the same
-/// manifest.
-///
-/// Currently upgraded (the program SHALLs our verifier observes):
-/// - **Revocation information**: a skipped OCSP check
-///   (`signingCredential.ocsp.skipped`, informational under core) becomes a
-///   failure — the program requires usable revocation information.
-/// - **Trusted timestamp**: absence of `timeStamp.trusted` adds a
-///   `timeStamp.missing` failure — the program requires a trusted timestamp.
-///
-/// Only applied once the manifest is otherwise well-formed (the caller invokes
-/// this on the full-evaluation path, not on early structural-failure exits).
-fn apply_compliance_upgrades(
-    results: &mut ValidationResults,
-    compliance: ComplianceLevel,
-    sig_url: &str,
-) {
-    if compliance != ComplianceLevel::ConformanceProgram {
-        return;
-    }
-    // OCSP skipped (informational) -> failure under the program.
-    if results.has_informational(SIGNING_CREDENTIAL_OCSP_SKIPPED) {
-        results.push_failure(
-            SIGNING_CREDENTIAL_OCSP_SKIPPED,
-            sig_url.to_string(),
-            "conformance program requires usable revocation information (SHALL)".into(),
-        );
-    }
-    // No trusted timestamp -> failure under the program.
-    if !results.has_success(TIME_STAMP_TRUSTED) {
-        results.push_failure(
-            TIME_STAMP_MISSING,
-            sig_url.to_string(),
-            "conformance program requires a trusted timestamp (SHALL)".into(),
-        );
-    }
-}
-
 /// Assemble the final [`VerifyOutput`] including the reader-report JSON.
 #[allow(clippy::too_many_arguments)] // internal report assembler; a params struct adds noise
 fn finish(
@@ -6841,7 +9340,7 @@ fn finish(
     declared_assertions: Option<&std::collections::HashSet<&str>>,
     chain: &[Vec<u8>],
     cose: Option<&[u8]>,
-    results: ValidationResults,
+    mut results: ValidationResults,
     verdict: Option<VersionVerdict>,
     profile: EngineProfile,
     report_decode_nodes: &mut usize,
@@ -6861,19 +9360,20 @@ fn finish(
         results
             .failure
             .iter()
-            .any(|s| is_construction_integrity_invalidating(&s.code))
+            .any(is_construction_integrity_invalidating)
     } else {
-        // Strict / conformance: byte-for-byte the prior POLICY_CODES rule.
-        const POLICY_CODES: [&str; 4] = [
+        // Strict / conformance: policy-bar failures leave `validated_under`
+        // intact; only a real construction defect clears it.
+        const POLICY_CODES: [&str; 3] = [
             SIGNING_CREDENTIAL_UNTRUSTED,
             SIGNING_CREDENTIAL_OCSP_SKIPPED,
-            TIME_STAMP_MISSING,
             CONFORMANCE_SPEC_VERSION_NONCONFORMANT,
         ];
-        results
-            .failure
-            .iter()
-            .any(|s| !POLICY_CODES.contains(&s.code.as_str()))
+        results.failure.iter().any(|s| {
+            !POLICY_CODES.contains(&s.code.as_str())
+                && !PROGRAM_FAILURE_CODES.contains(&s.code.as_str())
+                && !is_identity_assertion_scoped(&s.code)
+        })
     };
     let mut verdict = verdict;
     if integrity_broken {
@@ -6896,7 +9396,7 @@ fn finish(
         // A manifest reached `finish`, so provenance is present.
         obj.insert(
             "provenance_verdict".to_string(),
-            provenance_verdict_json(&results, true),
+            provenance_verdict_json(&results, true, profile),
         );
     }
     if let Some(v) = &verdict {
@@ -6906,6 +9406,7 @@ fn finish(
     }
     VerifyOutput {
         validation_state: state,
+        network_needs: std::mem::take(&mut results.network_needs),
         results,
         report_json,
         crjson: None,
@@ -6935,10 +9436,104 @@ fn no_manifest_output(explanation: &str, profile: EngineProfile, present: bool) 
         "validation_status": status_array(&results.failure),
         "validation_results": validation_results_json(&results),
         "validation_state": state.as_str(),
-        "provenance_verdict": provenance_verdict_json(&results, present),
+        "provenance_verdict": provenance_verdict_json(&results, present, profile),
     });
     VerifyOutput {
         validation_state: state,
+        network_needs: Vec::new(),
+        results,
+        report_json,
+        crjson: None,
+        version_verdict: None,
+    }
+}
+fn failure_only_output(
+    code: &'static str,
+    url: String,
+    explanation: String,
+    profile: EngineProfile,
+) -> VerifyOutput {
+    failure_only_output_with_details(code, url, explanation, None, profile)
+}
+
+/// [`failure_only_output`] carrying machine-readable evidence on the status.
+fn failure_only_output_with_details(
+    code: &'static str,
+    url: String,
+    explanation: String,
+    details: Option<Json>,
+    profile: EngineProfile,
+) -> VerifyOutput {
+    let mut results = ValidationResults::default();
+    match details {
+        Some(details) => results.push_failure_with_details(code, url, explanation, details),
+        None => results.push_failure(code, url, explanation),
+    }
+    let mut output = VerifyOutput {
+        validation_state: ValidationState::Invalid,
+        report_json: json!({
+            "active_manifest": Json::Null,
+            "manifests": Json::Object(Map::new()),
+            "validation_status": status_array(&results.failure),
+            "validation_results": validation_results_json(&results),
+            "validation_state": ValidationState::Invalid.as_str(),
+            "provenance_verdict": provenance_verdict_json(&results, true, profile),
+        }),
+        network_needs: std::mem::take(&mut results.network_needs),
+        results,
+        crjson: None,
+        version_verdict: None,
+    };
+    stamp_profile(&mut output, profile);
+    output
+}
+
+fn jumbf_failure_output(
+    error: &JumbfError,
+    manifest_store: &[u8],
+    profile: EngineProfile,
+) -> VerifyOutput {
+    let (code, url) = match error {
+        JumbfError::CompressedManifestInvalid { label, .. } => (
+            MANIFEST_COMPRESSED_INVALID,
+            format!("self#jumbf=/c2pa/{label}"),
+        ),
+        JumbfError::UnexpectedLabel { expected, .. } if *expected == "c2pa.signature" => (
+            CLAIM_SIGNATURE_MISSING,
+            "self#jumbf=/c2pa/c2pa.signature".to_string(),
+        ),
+        JumbfError::UnexpectedLabel { .. }
+        | JumbfError::InvalidStructure(_)
+        | JumbfError::AmbiguousLabel(_) => (CLAIM_MALFORMED, "self#jumbf=/c2pa".to_string()),
+        _ => (GENERAL_ERROR, "self#jumbf=/c2pa".to_string()),
+    };
+    let mut output = failure_only_output(code, url, error.to_string(), profile);
+    stamp_manifest_store_hash(&mut output, manifest_store);
+    output
+}
+
+fn expand_for_validation<'a>(
+    manifest_store: &'a [u8],
+    profile: EngineProfile,
+) -> Result<ExpandedStore<'a>, Box<VerifyOutput>> {
+    expand_store(manifest_store)
+        .map_err(|error| Box::new(jumbf_failure_output(&error, manifest_store, profile)))
+}
+fn container_failure_output(code: &str, explanation: &str, profile: EngineProfile) -> VerifyOutput {
+    let mut results = ValidationResults::default();
+    results.push_failure(code, String::new(), explanation.into());
+    let state = ValidationState::Invalid;
+    let report_json = json!({
+        "active_manifest": Json::Null,
+        "manifests": Json::Object(Map::new()),
+        "validation_status": status_array(&results.failure),
+        "validation_results": validation_results_json(&results),
+        "validation_state": state.as_str(),
+        "provenance_verdict": provenance_verdict_json(&results, true, profile),
+    });
+    VerifyOutput {
+        validation_state: state,
+        network_needs: Vec::new(),
         results,
         report_json,
         crjson: None,
@@ -6979,6 +9574,25 @@ fn validation_results_json(results: &ValidationResults) -> Json {
     })
 }
 
+/// Recompute `validation_results` from `results` in a report that already has
+/// one, preserving the additive `ingredientDeltas` block.
+///
+/// The active manifest's status codes are a pure function of `results`, but the
+/// per-ingredient deltas are not: they record what the ingredient walk derived
+/// for other manifests, which no later change to this manifest's verdict can
+/// restate.
+fn restate_validation_results(report: &mut Map<String, Json>, results: &ValidationResults) {
+    let deltas = report
+        .get("validation_results")
+        .and_then(|value| value.get("ingredientDeltas"))
+        .cloned();
+    let mut restated = validation_results_json(results);
+    if let (Some(object), Some(deltas)) = (restated.as_object_mut(), deltas) {
+        object.insert("ingredientDeltas".into(), deltas);
+    }
+    report.insert("validation_results".to_string(), restated);
+}
+
 /// Build one reader-report manifest entry (the per-label value in the
 /// `manifests` map) from a parsed manifest and its decoded claim.
 fn manifest_entry_json(
@@ -6991,16 +9605,21 @@ fn manifest_entry_json(
     report_decode_nodes: &mut usize,
 ) -> Json {
     let mut assertions = Vec::with_capacity(manifest.assertions.len());
-    for (alabel, cbor) in &manifest.assertions {
+    for (alabel, payload) in &manifest.assertions {
         if declared_assertions.is_some_and(|labels| !labels.contains(alabel.as_str())) {
             continue;
         }
-        let data = match decode((*cbor, &mut *report_decode_nodes)) {
-            Ok(value) => report::cbor_to_json(&value),
-            Err(DecodeError::NodeLimitExceeded(_)) => {
-                json!({ "_encypher_omitted": "decoded assertion report node budget exceeded" })
+        let data = match manifest.assertion_content_type(alabel) {
+            Some(AssertionContentType::Json) => {
+                serde_json::from_slice(payload).unwrap_or_else(|_| json!({}))
             }
-            Err(_) => json!({}),
+            _ => match decode((*payload, &mut *report_decode_nodes)) {
+                Ok(value) => report::cbor_to_json(&value),
+                Err(DecodeError::NodeLimitExceeded(_)) => {
+                    json!({ "_encypher_omitted": "decoded assertion report node budget exceeded" })
+                }
+                Err(_) => json!({}),
+            },
         };
         assertions.push(json!({ "label": alabel, "data": data }));
     }
@@ -7148,7 +9767,10 @@ mod tests {
     //! the on-disk interoperability corpus.
     use super::*;
     use crate::c2pa_cbor::{encode, Profile};
-    use crate::c2pa_core::jumbf::{build_manifest, build_manifest_store};
+    use crate::c2pa_core::jumbf::{
+        build_manifest, build_manifest_store, compress_manifest, parse_manifest_store, superbox,
+        superbox_content, UUID_COMPRESSED_MANIFEST, UUID_JSON_CONTENT,
+    };
     use sha2::{Digest, Sha256};
 
     fn vmap(pairs: Vec<(&str, Value)>) -> Value {
@@ -7208,14 +9830,41 @@ mod tests {
         let ordinary = build_manifest(label, &[], &[0xa0], &[0xd2, 0x84]);
         let expected = Sha256::digest(&ordinary[8..]).to_vec();
         let store = build_manifest_store(&[extended_jumbf_box(&ordinary)]);
-        let parsed = parse_manifest_store(&store).unwrap();
+        let expanded = expand_store(&store).unwrap();
+        let parsed = parse_manifest_store(expanded.bytes()).unwrap();
 
-        let hashes = manifest_hashes(&store, &parsed.manifests).unwrap();
+        let hashes = manifest_hashes(&expanded, &parsed.manifests).unwrap();
 
         assert_eq!(
-            hashes.get(label).map(Vec::as_slice),
+            hashes
+                .get(label)
+                .map(|digests| digests.expanded_sha256.as_slice()),
             Some(expected.as_slice())
         );
+    }
+    #[test]
+    fn compressed_manifest_hashes_accept_stored_and_expanded_domains() {
+        let manifest = build_manifest("urn:c2pa:hash-domains", &[], &[0xa0], &[0xd2, 0x84]);
+        let compressed = compress_manifest(&manifest).unwrap();
+        let stored_content = superbox_content(&compressed).unwrap().to_vec();
+        let store = build_manifest_store(&[compressed]);
+        let expanded = expand_store(&store).unwrap();
+        let parsed = parse_manifest_store(expanded.bytes()).unwrap();
+        let hashes = manifest_hashes(&expanded, &parsed.manifests).unwrap();
+        let mut cache = IngredientManifestDigestCache::new(StoreContext {
+            manifests: &parsed.manifests,
+            manifest_hashes: &hashes,
+        });
+        let parsed_manifest = &parsed.manifests[0];
+
+        assert!(cache.matches(
+            parsed_manifest,
+            0,
+            &Sha256::digest(parsed_manifest.manifest_jumbf)
+        ));
+        assert!(cache.matches(parsed_manifest, 0, &Sha256::digest(&stored_content)));
+        assert!(cache.matches(parsed_manifest, 1, &Sha384::digest(&stored_content)));
+        assert!(cache.matches(parsed_manifest, 2, &Sha512::digest(&stored_content)));
     }
 
     fn ingredient_reference(url: String, hash: Vec<u8>) -> Value {
@@ -7232,11 +9881,17 @@ mod tests {
         actual_signature: &[u8],
         expected_signature: &[u8],
         redacted: bool,
+        link_field: &str,
+        generation: ClaimGeneration,
     ) -> ValidationResults {
         let child_label = "urn:c2pa:child";
+        let ingredient_label = match generation {
+            ClaimGeneration::V1 => "c2pa.ingredient",
+            ClaimGeneration::V2 => "c2pa.ingredient.v3",
+        };
         let ingredient = vmap(vec![
             (
-                "activeManifest",
+                link_field,
                 ingredient_reference(
                     format!("self#jumbf=/c2pa/{child_label}"),
                     sha(expected_manifest),
@@ -7254,7 +9909,7 @@ mod tests {
         let parent = ParsedManifest {
             label: "urn:c2pa:parent".into(),
             manifest_jumbf: &[],
-            assertions: vec![("c2pa.ingredient.v3".into(), ingredient_cbor.as_slice())],
+            assertions: vec![(ingredient_label.into(), ingredient_cbor.as_slice())],
             assertion_jumbf: Vec::new(),
             claim_cbor: None,
             signature_cose: None,
@@ -7271,39 +9926,126 @@ mod tests {
             claim_count: 1,
             claim_box_label: None,
         };
+        let reference_field = match generation {
+            ClaimGeneration::V1 => "assertions",
+            ClaimGeneration::V2 => "created_assertions",
+        };
         let mut claim_fields = vec![(
-            "created_assertions",
+            reference_field,
             Value::Array(vec![vmap(vec![(
                 "url",
-                Value::Text("self#jumbf=c2pa.assertions/c2pa.ingredient.v3".into()),
+                Value::Text(format!("self#jumbf=c2pa.assertions/{ingredient_label}")),
             )])]),
         )];
         if redacted {
             claim_fields.push((
                 "redacted_assertions",
                 Value::Array(vec![Value::Text(format!(
-                    "self#jumbf=/c2pa/{child_label}/c2pa.assertions/c2pa.actions"
+                    // `c2pa.actions` may never be redacted, so a redaction
+                    // that selects the claim-signature method must name an
+                    // assertion the spec allows a claim to remove.
+                    "self#jumbf=/c2pa/{child_label}/c2pa.assertions/c2pa.metadata"
                 ))]),
             ));
         }
         let claim = vmap(claim_fields);
         let manifests = [child];
         let mut manifest_hashes = std::collections::HashMap::new();
-        manifest_hashes.insert(child_label.to_string(), sha(actual_manifest));
-        let claim_refs = ClaimAssertionRefs::build(&parent, &claim, ClaimGeneration::V2);
+        manifest_hashes.insert(
+            child_label.to_string(),
+            ManifestDigests::expanded(sha(actual_manifest)),
+        );
+        let claim_refs = ClaimAssertionRefs::build(&parent, &claim, generation);
         let mut results = ValidationResults::default();
         let mut digest_cache = IngredientManifestDigestCache::new(StoreContext {
             manifests: &manifests,
             manifest_hashes: &manifest_hashes,
         });
         verify_ingredient_references(
+            "urn:c2pa:parent",
             &claim_refs,
             &claim,
             &mut digest_cache,
             "self#jumbf=/c2pa/urn:c2pa:parent/c2pa.signature",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         results
+    }
+
+    /// C2PA 1.0 generators hashed a `c2pa_manifest` ingredient link over the
+    /// ingredient's claim bytes, not its manifest box (c2pa-rs keeps reading
+    /// them as "the 1.0 version"). The default posture accepts that legacy hash
+    /// on the legacy link only; strict conformance and `activeManifest` links
+    /// still require the manifest-box hash.
+    #[test]
+    fn legacy_c2pa_manifest_link_accepts_a_claim_hash_by_default_only() {
+        let child_label = "urn:c2pa:child";
+        let child_claim = enc(&vmap(vec![("instanceID", Value::Text("xmp:iid:c".into()))]));
+        let child_box = b"child manifest superbox content".as_slice();
+        let run = |field: &str, profile: EngineProfile| {
+            let ingredient = enc(&vmap(vec![(
+                field,
+                ingredient_reference(format!("self#jumbf=/c2pa/{child_label}"), sha(&child_claim)),
+            )]));
+            let parent = ParsedManifest {
+                label: "urn:c2pa:parent".into(),
+                manifest_jumbf: &[],
+                assertions: vec![("c2pa.ingredient".into(), ingredient.as_slice())],
+                assertion_jumbf: Vec::new(),
+                claim_cbor: None,
+                signature_cose: None,
+                claim_count: 1,
+                claim_box_label: Some("c2pa.claim".into()),
+            };
+            let manifests = [ParsedManifest {
+                label: child_label.into(),
+                manifest_jumbf: child_box,
+                assertions: Vec::new(),
+                assertion_jumbf: Vec::new(),
+                claim_cbor: Some(&child_claim),
+                signature_cose: None,
+                claim_count: 1,
+                claim_box_label: Some("c2pa.claim".into()),
+            }];
+            let claim = vmap(vec![(
+                "assertions",
+                Value::Array(vec![vmap(vec![(
+                    "url",
+                    Value::Text("self#jumbf=c2pa.assertions/c2pa.ingredient".into()),
+                )])]),
+            )]);
+            let mut hashes = std::collections::HashMap::new();
+            hashes.insert(
+                child_label.to_string(),
+                ManifestDigests::expanded(sha(child_box)),
+            );
+            let refs = ClaimAssertionRefs::build(&parent, &claim, ClaimGeneration::V1);
+            let mut results = ValidationResults::default();
+            let mut cache = IngredientManifestDigestCache::new(StoreContext {
+                manifests: &manifests,
+                manifest_hashes: &hashes,
+            });
+            verify_ingredient_references(
+                "urn:c2pa:parent",
+                &refs,
+                &claim,
+                &mut cache,
+                "self#jumbf=/c2pa/urn:c2pa:parent/c2pa.signature",
+                profile,
+                &mut results,
+            );
+            results
+        };
+        let strict = EngineProfile::strict(SpecVersion::V2_4);
+
+        let default_legacy = run("c2pa_manifest", EngineProfile::GENEROUS);
+        assert!(!default_legacy.has_failure(INGREDIENT_MANIFEST_MISMATCH));
+        assert!(!default_legacy.has_success(INGREDIENT_MANIFEST_VALIDATED));
+        assert!(default_legacy.has_informational(INGREDIENT_LEGACY_CLAIM_HASH));
+        assert!(run("c2pa_manifest", strict).has_failure(INGREDIENT_MANIFEST_MISMATCH));
+        assert!(run("activeManifest", EngineProfile::GENEROUS)
+            .has_failure(INGREDIENT_MANIFEST_MISMATCH));
     }
 
     #[test]
@@ -7340,6 +10082,8 @@ mod tests {
             allowed_certs: None,
             validation_time: None,
             profile: EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
         };
 
         let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
@@ -7378,6 +10122,8 @@ mod tests {
             b"swapped signature",
             b"expected signature",
             false,
+            "activeManifest",
+            ClaimGeneration::V2,
         );
         assert!(results.has_success(INGREDIENT_MANIFEST_VALIDATED));
         assert!(!results.has_success(INGREDIENT_CLAIM_SIGNATURE_VALIDATED));
@@ -7392,6 +10138,8 @@ mod tests {
             b"child signature",
             b"child signature",
             false,
+            "activeManifest",
+            ClaimGeneration::V2,
         );
         assert!(results.has_failure(INGREDIENT_MANIFEST_MISMATCH));
         assert!(!results.has_success(INGREDIENT_MANIFEST_VALIDATED));
@@ -7405,6 +10153,8 @@ mod tests {
             b"child signature",
             b"child signature",
             true,
+            "activeManifest",
+            ClaimGeneration::V2,
         );
         assert!(results.has_success(INGREDIENT_CLAIM_SIGNATURE_VALIDATED));
         assert!(!results.has_failure(INGREDIENT_MANIFEST_MISMATCH));
@@ -7418,31 +10168,79 @@ mod tests {
             b"swapped signature",
             b"expected signature",
             true,
+            "activeManifest",
+            ClaimGeneration::V2,
         );
         assert!(results.has_failure(INGREDIENT_CLAIM_SIGNATURE_MISMATCH));
         assert!(!results.has_success(INGREDIENT_CLAIM_SIGNATURE_VALIDATED));
     }
+    #[test]
+    fn legacy_c2pa_manifest_link_is_validated() {
+        for generation in [ClaimGeneration::V1, ClaimGeneration::V2] {
+            let results = run_ingredient_bindings(
+                b"child manifest",
+                b"child manifest",
+                b"child signature",
+                b"child signature",
+                false,
+                "c2pa_manifest",
+                generation,
+            );
+            assert!(
+                results.has_success(INGREDIENT_MANIFEST_VALIDATED),
+                "{generation:?}"
+            );
+            assert!(results.failure.is_empty(), "{generation:?}");
+        }
+    }
 
-    /// CAWG identity/ICA failure codes are assertion-scoped per the CAWG 1.2
+    /// CAWG identity/ICA failure codes are assertion-scoped per the CAWG 1.3
     /// consumer layering: they never break C2PA manifest integrity in either
     /// posture, while unknown and C2PA failure codes keep invalidating.
     #[test]
     fn cawg_failure_codes_are_assertion_scoped_not_integrity_invalidating() {
+        let status = |code: &str, details: Option<Json>| StatusCode {
+            code: code.into(),
+            url: String::new(),
+            explanation: String::new(),
+            details,
+        };
         for code in [
             "cawg.ica.did_unavailable",
             "cawg.ica.signature_mismatch",
             "cawg.identity.cbor.invalid",
+            "cawg.x509.signature.mismatch",
         ] {
-            assert!(!is_construction_integrity_invalidating(code), "{code}");
             assert!(
-                !is_integrity_invalidating(code, EngineProfile::CONFORMANCE_V2_2),
+                !is_construction_integrity_invalidating(&status(code, None)),
+                "{code}"
+            );
+            assert!(
+                !is_integrity_invalidating(&status(code, None), EngineProfile::CONFORMANCE_V2_2),
                 "{code} (strict)"
             );
         }
-        assert!(is_construction_integrity_invalidating(
-            ASSERTION_HASHED_URI_MISMATCH
+        assert!(is_construction_integrity_invalidating(&status(
+            ASSERTION_HASHED_URI_MISMATCH,
+            None
+        )));
+        assert!(is_construction_integrity_invalidating(&status(
+            "some.future.code",
+            None
+        )));
+        // The same code from the external-data procedure is carved out: C2PA
+        // 2.4 forbids rejecting a claim over unretrievable external data.
+        assert!(!is_construction_integrity_invalidating(&status(
+            ASSERTION_HASHED_URI_MISMATCH,
+            Some(json!({ "external_data": true }))
+        )));
+        assert!(!is_integrity_invalidating(
+            &status(
+                ASSERTION_HASHED_URI_MISMATCH,
+                Some(json!({ "external_data": true }))
+            ),
+            EngineProfile::CONFORMANCE_V2_2
         ));
-        assert!(is_construction_integrity_invalidating("some.future.code"));
 
         let mut results = ValidationResults::default();
         results.push_failure(
@@ -7454,6 +10252,47 @@ mod tests {
             compute_state(&results, EngineProfile::CONFORMANCE_V2_2),
             ValidationState::Valid
         );
+    }
+
+    #[test]
+    fn revoked_and_outside_validity_invalidate_only_the_strict_verdict() {
+        for code in [
+            SIGNING_CREDENTIAL_OCSP_REVOKED,
+            CLAIM_SIGNATURE_OUTSIDE_VALIDITY,
+        ] {
+            let mut results = ValidationResults::default();
+            results.push_failure(code, String::new(), "test".into());
+            assert_eq!(
+                provenance_verdict_json(&results, true, EngineProfile::GENEROUS)["integrity"],
+                "valid"
+            );
+            assert_eq!(
+                provenance_verdict_json(&results, true, EngineProfile::strict(SpecVersion::V2_4),)
+                    ["integrity"],
+                "invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn text_container_failures_are_statuses_not_api_errors() {
+        let malformed = b"-----BEGIN C2PA MANIFEST----- not-a-uri -----END C2PA MANIFEST-----";
+        let output = verify(&VerifyInput {
+            data: malformed,
+            mime: "text/yaml",
+            claim_signer_trust: None,
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: None,
+            profile: EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        })
+        .expect("container defects are validation results");
+        assert!(output
+            .results
+            .has_failure("manifest.structuredText.malformedReference"));
+        assert_eq!(output.validation_state, ValidationState::Invalid);
     }
 
     fn canonical_test_part_label(label: &str) -> String {
@@ -7545,6 +10384,7 @@ mod tests {
             data,
             format,
             "urn:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         results
@@ -8048,10 +10888,107 @@ mod tests {
             data,
             AssetFormat::Jpeg,
             &[],
+            update_manifest::StoreRendition::AsSigned,
             "urn:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         results
+    }
+
+    fn run_text_data_hash(
+        data: &[u8],
+        expected: Vec<u8>,
+        exclusions: &[(usize, usize)],
+    ) -> ValidationResults {
+        let exclusions = Value::Array(
+            exclusions
+                .iter()
+                .map(|(start, length)| {
+                    vmap(vec![
+                        ("start", Value::Integer(*start as i128)),
+                        ("length", Value::Integer(*length as i128)),
+                    ])
+                })
+                .collect(),
+        );
+        let dh = vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(expected)),
+            ("exclusions", exclusions),
+        ]);
+        let owned = enc(&dh);
+        let manifest = ParsedManifest {
+            label: "urn:test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("c2pa.hash.data".into(), owned.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: None,
+        };
+        let claim = vmap(vec![(
+            "created_assertions",
+            Value::Array(vec![hashed_uri_for_assertion("c2pa.hash.data")]),
+        )]);
+        let claim_refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+        let mut results = ValidationResults::default();
+        let _ = verify_data_hash(
+            &claim,
+            &claim_refs,
+            data,
+            AssetFormat::TextUnstructured,
+            &[],
+            update_manifest::StoreRendition::AsSigned,
+            "urn:test",
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+        results
+    }
+
+    #[test]
+    fn unstructured_text_hash_removes_wrapper_then_normalizes_to_nfc() {
+        let carrier_nfd = "Cafe\u{301}";
+        let wrapper = c2pa_text::encode_wrapper(b"manifest");
+        let asset = format!("{carrier_nfd}{wrapper}");
+        let expected = sha("Caf\u{e9}".as_bytes());
+        let results = run_text_data_hash(
+            asset.as_bytes(),
+            expected,
+            &[(carrier_nfd.len(), wrapper.len())],
+        );
+
+        assert!(results.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(!results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+    }
+
+    #[test]
+    fn unstructured_text_exclusion_must_match_a_wrapper_exactly() {
+        let carrier = "signed text";
+        let wrapper = c2pa_text::encode_wrapper(b"manifest");
+        let asset = format!("{carrier}{wrapper}");
+        let results = run_text_data_hash(asset.as_bytes(), sha(carrier.as_bytes()), &[(0, 1)]);
+
+        assert!(results.has_failure(ASSERTION_DATA_HASH_MALFORMED));
+        assert!(!results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+    }
+
+    #[test]
+    fn unstructured_text_rejects_multiple_excluded_wrappers() {
+        let first = c2pa_text::encode_wrapper(b"first");
+        let second = c2pa_text::encode_wrapper(b"second");
+        let asset = format!("signed{first} text{second}");
+        let second_start = "signed".len() + first.len() + " text".len();
+        let results = run_text_data_hash(
+            asset.as_bytes(),
+            sha(b"signed text"),
+            &[("signed".len(), first.len()), (second_start, second.len())],
+        );
+
+        assert!(results.has_failure("manifest.text.multipleWrappers"));
+        assert!(!results.has_success(ASSERTION_DATA_HASH_MATCH));
     }
 
     #[test]
@@ -8144,7 +11081,7 @@ mod tests {
         assert!(locate_text_wrapper(&text[..cut_at]).is_none());
     }
 
-    fn structural_manifest() -> ParsedManifest<'static> {
+    fn structural_manifest_for(generation: ClaimGeneration) -> ParsedManifest<'static> {
         ParsedManifest {
             label: "urn:c2pa:00000000-0000-4000-8000-000000000001".into(),
             manifest_jumbf: &[],
@@ -8153,8 +11090,17 @@ mod tests {
             claim_cbor: None,
             signature_cose: None,
             claim_count: 1,
-            claim_box_label: Some("c2pa.claim.v2".into()),
+            claim_box_label: Some(
+                match generation {
+                    ClaimGeneration::V1 => "c2pa.claim",
+                    ClaimGeneration::V2 => "c2pa.claim.v2",
+                }
+                .into(),
+            ),
         }
+    }
+    fn structural_manifest() -> ParsedManifest<'static> {
+        structural_manifest_for(ClaimGeneration::V2)
     }
 
     fn hashed_uri_for_assertion(label: &str) -> Value {
@@ -8172,11 +11118,15 @@ mod tests {
         hashed_uri_for_assertion("c2pa.hash.data")
     }
 
-    fn run_structure(claim: &Value) -> (bool, ValidationResults) {
-        let manifests = [structural_manifest()];
+    fn run_structure_with(
+        claim: &Value,
+        generation: ClaimGeneration,
+        profile: EngineProfile,
+    ) -> (bool, ValidationResults) {
+        let manifests = [structural_manifest_for(generation)];
         let hashes = std::collections::HashMap::new();
         let mut results = ValidationResults::default();
-        let claim_refs = ClaimAssertionRefs::build(&manifests[0], claim, ClaimGeneration::V2);
+        let claim_refs = ClaimAssertionRefs::build(&manifests[0], claim, generation);
         let fatal = verify_claim_structure(
             &manifests[0],
             StoreContext {
@@ -8184,13 +11134,111 @@ mod tests {
                 manifest_hashes: &hashes,
             },
             claim,
-            ClaimGeneration::V2,
+            generation,
             &claim_refs,
             AssetFormat::Jpeg,
             "self#jumbf=/c2pa/test/c2pa.signature",
+            profile,
             &mut results,
         );
         (fatal, results)
+    }
+
+    fn run_structure(claim: &Value) -> (bool, ValidationResults) {
+        run_structure_with(claim, ClaimGeneration::V2, EngineProfile::GENEROUS)
+    }
+
+    #[test]
+    fn legacy_v1_generator_string_without_generator_info_is_posture_sensitive() {
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+            ("claim_generator", Value::Text("legacy/1.0".into())),
+            ("dc:format", Value::Text("image/jpeg".into())),
+            ("assertions", Value::Array(vec![valid_hashed_uri()])),
+        ]);
+
+        let (default_fatal, default_results) =
+            run_structure_with(&claim, ClaimGeneration::V1, EngineProfile::GENEROUS);
+        assert!(!default_fatal, "{default_results:?}");
+        assert!(!default_results.has_failure(CLAIM_MALFORMED));
+        assert!(
+            default_results.has_informational(CLAIM_GENERATOR_INFO_MISSING),
+            "{default_results:?}"
+        );
+        let claim_with_empty_info = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+            ("claim_generator", Value::Text("legacy/1.0".into())),
+            ("claim_generator_info", Value::Array(Vec::new())),
+            ("dc:format", Value::Text("image/jpeg".into())),
+            ("assertions", Value::Array(vec![valid_hashed_uri()])),
+        ]);
+        let (empty_default_fatal, empty_default_results) = run_structure_with(
+            &claim_with_empty_info,
+            ClaimGeneration::V1,
+            EngineProfile::GENEROUS,
+        );
+        assert!(!empty_default_fatal, "{empty_default_results:?}");
+        assert!(!empty_default_results.has_failure(CLAIM_MALFORMED));
+        assert!(empty_default_results.has_informational(CLAIM_GENERATOR_INFO_MISSING));
+        let mut claim_with_null_info = claim_with_empty_info.clone();
+        if let Value::Map(fields) = &mut claim_with_null_info {
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.as_text() == Some("claim_generator_info"))
+                .expect("claim carries generator info")
+                .1 = Value::Null;
+        }
+        let (null_default_fatal, null_default_results) = run_structure_with(
+            &claim_with_null_info,
+            ClaimGeneration::V1,
+            EngineProfile::GENEROUS,
+        );
+        assert!(!null_default_fatal, "{null_default_results:?}");
+        assert!(!null_default_results.has_failure(CLAIM_MALFORMED));
+        assert!(null_default_results.has_informational(CLAIM_GENERATOR_INFO_MISSING));
+
+        let (strict_fatal, strict_results) = run_structure_with(
+            &claim,
+            ClaimGeneration::V1,
+            EngineProfile::strict(SpecVersion::V2_4),
+        );
+        assert!(strict_fatal);
+        assert!(strict_results.has_failure(CLAIM_MALFORMED));
+        assert!(!strict_results.has_informational(CLAIM_GENERATOR_INFO_MISSING));
+
+        let (empty_strict_fatal, empty_strict_results) = run_structure_with(
+            &claim_with_empty_info,
+            ClaimGeneration::V1,
+            EngineProfile::strict(SpecVersion::V2_4),
+        );
+        assert!(empty_strict_fatal);
+        assert!(empty_strict_results.has_failure(CLAIM_MALFORMED));
+        assert!(!empty_strict_results.has_informational(CLAIM_GENERATOR_INFO_MISSING));
+        let (null_strict_fatal, null_strict_results) = run_structure_with(
+            &claim_with_null_info,
+            ClaimGeneration::V1,
+            EngineProfile::strict(SpecVersion::V2_4),
+        );
+        assert!(null_strict_fatal);
+        assert!(null_strict_results.has_failure(CLAIM_MALFORMED));
+        assert!(!null_strict_results.has_informational(CLAIM_GENERATOR_INFO_MISSING));
+
+        let without_legacy_generator = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+            ("dc:format", Value::Text("image/jpeg".into())),
+            ("assertions", Value::Array(vec![valid_hashed_uri()])),
+        ]);
+        let (missing_both_fatal, missing_both_results) = run_structure_with(
+            &without_legacy_generator,
+            ClaimGeneration::V1,
+            EngineProfile::GENEROUS,
+        );
+        assert!(missing_both_fatal);
+        assert!(missing_both_results.has_failure(CLAIM_MALFORMED));
+        assert!(!missing_both_results.has_informational(CLAIM_GENERATOR_INFO_MISSING));
     }
 
     #[test]
@@ -8275,6 +11323,7 @@ mod tests {
         icon_label: &str,
         expected_icon_hash: Vec<u8>,
         stored_icon_jumbf: Option<&[u8]>,
+        declare_icon: bool,
     ) -> (bool, ValidationResults) {
         let hard_label = "c2pa.hash.data";
         let hard_jumbf = b"hard-binding assertion jumbf";
@@ -8287,6 +11336,11 @@ mod tests {
             ("alg", Value::Text("sha256".into())),
             ("hash", Value::Bytes(expected_icon_hash)),
         ]);
+        let icon_declarations = if declare_icon {
+            vec![icon_reference.clone()]
+        } else {
+            Vec::new()
+        };
         let generator = vmap(vec![
             ("name", Value::Text("generator".into())),
             ("icon", icon_reference),
@@ -8299,18 +11353,30 @@ mod tests {
             ("alg", Value::Text("sha256".into())),
             ("hash", Value::Bytes(sha(hard_jumbf))),
         ]);
+        // An icon hashed URI reaches an assertion without declaring it, so a
+        // store box reachable only from the icon is `assertion.undeclared`
+        // (C2PA 2.4 Validation, Validate the Assertions). `declare_icon` selects
+        // between the lawful shape, where the claim declares the icon as well,
+        // and the shape that must fail closed.
+        let declarations = |hard: Value| {
+            let mut list = vec![hard];
+            list.extend(icon_declarations);
+            Value::Array(list)
+        };
         let claim = match generation {
             ClaimGeneration::V1 => vmap(vec![
                 ("instanceID", Value::Text("xmp:iid:test".into())),
+                ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
                 ("claim_generator", Value::Text("generator/1.0".into())),
                 ("claim_generator_info", Value::Array(vec![generator])),
                 ("dc:format", Value::Text("image/jpeg".into())),
-                ("assertions", Value::Array(vec![hard_reference])),
+                ("assertions", declarations(hard_reference)),
             ]),
             ClaimGeneration::V2 => vmap(vec![
                 ("instanceID", Value::Text("urn:uuid:test".into())),
+                ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
                 ("claim_generator_info", generator),
-                ("created_assertions", Value::Array(vec![hard_reference])),
+                ("created_assertions", declarations(hard_reference)),
             ]),
         };
         let mut assertions = vec![(hard_label.into(), assertion_payload.as_slice())];
@@ -8350,6 +11416,7 @@ mod tests {
             &claim_refs,
             AssetFormat::Jpeg,
             "self#jumbf=/c2pa/test/c2pa.signature",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         if !fatal {
@@ -8358,6 +11425,7 @@ mod tests {
                 &mut claim_refs,
                 generation,
                 &manifests[0].label,
+                EngineProfile::GENEROUS,
                 &mut results,
             );
         }
@@ -8371,8 +11439,13 @@ mod tests {
             (ClaimGeneration::V1, "c2pa.icon__1"),
             (ClaimGeneration::V2, "c2pa.icon"),
         ] {
-            let (fatal, results) =
-                run_generator_icon_binding(generation, label, sha(icon_jumbf), Some(icon_jumbf));
+            let (fatal, results) = run_generator_icon_binding(
+                generation,
+                label,
+                sha(icon_jumbf),
+                Some(icon_jumbf),
+                true,
+            );
             assert!(!fatal, "{generation:?}");
             assert!(
                 results.has_success(ASSERTION_HASHED_URI_MATCH),
@@ -8389,26 +11462,36 @@ mod tests {
     #[test]
     fn generator_icon_missing_mismatch_and_wrong_label_fail_closed() {
         let icon_jumbf = b"embedded c2pa.icon assertion jumbf";
-        let (fatal, missing) =
-            run_generator_icon_binding(ClaimGeneration::V2, "c2pa.icon", sha(icon_jumbf), None);
+        let (fatal, missing) = run_generator_icon_binding(
+            ClaimGeneration::V2,
+            "c2pa.icon",
+            sha(icon_jumbf),
+            None,
+            false,
+        );
         assert!(!fatal);
-        assert!(missing.has_failure(HASHED_URI_MISSING));
+        assert!(missing.has_failure(ASSERTION_MISSING));
 
         let (fatal, mismatch) = run_generator_icon_binding(
             ClaimGeneration::V2,
             "c2pa.icon",
             sha(b"different icon assertion"),
             Some(icon_jumbf),
+            true,
         );
         assert!(!fatal);
         assert!(mismatch.has_failure(ASSERTION_HASHED_URI_MISMATCH));
 
+        // A wrongly labelled icon target is left undeclared: declaring it with
+        // the same hashed URI would collapse the icon reference into the
+        // declaration's binding and skip the icon-label rule under test.
         for label in ["c2pa.thumbnail.claim.jpeg", "c2pa.icon__0", "c2pa.icon__x"] {
             let (fatal, wrong_label) = run_generator_icon_binding(
                 ClaimGeneration::V2,
                 label,
                 sha(icon_jumbf),
                 Some(icon_jumbf),
+                false,
             );
             assert!(fatal, "{label}");
             assert!(wrong_label.has_failure(CLAIM_MALFORMED), "{label}");
@@ -8416,6 +11499,100 @@ mod tests {
                 !wrong_label.has_success(ASSERTION_HASHED_URI_MATCH),
                 "{label}"
             );
+        }
+    }
+
+    #[test]
+    fn cross_manifest_assertion_reference_reports_outside_manifest() {
+        let manifest = structural_manifest();
+        let reference = vmap(vec![
+            (
+                "url",
+                Value::Text(
+                    "self#jumbf=/c2pa/urn:c2pa:other/c2pa.assertions/c2pa.hash.data".into(),
+                ),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(vec![0; 32])),
+        ]);
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("urn:uuid:test".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("generator".into()))]),
+            ),
+            ("created_assertions", Value::Array(vec![reference])),
+        ]);
+        let mut claim_refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+        let mut results = ValidationResults::default();
+        verify_assertion_bindings(
+            &claim,
+            &mut claim_refs,
+            ClaimGeneration::V2,
+            &manifest.label,
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+        assert!(results.has_failure(ASSERTION_OUTSIDE_MANIFEST));
+        assert!(!results.has_failure(HASHED_URI_MISSING));
+    }
+
+    #[test]
+    fn sha1_assertion_binding_is_rejected_in_both_postures() {
+        let assertion_jumbf = b"sha1 assertion jumbf";
+        let assertion_payload = enc(&vmap(vec![("data", Value::Bytes(vec![1]))]));
+        let label = "c2pa.hash.data";
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:00000000-0000-4000-8000-000000000001".into(),
+            manifest_jumbf: &[],
+            assertions: vec![(label.into(), assertion_payload.as_slice())],
+            assertion_jumbf: vec![(label.into(), assertion_jumbf.as_slice())],
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let reference = vmap(vec![
+            (
+                "url",
+                Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+            ),
+            ("alg", Value::Text("sha1".into())),
+            (
+                "hash",
+                Value::Bytes(
+                    hex::decode("b1097bad25d72460ebc5fdfef3f195a6c29148c4")
+                        .expect("valid SHA-1 fixture digest"),
+                ),
+            ),
+        ]);
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("urn:uuid:test".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("generator".into()))]),
+            ),
+            ("created_assertions", Value::Array(vec![reference])),
+        ]);
+
+        for profile in [
+            EngineProfile::strict(SpecVersion::V2_4),
+            EngineProfile::GENEROUS,
+        ] {
+            let mut refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+            let mut results = ValidationResults::default();
+            verify_assertion_bindings(
+                &claim,
+                &mut refs,
+                ClaimGeneration::V2,
+                &manifest.label,
+                profile,
+                &mut results,
+            );
+            assert!(results.has_failure(ALGORITHM_UNSUPPORTED));
+            assert!(!results.has_informational(ALGORITHM_DEPRECATED));
+            assert!(!results.has_success(ASSERTION_HASHED_URI_MATCH));
+            assert!(!results.has_failure(ASSERTION_HASHED_URI_MISMATCH));
         }
     }
 
@@ -8543,6 +11720,7 @@ mod tests {
             &claim_refs,
             AssetFormat::Jpeg,
             "self#jumbf=/c2pa/test/c2pa.signature",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         assert!(fatal);
@@ -8628,6 +11806,7 @@ mod tests {
             &claim_refs,
             AssetFormat::Jpeg,
             ICON_SIG_URL,
+            EngineProfile::GENEROUS,
             &mut results,
         );
         verify_assertion_bindings(
@@ -8635,6 +11814,7 @@ mod tests {
             &mut claim_refs,
             generation,
             ICON_MANIFEST_LABEL,
+            EngineProfile::GENEROUS,
             &mut results,
         );
         (fatal, duplicate, results)
@@ -8668,6 +11848,7 @@ mod tests {
         let icon = bound_hashed_uri(ICON_LABEL, ICON_JUMBF);
         let claim = vmap(vec![
             ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
             (
                 "claim_generator_info",
                 vmap(vec![
@@ -8707,6 +11888,7 @@ mod tests {
         };
         let claim = vmap(vec![
             ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
             ("claim_generator", Value::Text("test/1.0".into())),
             ("dc:format", Value::Text("image/jpeg".into())),
             (
@@ -8838,6 +12020,7 @@ mod tests {
                 &mut claim_refs,
                 ClaimGeneration::V2,
                 "urn:test",
+                EngineProfile::GENEROUS,
                 &mut results,
             );
         }
@@ -8922,6 +12105,7 @@ mod tests {
             &claim_refs,
             AssetFormat::Jpeg,
             "self#jumbf=/c2pa/test/c2pa.signature",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         assert!(fatal);
@@ -9068,7 +12252,9 @@ mod tests {
             data,
             AssetFormat::Bmff,
             &[],
+            update_manifest::StoreRendition::AsSigned,
             "urn:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         results
@@ -9538,40 +12724,6 @@ mod tests {
     }
 
     #[test]
-    fn fragment_merkle_rejects_non_increasing_playback_locations() {
-        let fragment0 = auxiliary_merkle_box(7, 9, 0, Vec::new());
-        let fragment1 = auxiliary_merkle_box(7, 9, 1, Vec::new());
-        let leaf0 =
-            crate::c2pa_formats::bmff_fragment_leaf_hash(&fragment0, "sha256", &[]).unwrap();
-        let leaf1 =
-            crate::c2pa_formats::bmff_fragment_leaf_hash(&fragment1, "sha256", &[]).unwrap();
-        let entry = fragment_merkle_entry(2, vec![Value::Bytes(leaf0), Value::Bytes(leaf1)]);
-
-        let mut ordered = ValidationResults::default();
-        assert!(verify_bmff_fragments(
-            std::slice::from_ref(&entry),
-            "sha256",
-            &[],
-            &[fragment0.as_slice(), fragment1.as_slice()],
-            "self#jumbf=c2pa.assertions/c2pa.hash.bmff.v3",
-            &mut ordered,
-        ));
-        assert!(ordered.failure.is_empty(), "{:?}", ordered.failure);
-
-        let mut reordered = ValidationResults::default();
-        assert!(!verify_bmff_fragments(
-            &[entry],
-            "sha256",
-            &[],
-            &[fragment1.as_slice(), fragment0.as_slice()],
-            "self#jumbf=c2pa.assertions/c2pa.hash.bmff.v3",
-            &mut reordered,
-        ));
-        assert!(reordered.has_failure(ASSERTION_BMFF_HASH_MISMATCH));
-        assert!(!reordered.has_success(ASSERTION_BMFF_HASH_MATCH));
-    }
-
-    #[test]
     fn monolithic_merkle_uses_indexed_auxiliary_proofs() {
         let left = sha(b"a");
         let right = sha(b"b");
@@ -9937,7 +13089,13 @@ mod tests {
             let status = embedded_ocsp_status_from_certificate_statuses(&statuses);
             assert!(status == expected_status);
             let mut results = ValidationResults::default();
-            record_embedded_ocsp_status(status, "self#jumbf=/c2pa/test", &mut results);
+            record_ocsp_status(
+                EmbeddedOcspOutcome::plain(status),
+                &OnlineOcspOutcome::default(),
+                &[],
+                "self#jumbf=/c2pa/test",
+                &mut results,
+            );
             assert_eq!(
                 results.has_failure(SIGNING_CREDENTIAL_OCSP_REVOKED),
                 leaf_revoked
@@ -10038,7 +13196,9 @@ mod tests {
             data,
             AssetFormat::Jpeg,
             &[],
+            update_manifest::StoreRendition::AsSigned,
             "urn:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         let kind = match operative_binding {
@@ -10054,6 +13214,7 @@ mod tests {
         let data = fixture_data();
         let claim = vmap(vec![
             ("instanceID", Value::Text("xmp:iid:test".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
             (
                 "claim_generator_info",
                 vmap(vec![("name", Value::Text("test".into()))]),
@@ -10159,9 +13320,18 @@ mod tests {
         let signed = padded_text_with_wrapper(carrier);
         let mut modified = signed.as_bytes().to_vec();
         modified.extend_from_slice(b" appended");
+        let (wrapper_start, wrapper_length) =
+            locate_text_wrapper(&signed).expect("embedded wrapper");
         let primary = enc(&vmap(vec![
             ("alg", Value::Text("sha256".into())),
-            ("hash", Value::Bytes(sha(signed.as_bytes()))),
+            ("hash", Value::Bytes(sha(carrier.as_bytes()))),
+            (
+                "exclusions",
+                Value::Array(vec![vmap(vec![
+                    ("start", Value::Integer(wrapper_start as i128)),
+                    ("length", Value::Integer(wrapper_length as i128)),
+                ])]),
+            ),
         ]));
         let region = enc(&vmap(vec![(
             "length",
@@ -10195,7 +13365,9 @@ mod tests {
             &modified,
             AssetFormat::TextUnstructured,
             &[],
+            update_manifest::StoreRendition::AsSigned,
             "urn:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         assert!(operative_binding.is_none());
@@ -10266,6 +13438,8 @@ mod tests {
             allowed_certs: None,
             validation_time: None,
             profile: EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
         };
         let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
         let output = verify_manifest(
@@ -10300,7 +13474,10 @@ mod tests {
         };
         let manifests = [child];
         let mut sha256_hashes = std::collections::HashMap::new();
-        sha256_hashes.insert("urn:c2pa:child".to_string(), sha(child_bytes));
+        sha256_hashes.insert(
+            "urn:c2pa:child".to_string(),
+            ManifestDigests::expanded(sha(child_bytes)),
+        );
         let mut cache = IngredientManifestDigestCache::new(StoreContext {
             manifests: &manifests,
             manifest_hashes: &sha256_hashes,
@@ -10364,6 +13541,8 @@ mod tests {
             allowed_certs: None,
             validation_time: None,
             profile: EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
         };
         let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
         let output = verify_manifest(
@@ -10465,6 +13644,7 @@ mod tests {
             &claim_refs,
             AssetFormat::Jpeg,
             "self#jumbf=/c2pa/urn:c2pa:node-budget/c2pa.signature",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         assert!(fatal);
@@ -10632,6 +13812,243 @@ mod tests {
         assert!(view.rejected);
         assert!(view.payloads.is_empty());
     }
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        const LOCAL: u32 = 0x0403_4b50;
+        const CENTRAL: u32 = 0x0201_4b50;
+        const EOCD: u32 = 0x0605_4b50;
+        let mut body = Vec::new();
+        let mut central = Vec::new();
+        for &(name, content) in entries {
+            let size = content.len() as u32;
+            let local_offset = body.len() as u32;
+            body.extend_from_slice(&LOCAL.to_le_bytes());
+            body.extend_from_slice(&20u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(content);
+
+            central.extend_from_slice(&CENTRAL.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&local_offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = body.len() as u32;
+        let cd_size = central.len() as u32;
+        body.extend_from_slice(&central);
+        body.extend_from_slice(&EOCD.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        body.extend_from_slice(&cd_size.to_le_bytes());
+        body.extend_from_slice(&cd_offset.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn collection_hash_allows_members_not_listed_in_uris() {
+        let archive = stored_zip(&[
+            ("listed.txt", b"signed member"),
+            ("unlisted.txt", b"bound only by the central directory"),
+        ]);
+        let index = crate::c2pa_formats::zip_index(&archive).unwrap();
+        let listed = index.get(b"listed.txt").unwrap();
+        let (start, end) = listed.hash_span();
+        let assertion = vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            (
+                "uris",
+                Value::Array(vec![vmap(vec![
+                    ("uri", Value::Text("listed.txt".into())),
+                    ("hash", Value::Bytes(sha(&archive[start..end]))),
+                ])]),
+            ),
+            (
+                "zip_central_directory_hash",
+                Value::Bytes(hash_parts("sha256", index.central_directory_hash_parts()).unwrap()),
+            ),
+        ]);
+        let mut results = ValidationResults::default();
+        verify_collection_hash(
+            &enc(&assertion),
+            &vmap(Vec::new()),
+            &archive,
+            false,
+            "urn:test",
+            &mut results,
+        );
+
+        assert!(results.has_success(ASSERTION_COLLECTION_HASH_MATCH));
+        assert!(!results.has_failure(ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT));
+    }
+
+    fn remote_only_font(uri: &str) -> Vec<u8> {
+        let mut table = Vec::new();
+        table.extend_from_slice(&1u16.to_be_bytes());
+        table.extend_from_slice(&0u16.to_be_bytes());
+        table.extend_from_slice(&20u32.to_be_bytes());
+        table.extend_from_slice(&(uri.len() as u16).to_be_bytes());
+        table.extend_from_slice(&0u16.to_be_bytes());
+        table.extend_from_slice(&0u32.to_be_bytes());
+        table.extend_from_slice(&0u32.to_be_bytes());
+        table.extend_from_slice(uri.as_bytes());
+
+        let mut font = Vec::new();
+        font.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        font.extend_from_slice(&1u16.to_be_bytes());
+        font.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        font.extend_from_slice(b"C2PA");
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&28u32.to_be_bytes());
+        font.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        font.extend_from_slice(&table);
+        font
+    }
+
+    #[test]
+    fn remote_only_font_reports_manifest_inaccessible_without_fetching() {
+        let font = remote_only_font("https://example.test/active.c2pa");
+        let output = verify(&regular_input(&font, "font/ttf", SpecVersion::V2_4)).unwrap();
+        assert!(output.results.has_failure(MANIFEST_INACCESSIBLE));
+        assert!(output.results.failure.iter().any(|status| {
+            status.code == MANIFEST_INACCESSIBLE && status.url == "https://example.test/active.c2pa"
+        }));
+    }
+
+    /// An SVG carries its XMP inline, so the documented `dcterms:provenance`
+    /// declaration of a remote manifest store sits in the asset itself.
+    fn svg_with_provenance(uri: &str) -> Vec<u8> {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+             xmlns:dcterms=\"http://purl.org/dc/terms/\" \
+             dcterms:provenance=\"{uri}\"><rect width=\"1\" height=\"1\"/></svg>"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_declared_remote_manifest_records_the_fetch_that_would_settle_it() {
+        let uri = "https://store.test/active.c2pa";
+        let svg = svg_with_provenance(uri);
+        let output = verify(&regular_input(&svg, "image/svg+xml", SpecVersion::V2_4)).unwrap();
+
+        assert!(
+            output
+                .results
+                .failure
+                .iter()
+                .any(|status| status.code == MANIFEST_INACCESSIBLE && status.url == uri),
+            "{:?}",
+            output.results.failure
+        );
+        assert_eq!(
+            output
+                .network_needs
+                .iter()
+                .map(NetworkNeed::to_json)
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!({
+                "kind": "remote_manifest",
+                "uri": uri,
+            })]
+        );
+    }
+
+    /// The remote declaration is only consulted when no store is embedded, so
+    /// an asset that carries its own store has nothing to fetch.
+    #[test]
+    fn an_embedded_store_leaves_the_remote_declaration_nothing_to_fetch() {
+        let assertion = crate::c2pa_core::jumbf::assertion_box("c2pa.actions.v2", &[0xa0], None);
+        let manifest = crate::c2pa_core::jumbf::build_manifest(
+            "urn:c2pa:test:remote",
+            &[assertion],
+            &[0xa0],
+            &[0xd2, 0x84],
+        );
+        let store = crate::c2pa_core::jumbf::build_manifest_store(&[manifest]);
+        let svg = crate::c2pa_formats::embed_manifest(
+            AssetFormat::Svg,
+            &svg_with_provenance("https://store.test/active.c2pa"),
+            &store,
+        )
+        .expect("embed");
+        let output = verify(&regular_input(&svg, "image/svg+xml", SpecVersion::V2_4)).unwrap();
+
+        assert!(!output.results.has_failure(MANIFEST_INACCESSIBLE));
+        assert!(
+            output.network_needs.is_empty(),
+            "{:?}",
+            output.network_needs
+        );
+    }
+
+    #[test]
+    fn carrier_placement_is_enforced_only_in_conformance_mode() {
+        let mut gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b".to_vec();
+        let assertion = crate::c2pa_core::jumbf::assertion_box("c2pa.actions.v2", &[0xa0], None);
+        let manifest = crate::c2pa_core::jumbf::build_manifest(
+            "urn:c2pa:test:placement",
+            &[assertion],
+            &[0xa0],
+            &[0xd2, 0x84],
+        );
+        let store = crate::c2pa_core::jumbf::build_manifest_store(&[manifest]);
+        gif = crate::c2pa_formats::embed_manifest(AssetFormat::Gif, &gif, &store).unwrap();
+        let exclusion =
+            crate::c2pa_formats::compute_data_hash_exclusions(AssetFormat::Gif, &gif).unwrap()[0];
+        let extension = gif[exclusion.start..exclusion.start + exclusion.length].to_vec();
+        gif.drain(exclusion.start..exclusion.start + exclusion.length);
+        let trailer = gif.len() - 1;
+        gif.splice(trailer..trailer, extension);
+
+        let generous = verify(&regular_input(&gif, "image/gif", SpecVersion::V2_4)).unwrap();
+        assert!(!generous.results.failure.iter().any(|status| {
+            status.explanation
+                == "GIF C2PA Application Extension follows the first image descriptor"
+        }));
+
+        let strict_input = VerifyInput {
+            data: &gif,
+            mime: "image/gif",
+            claim_signer_trust: None,
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: None,
+            profile: EngineProfile::strict(SpecVersion::V2_4),
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        };
+        let strict = verify(&strict_input).unwrap();
+        assert!(strict.results.failure.iter().any(|status| {
+            status.code == GENERAL_ERROR
+                && status.explanation
+                    == "GIF C2PA Application Extension follows the first image descriptor"
+        }));
+    }
+
     #[test]
     fn collection_uri_round_trips_reserved_docx_member_bytes() {
         let member = "[Content_Types].xml";
@@ -10654,5 +14071,2150 @@ mod tests {
         ] {
             assert!(canonical_collection_uri_member(uri).is_none(), "{uri}");
         }
+    }
+
+    fn raw_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&u32::try_from(8 + payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn regular_input<'a>(data: &'a [u8], mime: &'a str, version: SpecVersion) -> VerifyInput<'a> {
+        VerifyInput {
+            data,
+            mime,
+            claim_signer_trust: None,
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: None,
+            profile: EngineProfile::new(version, OperatingMode::Regular),
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        }
+    }
+
+    #[test]
+    fn strict_out_of_scope_status_uses_the_entity_namespace() {
+        let output = verify(&VerifyInput {
+            profile: EngineProfile::strict(SpecVersion::V2_2),
+            ..regular_input(b"", "text/plain", SpecVersion::V2_2)
+        })
+        .expect("out-of-scope text must still produce a report");
+
+        assert!(
+            output
+                .results
+                .informational
+                .iter()
+                .any(|status| status.code == "com.encypher.conformance.outOfScope"),
+            "{:?}",
+            output.results.informational
+        );
+        assert!(
+            output
+                .results
+                .informational
+                .iter()
+                .all(|status| !status.code.starts_with("conformanceScope.")),
+            "{:?}",
+            output.results.informational
+        );
+    }
+
+    #[test]
+    fn strict_spec_version_status_uses_the_entity_namespace() {
+        const JPEG: &[u8] =
+            include_bytes!("tests/fixtures/c2pa-rs-compressed/compressed_boxhash.jpg");
+        let output = verify(&VerifyInput {
+            profile: EngineProfile::strict(SpecVersion::V1_4),
+            ..regular_input(JPEG, "image/jpeg", SpecVersion::V1_4)
+        })
+        .expect("v2 manifest must still produce a v1.4-targeted strict report");
+
+        assert!(
+            output.results.failure.iter().any(|status| {
+                status.code == "com.encypher.conformance.specVersionNonConformant"
+            }),
+            "{:?}",
+            output.results.failure
+        );
+        assert!(
+            output
+                .results
+                .failure
+                .iter()
+                .all(|status| !status.code.starts_with("conformanceScope.")),
+            "{:?}",
+            output.results.failure
+        );
+    }
+
+    /// A signer that no configured anchor accepts is `signingCredential.untrusted`
+    /// under strict conformance even when no anchors are configured at all: an
+    /// empty trust list contains nothing, and a silent report would read as
+    /// trusted to a crJSON consumer. The default posture keeps "not evaluated".
+    #[test]
+    fn strict_reports_an_untrusted_signer_when_no_anchors_are_configured() {
+        const JPEG: &[u8] =
+            include_bytes!("tests/fixtures/c2pa-rs-compressed/compressed_boxhash.jpg");
+        let generous =
+            verify(&regular_input(JPEG, "image/jpeg", SpecVersion::V2_4)).expect("default report");
+        assert!(!generous.results.has_failure(SIGNING_CREDENTIAL_UNTRUSTED));
+        assert!(!generous.results.has_success(SIGNING_CREDENTIAL_TRUSTED));
+
+        let strict = verify(&VerifyInput {
+            profile: EngineProfile::strict(SpecVersion::V2_4),
+            ..regular_input(JPEG, "image/jpeg", SpecVersion::V2_4)
+        })
+        .expect("strict report");
+        assert!(
+            strict.results.has_failure(SIGNING_CREDENTIAL_UNTRUSTED),
+            "{:?}",
+            strict.results.failure
+        );
+    }
+
+    #[test]
+    fn c2pa_rs_compressed_vectors_verify_at_2_2_and_2_4() {
+        const JPEG: &[u8] =
+            include_bytes!("tests/fixtures/c2pa-rs-compressed/compressed_boxhash.jpg");
+        const PNG: &[u8] =
+            include_bytes!("tests/fixtures/c2pa-rs-compressed/compressed_boxhash.png");
+
+        for (name, data, mime) in [("jpeg", JPEG, "image/jpeg"), ("png", PNG, "image/png")] {
+            for version in [SpecVersion::V2_2, SpecVersion::V2_4] {
+                let out = verify(&regular_input(data, mime, version))
+                    .unwrap_or_else(|error| panic!("{name} at {version:?}: {error}"));
+                assert_eq!(
+                    out.validation_state,
+                    ValidationState::Valid,
+                    "{name} at {version:?}: {:?}",
+                    out.results.failure
+                );
+                assert!(
+                    out.results.has_success(CLAIM_SIGNATURE_VALIDATED),
+                    "{name} at {version:?}: {:?}",
+                    out.results.success
+                );
+                assert!(
+                    out.results.has_success(ASSERTION_BOXES_HASH_MATCH),
+                    "{name} at {version:?}: {:?}",
+                    out.results.success
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_compressed_epub_fixture_verifies() {
+        const EPUB: &[u8] =
+            include_bytes!("tests/fixtures/compressed-epub/application_epub_zip.epub");
+        let out = verify(&regular_input(
+            EPUB,
+            "application/epub+zip",
+            SpecVersion::V2_4,
+        ))
+        .expect("compressed EPUB must produce a report");
+
+        assert_eq!(
+            out.validation_state,
+            ValidationState::Valid,
+            "{:?}",
+            out.results.failure
+        );
+        assert!(!out.results.has_failure("manifest.compressed.invalid"));
+    }
+
+    #[test]
+    fn corrupt_compressed_manifest_is_a_report_failure_not_an_api_error() {
+        let corrupt = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:corrupt",
+            &[raw_box(b"brob", b"not brotli")],
+            None,
+        );
+        let store = build_manifest_store(&[corrupt]);
+        let out = verify(&regular_input(
+            &store,
+            "application/c2pa",
+            SpecVersion::V2_4,
+        ))
+        .expect("asset-supplied corrupt compression must produce a report");
+
+        assert_eq!(out.validation_state, ValidationState::Invalid);
+        let status = out
+            .results
+            .failure
+            .iter()
+            .find(|status| status.code == "manifest.compressed.invalid")
+            .expect("compressed status");
+        assert_eq!(status.url, "self#jumbf=/c2pa/urn:c2pa:corrupt");
+    }
+
+    #[test]
+    fn malformed_jumbf_is_general_error_not_an_api_error() {
+        let out = verify(&regular_input(
+            b"malformed store bytes",
+            "application/c2pa",
+            SpecVersion::V2_4,
+        ))
+        .expect("asset-supplied malformed framing must produce a report");
+
+        assert_eq!(out.validation_state, ValidationState::Invalid);
+        assert!(out.results.has_failure("general.error"));
+    }
+
+    #[test]
+    fn malformed_json_assertion_emits_registered_status() {
+        let assertion = superbox(
+            &UUID_JSON_CONTENT,
+            "c2pa.metadata",
+            &[raw_box(b"json", br#"{"broken":"#)],
+            None,
+        );
+        let assertion_content = superbox_content(&assertion).unwrap();
+        let claim = enc(&vmap(vec![
+            ("instanceID", Value::Text("urn:uuid:json".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![
+                    ("name", Value::Text("test".into())),
+                    ("specVersion", Value::Text("2.4.0".into())),
+                ]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(vec![vmap(vec![
+                    (
+                        "url",
+                        Value::Text("self#jumbf=c2pa.assertions/c2pa.metadata".into()),
+                    ),
+                    ("alg", Value::Text("sha256".into())),
+                    ("hash", Value::Bytes(sha(assertion_content))),
+                ])]),
+            ),
+        ]));
+        let manifest = build_manifest("urn:c2pa:json", &[assertion], &claim, &[0xd2, 0x84]);
+        let store = build_manifest_store(&[manifest]);
+        let parsed = parse_manifest_store(&store).unwrap();
+        let manifest = &parsed.manifests[0];
+        let claim = decode(manifest.claim_cbor.unwrap()).unwrap();
+        let refs = ClaimAssertionRefs::build(manifest, &claim, ClaimGeneration::V2);
+        let hashes = std::collections::HashMap::new();
+        let mut results = ValidationResults::default();
+
+        verify_claim_structure(
+            manifest,
+            StoreContext {
+                manifests: &parsed.manifests,
+                manifest_hashes: &hashes,
+            },
+            &claim,
+            ClaimGeneration::V2,
+            &refs,
+            AssetFormat::Jpeg,
+            "self#jumbf=/c2pa/urn:c2pa:json/c2pa.signature",
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+
+        assert!(results.has_failure("assertion.json.invalid"));
+        assert!(!results.has_failure(ASSERTION_CBOR_INVALID));
+    }
+
+    #[test]
+    fn standard_manifest_with_two_parent_ingredients_emits_multiple_parents() {
+        let parent = |label: &str| {
+            (
+                label.to_string(),
+                enc(&vmap(vec![(
+                    "relationship",
+                    Value::Text("parentOf".into()),
+                )])),
+            )
+        };
+        let owned = [
+            parent("c2pa.ingredient.v3"),
+            parent("c2pa.ingredient.v3__1"),
+        ];
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:parents".into(),
+            manifest_jumbf: &[],
+            assertions: owned
+                .iter()
+                .map(|(label, payload)| (label.clone(), payload.as_slice()))
+                .collect(),
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = vmap(vec![
+            ("instanceID", Value::Text("urn:uuid:parents".into())),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![
+                    ("name", Value::Text("test".into())),
+                    ("specVersion", Value::Text("2.4.0".into())),
+                ]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(
+                    owned
+                        .iter()
+                        .map(|(label, _)| hashed_uri_for_assertion(label))
+                        .collect(),
+                ),
+            ),
+        ]);
+        let manifests = [manifest];
+        let refs = ClaimAssertionRefs::build(&manifests[0], &claim, ClaimGeneration::V2);
+        let hashes = std::collections::HashMap::new();
+        let mut results = ValidationResults::default();
+
+        verify_claim_structure(
+            &manifests[0],
+            StoreContext {
+                manifests: &manifests,
+                manifest_hashes: &hashes,
+            },
+            &claim,
+            ClaimGeneration::V2,
+            &refs,
+            AssetFormat::Jpeg,
+            "self#jumbf=/c2pa/urn:c2pa:parents/c2pa.signature",
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+
+        assert!(results.has_failure("manifest.multipleParents"));
+    }
+    #[test]
+    fn non_semver_spec_version_is_advisory_by_default_and_fails_strict() {
+        let claim = vmap(vec![(
+            "claim_generator_info",
+            vmap(vec![
+                ("name", Value::Text("legacy generator".into())),
+                ("specVersion", Value::Text("2.4".into())),
+            ]),
+        )]);
+        let url = "self#jumbf=/c2pa/test/c2pa.signature";
+
+        let mut generous = ValidationResults::default();
+        assert!(!verify_spec_version_metadata(
+            &claim,
+            EngineProfile::GENEROUS,
+            url,
+            &mut generous,
+        ));
+        assert!(generous
+            .informational
+            .iter()
+            .any(|status| status.code == CLAIM_SPEC_VERSION_NOT_SEMVER));
+        assert!(!generous.has_failure(CLAIM_MALFORMED));
+
+        let mut strict = ValidationResults::default();
+        assert!(verify_spec_version_metadata(
+            &claim,
+            EngineProfile::strict(SpecVersion::V2_4),
+            url,
+            &mut strict,
+        ));
+        assert!(strict.has_failure(CLAIM_MALFORMED));
+    }
+
+    /// C2PA 2.4 Validation, Standard Manifest Assertions: "Validate that either
+    /// a `c2pa.created` or `c2pa.opened` action is contained in exactly one
+    /// actions assertion." That is a validator rule, so a v2 standard manifest
+    /// without one fails in the default posture. `c2pa.actions` validation
+    /// allows that assertion to be the first one of either the
+    /// `created_assertions` or the `gathered_assertions` array. Update
+    /// manifests are exempt: the requirement is stated for standard manifests
+    /// only, and C2PA 2.4 Manifests, Update Manifests, lets an update carry
+    /// just `c2pa.edited.metadata`. v1 claims keep the strict-only policy.
+    #[test]
+    fn inception_action_is_required_of_standard_manifests_only() {
+        // Every fixture here declares its single actions assertion in the
+        // gathered array (in the v1 claim's `assertions` array), never in
+        // `created_assertions`.
+        let gathered_only =
+            |only_action: &str, generation: ClaimGeneration, kind: ManifestKind, profile| {
+                let label = if generation == ClaimGeneration::V1 {
+                    "c2pa.actions"
+                } else {
+                    "c2pa.actions.v2"
+                };
+                let actions = enc(&vmap(vec![(
+                    "actions",
+                    Value::Array(vec![vmap(vec![(
+                        "action",
+                        Value::Text(only_action.into()),
+                    )])]),
+                )]));
+                let manifest = ParsedManifest {
+                    label: "urn:c2pa:00000000-0000-4000-8000-000000000001".into(),
+                    manifest_jumbf: &[],
+                    assertions: vec![(label.into(), actions.as_slice())],
+                    assertion_jumbf: Vec::new(),
+                    claim_cbor: None,
+                    signature_cose: None,
+                    claim_count: 1,
+                    claim_box_label: Some("c2pa.claim.v2".into()),
+                };
+                let field = if generation == ClaimGeneration::V1 {
+                    "assertions"
+                } else {
+                    "gathered_assertions"
+                };
+                let claim = vmap(vec![(
+                    field,
+                    Value::Array(vec![hashed_uri_for_assertion(label)]),
+                )]);
+                let refs = ClaimAssertionRefs::build(&manifest, &claim, generation);
+                let mut results = ValidationResults::default();
+                verify_action_assertions(
+                    &refs,
+                    &claim,
+                    generation,
+                    kind,
+                    StoreContext {
+                        manifests: std::slice::from_ref(&manifest),
+                        manifest_hashes: &std::collections::HashMap::new(),
+                    },
+                    &manifest.label,
+                    "self#jumbf=/c2pa/test/c2pa.signature",
+                    profile,
+                    &mut results,
+                );
+                results.has_failure(ASSERTION_ACTION_MALFORMED)
+            };
+        let strict = EngineProfile::strict(SpecVersion::V2_4);
+
+        assert!(gathered_only(
+            "c2pa.edited.metadata",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS
+        ));
+        // An inception action in the first gathered actions assertion satisfies
+        // the requirement even with no `created_assertions` actions assertion.
+        assert!(!gathered_only(
+            "c2pa.opened",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS
+        ));
+        assert!(!gathered_only(
+            "c2pa.edited.metadata",
+            ClaimGeneration::V2,
+            ManifestKind::Update,
+            EngineProfile::GENEROUS
+        ));
+        assert!(!gathered_only(
+            "c2pa.edited.metadata",
+            ClaimGeneration::V2,
+            ManifestKind::Update,
+            strict
+        ));
+        assert!(!gathered_only(
+            "c2pa.edited.metadata",
+            ClaimGeneration::V1,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS
+        ));
+        assert!(gathered_only(
+            "c2pa.edited.metadata",
+            ClaimGeneration::V1,
+            ManifestKind::Standard,
+            strict
+        ));
+    }
+
+    /// Build a v2 standard manifest carrying the given actions assertions and
+    /// extra declared assertion labels, then run the action validator over it.
+    fn run_actions(
+        assertions: &[(&str, Vec<Value>)],
+        extra_labels: &[&str],
+        generation: ClaimGeneration,
+        profile: EngineProfile,
+    ) -> ValidationResults {
+        const LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-0000000000ac";
+        let payload = enc(&vmap(vec![("data", Value::Bytes(vec![1]))]));
+        let encoded: Vec<(String, Vec<u8>)> = assertions
+            .iter()
+            .map(|(label, actions)| {
+                (
+                    (*label).to_string(),
+                    enc(&vmap(vec![("actions", Value::Array(actions.clone()))])),
+                )
+            })
+            .collect();
+        let mut stored: Vec<(String, &[u8])> = encoded
+            .iter()
+            .map(|(label, bytes)| (label.clone(), bytes.as_slice()))
+            .collect();
+        stored.extend(
+            extra_labels
+                .iter()
+                .map(|label| ((*label).to_string(), payload.as_slice())),
+        );
+        let manifest = ParsedManifest {
+            label: LABEL.into(),
+            manifest_jumbf: &[],
+            assertions: stored,
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let field = if generation == ClaimGeneration::V1 {
+            "assertions"
+        } else {
+            "created_assertions"
+        };
+        let claim = vmap(vec![(
+            field,
+            Value::Array(
+                assertions
+                    .iter()
+                    .map(|(label, _)| *label)
+                    .chain(extra_labels.iter().copied())
+                    .map(hashed_uri_for_assertion)
+                    .collect(),
+            ),
+        )]);
+        let refs = ClaimAssertionRefs::build(&manifest, &claim, generation);
+        let mut results = ValidationResults::default();
+        verify_action_assertions(
+            &refs,
+            &claim,
+            generation,
+            ManifestKind::Standard,
+            StoreContext {
+                manifests: std::slice::from_ref(&manifest),
+                manifest_hashes: &std::collections::HashMap::new(),
+            },
+            &manifest.label,
+            "self#jumbf=/c2pa/test/c2pa.signature",
+            profile,
+            &mut results,
+        );
+        results
+    }
+
+    fn action(kind: &str) -> Value {
+        vmap(vec![("action", Value::Text(kind.into()))])
+    }
+
+    /// C2PA 2.4 Validation, `c2pa.actions` validation: a `c2pa.created` or
+    /// `c2pa.opened` action is `assertion.action.malformed` "unless" its
+    /// assertion is the first actions assertion of the claim's array and the
+    /// action is the first element of that assertion's `actions` array. That is
+    /// a validator step, so it holds in the default posture for v2 claims; v1
+    /// claims keep the strict-only policy.
+    #[test]
+    fn misplaced_inception_actions_are_malformed_in_the_default_posture() {
+        let created = || {
+            vmap(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ])
+        };
+        let malformed = |assertions: &[(&str, Vec<Value>)], generation, profile| {
+            run_actions(assertions, &[], generation, profile)
+                .has_failure(ASSERTION_ACTION_MALFORMED)
+        };
+        let default = EngineProfile::GENEROUS;
+
+        // Well-formed: one inception action, first element of the only assertion.
+        assert!(!malformed(
+            &[("c2pa.actions.v2", vec![created(), action("c2pa.edited")])],
+            ClaimGeneration::V2,
+            default
+        ));
+        // Not the first element of its assertion.
+        assert!(malformed(
+            &[("c2pa.actions.v2", vec![action("c2pa.edited"), created()])],
+            ClaimGeneration::V2,
+            default
+        ));
+        // Not the first actions assertion of the array.
+        assert!(malformed(
+            &[
+                ("c2pa.actions.v2", vec![created()]),
+                ("c2pa.actions.v2__1", vec![action("c2pa.opened")]),
+            ],
+            ClaimGeneration::V2,
+            default
+        ));
+        // v1 keeps the existing policy: strict conformance only.
+        let v1 = [("c2pa.actions", vec![action("c2pa.edited"), created()])];
+        assert!(!malformed(&v1, ClaimGeneration::V1, default));
+        assert!(malformed(
+            &v1,
+            ClaimGeneration::V1,
+            EngineProfile::strict(SpecVersion::V2_4)
+        ));
+    }
+
+    /// C2PA 2.4 Validation, `c2pa.actions` validation: for `c2pa.watermarked`
+    /// (deprecated) or `c2pa.watermarked.bound`, "Verify that there is also a
+    /// `c2pa.soft-binding` assertion present in the manifest. If there is not,
+    /// the claim shall be rejected with a failure code of
+    /// `assertion.action.softBindingMissing`."
+    #[test]
+    fn watermark_actions_require_a_soft_binding_assertion() {
+        let missing = |kind: &str, extra_labels: &[&str]| {
+            run_actions(
+                &[(
+                    "c2pa.actions.v2",
+                    vec![action("c2pa.created"), action(kind)],
+                )],
+                extra_labels,
+                ClaimGeneration::V2,
+                EngineProfile::GENEROUS,
+            )
+            .has_failure(ASSERTION_ACTION_SOFT_BINDING_MISSING)
+        };
+
+        assert!(missing("c2pa.watermarked.bound", &[]));
+        assert!(missing("c2pa.watermarked", &[]));
+        assert!(!missing("c2pa.watermarked.bound", &["c2pa.soft-binding"]));
+        assert!(!missing("c2pa.watermarked", &["c2pa.soft-binding__1"]));
+        assert!(!missing("c2pa.edited", &[]));
+        // Only a `c2pa.soft-binding` assertion satisfies the requirement.
+        assert!(missing("c2pa.watermarked.bound", &["c2pa.thumbnail.claim"]));
+    }
+
+    /// C2PA 2.4 Validation, Validate the Assertions: an assertion present in
+    /// the assertion store but not referenced by an element of the claim's
+    /// `created_assertions`/`gathered_assertions` (or v1 `assertions`) "shall be
+    /// rejected with a failure code of `assertion.undeclared`". A
+    /// `claim_generator_info` icon reaches an assertion; it does not declare it.
+    #[test]
+    fn an_assertion_reachable_only_through_the_generator_icon_is_undeclared() {
+        let icon_jumbf = b"embedded c2pa.icon assertion jumbf";
+
+        let (fatal, icon_only) = run_generator_icon_binding(
+            ClaimGeneration::V2,
+            "c2pa.icon",
+            sha(icon_jumbf),
+            Some(icon_jumbf),
+            false,
+        );
+        assert!(fatal);
+        assert!(
+            icon_only
+                .failure
+                .iter()
+                .any(|status| status.code == ASSERTION_UNDECLARED
+                    && status.url.ends_with("c2pa.icon"))
+        );
+
+        let (fatal, declared) = run_generator_icon_binding(
+            ClaimGeneration::V2,
+            "c2pa.icon",
+            sha(icon_jumbf),
+            Some(icon_jumbf),
+            true,
+        );
+        assert!(!fatal);
+        assert!(!declared.has_failure(ASSERTION_UNDECLARED));
+        assert!(declared.has_success(ASSERTION_HASHED_URI_MATCH));
+    }
+
+    /// C2PA 2.4 Validation, Specific Assertion Validation, selects an
+    /// assertion's checks from its label. A known label delivered in a JSON
+    /// JUMBF content box owes the same checks as the CBOR spelling, so the
+    /// payload is projected into one value model instead of being skipped.
+    #[test]
+    fn json_content_assertions_of_known_labels_are_semantically_validated() {
+        let run = |label: &str, json: &[u8]| {
+            let assertion = superbox(&UUID_JSON_CONTENT, label, &[raw_box(b"json", json)], None);
+            let assertion_content = superbox_content(&assertion).unwrap();
+            let claim = enc(&vmap(vec![
+                ("instanceID", Value::Text("urn:uuid:json-semantics".into())),
+                ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+                (
+                    "claim_generator_info",
+                    vmap(vec![
+                        ("name", Value::Text("test".into())),
+                        ("specVersion", Value::Text("2.4.0".into())),
+                    ]),
+                ),
+                (
+                    "created_assertions",
+                    Value::Array(vec![vmap(vec![
+                        (
+                            "url",
+                            Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                        ),
+                        ("alg", Value::Text("sha256".into())),
+                        ("hash", Value::Bytes(sha(assertion_content))),
+                    ])]),
+                ),
+            ]));
+            let store = build_manifest_store(&[build_manifest(
+                "urn:c2pa:json-semantics",
+                &[assertion.clone()],
+                &claim,
+                &[0xd2, 0x84],
+            )]);
+            let parsed = parse_manifest_store(&store).unwrap();
+            let manifest = &parsed.manifests[0];
+            let claim = decode(manifest.claim_cbor.unwrap()).unwrap();
+            let refs = ClaimAssertionRefs::build(manifest, &claim, ClaimGeneration::V2);
+            let hashes = std::collections::HashMap::new();
+            let mut results = ValidationResults::default();
+            verify_claim_structure(
+                manifest,
+                StoreContext {
+                    manifests: &parsed.manifests,
+                    manifest_hashes: &hashes,
+                },
+                &claim,
+                ClaimGeneration::V2,
+                &refs,
+                AssetFormat::Jpeg,
+                "self#jumbf=/c2pa/urn:c2pa:json-semantics/c2pa.signature",
+                EngineProfile::GENEROUS,
+                &mut results,
+            );
+            results
+        };
+
+        // An ingredient with no `relationship` is `assertion.ingredient.malformed`
+        // whichever content type carried it.
+        let empty_ingredient = run("c2pa.ingredient.v3", b"{}");
+        assert!(empty_ingredient.has_failure(ASSERTION_INGREDIENT_MALFORMED));
+        assert!(!empty_ingredient.has_failure(ASSERTION_JSON_INVALID));
+        assert!(
+            !run("c2pa.ingredient.v3", br#"{"relationship":"parentOf"}"#)
+                .has_failure(ASSERTION_INGREDIENT_MALFORMED)
+        );
+
+        // An actions assertion with no `actions` field is
+        // `assertion.action.malformed`, and its actions are otherwise checked.
+        assert!(run("c2pa.actions.v2", b"{}").has_failure(ASSERTION_ACTION_MALFORMED));
+        assert!(run(
+            "c2pa.actions.v2",
+            br#"{"actions":[{"action":"c2pa.created"},{"action":"c2pa.watermarked.bound"}]}"#
+        )
+        .has_failure(ASSERTION_ACTION_SOFT_BINDING_MISSING));
+    }
+
+    /// C2PA 2.4 `c2pa.actions` validation: `c2pa.opened` resolves exactly one
+    /// parentOf ingredient in this manifest, `c2pa.placed` componentOf
+    /// ingredients in this manifest, `c2pa.removed` componentOf ingredients in
+    /// another manifest, and `c2pa.transcoded`/`c2pa.repackaged` optional
+    /// parentOf ingredients.
+    #[test]
+    fn action_ingredient_references_follow_the_relationship_each_action_requires() {
+        const CURRENT: &str = "urn:c2pa:00000000-0000-4000-8000-00000000000c";
+        const PRIOR: &str = "urn:c2pa:00000000-0000-4000-8000-00000000000p";
+        let ingredient = |relationship: &str| {
+            enc(&vmap(vec![(
+                "relationship",
+                Value::Text(relationship.into()),
+            )]))
+        };
+        let component = ingredient("componentOf");
+        let parent = ingredient("parentOf");
+        let prior_component = ingredient("componentOf");
+        let (component_box, parent_box, prior_box) = (
+            b"component ingredient box".as_slice(),
+            b"parent ingredient box".as_slice(),
+            b"prior component ingredient box".as_slice(),
+        );
+        let href = |manifest: &str, label: &str, jumbf: &[u8]| {
+            vmap(vec![
+                (
+                    "url",
+                    Value::Text(format!(
+                        "self#jumbf=/c2pa/{manifest}/c2pa.assertions/{label}"
+                    )),
+                ),
+                ("alg", Value::Text("sha256".into())),
+                ("hash", Value::Bytes(sha(jumbf))),
+            ])
+        };
+        let component_ref = href(CURRENT, "c2pa.ingredient.v3", component_box);
+        let parent_ref = href(CURRENT, "c2pa.ingredient.v3__1", parent_box);
+        let prior_ref = href(PRIOR, "c2pa.ingredient.v3", prior_box);
+
+        let prior = || ParsedManifest {
+            label: PRIOR.into(),
+            manifest_jumbf: &[],
+            assertions: vec![("c2pa.ingredient.v3".into(), prior_component.as_slice())],
+            assertion_jumbf: vec![("c2pa.ingredient.v3".into(), prior_box)],
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let mismatch = |action: Value| {
+            let actions = enc(&vmap(vec![("actions", Value::Array(vec![action]))]));
+            let manifest = ParsedManifest {
+                label: CURRENT.into(),
+                manifest_jumbf: &[],
+                assertions: vec![
+                    ("c2pa.ingredient.v3".into(), component.as_slice()),
+                    ("c2pa.ingredient.v3__1".into(), parent.as_slice()),
+                    ("c2pa.actions.v2".into(), actions.as_slice()),
+                ],
+                assertion_jumbf: vec![
+                    ("c2pa.ingredient.v3".into(), component_box),
+                    ("c2pa.ingredient.v3__1".into(), parent_box),
+                ],
+                claim_cbor: None,
+                signature_cose: None,
+                claim_count: 1,
+                claim_box_label: Some("c2pa.claim.v2".into()),
+            };
+            let claim = vmap(vec![(
+                "created_assertions",
+                Value::Array(vec![
+                    hashed_uri_for_assertion("c2pa.ingredient.v3"),
+                    hashed_uri_for_assertion("c2pa.ingredient.v3__1"),
+                    hashed_uri_for_assertion("c2pa.actions.v2"),
+                ]),
+            )]);
+            let manifests = [prior(), manifest];
+            let refs = ClaimAssertionRefs::build(&manifests[1], &claim, ClaimGeneration::V2);
+            let hashes = std::collections::HashMap::new();
+            let mut results = ValidationResults::default();
+            verify_action_assertions(
+                &refs,
+                &claim,
+                ClaimGeneration::V2,
+                ManifestKind::Standard,
+                StoreContext {
+                    manifests: &manifests,
+                    manifest_hashes: &hashes,
+                },
+                CURRENT,
+                "self#jumbf=/c2pa/test/c2pa.signature",
+                EngineProfile::GENEROUS,
+                &mut results,
+            );
+            results.has_failure(ASSERTION_ACTION_INGREDIENT_MISMATCH)
+        };
+        let action = |kind: &str, ingredients: Option<Vec<Value>>| {
+            let mut fields = vec![("action", Value::Text(kind.into()))];
+            if let Some(ingredients) = ingredients {
+                fields.push((
+                    "parameters",
+                    vmap(vec![("ingredients", Value::Array(ingredients))]),
+                ));
+            }
+            vmap(fields)
+        };
+
+        assert!(!mismatch(action(
+            "c2pa.opened",
+            Some(vec![parent_ref.clone()])
+        )));
+        assert!(mismatch(action(
+            "c2pa.opened",
+            Some(vec![component_ref.clone()])
+        )));
+        assert!(mismatch(action("c2pa.opened", None)));
+        assert!(!mismatch(action(
+            "c2pa.placed",
+            Some(vec![component_ref.clone()])
+        )));
+        assert!(mismatch(action(
+            "c2pa.placed",
+            Some(vec![parent_ref.clone()])
+        )));
+        assert!(mismatch(action("c2pa.placed", Some(Vec::new()))));
+        assert!(!mismatch(action(
+            "c2pa.removed",
+            Some(vec![prior_ref.clone()])
+        )));
+        assert!(mismatch(action(
+            "c2pa.removed",
+            Some(vec![component_ref.clone()])
+        )));
+        assert!(mismatch(action("c2pa.removed", None)));
+        assert!(!mismatch(action("c2pa.transcoded", None)));
+        assert!(!mismatch(action("c2pa.repackaged", Some(vec![parent_ref]))));
+        assert!(mismatch(action(
+            "c2pa.transcoded",
+            Some(vec![component_ref])
+        )));
+
+        let mut tampered = prior_ref;
+        if let Value::Map(fields) = &mut tampered {
+            for (key, value) in fields.iter_mut() {
+                if key.as_text() == Some("hash") {
+                    *value = Value::Bytes(vec![0; 32]);
+                }
+            }
+        }
+        assert!(mismatch(action("c2pa.removed", Some(vec![tampered]))));
+    }
+    /// v1 claims are held to the ingredient-reference rules only under strict
+    /// conformance, and a v1 `c2pa.actions` assertion may spell the field
+    /// `ingredients` (as c2pa-rs writes it) as long as it resolves.
+    #[test]
+    fn v1_action_ingredient_rules_are_strict_only_and_accept_either_spelling() {
+        const LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-0000000000v1";
+        let parent = enc(&vmap(vec![(
+            "relationship",
+            Value::Text("parentOf".into()),
+        )]));
+        let parent_box = b"v1 parent ingredient box".as_slice();
+        let parent_ref = vmap(vec![
+            (
+                "url",
+                Value::Text("self#jumbf=c2pa.assertions/c2pa.ingredient".into()),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(parent_box))),
+        ]);
+        let mismatch = |parameters: Option<Value>, profile: EngineProfile| {
+            let mut opened = vec![("action", Value::Text("c2pa.opened".into()))];
+            if let Some(parameters) = parameters {
+                opened.push(("parameters", parameters));
+            }
+            let actions = enc(&vmap(vec![("actions", Value::Array(vec![vmap(opened)]))]));
+            let manifests = [ParsedManifest {
+                label: LABEL.into(),
+                manifest_jumbf: &[],
+                assertions: vec![
+                    ("c2pa.ingredient".into(), parent.as_slice()),
+                    ("c2pa.actions".into(), actions.as_slice()),
+                ],
+                assertion_jumbf: vec![("c2pa.ingredient".into(), parent_box)],
+                claim_cbor: None,
+                signature_cose: None,
+                claim_count: 1,
+                claim_box_label: Some("c2pa.claim".into()),
+            }];
+            let claim = vmap(vec![(
+                "assertions",
+                Value::Array(vec![
+                    hashed_uri_for_assertion("c2pa.ingredient"),
+                    hashed_uri_for_assertion("c2pa.actions"),
+                ]),
+            )]);
+            let refs = ClaimAssertionRefs::build(&manifests[0], &claim, ClaimGeneration::V1);
+            let hashes = std::collections::HashMap::new();
+            let mut results = ValidationResults::default();
+            verify_action_assertions(
+                &refs,
+                &claim,
+                ClaimGeneration::V1,
+                ManifestKind::Standard,
+                StoreContext {
+                    manifests: &manifests,
+                    manifest_hashes: &hashes,
+                },
+                LABEL,
+                "self#jumbf=/c2pa/test/c2pa.signature",
+                profile,
+                &mut results,
+            );
+            results.has_failure(ASSERTION_ACTION_INGREDIENT_MISMATCH)
+        };
+        let strict = EngineProfile::strict(SpecVersion::V2_4);
+
+        assert!(!mismatch(None, EngineProfile::GENEROUS));
+        assert!(mismatch(None, strict));
+        assert!(!mismatch(
+            Some(vmap(vec![("ingredient", parent_ref.clone())])),
+            strict
+        ));
+        assert!(!mismatch(
+            Some(vmap(vec![("ingredients", Value::Array(vec![parent_ref]))])),
+            strict
+        ));
+    }
+
+    fn data_hash_exclusion_result(exclusions: Value, data_len: usize) -> ValidationResults {
+        let hash_data = vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(vec![0; 32])),
+            ("exclusions", exclusions),
+        ]);
+        let cbor = enc(&hash_data);
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("c2pa.hash.data".into(), cbor.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = vmap(vec![(
+            "created_assertions",
+            Value::Array(vec![hashed_uri_for_assertion("c2pa.hash.data")]),
+        )]);
+        let refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+        let mut results = ValidationResults::default();
+        let data = vec![0; data_len];
+        verify_primary_hard_binding(
+            &claim,
+            &refs,
+            &data,
+            AssetFormat::Jpeg,
+            &[],
+            update_manifest::StoreRendition::AsSigned,
+            &manifest.label,
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+        results
+    }
+
+    #[test]
+    fn malformed_data_exclusions_emit_validation_statuses() {
+        let malformed = data_hash_exclusion_result(
+            Value::Array(vec![vmap(vec![
+                ("start", Value::Integer((-1).into())),
+                ("length", Value::Integer(1.into())),
+            ])]),
+            10,
+        );
+        assert!(malformed.has_failure(ASSERTION_DATA_HASH_MALFORMED));
+
+        let outside = data_hash_exclusion_result(
+            Value::Array(vec![vmap(vec![
+                ("start", Value::Integer(9.into())),
+                ("length", Value::Integer(2.into())),
+            ])]),
+            10,
+        );
+        assert!(outside.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+    }
+
+    #[test]
+    fn box_entry_exclusions_and_font_normalization_are_hashed_exactly() {
+        let data: Vec<u8> = (0..20).collect();
+        let spans = vec![
+            crate::c2pa_formats::BoxSpan::contiguous("A", 0, 5),
+            crate::c2pa_formats::BoxSpan::contiguous("B", 10, 20),
+        ];
+        let exclusions = [exclusions::BoxExclusion {
+            box_index: 1,
+            start: 2,
+            length: 3,
+        }];
+        let mut expected = data[..12].to_vec();
+        expected.extend_from_slice(&data[15..]);
+        assert_eq!(
+            hash_box_entry("sha256", &data, &spans, &exclusions, AssetFormat::Jpeg),
+            hash_bytes("sha256", &expected)
+        );
+
+        let head = [9u8; 16];
+        let head_span = [crate::c2pa_formats::BoxSpan::contiguous(
+            "head",
+            0,
+            head.len(),
+        )];
+        let mut normalized = head;
+        normalized[8..12].fill(0);
+        assert_eq!(
+            hash_box_entry("sha256", &head, &head_span, &[], AssetFormat::Font),
+            hash_bytes("sha256", &normalized)
+        );
+    }
+
+    /// A general box hash over a container the spec gives no box convention
+    /// for is the claim's only hard binding and cannot be evaluated, so the
+    /// verifier must fail closed rather than leave the manifest valid with no
+    /// content binding checked.
+    #[test]
+    fn boxes_hash_without_segmentation_fails_closed() {
+        let cbor = enc(&vmap(vec![("boxes", Value::Array(Vec::new()))]));
+        let mut results = ValidationResults::default();
+        verify_boxes_hash(
+            &cbor,
+            &vmap(Vec::new()),
+            AssetFormat::C2paStore,
+            &[],
+            false,
+            "urn:c2pa:test",
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+        assert!(results.has_failure(ASSERTION_BOXES_HASH_UNEVALUATED));
+        assert!(!results.has_success(ASSERTION_BOXES_HASH_MATCH));
+        assert_eq!(
+            compute_state(&results, EngineProfile::GENEROUS),
+            ValidationState::Invalid,
+        );
+    }
+
+    /// An Ogg logical bitstream is one box even when its pages interleave with
+    /// another stream's, so the entry hashes that stream's pages and nothing
+    /// in between.
+    #[test]
+    fn scattered_box_entries_hash_only_their_own_ranges() {
+        let data: Vec<u8> = (0..40).collect();
+        let spans = [crate::c2pa_formats::BoxSpan::scattered(
+            "Stream-1",
+            vec![(0, 10), (20, 30)],
+        )];
+        let mut expected = data[..10].to_vec();
+        expected.extend_from_slice(&data[20..30]);
+        assert_eq!(
+            hash_box_entry("sha256", &data, &spans, &[], AssetFormat::Ogg),
+            hash_bytes("sha256", &expected)
+        );
+
+        // An exclusion offset is measured within the box's own content, so
+        // bytes 8..12 of the box span the seam between its two ranges.
+        let exclusions = [exclusions::BoxExclusion {
+            box_index: 0,
+            start: 8,
+            length: 4,
+        }];
+        let mut expected = data[..8].to_vec();
+        expected.extend_from_slice(&data[22..30]);
+        assert_eq!(
+            hash_box_entry("sha256", &data, &spans, &exclusions, AssetFormat::Ogg),
+            hash_bytes("sha256", &expected)
+        );
+    }
+
+    #[test]
+    fn sha1_box_and_collection_hashes_are_rejected_before_hashing() {
+        let boxes = enc(&vmap(vec![(
+            "boxes",
+            Value::Array(vec![vmap(vec![
+                ("names", Value::Array(vec![Value::Text("C2PA".into())])),
+                ("alg", Value::Text("sha1".into())),
+                ("hash", Value::Bytes(vec![0; 20])),
+            ])]),
+        )]));
+        let mut box_results = ValidationResults::default();
+        verify_boxes_hash(
+            &boxes,
+            &vmap(Vec::new()),
+            AssetFormat::C2paStore,
+            &[],
+            false,
+            "urn:c2pa:test",
+            EngineProfile::GENEROUS,
+            &mut box_results,
+        );
+        assert!(box_results.has_failure(ALGORITHM_UNSUPPORTED));
+        assert!(!box_results.has_success(ASSERTION_BOXES_HASH_MATCH));
+
+        let collection = enc(&vmap(vec![
+            ("uris", Value::Array(Vec::new())),
+            ("alg", Value::Text("sha1".into())),
+            ("zip_central_directory_hash", Value::Bytes(vec![0; 20])),
+        ]));
+        let mut collection_results = ValidationResults::default();
+        verify_collection_hash(
+            &collection,
+            &vmap(Vec::new()),
+            &[],
+            false,
+            "urn:c2pa:test",
+            &mut collection_results,
+        );
+        assert!(collection_results.has_failure(ALGORITHM_UNSUPPORTED));
+        assert!(!collection_results.has_failure(ASSERTION_COLLECTION_HASH_MISMATCH));
+        assert!(!collection_results.has_success(ASSERTION_COLLECTION_HASH_MATCH));
+
+        let missing_algorithm = enc(&vmap(vec![
+            ("uris", Value::Array(Vec::new())),
+            ("zip_central_directory_hash", Value::Bytes(vec![0; 32])),
+        ]));
+        let mut missing_results = ValidationResults::default();
+        verify_collection_hash(
+            &missing_algorithm,
+            &vmap(Vec::new()),
+            &[],
+            false,
+            "urn:c2pa:test",
+            &mut missing_results,
+        );
+        assert!(missing_results.has_failure(ALGORITHM_UNSUPPORTED));
+        assert!(!missing_results.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
+    }
+
+    #[test]
+    fn collection_hash_falls_back_to_claim_algorithm() {
+        let empty_zip = [
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let collection = enc(&vmap(vec![
+            ("uris", Value::Array(Vec::new())),
+            (
+                "zip_central_directory_hash",
+                Value::Bytes(hash_bytes("sha256", &empty_zip).expect("allowed hash")),
+            ),
+        ]));
+        let claim = vmap(vec![("alg", Value::Text("sha256".into()))]);
+        let mut results = ValidationResults::default();
+        verify_collection_hash(
+            &collection,
+            &claim,
+            &empty_zip,
+            false,
+            "urn:c2pa:test",
+            &mut results,
+        );
+        assert!(results.has_success(ASSERTION_COLLECTION_HASH_MATCH));
+        assert!(!results.has_failure(ALGORITHM_UNSUPPORTED));
+        assert!(!results.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
+    }
+
+    #[test]
+    fn bmff_optional_boxes_are_reported_as_additional_exclusions() {
+        let map = |xpath: &str| crate::c2pa_formats::BmffExclusionMap {
+            xpath: xpath.into(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version: None,
+            flags: None,
+            exact: false,
+        };
+        assert!(!bmff_has_additional_exclusions(
+            &[map("/uuid"), map("/ftyp"), map("/mfra")],
+            false,
+        ));
+        assert!(bmff_has_additional_exclusions(&[map("/free")], false));
+        assert!(!bmff_has_additional_exclusions(&[map("/mdat")], true));
+    }
+
+    #[test]
+    fn malformed_ingredient_emits_registered_status() {
+        let ingredient = enc(&vmap(Vec::new()));
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("c2pa.ingredient.v2".into(), ingredient.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = vmap(vec![(
+            "created_assertions",
+            Value::Array(vec![hashed_uri_for_assertion("c2pa.ingredient.v2")]),
+        )]);
+        let refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+        let mut results = ValidationResults::default();
+        verify_ingredient_shapes(&manifest, &refs, &mut results);
+        assert!(results.has_failure(ASSERTION_INGREDIENT_MALFORMED));
+    }
+
+    #[test]
+    fn embedded_alternative_content_hash_emits_match() {
+        let embedded_jumbf = b"embedded original preservation image";
+        let embedded_cbor = enc(&vmap(vec![("data", Value::Bytes(vec![1]))]));
+        let representation = vmap(vec![
+            ("type", Value::Text("exif.originalPreservationImage".into())),
+            (
+                "parameters",
+                vmap(vec![(
+                    "embeddedOriginalPreservationImage",
+                    vmap(vec![
+                        (
+                            "url",
+                            Value::Text("self#jumbf=c2pa.assertions/c2pa.embedded-data".into()),
+                        ),
+                        ("alg", Value::Text("sha256".into())),
+                        ("hash", Value::Bytes(sha(embedded_jumbf))),
+                    ]),
+                )]),
+            ),
+        ]);
+        let representation_cbor = enc(&representation);
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![
+                (
+                    "c2pa.alternative-content-representation".into(),
+                    representation_cbor.as_slice(),
+                ),
+                ("c2pa.embedded-data".into(), embedded_cbor.as_slice()),
+            ],
+            assertion_jumbf: vec![
+                (
+                    "c2pa.alternative-content-representation".into(),
+                    representation_cbor.as_slice(),
+                ),
+                ("c2pa.embedded-data".into(), embedded_jumbf.as_slice()),
+            ],
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = vmap(vec![(
+            "created_assertions",
+            Value::Array(vec![
+                hashed_uri_for_assertion("c2pa.alternative-content-representation"),
+                hashed_uri_for_assertion("c2pa.embedded-data"),
+            ]),
+        )]);
+        let refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+        let mut results = ValidationResults::default();
+        verify_alternative_content(&manifest, &claim, &refs, &mut results);
+        assert!(results.has_success(ASSERTION_ALTERNATIVE_CONTENT_MATCH));
+        assert!(results.failure.is_empty());
+    }
+
+    // ---- data-hash exclusion content (C2PA 2.4 "Validating a data hash") ----
+
+    /// Run the sole `c2pa.hash.data` hard binding over `data` with the given
+    /// exclusion ranges and a `hash` computed over exactly those ranges, so the
+    /// byte hash always matches and only the exclusion rules can reject it.
+    fn data_hash_binding(
+        format: AssetFormat,
+        data: &[u8],
+        exclusions: &[(usize, usize)],
+    ) -> ValidationResults {
+        let declared = Value::Array(
+            exclusions
+                .iter()
+                .map(|(start, length)| {
+                    vmap(vec![
+                        ("start", Value::Integer(*start as i128)),
+                        ("length", Value::Integer(*length as i128)),
+                    ])
+                })
+                .collect(),
+        );
+        let hash = hash_with_exclusions("sha256", data, exclusions).expect("hash");
+        let cbor = enc(&vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(hash)),
+            ("exclusions", declared),
+        ]));
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("c2pa.hash.data".into(), cbor.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = vmap(vec![(
+            "created_assertions",
+            Value::Array(vec![hashed_uri_for_assertion("c2pa.hash.data")]),
+        )]);
+        let refs = ClaimAssertionRefs::build(&manifest, &claim, ClaimGeneration::V2);
+        let mut results = ValidationResults::default();
+        verify_primary_hard_binding(
+            &claim,
+            &refs,
+            data,
+            format,
+            &[],
+            update_manifest::StoreRendition::AsSigned,
+            &manifest.label,
+            EngineProfile::GENEROUS,
+            &mut results,
+        );
+        results
+    }
+
+    /// A JPEG carrying a real manifest store, with the byte span of its C2PA
+    /// `APP11` run.
+    fn signed_jpeg() -> (Vec<u8>, crate::c2pa_formats::DataHashExclusion) {
+        let store = build_manifest_store(&[build_manifest(
+            "urn:c2pa:test:0001",
+            &[],
+            &[0xa0],
+            &[0xd2, 0x84],
+        )]);
+        let asset = crate::c2pa_formats::embed_manifest(
+            AssetFormat::Jpeg,
+            include_bytes!("../../../../tests/fixtures/signed_test.jpg"),
+            &store,
+        )
+        .expect("embed");
+        let carrier = crate::c2pa_formats::compute_data_hash_exclusions(AssetFormat::Jpeg, &asset)
+            .expect("carrier");
+        assert_eq!(carrier.len(), 1, "one contiguous APP11 run");
+        (asset, carrier[0])
+    }
+
+    #[test]
+    fn an_exact_manifest_carrier_exclusion_matches_without_caveat() {
+        let (asset, carrier) = signed_jpeg();
+        let results = data_hash_binding(
+            AssetFormat::Jpeg,
+            &asset,
+            &[(carrier.start, carrier.length)],
+        );
+        assert!(
+            results.has_success(ASSERTION_DATA_HASH_MATCH),
+            "{results:?}"
+        );
+        assert!(!results.has_informational(ASSERTION_DATA_HASH_ADDITIONAL_EXCLUSIONS_PRESENT));
+    }
+
+    /// C2PA 2.4: "A validator shall ensure that the data contained within the
+    /// exclusion range containing the C2PA Manifest Store consists of only the
+    /// C2PA Manifest Store and any appropriate padding ... If a validator
+    /// encounters any data other than what is permitted, then the manifest
+    /// shall be rejected with a failure code of assertion.dataHash.mismatch."
+    /// The hash still matches, so only this rule can catch the smuggled bytes.
+    #[test]
+    fn asset_bytes_hidden_inside_the_manifest_exclusion_are_rejected() {
+        let (asset, carrier) = signed_jpeg();
+        let widened = (carrier.start, carrier.length + 16);
+        assert!(
+            asset[carrier.start + carrier.length..][..16]
+                .iter()
+                .any(|byte| *byte != 0),
+            "the widened bytes must be real asset content, not padding"
+        );
+        let results = data_hash_binding(AssetFormat::Jpeg, &asset, &[widened]);
+        assert!(
+            results.has_failure(ASSERTION_DATA_HASH_MISMATCH),
+            "{results:?}"
+        );
+        assert!(!results.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    /// C2PA 2.4 "Hashing of JPEG 1 files": "a validator shall match the total
+    /// length of the exclusion range with that of the total length of all
+    /// APP11 segments representing the C2PA Manifest to ensure that the length
+    /// was not tampered with."
+    #[test]
+    fn a_jpeg_exclusion_shorter_than_the_app11_run_is_rejected() {
+        let (asset, carrier) = signed_jpeg();
+        let results = data_hash_binding(
+            AssetFormat::Jpeg,
+            &asset,
+            &[(carrier.start, carrier.length - 8)],
+        );
+        assert!(
+            results.has_failure(ASSERTION_DATA_HASH_MISMATCH),
+            "{results:?}"
+        );
+        assert!(!results.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    /// Zeroed padding beside the store is explicitly permitted, and metadata
+    /// ranges away from the store stay informational rather than fatal.
+    #[test]
+    fn zero_padding_and_metadata_exclusions_remain_acceptable() {
+        let mut asset =
+            crate::c2pa_formats::embed_manifest(AssetFormat::Png, &minimal_png(), &[0xAA; 64])
+                .expect("embed");
+        let carrier = crate::c2pa_formats::compute_data_hash_exclusions(AssetFormat::Png, &asset)
+            .expect("carrier")[0];
+        // A zero-length, zero-typed PNG chunk: twelve bytes of pure padding
+        // directly after the manifest carrier.
+        let pad_at = carrier.start + carrier.length;
+        asset.splice(pad_at..pad_at, [0u8; 12]);
+
+        let padded = data_hash_binding(
+            AssetFormat::Png,
+            &asset,
+            &[(carrier.start, carrier.length + 12)],
+        );
+        assert!(padded.has_success(ASSERTION_DATA_HASH_MATCH), "{padded:?}");
+
+        let with_metadata = data_hash_binding(
+            AssetFormat::Png,
+            &asset,
+            &[(0, 8), (carrier.start, carrier.length)],
+        );
+        assert!(with_metadata.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(
+            with_metadata.has_informational(ASSERTION_DATA_HASH_ADDITIONAL_EXCLUSIONS_PRESENT),
+            "a range away from the carrier is the additional-exclusions case"
+        );
+    }
+
+    fn minimal_png() -> Vec<u8> {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let chunk = |png: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]| {
+            png.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(body);
+            let mut crc_input = kind.to_vec();
+            crc_input.extend_from_slice(body);
+            png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        };
+        chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+        chunk(&mut png, b"IDAT", &[0x78, 0x9C, 0x01, 0x02]);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    // ---- general box hash on GIF, RIFF, and Ogg (C2PA 2.4 BoxesHash) ----
+
+    /// Build a `c2pa.hash.boxes` assertion over `spans`, hashing each box
+    /// independently of the verifier, then run it over `data`.
+    fn boxes_hash_binding_for_spans(
+        format: AssetFormat,
+        signed: &[u8],
+        data: &[u8],
+        spans: &[crate::c2pa_formats::BoxSpan],
+        profile: EngineProfile,
+    ) -> ValidationResults {
+        let entries: Vec<Value> = spans
+            .iter()
+            .map(|span| {
+                let hash = if span.name == "C2PA" {
+                    vec![0x00]
+                } else {
+                    let mut content = Vec::new();
+                    for &(start, end) in span.ranges() {
+                        content.extend_from_slice(&signed[start..end]);
+                    }
+                    sha(&content)
+                };
+                vmap(vec![
+                    ("names", Value::Array(vec![Value::Text(span.name.clone())])),
+                    ("alg", Value::Text("sha256".into())),
+                    ("hash", Value::Bytes(hash)),
+                ])
+            })
+            .collect();
+        let cbor = enc(&vmap(vec![("boxes", Value::Array(entries))]));
+        let mut results = ValidationResults::default();
+        verify_boxes_hash(
+            &cbor,
+            &vmap(Vec::new()),
+            format,
+            data,
+            false,
+            "urn:c2pa:test",
+            profile,
+            &mut results,
+        );
+        results
+    }
+
+    fn boxes_hash_binding(format: AssetFormat, signed: &[u8], data: &[u8]) -> ValidationResults {
+        let spans = crate::c2pa_formats::box_spans(format, signed)
+            .expect("segmentation")
+            .expect("a segmentable container");
+        boxes_hash_binding_for_spans(format, signed, data, &spans, EngineProfile::GENEROUS)
+    }
+
+    fn restart_interval_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xDA, 0x00, 0x02, // SOS with an empty synthetic header
+            0x11, 0x22, // first entropy-coded segment
+            0xFF, 0xD0, 0x33, 0xFF, 0x00, 0x44, // RST0 + stuffed entropy bytes
+            0xFF, 0xD1, 0x55, // RST1 + final entropy-coded segment
+            0xFF, 0xD9, // EOI
+        ]
+    }
+
+    /// C2PA 2.4 BoxesHash, JPEG-specific handling: "The Start of Scan box and
+    /// Restart boxes ... will include the entropy coded segments following the
+    /// respective marker." Strict accepts only that reading. Default also
+    /// reads historical c2pa-rs output, where SOS covers the full scan and each
+    /// restart box covers only its marker. Both layouts still bind every byte.
+    #[test]
+    fn jpeg_restart_box_hash_layout_is_posture_sensitive_and_tamper_evident() {
+        let store = build_manifest_store(&[build_manifest(
+            "urn:c2pa:test:0001",
+            &[],
+            &[0xa0],
+            &[0xd2, 0x84],
+        )]);
+        let signed = crate::c2pa_formats::embed_manifest(
+            AssetFormat::Jpeg,
+            &restart_interval_jpeg(),
+            &store,
+        )
+        .expect("embed");
+        let strict_spans = crate::c2pa_formats::box_spans(AssetFormat::Jpeg, &signed)
+            .expect("segmentation")
+            .expect("JPEG spans");
+        let overlapping_spans =
+            crate::c2pa_formats::jpeg_box_spans_with_overlapping_restart_segments(&signed)
+                .expect("compatibility segmentation");
+
+        let entropy_byte = strict_spans
+            .iter()
+            .find(|span| span.name == "RST0")
+            .expect("RST0")
+            .start()
+            + 2;
+        let mut tampered = signed.clone();
+        tampered[entropy_byte] ^= 0xFF;
+        let strict_profile = EngineProfile::strict(SpecVersion::V2_4);
+
+        for profile in [EngineProfile::GENEROUS, strict_profile] {
+            let intact = boxes_hash_binding_for_spans(
+                AssetFormat::Jpeg,
+                &signed,
+                &signed,
+                &strict_spans,
+                profile,
+            );
+            assert!(intact.has_success(ASSERTION_BOXES_HASH_MATCH), "{intact:?}");
+            assert!(!intact.has_informational(ASSERTION_BOXES_HASH_OVERLAPPING_RESTART_SEGMENTS));
+
+            let edited = boxes_hash_binding_for_spans(
+                AssetFormat::Jpeg,
+                &signed,
+                &tampered,
+                &strict_spans,
+                profile,
+            );
+            assert!(
+                edited.has_failure(ASSERTION_BOXES_HASH_MISMATCH),
+                "{edited:?}"
+            );
+            assert!(!edited.has_success(ASSERTION_BOXES_HASH_MATCH));
+        }
+
+        let default_compat = boxes_hash_binding_for_spans(
+            AssetFormat::Jpeg,
+            &signed,
+            &signed,
+            &overlapping_spans,
+            EngineProfile::GENEROUS,
+        );
+        assert!(
+            default_compat.has_success(ASSERTION_BOXES_HASH_MATCH),
+            "{default_compat:?}"
+        );
+        assert!(default_compat.has_informational(ASSERTION_BOXES_HASH_OVERLAPPING_RESTART_SEGMENTS));
+
+        let strict_compat = boxes_hash_binding_for_spans(
+            AssetFormat::Jpeg,
+            &signed,
+            &signed,
+            &overlapping_spans,
+            strict_profile,
+        );
+        assert!(
+            strict_compat.has_failure(ASSERTION_BOXES_HASH_MISMATCH),
+            "{strict_compat:?}"
+        );
+        assert!(!strict_compat.has_success(ASSERTION_BOXES_HASH_MATCH));
+
+        for profile in [EngineProfile::GENEROUS, strict_profile] {
+            let edited = boxes_hash_binding_for_spans(
+                AssetFormat::Jpeg,
+                &signed,
+                &tampered,
+                &overlapping_spans,
+                profile,
+            );
+            assert!(
+                edited.has_failure(ASSERTION_BOXES_HASH_MISMATCH),
+                "{edited:?}"
+            );
+            assert!(!edited.has_success(ASSERTION_BOXES_HASH_MATCH));
+        }
+    }
+
+    /// C2PA 2.4 Validation, "Validating a general box hash": "If the hash
+    /// value for any box does not match ... the manifest shall be rejected
+    /// with a failure code of assertion.boxesHash.mismatch." These containers
+    /// were never segmented, so a box-hash-signed GIF, WAV, or Ogg stayed
+    /// valid no matter how its content was edited.
+    #[test]
+    fn box_hash_signed_gif_riff_and_ogg_detect_content_tampering() {
+        let store = build_manifest_store(&[build_manifest(
+            "urn:c2pa:test:0001",
+            &[],
+            &[0xa0],
+            &[0xd2, 0x84],
+        )]);
+        // Each case names a payload byte pattern that lies in rendered
+        // content, outside the manifest carrier.
+        let cases: [(AssetFormat, Vec<u8>, &[u8]); 3] = [
+            (
+                AssetFormat::Gif,
+                crate::c2pa_formats::sample_gif(),
+                &[0x44, 0x01],
+            ),
+            (
+                AssetFormat::Riff,
+                crate::c2pa_formats::sample_riff(),
+                &[0x88, 0x58],
+            ),
+            (
+                AssetFormat::Ogg,
+                crate::c2pa_formats::sample_ogg(),
+                b"fixture",
+            ),
+        ];
+        for (format, asset, payload) in cases {
+            let signed =
+                crate::c2pa_formats::embed_manifest(format, &asset, &store).expect("embed");
+            let intact = boxes_hash_binding(format, &signed, &signed);
+            assert!(
+                intact.has_success(ASSERTION_BOXES_HASH_MATCH),
+                "{format:?}: {intact:?}"
+            );
+
+            // Edit one byte of rendered content, leaving the container itself
+            // well-formed, which is exactly what a content binding must catch.
+            let target = signed
+                .windows(payload.len())
+                .position(|window| window == payload)
+                .expect("payload present");
+            let mut tampered = signed.clone();
+            if format == AssetFormat::Ogg {
+                crate::c2pa_formats::tamper_ogg_page_byte(&mut tampered, target);
+            } else {
+                tampered[target] ^= 0xFF;
+            }
+            let edited = boxes_hash_binding(format, &signed, &tampered);
+            assert!(
+                edited.has_failure(ASSERTION_BOXES_HASH_MISMATCH),
+                "{format:?}: {edited:?}"
+            );
+            assert!(!edited.has_success(ASSERTION_BOXES_HASH_MATCH));
+            assert_eq!(
+                compute_state(&edited, EngineProfile::GENEROUS),
+                ValidationState::Invalid,
+                "{format:?}"
+            );
+        }
+    }
+
+    /// "If there are any other boxes present in the asset, then the manifest
+    /// shall be rejected with a failure code of assertion.boxesHash.unknownBox."
+    /// Data appended after the GIF trailer is such a box (BoxesHash names it
+    /// `c2pa.after`), so it can never ride along unhashed.
+    #[test]
+    fn gif_data_outside_the_signed_block_stream_is_an_unknown_box() {
+        let asset = crate::c2pa_formats::sample_gif();
+        let mut appended = asset.clone();
+        appended.extend_from_slice(b"payload the claim never covered");
+        let results = boxes_hash_binding(AssetFormat::Gif, &asset, &appended);
+        assert!(
+            results.has_failure(ASSERTION_BOXES_HASH_UNKNOWN_BOX),
+            "{results:?}"
+        );
+        assert!(!results.has_success(ASSERTION_BOXES_HASH_MATCH));
+    }
+
+    /// Build one manifest carrying `label` -> `assertion`, declare it in
+    /// `field`, and run only the external-data assertion rules over it.
+    fn run_external_data(
+        label: &str,
+        assertion: &Value,
+        field: &'static str,
+        generation: ClaimGeneration,
+        manifest_kind: ManifestKind,
+        profile: EngineProfile,
+    ) -> ValidationResults {
+        run_external_data_with_evidence(
+            label,
+            assertion,
+            field,
+            generation,
+            manifest_kind,
+            profile,
+            OnlineEvidence::default(),
+        )
+    }
+
+    /// [`run_external_data`] with caller-supplied content for the referenced
+    /// URI.
+    #[allow(clippy::too_many_arguments)]
+    fn run_external_data_with_evidence(
+        label: &str,
+        assertion: &Value,
+        field: &'static str,
+        generation: ClaimGeneration,
+        manifest_kind: ManifestKind,
+        profile: EngineProfile,
+        evidence: OnlineEvidence<'_>,
+    ) -> ValidationResults {
+        let payload = enc(assertion);
+        let manifest = ParsedManifest {
+            label: "urn:c2pa:00000000-0000-4000-8000-0000000000ed".into(),
+            manifest_jumbf: &[],
+            assertions: vec![(label.into(), payload.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = vmap(vec![(
+            field,
+            Value::Array(vec![hashed_uri_for_assertion(label)]),
+        )]);
+        let refs = ClaimAssertionRefs::build(&manifest, &claim, generation);
+        let mut results = ValidationResults::default();
+        verify_external_data_assertions(
+            &refs,
+            generation,
+            manifest_kind,
+            &manifest.label,
+            profile,
+            evidence,
+            &mut results,
+        );
+        results
+    }
+
+    fn cloud_location() -> Value {
+        vmap(vec![
+            ("url", Value::Text("https://store.test/a".into())),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(vec![7; 32])),
+        ])
+    }
+
+    fn cloud_data(referenced: &str) -> Value {
+        vmap(vec![
+            ("label", Value::Text(referenced.into())),
+            ("size", Value::Integer(4321)),
+            ("location", cloud_location()),
+        ])
+    }
+
+    fn gathered_cloud_data(referenced: &str, kind: ManifestKind) -> ValidationResults {
+        run_external_data(
+            "c2pa.cloud-data",
+            &cloud_data(referenced),
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            kind,
+            EngineProfile::GENEROUS,
+        )
+    }
+
+    /// Offline, the unread cloud-data content is reported inaccessible and
+    /// recorded as the fetch that would read it.
+    #[test]
+    fn unread_cloud_data_records_the_fetch_that_would_read_it() {
+        let results = gathered_cloud_data("c2pa.metadata", ManifestKind::Standard);
+        assert!(results.has_failure(ASSERTION_INACCESSIBLE));
+        assert_eq!(
+            results
+                .network_needs
+                .iter()
+                .map(NetworkNeed::to_json)
+                .collect::<Vec<_>>(),
+            vec![json!({
+                "kind": "external_data",
+                "uri": "https://store.test/a",
+                "assertion_label": "c2pa.metadata",
+            })]
+        );
+    }
+
+    /// C2PA 2.4 Validation, Validation of External References: supplied
+    /// content is hashed against the `location` map's own `alg` and `hash`.
+    #[test]
+    fn supplied_cloud_data_is_checked_against_its_declared_hash() {
+        let content = b"the externally stored assertion".to_vec();
+        let location = vmap(vec![
+            ("url", Value::Text("https://store.test/a".into())),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(Sha256::digest(&content).to_vec())),
+        ]);
+        let assertion = vmap(vec![
+            ("label", Value::Text("c2pa.metadata".into())),
+            ("size", Value::Integer(content.len() as i128)),
+            ("location", location),
+        ]);
+        let supplied =
+            std::collections::HashMap::from([("https://store.test/a".to_string(), content)]);
+        let evidence = OnlineEvidence {
+            external_data: Some(&supplied),
+            ..OnlineEvidence::default()
+        };
+        let results = run_external_data_with_evidence(
+            "c2pa.cloud-data",
+            &assertion,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+            evidence,
+        );
+        assert!(results.has_success(ASSERTION_ACCESSIBLE));
+        assert!(results.has_success(ASSERTION_HASHED_URI_MATCH));
+        assert!(!results.has_failure(ASSERTION_INACCESSIBLE));
+        assert!(results.network_needs.is_empty());
+
+        // Content that does not hash to the declared value is reported, and
+        // still does not reject the claim.
+        let tampered = std::collections::HashMap::from([(
+            "https://store.test/a".to_string(),
+            b"something else entirely".to_vec(),
+        )]);
+        let mismatch = run_external_data_with_evidence(
+            "c2pa.cloud-data",
+            &assertion,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+            OnlineEvidence {
+                external_data: Some(&tampered),
+                ..OnlineEvidence::default()
+            },
+        );
+        assert!(mismatch.has_success(ASSERTION_ACCESSIBLE));
+        assert!(mismatch.has_failure(ASSERTION_HASHED_URI_MISMATCH));
+        assert_eq!(
+            compute_state(&mismatch, EngineProfile::CONFORMANCE_V2_2),
+            ValidationState::Valid,
+            "external data must never reject a claim"
+        );
+    }
+
+    /// C2PA 2.4 Validation, `c2pa.cloud-data` validation, steps 1-4.
+    #[test]
+    fn cloud_data_structure_and_referenced_label_rules_are_enforced_offline() {
+        // Step 1: label, size and location are all required.
+        for missing in ["label", "size", "location"] {
+            let mut fields = vec![
+                ("label", Value::Text("c2pa.metadata".into())),
+                ("size", Value::Integer(4321)),
+                ("location", cloud_location()),
+            ];
+            fields.retain(|(name, _)| *name != missing);
+            let results = run_external_data(
+                "c2pa.cloud-data",
+                &vmap(fields),
+                "gathered_assertions",
+                ClaimGeneration::V2,
+                ManifestKind::Standard,
+                EngineProfile::GENEROUS,
+            );
+            assert!(
+                results.has_failure(ASSERTION_CLOUD_DATA_MALFORMED),
+                "missing {missing}: {results:?}"
+            );
+        }
+
+        // Step 2: a hard binding may never live in the cloud.
+        for binding in [
+            "c2pa.hash.data",
+            "c2pa.hash.bmff.v3",
+            "c2pa.hash.multi-asset",
+        ] {
+            let results = gathered_cloud_data(binding, ManifestKind::Standard);
+            assert!(
+                results.has_failure(ASSERTION_CLOUD_DATA_HARD_BINDING),
+                "{binding}: {results:?}"
+            );
+        }
+
+        // Step 3: an update manifest may not point at a remote actions
+        // assertion. Step 4 catches the same label in a standard manifest.
+        let update = gathered_cloud_data("c2pa.actions", ManifestKind::Update);
+        assert!(
+            update.has_failure(ASSERTION_CLOUD_DATA_ACTIONS),
+            "{update:?}"
+        );
+        let standard = gathered_cloud_data("c2pa.actions", ManifestKind::Standard);
+        assert!(
+            standard.has_failure(ASSERTION_CLOUD_DATA_MALFORMED),
+            "{standard:?}"
+        );
+        assert!(!standard.has_failure(ASSERTION_CLOUD_DATA_ACTIONS));
+
+        // Step 4: ingredients may not be stored remotely either. The `__1`
+        // storage suffix does not let a forbidden type through.
+        let ingredient = gathered_cloud_data("c2pa.ingredient.v3__1", ManifestKind::Standard);
+        assert!(
+            ingredient.has_failure(ASSERTION_CLOUD_DATA_MALFORMED),
+            "{ingredient:?}"
+        );
+
+        // A `location` that could never resolve or be checked is incomplete.
+        let no_hash = vmap(vec![
+            ("label", Value::Text("c2pa.metadata".into())),
+            ("size", Value::Integer(4321)),
+            (
+                "location",
+                vmap(vec![("url", Value::Text("https://store.test/a".into()))]),
+            ),
+        ]);
+        let results = run_external_data(
+            "c2pa.cloud-data",
+            &no_hash,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+        );
+        assert!(
+            results.has_failure(ASSERTION_CLOUD_DATA_MALFORMED),
+            "{results:?}"
+        );
+    }
+
+    /// A well-formed cloud data assertion is reported as unread, not rejected:
+    /// C2PA 2.4 Validation, External Data Validation, General.
+    #[test]
+    fn an_unread_cloud_assertion_is_reported_with_its_uri_and_does_not_reject_the_claim() {
+        let results = gathered_cloud_data("c2pa.metadata", ManifestKind::Standard);
+
+        let status = results
+            .failure
+            .iter()
+            .find(|status| status.code == ASSERTION_INACCESSIBLE)
+            .unwrap_or_else(|| panic!("{results:?}"));
+        assert_eq!(
+            status.details.as_ref().and_then(|d| d.get("uri")),
+            Some(&Json::from("https://store.test/a"))
+        );
+        assert_eq!(
+            status
+                .details
+                .as_ref()
+                .and_then(|d| d.get("assertion_label")),
+            Some(&Json::from("c2pa.metadata"))
+        );
+        assert!(!results.has_failure(ASSERTION_CLOUD_DATA_MALFORMED));
+
+        for profile in [
+            EngineProfile::GENEROUS,
+            EngineProfile::strict(SpecVersion::V2_4),
+        ] {
+            assert_eq!(
+                compute_state(&results, profile),
+                ValidationState::Valid,
+                "{profile:?}"
+            );
+        }
+    }
+
+    /// C2PA 2.4 Validation, `c2pa.external-reference` validation, steps 1-4.
+    #[test]
+    fn external_reference_structure_rules_are_enforced_offline() {
+        let run = |assertion: &Value| {
+            run_external_data(
+                "c2pa.external-reference",
+                assertion,
+                "gathered_assertions",
+                ClaimGeneration::V2,
+                ManifestKind::Standard,
+                EngineProfile::GENEROUS,
+            )
+        };
+
+        // Step 1: a location with a url is required.
+        assert!(run(&vmap(vec![("description", Value::Text("x".into()))]))
+            .has_failure(ASSERTION_EXTERNAL_REFERENCE_MALFORMED));
+        assert!(run(&vmap(vec![(
+            "location",
+            vmap(vec![("dc:format", Value::Text("application/json".into()))]),
+        )]))
+        .has_failure(ASSERTION_EXTERNAL_REFERENCE_MALFORMED));
+
+        // Step 2: alg and hash travel together or not at all.
+        let half_hashed = vmap(vec![(
+            "location",
+            vmap(vec![
+                ("url", Value::Text("https://store.test/b".into())),
+                ("alg", Value::Text("sha256".into())),
+            ]),
+        )]);
+        assert!(run(&half_hashed).has_failure(ASSERTION_EXTERNAL_REFERENCE_MALFORMED));
+
+        // Step 4: forbidden referenced assertion types.
+        let forbidden = vmap(vec![
+            ("label", Value::Text("c2pa.actions.v2".into())),
+            (
+                "location",
+                vmap(vec![("url", Value::Text("https://store.test/b".into()))]),
+            ),
+        ]);
+        assert!(run(&forbidden).has_failure(ASSERTION_EXTERNAL_REFERENCE_MALFORMED));
+
+        // An unhashed reference to arbitrary data is well formed. It carries no
+        // assertion, so it is advisory rather than a remote assertion.
+        let blob = vmap(vec![(
+            "location",
+            vmap(vec![
+                ("url", Value::Text("https://store.test/blob".into())),
+                ("dc:format", Value::Text("application/octet-stream".into())),
+            ]),
+        )]);
+        let results = run(&blob);
+        assert!(!results.has_failure(ASSERTION_EXTERNAL_REFERENCE_MALFORMED));
+        assert!(!results.has_failure(ASSERTION_INACCESSIBLE));
+        assert!(results
+            .informational
+            .iter()
+            .any(|status| status.code == EXTERNAL_REFERENCE_NOT_RETRIEVED));
+    }
+
+    /// C2PA 2.4 Standard Assertions, External Reference: the assertion "should
+    /// appear in `gathered_assertions`". A SHOULD is raised to the registered
+    /// failure only under the conformance posture.
+    #[test]
+    fn an_external_reference_in_created_assertions_fails_strict_only() {
+        let assertion = vmap(vec![
+            ("label", Value::Text("c2pa.metadata".into())),
+            (
+                "location",
+                vmap(vec![("url", Value::Text("https://store.test/b".into()))]),
+            ),
+        ]);
+        let created = |profile| {
+            run_external_data(
+                "c2pa.external-reference",
+                &assertion,
+                "created_assertions",
+                ClaimGeneration::V2,
+                ManifestKind::Standard,
+                profile,
+            )
+        };
+
+        assert!(!created(EngineProfile::GENEROUS).has_failure(ASSERTION_EXTERNAL_REFERENCE_CREATED));
+        assert!(created(EngineProfile::strict(SpecVersion::V2_4))
+            .has_failure(ASSERTION_EXTERNAL_REFERENCE_CREATED));
+        assert!(!run_external_data(
+            "c2pa.external-reference",
+            &assertion,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::strict(SpecVersion::V2_4),
+        )
+        .has_failure(ASSERTION_EXTERNAL_REFERENCE_CREATED));
     }
 }

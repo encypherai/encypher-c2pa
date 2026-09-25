@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared byte-reading helpers and an ISOBMFF box walker.
 
 use crate::c2pa_formats::{AssetFormat, FormatError};

@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Format-specific C2PA manifest extraction and container parsing.
 //!
 //! A C2PA manifest store is a JUMBF superbox. Each asset format defines where
@@ -31,8 +34,12 @@ mod svg;
 mod text;
 pub(crate) mod text_standard;
 mod tiff;
-mod util;
+pub(crate) mod util;
+pub(crate) mod xmp;
 mod zip;
+pub(crate) use pdf::{
+    manifest_store_sections as pdf_manifest_store_sections, PdfManifestStoreSection,
+};
 
 /// A C2PA-carrying asset container format.
 ///
@@ -338,35 +345,121 @@ pub(crate) use bmff::bmff_hash_reader;
 /// compute fragment Merkle leaf hashes (fragmented BMFF verification).
 pub(crate) use bmff::{bmff_fragment_leaf_hash, bmff_merkle_boxes, BmffMerkleBox};
 
-/// One named span of an asset for the general box hash (`c2pa.hash.boxes`).
+/// Re-export: fragmented live-stream encapsulation vocabulary and the
+/// fail-closed brand gate for a declared fMP4/CMAF stream.
+pub(crate) use bmff::{
+    bmff_check_stream_brand, BmffBrands, StreamEncapsulation, StreamFileRole, StreamMethod,
+};
+
+/// One named box of an asset for the general box hash (`c2pa.hash.boxes`).
 ///
 /// Produced by [`box_spans`]: the asset is segmented into its box-like
 /// structures per the C2PA conventions (spec 18.4 examples): JPEG marker
 /// segments (`SOI`, `APP0`, `DQT`, …, `SOS`, `RST0`, `EOI`), PNG signature +
-/// chunks (`PNGh`, `IHDR`, …). The contiguous run of segments carrying the
-/// C2PA Manifest Store is merged into a single span named `C2PA`.
+/// chunks (`PNGh`, `IHDR`, …), GIF blocks (`GIF89a`, `LSD`, `2C`, `TBID`,
+/// `3B`), RIFF chunks, Ogg logical bitstreams. The contiguous run of segments
+/// carrying the C2PA Manifest Store is merged into a single box named `C2PA`.
+///
+/// A box is one contiguous byte range in every container except Ogg, where the
+/// spec defines a box as a whole logical bitstream whose pages may interleave
+/// with other streams. [`BoxSpan::ranges`] is therefore the authoritative
+/// content of the box, in file order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxSpan {
     /// The C2PA box identifier (e.g. `APP0`, `IHDR`, `C2PA`).
     pub name: String,
-    /// Byte offset of the span's first byte.
-    pub start: usize,
-    /// One-past-the-end byte offset.
-    pub end: usize,
+    /// Non-empty, ascending, non-overlapping `[start, end)` byte ranges.
+    ranges: Vec<(usize, usize)>,
 }
 
-/// Segment `data` into named spans for `c2pa.hash.boxes` validation.
+impl BoxSpan {
+    /// A box occupying one contiguous byte range.
+    pub fn contiguous(name: impl Into<String>, start: usize, end: usize) -> Self {
+        Self {
+            name: name.into(),
+            ranges: vec![(start, end)],
+        }
+    }
+
+    /// A box assembled from several byte ranges, in file order.
+    pub fn scattered(name: impl Into<String>, ranges: Vec<(usize, usize)>) -> Self {
+        debug_assert!(!ranges.is_empty(), "a box span covers at least one range");
+        Self {
+            name: name.into(),
+            ranges,
+        }
+    }
+
+    /// Byte offset of the box's first byte.
+    pub fn start(&self) -> usize {
+        self.ranges.first().map_or(0, |range| range.0)
+    }
+
+    /// One-past-the-end offset of the box's last byte.
+    pub fn end(&self) -> usize {
+        self.ranges.last().map_or(0, |range| range.1)
+    }
+
+    /// Total number of bytes the box covers, which is less than
+    /// `end() - start()` when the box is scattered.
+    pub fn byte_len(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .sum()
+    }
+
+    /// The byte ranges making up the box, in file order.
+    pub fn ranges(&self) -> &[(usize, usize)] {
+        &self.ranges
+    }
+
+    /// True when the box is a single contiguous range.
+    pub fn is_contiguous(&self) -> bool {
+        self.ranges.len() == 1
+    }
+
+    /// Extend a contiguous box's end offset, used to merge an adjacent
+    /// manifest-store fragment into the single `C2PA` box.
+    fn extend_to(&mut self, end: usize) {
+        if let Some(last) = self.ranges.last_mut() {
+            last.1 = end;
+        }
+    }
+}
+
+/// Segment `data` into named boxes for `c2pa.hash.boxes` validation.
 ///
-/// Returns `Ok(None)` for container formats whose box-hash segmentation is
-/// not implemented (the validator reports those informationally rather than
-/// risking a false mismatch).
+/// Returns `Ok(None)` for container formats that have no general-box-hash
+/// convention in the specification. The validator fails those closed rather
+/// than reporting a hard binding it did not evaluate.
 pub fn box_spans(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<BoxSpan>>, FormatError> {
     match format {
         AssetFormat::Jpeg => jpeg::box_spans(data).map(Some),
         AssetFormat::Png => png::box_spans(data).map(Some),
+        AssetFormat::Jxl => jxl::box_spans(data).map(Some),
+        AssetFormat::Font => font::box_spans(data).map(Some),
+        AssetFormat::Gif => gif::box_spans(data).map(Some),
+        AssetFormat::Riff => riff::box_spans(data).map(Some),
+        AssetFormat::Ogg => ogg::box_spans(data).map(Some),
         _ => Ok(None),
     }
 }
+/// Historical c2pa-rs JPEG segmentation accepted only by the validator's
+/// default compatibility posture.
+pub(crate) fn jpeg_box_spans_with_overlapping_restart_segments(
+    data: &[u8],
+) -> Result<Vec<BoxSpan>, FormatError> {
+    jpeg::box_spans_with_overlapping_restart_segments(data)
+}
+
+/// Re-export: minimal GIF, RIFF, and Ogg containers, and the Ogg content-edit
+/// helper, used by box-hash tests in the validator module.
+#[cfg(test)]
+pub(crate) use {
+    gif::sample_asset as sample_gif, ogg::sample_asset as sample_ogg,
+    ogg::tamper_page_byte as tamper_ogg_page_byte, riff::sample_asset as sample_riff,
+};
 
 /// Re-export ZIP collection helpers for `c2pa.hash.collection.data`.
 pub(crate) use zip::{
@@ -377,6 +470,77 @@ pub(crate) use zip::{
 /// Re-export: the payload spans of every top-level `mdat` box, in file order
 /// (monolithic chunked-mdat merkle validation).
 pub(crate) use bmff::bmff_mdat_payloads;
+
+/// Return a registered text-container failure when an embedded wrapper or
+/// structured-text reference is present but unusable.
+pub(crate) fn text_diagnostic(format: AssetFormat, data: &[u8]) -> Option<text::TextDiagnostic> {
+    match format {
+        AssetFormat::TextUnstructured => text::diagnostic(text::TextMethod::Unstructured, data),
+        AssetFormat::TextStructured { .. } => text::diagnostic(text::TextMethod::Structured, data),
+        _ => None,
+    }
+}
+
+pub(crate) fn unstructured_text_wrapper_spans(
+    data: &[u8],
+) -> Result<Vec<DataHashExclusion>, FormatError> {
+    text::unstructured_wrapper_spans(data)
+}
+
+/// A remote C2PA Manifest Store declaration read out of the asset's bytes.
+///
+/// The SDK never fetches: this records what the asset says about where its
+/// manifest lives so the verifier can report the registered
+/// `manifest.inaccessible` outcome with the URI attached.
+pub(crate) struct RemoteManifestRef {
+    /// The declared URI, verbatim after XML entity resolution.
+    pub uri: String,
+    /// Where the declaration was read from, for the status `details`.
+    pub source: &'static str,
+}
+
+/// Read a documented remote-manifest declaration from `data`.
+///
+/// C2PA 2.4 Validation, By Reference, lists the locations a validator should
+/// consult when no manifest store is embedded. Two of them are visible in the
+/// asset's own bytes and are read here: XMP `dcterms:provenance` in the
+/// format's standard XMP location, and the font `C2PA` table's active-manifest
+/// URI. The HTTP `Link` header is a property of a retrieval this SDK does not
+/// perform, and the `.c2pa` sidecar is a filesystem lookup the caller makes
+/// itself and then supplies through the detached entry point.
+pub(crate) fn remote_manifest_uri(
+    format: AssetFormat,
+    data: &[u8],
+) -> Result<Option<RemoteManifestRef>, FormatError> {
+    if format == AssetFormat::Font {
+        if let Some(uri) = font::remote_manifest_uri(data)? {
+            return Ok(Some(RemoteManifestRef {
+                uri: uri.to_string(),
+                source: "font.C2PA.activeManifestUri",
+            }));
+        }
+        return Ok(None);
+    }
+    Ok(
+        xmp::provenance_uri(format, data).map(|uri| RemoteManifestRef {
+            uri,
+            source: "xmp.dcterms:provenance",
+        }),
+    )
+}
+
+pub(crate) fn carrier_placement_error(
+    format: AssetFormat,
+    data: &[u8],
+) -> Result<Option<&'static str>, FormatError> {
+    match format {
+        AssetFormat::Gif => gif::placement_error(data),
+        AssetFormat::Tiff => tiff::placement_error(data),
+        AssetFormat::Svg => svg::placement_error(data),
+        AssetFormat::Bmff => bmff::placement_error(data),
+        _ => Ok(None),
+    }
+}
 
 /// Extract the raw JUMBF manifest-store bytes from `data`.
 ///
@@ -804,6 +968,26 @@ mod tests {
                 got
             }) if got == crate::MAX_MANIFEST_STORE_BYTES + 1
         ));
+    }
+
+    pub(crate) fn span_names(spans: &[BoxSpan]) -> Vec<&str> {
+        spans.iter().map(|span| span.name.as_str()).collect()
+    }
+
+    /// Every byte of the asset belongs to exactly one box: bytes outside all
+    /// boxes would never be hashed, which is a tamper hole.
+    pub(crate) fn assert_box_coverage(spans: &[BoxSpan], len: usize) {
+        let mut ranges: Vec<(usize, usize)> = spans
+            .iter()
+            .flat_map(|span| span.ranges().iter().copied())
+            .collect();
+        ranges.sort_unstable();
+        let mut cursor = 0usize;
+        for (start, end) in ranges {
+            assert_eq!(start, cursor, "gap or overlap before offset {start}");
+            cursor = end;
+        }
+        assert_eq!(cursor, len, "boxes stop short of the asset end");
     }
 }
 

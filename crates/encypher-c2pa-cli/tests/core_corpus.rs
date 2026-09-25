@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Offline core-C2PA contract over pinned third-party media.
 //!
 //! The assets come from a fixed `contentauth/c2pa-rs` commit, but verification

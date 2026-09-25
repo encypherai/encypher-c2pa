@@ -18,69 +18,36 @@
   </p>
 </div>
 
-Local-first, verification-only C2PA + CAWG SDK for Rust, Python, Go, and browser JavaScript, by [Encypher](https://encypher.com).
+Check the Content Credentials on a file without sending the file anywhere. Encypher C2PA reads the provenance record embedded in an image, video, audio file, document, font, or text, and tells you two things separately: whether the record and the content are intact, and whether you trust whoever signed it.
 
-The verifier reads local bytes. It does not upload the asset, fetch a trust list, or require an account. Cryptographic integrity and trust are separate fields in every report. On first interactive use, the SDK asks whether it may send bounded, anonymous failure telemetry and saves the answer.
+Verification runs on your machine. It needs no account, and verifying a file makes no network request unless you allow online checks. The command line also checks once a day for a newer release, which you can turn off (see [Updates](#updates)). Teams that mark AI-generated output for the EU AI Act (Article 50) or the California AI Transparency Act can use it to confirm that what they ship still verifies after it leaves their systems.
 
-> Stable report schema `1.0`, engine profile `c2pa-2.4`, CAWG identity 1.2.
+The SDK implements the open standards: [C2PA 2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) manifests and [CAWG Identity 1.3](https://cawg.io/identity/1.3/) assertions. One Rust core serves the command line, Rust, Python, browser JavaScript, Go, and C.
 
-## Product and standards version matrix
+## Quick start
 
-Every distribution uses the same verification core and report schema.
-
-| Product | Product version | Distribution | C2PA profile | CAWG support |
-|---|---:|---|---|---|
-| Rust SDK | `1.0.6` | [`encypher-c2pa`](https://crates.io/crates/encypher-c2pa) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Command-line interface | `1.0.6` | [`encypher-c2pa-cli`](https://crates.io/crates/encypher-c2pa-cli) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Python SDK | `1.0.6` | [`encypher-c2pa`](https://pypi.org/project/encypher-c2pa/) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Browser JavaScript SDK | `1.0.6` | [`@encypherai/c2pa`](https://www.npmjs.com/package/@encypherai/c2pa) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| Go binding | `v1.0.6` source tag | [`bindings/go`](https://github.com/encypherai/encypher-c2pa/tree/v1.0.6/bindings/go) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-| C ABI | `v1.0.6` source tag | [`bindings/c`](https://github.com/encypherai/encypher-c2pa/tree/v1.0.6/bindings/c) | [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) | [Identity 1.2](https://cawg.io/identity/1.2/) |
-
-The standards columns describe verification compatibility, not a conformance certification claim.
-
-## What it does
-
-- Extracts C2PA manifests from images, video, audio, documents, fonts, archives, and structured text.
-- Verifies claim signatures, hashed-URI references, and format-specific hard bindings.
-- Verifies fragmented BMFF streams (fMP4 and CMAF) from an initialization segment plus any available media-segment subset.
-- Walks ingredient and manifest chains included in the asset.
-- Validates CAWG identity assertions (X.509 COSE and identity-claims-aggregation credentials, offline `did:web`/`did:jwk` resolution) per CAWG Identity 1.2.
-- Evaluates trust against bundled snapshots plus caller PEM, with an explicit custom-only mode.
-- Reports revocation and freshness as unknown or not checked when the asset lacks usable evidence.
-- Runs through one Rust core in the CLI, Python wheel, Go binding, and browser WASM package.
-- Optionally reports bounded validation failure codes, without sending customer content.
-
-It does not sign media. The published API contains no signing keys, no COSE signing paths, and nothing that constructs a C2PA manifest or writes one into an asset. The verification kernel lives in private modules of this crate, so that code is unreachable from outside it by construction rather than by configuration, and the writers are additionally `cfg(test)`, so they are not compiled into the released artifact at all. For managed signing, policy, durable receipts, or hosted trust decisions, use the [Encypher API](https://api.encypher.com/docs).
-
-**Scope: open standards only.** The SDK verifies C2PA manifests and CAWG identity assertions. It does not detect or read Encypher's proprietary provenance markers (invisible text provenance, durable soft bindings, marker registries); content carrying those markers verifies here as ordinary C2PA content. For proprietary-marker detection and the full provenance record, use the [Encypher API](https://api.encypher.com/docs).
-
-## Install
-
-Tagged releases publish the packages below. For an unreleased checkout, use [Build from source](#build-from-source).
-
-### CLI
+### Command line
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.0.6
-encypher-c2pa verify composition.mp4
-encypher-c2pa verify composition.mp4 --json
+cargo install encypher-c2pa-cli --version 1.1.0
+encypher-c2pa verify photo.jpg
+encypher-c2pa verify photo.jpg --json
 encypher-c2pa formats
 ```
 
-Exit codes: `0` valid integrity, `2` absent or invalid provenance, `3` unsupported MIME type, `1` operational or input error.
+The MIME type comes from the file extension; pass `--mime` for a file whose name does not say what it is. Exit codes: `0` integrity valid, `2` provenance absent or invalid, `3` unsupported MIME type, `1` operational or input error.
 
 ### Rust
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.0.6"
+encypher-c2pa = "1.1.0"
 ```
 
 ```rust
 use encypher_c2pa::{verify_file, VerifyOptions};
 
-let report = verify_file("composition.mp4", None, &VerifyOptions::default())?;
+let report = verify_file("photo.jpg", None, &VerifyOptions::default())?;
 println!("integrity={} trust={}", report.integrity, report.trust.status);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -94,12 +61,11 @@ pip install encypher-c2pa
 ```python
 from encypher_c2pa import verify
 
-report = verify("composition.mp4")
-print(report["integrity"])
-print(report["trust"]["status"])
+report = verify("photo.jpg")
+print(report["integrity"], report["trust"]["status"])
 ```
 
-The wheel supports Python 3.9 and later through the stable ABI.
+The wheel supports Python 3.9 and later.
 
 ### Browser JavaScript
 
@@ -116,17 +82,15 @@ const report = verify(new Uint8Array(await file.arrayBuffer()), file.type);
 console.log(report.integrity, report.trust.status);
 ```
 
-The browser package performs verification in WebAssembly. See [`examples/browser`](https://github.com/encypherai/encypher-c2pa/tree/main/examples/browser).
+Verification runs in WebAssembly inside the page. See [`examples/browser`](https://github.com/encypherai/encypher-c2pa/tree/main/examples/browser).
 
 ### Go
 
-The Go source binding supports Linux and macOS and uses the repository's stable
-C ABI. Build the static library before testing a source checkout:
+The Go binding is a source distribution for Linux and macOS. It links the C ABI, so build the static library first:
 
 ```bash
 cargo build -p encypher-c2pa-ffi --release
-cd bindings/go
-go test ./...
+cd bindings/go && go test ./...
 ```
 
 ```go
@@ -137,93 +101,13 @@ if err != nil {
 fmt.Println(report.Integrity, report.Trust.Status)
 ```
 
-The Go binding is a source distribution in this release. Its first interactive verification uses the shared native telemetry preference described below.
+The C ABI is declared in [`bindings/c/include/encypher_c2pa.h`](https://github.com/encypherai/encypher-c2pa/blob/main/bindings/c/include/encypher_c2pa.h). Every returned string must be released with `encypher_c2pa_free_string`.
 
-Path-based convenience APIs in Rust, Python, and Go accept regular files up to 128 MiB; byte-slice APIs remain bounded only by caller memory.
+Path-based APIs in Rust, Python, and Go read regular files up to 128 MiB. Byte-buffer APIs are bounded only by caller memory.
 
-## Optional failure telemetry
+## Reading a report
 
-Telemetry is off by default. On the first interactive verification, the SDK shows the data contract, asks once, and saves the answer. Native bindings share the per-user config file. Browser JavaScript uses local storage. Non-interactive processes do not prompt and remain off until configured.
-
-Telemetry fires only for invalid provenance or an operational validation error. Each event contains:
-
-- schema, SDK, SDK version, and engine profile;
-- the canonical MIME type;
-- `invalid_provenance` or `verification_error`;
-- at most eight bounded validation status codes.
-
-Events never contain asset bytes, manifests, reports, filenames, paths, URLs, certificates, keys, trust material, account IDs, or machine IDs. Native clients use a bounded best-effort queue, so telemetry never blocks verification. See [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md) for the full contract.
-
-```bash
-encypher-c2pa telemetry on
-encypher-c2pa telemetry off
-encypher-c2pa telemetry status
-```
-
-```python
-from encypher_c2pa import configure_telemetry
-
-configure_telemetry(True)
-```
-
-```go
-err := c2pa.ConfigureTelemetry(true)
-```
-
-```javascript
-configureTelemetry(true);
-```
-
-An explicit per-call value overrides the saved native preference. In Python, `verify(..., telemetry=True)` attempts to save that choice; if the preference store is unavailable, the explicit value still governs that verification. Automated native deployments may set `ENCYPHER_C2PA_TELEMETRY=on` or `off` without writing a config file.
-
-## Bundled trust lists by default
-
-Default verification evaluates both integrity and signer trust, but keeps those conclusions separate. Every install compiles a pinned `2026-08-11` snapshot into the Rust library, CLI, Python wheel, Go/C library, and browser WASM package. Verification remains local and deterministic; it makes no trust-list, AIA, OCSP, CRL, DID, ingredient, or assertion network request.
-
-| Packaged source | Default use |
-|---|---|
-| C2PA Trust List | Claim-signing trust anchors |
-| C2PA TSA Trust List | RFC 3161 timestamp-authority anchors |
-| IPTC Verified News Publishers end-entity list | Directly allowed claim-signing and CAWG identity certificates |
-| IPTC Verified News Publishers anchor list | CAWG identity anchors; empty at this snapshot |
-| Mozilla Root Store with the Email trust bit | CAWG 1.2 interim X.509 identity anchors |
-| Encypher C2PA Root CA | Claim-signing trust anchor |
-| Encypher C2PA TSA Issuing CA | Timestamp-authority anchor |
-| Encypher Verified Organizations List | CAWG identity trust anchor |
-
-The Mozilla and IPTC CAWG sources implement the CAWG Identity 1.2 interim X.509 trust configuration in section 8.2.4.1. The validator also enforces that section's EKU, certificate-policy, timestamp, and 31 March 2027 cutoff rules.
-
-The exact source URLs and SHA-256 digests live in [`default_trust/sources.json`](https://github.com/encypherai/encypher-c2pa/blob/main/crates/encypher-c2pa/src/default_trust/sources.json). `DEFAULT_TRUST_SNAPSHOT_DATE` exposes the snapshot date to Rust callers. A new SDK release is required to refresh these packaged bytes.
-
-Caller-supplied PEM bundles extend the packaged defaults. Set `no_default_trust: true` (Python: `no_default_trust=True`, Go: `NoDefaultTrust: true`, CLI: `--no-default-trust`) to ignore every packaged list and evaluate only caller-supplied material.
-
-| CLI flag | `VerifyOptions` field / Python keyword | Gates |
-|---|---|---|
-| `--trust` | `trust_pem` | Additional claim-signing trust anchors |
-| `--tsa-trust` | `tsa_trust_pem` | Additional timestamp-authority anchors |
-| `--allowed` | `allowed_list_pem` | Additional directly allowed claim-signing certificates |
-| `--cawg-trust` | `cawg_trust_pem` | Additional CAWG X.509 identity anchors |
-| `--cawg-allowed` | `cawg_allowed_certs_pem` | Directly allowed CAWG identity certificates |
-| `--cawg-did-documents` | `cawg_did_documents` | Pinned offline DID documents for `did:web` ICA issuers |
-| `--no-default-trust` | `no_default_trust` | Disable all packaged trust snapshots |
-
-Every CLI trust flag is repeatable and repeated bundles merge. CAWG document-signing credentials must chain to a CAWG anchor or match a CAWG allowed certificate; certificate profile alone never establishes trust. `--cawg-strict-encoding` (`cawg_strict_encoding`) refuses CAWG 1.1-era legacy encodings. CAWG identity outcomes remain assertion-scoped: they never turn a valid C2PA integrity result into a trust result.
-
-```bash
-# Out-of-box verification uses the packaged snapshot.
-encypher-c2pa verify article-photo.jpg --json
-
-# A closed deployment can replace the defaults with its own pinned policy.
-encypher-c2pa verify article-photo.jpg \
-  --no-default-trust \
-  --trust organization-anchors.pem \
-  --tsa-trust organization-tsa-anchors.pem \
-  --time 2026-08-11T00:00:00Z --json
-```
-
-Revocation evidence is read only from OCSP responses stapled into the manifest. The offline verifier cannot prove that a packaged or caller-supplied list is still current, so `freshness.status` remains `unknown`.
-
-The top-level report keeps these conclusions apart:
+Every report answers the integrity question and the trust question in separate fields, because they fail for different reasons. A photo can be untouched since signing and still be signed by someone you do not trust.
 
 ```json
 {
@@ -236,63 +120,243 @@ The top-level report keeps these conclusions apart:
     "status": "not_valid_for_supplied_material",
     "basis": "bundled_static_material",
     "validation_time": "2026-08-11T12:00:00Z",
-    "revocation": {
-      "status": "not_checked",
-      "source": "none",
-      "responder_signature": "not_applicable"
-    },
+    "revocation": { "status": "not_checked", "source": "none", "responder_signature": "not_applicable" },
     "freshness": { "status": "unknown", "as_of": null }
   },
-  "policy": null,
-  "managed_receipt": null
+  "validation_results": { "success": [], "informational": [], "failure": [] }
 }
 ```
 
-See [Trust model](https://github.com/encypherai/encypher-c2pa/blob/main/docs/TRUST_MODEL.md) and [Report schema](https://github.com/encypherai/encypher-c2pa/blob/main/docs/REPORT_SCHEMA.md).
+- `integrity`: the claim signature verifies, every referenced assertion matches its hash, and the content matches its hard binding (the hash that ties the manifest to the file's bytes).
+- `trust`: whether the signing certificate chains to an anchor you accept, evaluated at `validation_time`.
+- `validation_results`: the C2PA and CAWG status codes behind both conclusions. Consumers should branch on these codes rather than on explanation text.
 
-## Optional: query the Encypher API
+The report schema is `1.0` and stable. See [Report schema](https://github.com/encypherai/encypher-c2pa/blob/main/docs/REPORT_SCHEMA.md).
 
-Verification stays local by default and makes no network call. For an explicit server-side cross-check, set `ENCYPHER_API_KEY` and pass `--encypher-api` to `verify`. The request contains the exact asset SHA-256, byte length, MIME type, and a bounded summary of the local verdict. When the format exposes the embedded C2PA manifest in one contiguous carrier, it also contains that manifest store and carrier so Encypher can validate the detached evidence independently. The complete asset, filename, and file path stay local.
+## What it verifies
 
-The API validates any detached manifest and compares its binding and exact file digest with Encypher's provenance records. Formats without contiguous detached evidence send no manifest data; the exact file digest can still be matched. The response never changes the local verdict or process exit code. In `--json` mode it attaches under a new top-level `encypher_api` key. In human mode it prints a trailing `encypher api:` block. A network error, non-success status, or unreadable response yields an error object and a stderr warning, never a verification failure.
+- Manifest stores embedded in 71 media types across images, video, audio, documents, archives, fonts, and structured text, including Brotli-compressed stores and update manifests.
+- Claim signatures, including RFC 3161 timestamps and OCSP responses stapled into the manifest. Signing, timestamp, and CAWG certificates are checked against the C2PA certificate profile and an RFC 5280 path to a trusted anchor.
+- Hashed references from the claim to each assertion, and the ingredient links that tie a manifest to the ones before it.
+- Hard bindings: data hash, BMFF hash (including Merkle trees for fragmented MP4), general box hash, ZIP collection hash, and multi-asset hash.
+- Live video streams signed under C2PA 2.4, segment by segment.
+- Every manifest in a PDF's incremental-update history, each against the version of the file that introduced it.
+- CAWG identity assertions signed with X.509 certificates or identity claims aggregation credentials, with `did:jwk` resolution and `did:web` documents you pin or, with online checks allowed, fetch. X.509 identity signatures report the registered CAWG Identity 1.3 `cawg.x509.*` codes. CAWG results apply to the identity assertion only; they never change the C2PA integrity verdict.
 
-```bash
-encypher-c2pa verify article-photo.jpg --encypher-api --json
-```
+`encypher-c2pa formats` prints the supported MIME types. [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md) lists them with the binding each uses. Text support covers every method C2PA 2.4 defines (plain-text wrapper, structured-text comment block, and HTML script element) through the [`c2pa-text`](https://crates.io/crates/c2pa-text) crate.
 
-The response is Encypher's own record, separate from the local verdict: a match there is not a trust decision about the signer, and an absence there does not weaken a valid local report.
+### Video streams
 
-## Format coverage
-
-`encypher-c2pa formats` prints the 71 canonical MIME types covered by the installed C2PA 2.4 engine profile. Container readers cover JPEG, PNG, WebP, TIFF/DNG, GIF, SVG, JPEG XL, ISO BMFF media, RIFF media, FLAC, MP3, PDF, ZIP-derived documents, fonts, EPUB, and text. The C2PA 2.4 set includes OpenDocument Graphics (`application/vnd.oasis.opendocument.graphics`) and tab-separated values (`text/tab-separated-values`).
-
-### Supported MIME types
-
-- **Images (13):** `image/avif`, `image/gif`, `image/heic`, `image/heic-sequence`, `image/heif`, `image/heif-sequence`, `image/jpeg`, `image/jxl`, `image/png`, `image/svg+xml`, `image/tiff`, `image/webp`, `image/x-adobe-dng`
-- **Video and audio (10):** `application/mp4`, `video/mp4`, `video/quicktime`, `video/x-m4v`, `video/x-msvideo`, `audio/flac`, `audio/mp4`, `audio/mpeg`, `audio/ogg`, `audio/wav`
-- **Documents and archives (29):** `application/epub+zip`, `application/oxps`, `application/pdf`, `application/vnd.ms-excel.sheet.binary.macroenabled.12`, `application/vnd.ms-excel.sheet.macroenabled.12`, `application/vnd.ms-excel.template.macroenabled.12`, `application/vnd.ms-powerpoint.presentation.macroenabled.12`, `application/vnd.ms-powerpoint.slideshow.macroenabled.12`, `application/vnd.ms-powerpoint.template.macroenabled.12`, `application/vnd.ms-visio.drawing`, `application/vnd.ms-visio.drawing.macroenabled.12`, `application/vnd.ms-visio.stencil`, `application/vnd.ms-visio.stencil.macroenabled.12`, `application/vnd.ms-visio.template`, `application/vnd.ms-visio.template.macroenabled.12`, `application/vnd.ms-word.document.macroenabled.12`, `application/vnd.ms-word.template.macroenabled.12`, `application/vnd.ms-xpsdocument`, `application/vnd.oasis.opendocument.graphics`, `application/vnd.oasis.opendocument.presentation`, `application/vnd.oasis.opendocument.spreadsheet`, `application/vnd.oasis.opendocument.text`, `application/vnd.openxmlformats-officedocument.presentationml.presentation`, `application/vnd.openxmlformats-officedocument.presentationml.slideshow`, `application/vnd.openxmlformats-officedocument.presentationml.template`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `application/vnd.openxmlformats-officedocument.spreadsheetml.template`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/vnd.openxmlformats-officedocument.wordprocessingml.template`
-- **Fonts and structured text (19):** `application/font-sfnt`, `application/javascript`, `application/json`, `application/toml`, `application/xhtml+xml`, `application/xml`, `application/yaml`, `application/x-font-ttf`, `font/otf`, `font/sfnt`, `font/ttf`, `text/css`, `text/csv`, `text/html`, `text/markdown`, `text/plain`, `text/tab-separated-values`, `text/x-python`, `text/xml`
-
-Text coverage is every method C2PA 2.4 defines, through the published [`c2pa-text`](https://crates.io/crates/c2pa-text) crate: A.8 unstructured text (the invisible variation-selector wrapper on `text/plain`, CSV, TSV, JSON, and social-post content), A.9 structured text (the ASCII-armour comment block for Markdown, XML/XHTML, YAML, TOML, CSS, JavaScript, Python, and every comment syntax `c2pa-text` defines), and A.7 HTML (the inline `application/c2pa` script element). Encypher's proprietary text markers are not part of this SDK.
-
-### Fragmented BMFF
-
-For fMP4 and CMAF, the ordinary MIME type remains `video/mp4`. Pass the signed initialization segment as the asset and each available `.m4s` media segment as a fragment. The verifier checks the initialization-segment hash and each supplied fragment's A.5.4 Merkle leaf. It does not require the complete stream.
+For fMP4 and CMAF, pass the signed initialization segment as the asset and each available media segment as a fragment. The MIME type stays `video/mp4`. The verifier checks the initialization-segment hash and each supplied segment's Merkle leaf, so a partial recording can be verified: supply the fragments you have, in playback order. Fragments not yet available at the end are not a failure, but a gap or a reordering inside the supplied run is, because C2PA 2.4 requires a validator to flag a sequence that does not match the signed one. When a player seeks on purpose, pass the index of each fragment that starts after the jump (`--expected-seek <N>`, `expected_seek_positions`); every fragment is still authenticated. A segment that no binding in the manifest covers fails verification; it is never reported as matched.
 
 ```bash
-encypher-c2pa verify init.mp4 \
-  --fragment seg-0.m4s \
-  --fragment seg-1.m4s \
-  --mime video/mp4
+encypher-c2pa verify init.mp4 --fragment seg-0.m4s --fragment seg-1.m4s --mime video/mp4
 ```
 
-Rust uses `verify_fragmented` or `verify_fragmented_with_options`. Python uses `verify(init, "video/mp4", fragments=[...])`. Browser WASM exports `verifyFragmented(init, fragments, "video/mp4", options)`. The C ABI exposes `encypher_c2pa_verify_fragmented`.
+Live streams signed under C2PA 2.4 bind each segment differently, so they take a declared encapsulation and protection method. With `verifiable-segment-info`, the initialization manifest carries session keys, and every segment's signed segment information must verify under them. With `per-segment`, each segment carries its own manifest, and the verifier recomputes the chain from each segment to the one before it. Which of the two a stream actually uses is read from the stream, not taken from the caller, and a stream whose bytes contradict its declared encapsulation is refused.
 
-Coverage means the verifier has a reader and C2PA hard-binding path for the MIME type. It does not mean every malformed or vendor-specific variant can be recovered. See [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md).
+```bash
+encypher-c2pa verify init.mp4 --fragment seg-0.m4s --fragment seg-1.m4s \
+  --mime video/mp4 --encapsulation cmaf --segment-mode per-segment --json
+```
+
+| Surface | Fragmented recording | Live stream |
+|---|---|---|
+| Rust | `verify_fragmented` | `verify_stream` |
+| Python | `verify(init, "video/mp4", fragments=[...])` | `verify_stream(init, segments, encapsulation=, method=)` |
+| WebAssembly | `verifyFragmented` | `verifyStream` |
+| Go | `VerifyFragmented` | `VerifyStream` |
+| C | `encypher_c2pa_verify_fragmented` | `encypher_c2pa_verify_stream` |
+
+The stream report carries a top-level `integrity`, the initialization manifest's report, a report per segment, and, for per-segment streams, whether the chain holds.
+
+## Trust
+
+Each install carries a pinned trust snapshot dated `2026-09-24`, compiled into every package. Trust material is never fetched: no trust list, no certificate chain, no CRL. With online checks off, which is the default, verification is entirely local and deterministic. Turning them on adds revocation status, a remote manifest store, a DID document, or external content as evidence; the trust snapshot is still the one on disk.
+
+| Packaged source | Used for |
+|---|---|
+| C2PA Trust List | Claim-signing anchors |
+| C2PA TSA Trust List | Timestamp-authority anchors |
+| IPTC Verified News Publishers, end-entity list | Directly allowed claim-signing and CAWG identity certificates, interim S/MIME rules |
+| IPTC Verified News Publishers, anchor list | CAWG identity anchors, interim S/MIME rules (empty in this snapshot) |
+| Mozilla Root Store, email trust bit | CAWG identity anchors, interim S/MIME rules (section 8.2.4.1) |
+| Encypher C2PA Root CA | Claim-signing anchor |
+| Encypher C2PA TSA Issuing CA | Timestamp-authority anchor |
+| Encypher Verified Organizations List | CAWG identity anchor, base trust model |
+
+CAWG Identity 1.3 ties its interim S/MIME conditions to the Mozilla and IPTC
+lists by name, so they apply to those two sources only. An identity that
+chains to the Encypher Verified Organizations root, or to an anchor you
+supply, is accepted under the base trust model: `emailProtection` with one of
+the six approved CA/Browser Forum S/MIME certificate policies, no 31 March
+2027 cutoff and no time-stamp condition. Every other check is unchanged.
+
+Source URLs and SHA-256 digests are in [`default_trust/sources.json`](https://github.com/encypherai/encypher-c2pa/blob/main/crates/encypher-c2pa/src/default_trust/sources.json). A new release refreshes the snapshot.
+
+Your own PEM bundles extend the snapshot. To evaluate only your own material, set `no_default_trust`.
+
+| CLI flag | Option | Purpose |
+|---|---|---|
+| `--trust` | `trust_pem` | Claim-signing anchors |
+| `--tsa-trust` | `tsa_trust_pem` | Timestamp-authority anchors |
+| `--allowed` | `allowed_list_pem` | Directly allowed claim-signing certificates |
+| `--cawg-trust` | `cawg_trust_pem` | CAWG X.509 identity anchors |
+| `--cawg-allowed` | `cawg_allowed_certs_pem` | Directly allowed CAWG identity certificates |
+| `--trust-anchor-not-before`, `--trust-anchor-not-after` | `trust_anchor_not_before`, `trust_anchor_not_after` | Validity window for your own anchors (RFC 3339) |
+| `--cawg-did-documents` | `cawg_did_documents` | Pinned DID documents for `did:web` issuers |
+| `--cawg-ica-trusted-issuer` | `cawg_ica_trusted_issuers` | Identity-aggregation issuer DIDs you trust directly |
+| `--cawg-ica-trust-anchor` | `cawg_ica_trust_anchors` | DIDs an issuer may reach through `controller` links in pinned DID documents |
+| `--cawg-ica-status-lists` | `cawg_ica_status_lists` | Revocation status lists, as a JSON map of list URI to base64 bitstring |
+| `--no-default-trust` | `no_default_trust` | Ignore every packaged snapshot |
+| `--time` | `validation_time` | RFC 3339 validation instant |
+
+Trust flags repeat, and repeated bundles merge. Python keyword arguments and the WebAssembly options object use the same names; Go uses the CamelCase equivalents, such as `NoDefaultTrust`.
+
+Each anchor serves one purpose. A claim-signing anchor cannot validate a timestamp authority, and a timestamp anchor cannot validate a claim signer. An identity-aggregation credential is trusted only when its issuer is listed or reaches a listed anchor, and a credential that names a revocation list is checked against the lists you supply; a missing list is reported, not assumed good.
+
+```bash
+encypher-c2pa verify photo.jpg \
+  --no-default-trust \
+  --trust org-anchors.pem \
+  --tsa-trust org-tsa-anchors.pem \
+  --time 2026-08-11T00:00:00Z --json
+```
+
+A verifier that has not been allowed online cannot prove that a trust list is current, so `freshness.status` is `unknown`, and revocation is read only from responses stapled into the manifest. Allowing online checks lets the verifier ask the OCSP responder named by the certificate. See [Trust model](https://github.com/encypherai/encypher-c2pa/blob/main/docs/TRUST_MODEL.md).
+
+## Manifests stored outside the file
+
+By default the SDK reads; it does not fetch. When an asset names its manifest by URL, the report returns the URL as `manifest.inaccessible` and stops there. Fetch the manifest yourself if you choose, then verify it with `verify_with_manifest_store`. The same entry point verifies a `.c2pa` sidecar, with the same trust material, validation time, and posture as an embedded manifest.
+
+```bash
+encypher-c2pa verify photo.jpg --manifest photo.c2pa
+```
+
+To have the store fetched for you, allow online checks (below).
+
+## Online checks (opt-in)
+
+Some questions cannot be answered from the file alone. Where the manifest lives, whether a signing certificate has been revoked, what an identity issuer's DID document says, what the content stored outside the asset is: each needs a server. Nothing is fetched unless you say so.
+
+Every report carries a `network` block. Offline, it lists what a fetch would settle, so you can see what allowing one would do:
+
+```json
+"network": {
+  "enabled": false,
+  "needed": [{"kind": "remote_manifest", "uri": "https://manifests.example.com/photo.c2pa"}],
+  "requests": []
+}
+```
+
+Allow it for one run, or save the answer:
+
+```bash
+encypher-c2pa verify photo.jpg --online     # this run only
+encypher-c2pa verify photo.jpg --offline    # this run only, whatever is saved
+encypher-c2pa online on                     # allow from now on
+encypher-c2pa online ask                    # ask each time a fetch is needed
+encypher-c2pa online off                    # never
+encypher-c2pa online status
+```
+
+With `ask`, or before you have answered, a run that needs a fetch prints each purpose and host, says that contacting them tells those servers the file is being checked, and offers `[y] yes, this time  [N] no  [a] always  [v] never`. A run with nobody at the terminal never prompts and stays offline.
+
+`ENCYPHER_C2PA_ONLINE=on` or `off` is the operator's switch. It applies to every surface and outranks the saved answer.
+
+Libraries never read the saved answer and never prompt, because the machine calling them may be checking files sent in by strangers. Pass the option instead:
+
+```python
+encypher_c2pa.verify("photo.jpg", online=True)
+```
+
+```rust
+let options = VerifyOptions { online: Some(true), ..Default::default() };
+```
+
+```go
+allow := true
+report, err := c2pa.Verify(asset, "image/jpeg", &c2pa.Options{Online: &allow})
+```
+
+In the browser, `verify` stays synchronous and offline; `await verifyOnline(bytes, mime, options)` does the same verification and fetches through the page's own `fetch`, so the page's CORS and Content-Security-Policy rules apply.
+
+What each host learns is one request for one URL: that somebody is checking a file that references it. The SDK never sends asset bytes. An OCSP request carries a certificate serial number and issuer hashes, nothing more. Full detail is in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
+
+The fetcher is narrow on purpose: https only, except OCSP responders, whose answers are signed and verified; at most 3 redirects, each re-checked; 5-second connect and 10-second total timeouts; at most 16 requests per verification; size caps of 64 MiB for a manifest store or external content, 64 KiB for an OCSP response, 256 KiB for a DID document; no cookies, no credentials, a fixed `encypher-c2pa/<version>` user agent. Every hostname is resolved through a filter that refuses loopback, private, link-local (including `169.254.169.254`), carrier-NAT, unique-local, multicast, and documentation addresses, and the connection uses the address that was vetted. Set `--online-allow-private-networks` (`online_allow_private_networks`) for an intranet deployment: that lifts the address filter and accepts plaintext http. Do not set it where files arrive from strangers.
+
+What stays caller-supplied, and why: ICA status-list credentials, because a credential has to be verified as a credential before it can be trusted; trust lists, because their currency is a snapshot policy rather than a fetch; and AIA `caIssuers` chain completion.
+
+Build without the fetcher entirely with `--no-default-features --features telemetry`, if you need to be able to prove a binary cannot reach the network for verification.
+
+## Updates
+
+Each release carries verification fixes and a refreshed trust snapshot, so an old copy judges files against old trust lists. The command line checks for a newer release once a day, when a person is at the terminal, and offers to install it:
+
+```text
+encypher-c2pa 1.1.1 is available. You have 1.1.0, with trust lists dated 2026-09-24.
+Releases carry verification fixes and refreshed trust lists.
+Update now? [y] yes  [N] not now  [s] skip this version  [o] stop checking
+```
+
+`y` runs `cargo install encypher-c2pa-cli --version 1.1.1 --locked`, then runs your command again on the new version. `s` skips that release; a later one is still offered. `o` turns the check off.
+
+The check is one request for the crate's public entry in the crates.io index. It carries no file, path, or identifier, gives up after two seconds, and fails silently. Runs with nobody at the terminal (pipes, CI, cron) never check, and `--offline` skips the check for that run. The libraries never check; update them through your package manager.
+
+```bash
+encypher-c2pa update                 # check and install now
+encypher-c2pa update-check off       # or: on, status
+```
+
+The setting is saved in `update.json` in the configuration directory (`~/.config/encypher/` on Linux and macOS, `%APPDATA%\Encypher\` on Windows, or `ENCYPHER_C2PA_CONFIG_DIR`). `{"check": false}` turns the check off. `ENCYPHER_C2PA_UPDATE_CHECK=on` or `off` overrides the file.
+
+## Verification posture
+
+By default the verifier applies the C2PA 2.4 validation rules. A few rules that content written under C2PA 1.x could not have followed, such as the links from an action to its ingredients, apply to that content only in strict mode.
+
+Set `strict_conformance` (`--strict-conformance`) to apply the C2PA Conformance Program as well. Strict mode turns the program's additional requirements into failures, such as a trusted timestamp and usable revocation information, and requires CAWG Identity 1.3 deterministic encoding of identity signatures. It also adds the report's Content Credentials JSON (`content_credentials`), the form conformance rubrics evaluate.
+
+Where the two postures differ, the default report says so with an informational status. For example, an identity signature over the CAWG 1.1 field order, which c2pa-rs still writes, verifies by default with `com.encypher.cawg.legacyProfile`. To refuse that encoding without taking on the rest of strict mode, set `cawg_strict_encoding` (`--cawg-strict-encoding`).
+
+## Failure telemetry (opt-in)
+
+Telemetry is off until you turn it on. On the first interactive run, the SDK shows what it would send and asks once. Non-interactive processes never prompt and stay off.
+
+An event is sent only when provenance is invalid or verification fails. It contains the SDK name and version, the engine profile, the MIME type, the outcome, and at most eight status codes. It never contains the file, the manifest, the report, a filename or path, a certificate or key, trust material, or any account or machine identifier. Sending never blocks verification. The full contract is in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
+
+```bash
+encypher-c2pa telemetry on      # or: off, status
+```
+
+Python uses `configure_telemetry(True)`, Go `c2pa.ConfigureTelemetry(true)`, and JavaScript `configureTelemetry(true)`. Native deployments can set `ENCYPHER_C2PA_TELEMETRY=on` or `off` instead. A per-call setting overrides the saved preference.
+
+## Optional cross-check with the Encypher API
+
+`--encypher-api` asks the [Encypher API](https://api.encypher.com/docs) whether Encypher holds a provenance record for the file. Set `ENCYPHER_API_KEY` first.
+
+```bash
+encypher-c2pa verify photo.jpg --encypher-api --json
+```
+
+The request carries the file's SHA-256, size, MIME type, and a summary of the local result. When the format keeps the manifest in one contiguous block, it also carries that manifest store so the API can validate it independently. The file itself, its name, and its path stay local.
+
+The answer is attached under `encypher_api` and never changes the local verdict or exit code. A match there is Encypher's record, not a trust decision about the signer. A network error produces a warning, not a failed verification.
+
+## Scope
+
+This SDK verifies open-standard Content Credentials. It does not sign media, build manifests, or write into files, and the published API has no path that could. [Verification boundary](https://github.com/encypherai/encypher-c2pa/blob/main/docs/VERIFICATION_BOUNDARY.md) describes the three CI controls that enforce this.
+
+It also does not read Encypher's proprietary provenance markers, such as sentence-level text provenance or durable soft bindings. Content that carries them verifies here as ordinary C2PA content. Signing, marker detection, hosted trust policy, and durable receipts are available through the [Encypher API](https://api.encypher.com/docs).
+
+## Standards status
+
+The verifier shares no code with other C2PA implementations. Interoperability is tested offline against pinned vectors: core media from `contentauth/c2pa-rs`, the CAWG identity corpus, and generated conformance vectors. Expected results come from the C2PA 2.4 status-code definitions, not from another implementation's output.
+
+The C2PA 2.4 and CAWG Identity 1.3 labels describe what the verifier targets. They are not a conformance certification. C2PA and Content Credentials are marks of their respective owners.
 
 ## Build from source
 
-Prerequisites: Rust 1.88 or later. Python packaging requires `uv` and `maturin`. Browser packaging requires `wasm-pack` and the `wasm32-unknown-unknown` Rust target.
+Requires Rust 1.88 or later. Python packaging needs `uv` and `maturin`. Browser packaging needs `wasm-pack` and the `wasm32-unknown-unknown` target.
 
 ```bash
 cargo test --workspace
@@ -307,105 +371,14 @@ node ../../scripts/package-wasm.mjs
 node ../../scripts/test-wasm.mjs
 ```
 
-## Security boundary
+Contribution rules are in [CONTRIBUTING.md](https://github.com/encypherai/encypher-c2pa/blob/main/CONTRIBUTING.md). The architecture is described in [Architecture](https://github.com/encypherai/encypher-c2pa/blob/main/docs/ARCHITECTURE.md).
 
-The public repository contains verification, parsing, format handling, signature checks, pinned packaged trust snapshots, caller-supplied trust evaluation, and the opt-in failure telemetry client. It excludes signing keys, managed trust policy, registry lookups, proprietary watermarking and fingerprinting, customer workflows, service credentials, and telemetry backends.
+## Security
 
-Manifest construction and container writing are not part of the published API. The verification kernel lives in private modules of the single published library, so that code is unreachable from outside the crate by construction rather than by configuration, and the writers are additionally `cfg(test)` so they are not compiled into the released artifact at all. No Cargo feature can expose them.
-
-Three CI controls defend this. Each is useful and none is a proof, so it is
-worth being exact about what each one checks.
-
-`scripts/check-public-surface.mjs` locks the SHAPE of the API. It takes the
-public surface from rustdoc's own output, so re-exports, macro expansion, impl
-methods, fields and variants are resolved by the compiler rather than inferred,
-and diffs it against a reviewed inventory (`public-surface.txt`). It reads four
-configurations and unions them: the host under no features, under `telemetry`
-alone, and under defaults, plus `wasm32-unknown-unknown` under no features,
-which is what the browser binding builds. The Cargo feature map is locked to an
-approved set derived from `cargo metadata`, so a feature added implicitly by an
-optional dependency, or an approved feature redefined to pull in more, fails.
-Within that scope the walk refuses rather than guesses: an item kind it cannot
-name, an impl receiver it cannot resolve, or any item it fails to reach is a
-failure. A source-level tripwire additionally rejects public items behind a
-`cfg` the extraction structurally cannot observe - `cfg(doc)`, or a target
-outside those four - because rustdoc cannot report on the conditions rustdoc
-itself runs under.
-
-What that control cannot see is conduct. An already-approved function whose body
-is rewritten to write bytes leaves the inventory byte-for-byte unchanged.
-`crates/encypher-c2pa/tests/read_only_contract.rs` covers that from the other
-side: for `verify`, `verify_with_options` and `verify_file`, it asserts the
-input is byte-identical afterwards and that no file is created or removed in the
-directory being read, across every extension in `SUPPORTED_EXTENSIONS` and every
-MIME from `supported_mime_types()`, on success and failure paths alike. It reads
-those lists from the crate rather than copying them, so a newly supported format
-is covered the moment it is added. It does not observe writes elsewhere on the
-filesystem, and it constrains the behaviour it exercises rather than proving a
-general property.
-
-A third control asks the kernel instead of the source.
-`crates/encypher-c2pa/tests/no_write_capability.rs` forks a child, installs a
-seccomp filter, and runs `verify`, `verify_with_options` and `verify_file`
-inside it. Be precise about the coverage, because it is uneven: there are
-signed fixtures for JPEG and MP4 only, and those are the cases asserted to come
-back present, with valid integrity and a matching hard binding, so a run that
-quietly stopped parsing cannot pass for a clean one. Every other MIME in
-`supported_mime_types()` and every extension in `SUPPORTED_EXTENSIONS` is
-driven through the same entry points on unsigned, truncated and absent input,
-which exercises format dispatch and the error paths rather than a successful
-parse. Error paths are worth covering here: they are the easiest place for a
-side effect to hide.
-
-The filter is an allowlist, not a denylist, and that distinction is the whole
-control. The first version enumerated mutating syscalls; a reviewer asked what
-it did about io_uring, and the answer was nothing - a ring performs `openat`
-and `write` as submission entries, so refusing those numbers refuses nothing.
-Now anything outside a fixed list of readers, memory operations and clocks
-kills the process, and a test calls `io_uring_setup` inside the sandbox to
-prove the default really is deny. Aliases, re-export paths, generic
-`io::Write` indirection, macro expansion, `unsafe`, a dependency writing on the
-library's behalf and shelling out to a subprocess are all equally impossible.
-Four of those routes are pinned by name in a regression test; the rest are
-refused by the default-deny allowlist rather than by any rule written for them,
-which is the point of a default-deny allowlist.
-
-Two details matter. It kills on the attempt rather than returning `EPERM`,
-because an earlier version returned an error and a discarded
-`let _ = write(..)` sailed through: the write failed, the result was dropped,
-verification finished and the test reported success. Refusing the syscall shows
-verification does not depend on writing; killing shows it does not try. And the
-allowlist is split in two - the six syscalls the scenario actually makes,
-each proved necessary on every CI run by removing it and requiring the run to
-die, and a declared headroom tier for portability across libc and kernel
-versions. None of the headroom entries can create or modify a file. Splitting
-it means a permission cannot sit in the list unexplained: removing any entry
-from the exercised tier must break the run.
-
-Each gate is checked against the kernel too, not against a description of the
-filter. Three canaries confirm that `openat` with `O_CREAT` dies, `open` with
-`O_WRONLY` dies and `ioctl` with a request other than `TCGETS` dies, while a
-read-only `openat` still succeeds - so the gates are gating rather than
-banning, and there is no model of the kernel that could drift away from it.
-
-Between them a boundary violation has to defeat a compiler-derived surface
-lock, an observable behaviour test, and a kernel that will not permit the
-syscall - instead of depending on a reviewer noticing.
-
-Default verification makes no network request. Opt-in failure telemetry follows the fixed privacy boundary described in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
-
-Report security issues through [GitHub private vulnerability reporting](https://github.com/encypherai/encypher-c2pa/security/advisories/new). See [SECURITY.md](https://github.com/encypherai/encypher-c2pa/blob/main/SECURITY.md).
-
-## Project status
-
-The implementation is independent of `c2pa-rs` at runtime; it shares no verification code with any other implementation. Interoperability is checked offline against pinned third-party vectors, core C2PA media from `contentauth/c2pa-rs` and the CAWG identity corpus, with expected outcomes derived from C2PA 2.4 status-code semantics rather than another implementation's output. The format-specific code uses the public [`c2pa-text`](https://crates.io/crates/c2pa-text) crate for standardized structured-text carriers.
-
-C2PA and Content Credentials are standards and marks of their respective owners. This project is not a certification claim.
+Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/encypherai/encypher-c2pa/security/advisories/new). Parser limits and the threat model are in [SECURITY.md](https://github.com/encypherai/encypher-c2pa/blob/main/SECURITY.md).
 
 ## License
 
-[Apache License 2.0](https://github.com/encypherai/encypher-c2pa/blob/main/LICENSE). Redistributions and derivative works must
-retain the [NOTICE](https://github.com/encypherai/encypher-c2pa/blob/main/NOTICE) file naming Encypher Corporation, as required by
-Section 4(d) of the license. Third-party test vectors under
-`tests/vectors/` retain their upstream licenses, pinned alongside the
-assets.
+Copyright 2026 Encypher Corporation. Licensed under the [Apache License 2.0](https://github.com/encypherai/encypher-c2pa/blob/main/LICENSE).
+
+Redistributions and derivative works must keep the [NOTICE](https://github.com/encypherai/encypher-c2pa/blob/main/NOTICE) file, which attributes the software to Encypher Corporation (Section 4(d)), and the copyright and license header in each source file (Section 4(c)). The license does not grant use of the Encypher name or logo (Section 6). Third-party test vectors under `tests/vectors/` keep their upstream licenses, recorded next to each asset.

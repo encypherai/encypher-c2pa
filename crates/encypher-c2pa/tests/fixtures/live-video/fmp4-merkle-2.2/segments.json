@@ -1,0 +1,36 @@
+{
+  "encapsulation": "fMP4",
+  "method": "verifiable-segment-info",
+  "stream_id": null,
+  "spec_version": "2.2",
+  "init": {
+    "path": "init.mp4",
+    "bytes": 6618,
+    "sha256": "10c4e938306b6e9b26cf489858b0769c12a3b294187f3a92f098807687e4b21b",
+    "sequence_number": null,
+    "manifest_label": null
+  },
+  "segments": [
+    {
+      "path": "seg-0.m4s",
+      "bytes": 490,
+      "sha256": "302ce9de30a18716eb71779eeb1a96ae3cb56509ad35ad5deaa3988c986f720d",
+      "sequence_number": null,
+      "manifest_label": null
+    },
+    {
+      "path": "seg-1.m4s",
+      "bytes": 490,
+      "sha256": "61142ff38be36723a407b062794a2fed140ace42a8614b3b5485896e2cd47533",
+      "sequence_number": null,
+      "manifest_label": null
+    },
+    {
+      "path": "seg-2.m4s",
+      "bytes": 490,
+      "sha256": "2c39b64f782463dde49b647de291d687be11b88f3449ebc9805d44200fed7662",
+      "sequence_number": null,
+      "manifest_label": null
+    }
+  ]
+}

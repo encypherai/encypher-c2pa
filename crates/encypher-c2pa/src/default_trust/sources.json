@@ -1,15 +1,15 @@
 {
-  "snapshot_date": "2026-08-11",
+  "snapshot_date": "2026-09-24",
   "lists": {
     "c2pa": {
       "file": "c2pa-trust.pem",
-      "url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/179a824a557a4a0c5ac1b6d2b98d67f436a2f34a/trust-list/C2PA-TRUST-LIST.pem",
-      "sha256": "5fc0f1571f9eb4dff7a242291e1b198d347a768709bd6915022e9b59d6d7769c"
+      "url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/70ec46e16962b81e70795fcb50a05e0128329a20/trust-list/C2PA-TRUST-LIST.pem",
+      "sha256": "75cacc98b79ecac33713c7ecfb58d4a0ef383f3c1f886e7409f9e37e8664aea5"
     },
     "c2paTsa": {
       "file": "c2pa-tsa-trust.pem",
-      "url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/600b28d3950b4803f3ba41352b205601ec1a77b5/trust-list/C2PA-TSA-TRUST-LIST.pem",
-      "sha256": "76788c4c36644ee24674f6d63e9ee6f0186c3e25e39ea80da67d1b6f35dbea62"
+      "url": "https://raw.githubusercontent.com/c2pa-org/conformance-public/4cb1f317aa4c7ce9cca557dc0cecee18bd784bb7/trust-list/C2PA-TSA-TRUST-LIST.pem",
+      "sha256": "c688d3555f4a2f1f8d663472bbd37888ff234abdd234c25934c0f9292e4eb5c9"
     },
     "iptcEndEntity": {
       "file": "iptc-vnpl-end-entity.pem",

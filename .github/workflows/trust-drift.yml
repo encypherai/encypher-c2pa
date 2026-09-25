@@ -1,0 +1,20 @@
+name: Trust snapshot drift
+
+on:
+  schedule:
+    - cron: "23 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Compare packaged trust snapshot with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check trust sources for certificate changes
+        run: scripts/refresh-trust-snapshot --check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

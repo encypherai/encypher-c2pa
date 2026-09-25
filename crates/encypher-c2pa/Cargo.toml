@@ -19,8 +19,12 @@ categories = ["cryptography", "multimedia"]
 exclude = ["tests/**"]
 
 [features]
-default = ["telemetry"]
+default = ["telemetry", "online"]
 telemetry = ["dep:ureq"]
+# Opt-in online checks. The feature compiles the fetcher; it never turns
+# fetching on. Without it a build cannot reach the network for verification at
+# all, which is what an air-gapped deployment wants to be able to prove.
+online = ["dep:ureq"]
 
 [dependencies]
 serde = { workspace = true }
@@ -47,11 +51,15 @@ cms = { workspace = true }
 x509-tsp = { workspace = true }
 unicode-normalization = "0.1"
 miniz_oxide = "0.8"
+brotli = { version = "8", default-features = false, features = ["std"] }
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# JSON Schema draft 2020-12 validator (MIT OR Apache-2.0), used only by the
+# crJSON schema-conformance test. Never linked into the published library.
+boon = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

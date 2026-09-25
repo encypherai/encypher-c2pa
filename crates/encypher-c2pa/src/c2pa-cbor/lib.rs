@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! CBOR encoding with explicit profiles for C2PA byte-parity.
 //!
 //! C2PA hash bindings depend on the exact CBOR byte encoding of claims and

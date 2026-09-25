@@ -1,0 +1,36 @@
+{
+  "encapsulation": "CMAF",
+  "method": "per-segment",
+  "stream_id": "encypher-cmaf-fixture",
+  "spec_version": "2.4",
+  "init": {
+    "path": "init.mp4",
+    "bytes": 2267,
+    "sha256": "602f465ea7eaaab4ec41febb92405e8fc8a043bfa530b1f5755bff45a3349041",
+    "sequence_number": 0,
+    "manifest_label": "urn:c2pa:a281133b-1fc5-4376-bfac-3880e07b18d6"
+  },
+  "segments": [
+    {
+      "path": "seg-0.m4s",
+      "bytes": 6304,
+      "sha256": "b23985d4333f5755b327f501156a67e7c8cceb2012507d938edfb671e46b8cef",
+      "sequence_number": 1,
+      "manifest_label": "urn:c2pa:5bab9bf8-c522-410b-8c5f-049b0e60178c"
+    },
+    {
+      "path": "seg-1.m4s",
+      "bytes": 8882,
+      "sha256": "d567197074021671f0039baf04944ce614bb6a87bc56372e8362d788b3b47060",
+      "sequence_number": 2,
+      "manifest_label": "urn:c2pa:380c111a-41bb-414a-96e6-318fbff3437d"
+    },
+    {
+      "path": "seg-2.m4s",
+      "bytes": 9563,
+      "sha256": "64da220640febd2bead4b1a3bd958a0150cc43f643d0407f59ea672d1857413f",
+      "sequence_number": 3,
+      "manifest_label": "urn:c2pa:864c4f6f-2d49-414e-af13-a957d6fec6e0"
+    }
+  ]
+}

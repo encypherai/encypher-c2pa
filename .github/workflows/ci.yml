@@ -55,6 +55,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all --check
+      # Every published package carries its own LICENSE and NOTICE copy
+      # (Apache-2.0 Section 4(a) and 4(d)); a stale copy ships stale attribution.
+      - name: License and NOTICE copies match the root
+        run: |
+          for dir in crates/encypher-c2pa crates/encypher-c2pa-cli bindings/python bindings/go; do
+            cmp LICENSE "$dir/LICENSE" || exit 1
+            cmp NOTICE "$dir/NOTICE" || exit 1
+          done
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # A plain `cargo audit`, not rustsec/audit-check: that action requires a
       # GITHUB_TOKEN plus checks/issues write scopes to publish its check run,

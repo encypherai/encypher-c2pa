@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! RFC 3161 timestamp-token verification for C2PA `sigTst2` headers.
 //!
 //! A timestamp is accepted only when its CMS signature, signed attributes,
@@ -22,7 +25,7 @@ use x509_cert::{
 };
 use x509_tsp::{TimeStampResp, TstInfo};
 
-use super::{common_name, validate_chain, TrustList, OID_KP_TIME_STAMPING};
+use super::{common_name, validate_chain, AnchorPurpose, TrustList, OID_KP_TIME_STAMPING};
 
 const OID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 const OID_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
@@ -128,6 +131,103 @@ pub fn token_from_timestamp_response(response_der: &[u8]) -> Result<Vec<u8>, &'s
         .map_err(|_| "timestamp_response_token_invalid")
 }
 
+/// The CMS structures inside one RFC 3161 `TimeStampToken`.
+struct TokenParts {
+    signed_data: SignedData,
+    /// DER of the `TSTInfo` eContent, which the signed `messageDigest`
+    /// attribute covers.
+    tst_octets: OctetString,
+    tst_info: TstInfo,
+}
+
+/// Decode a `TimeStampToken` into its signed data and `TSTInfo`. Structural
+/// decoding only: no imprint, signature, or trust check happens here.
+fn parse_token_parts(token_der: &[u8]) -> Result<TokenParts, &'static str> {
+    let content_info = ContentInfo::from_der(token_der).map_err(|_| "timestamp_parse_error")?;
+    if content_info.content_type != OID_SIGNED_DATA {
+        return Err("timestamp_not_signed_data");
+    }
+    let signed_data = content_info
+        .content
+        .decode_as::<SignedData>()
+        .map_err(|_| "timestamp_signed_data_invalid")?;
+    if signed_data.encap_content_info.econtent_type != OID_TST_INFO {
+        return Err("timestamp_not_tst_info");
+    }
+    let econtent = signed_data
+        .encap_content_info
+        .econtent
+        .as_ref()
+        .ok_or("timestamp_tst_info_missing")?;
+    let tst_octets = econtent
+        .decode_as::<OctetString>()
+        .map_err(|_| "timestamp_tst_info_invalid")?;
+    let tst_info =
+        TstInfo::from_der(tst_octets.as_bytes()).map_err(|_| "timestamp_tst_info_invalid")?;
+    Ok(TokenParts {
+        signed_data,
+        tst_octets,
+        tst_info,
+    })
+}
+
+/// Locate the certificate a `SignerInfo` names inside the token's certificate set.
+fn signer_certificate<'a>(
+    signed_data: &'a SignedData,
+    signer_info: &SignerInfo,
+) -> Option<&'a Certificate> {
+    signed_data
+        .certificates
+        .as_ref()?
+        .0
+        .iter()
+        .find_map(|choice| match choice {
+            CertificateChoices::Certificate(cert) if signer_matches(signer_info, cert) => {
+                Some(cert)
+            }
+            _ => None,
+        })
+}
+
+/// The time an RFC 3161 token asserts, plus the DER of the TSA certificate that
+/// signed it.
+///
+/// This is a descriptive read for reporting surfaces such as the crJSON
+/// `timeStampInfo` object. It performs no imprint, signature, or trust check,
+/// so its presence is never evidence that a timestamp is valid:
+/// [`verify_timestamp_token`] answers that question.
+#[derive(Debug, Clone)]
+pub struct TokenDescription {
+    /// `TSTInfo.genTime`.
+    pub generated_at: OffsetDateTime,
+    /// DER of the TSA signer certificate carried by the token, when present.
+    pub signer_cert_der: Option<Vec<u8>>,
+}
+
+/// Read the descriptive fields of an RFC 3161 `TimeStampToken`.
+///
+/// Returns `None` when the token does not decode or carries no representable
+/// generation time.
+pub fn describe_timestamp_token(token_der: &[u8]) -> Option<TokenDescription> {
+    let parts = parse_token_parts(token_der).ok()?;
+    let generated_at = OffsetDateTime::from_unix_timestamp(
+        parts.tst_info.gen_time.to_unix_duration().as_secs() as i64,
+    )
+    .ok()?;
+    let signer_cert_der = parts
+        .signed_data
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .and_then(|signer_info| signer_certificate(&parts.signed_data, signer_info))
+        .and_then(|cert| cert.to_der().ok());
+    Some(TokenDescription {
+        generated_at,
+        signer_cert_der,
+    })
+}
+
 /// Verify an RFC 3161 `TimeStampToken` against the exact C2PA timestamp input.
 ///
 /// `timestamp_input` is the C2PA v2 CounterSignature `ToBeSigned` value, not the
@@ -167,27 +267,12 @@ fn verify_timestamp_token_inner(
     tsa_trust: &TrustList,
     verification_time: OffsetDateTime,
 ) -> Result<TimestampResult, &'static str> {
-    let content_info = ContentInfo::from_der(token_der).map_err(|_| "timestamp_parse_error")?;
-    if content_info.content_type != OID_SIGNED_DATA {
-        return Err("timestamp_not_signed_data");
-    }
-    let signed_data = content_info
-        .content
-        .decode_as::<SignedData>()
-        .map_err(|_| "timestamp_signed_data_invalid")?;
-    if signed_data.encap_content_info.econtent_type != OID_TST_INFO {
-        return Err("timestamp_not_tst_info");
-    }
-    let econtent = signed_data
-        .encap_content_info
-        .econtent
-        .as_ref()
-        .ok_or("timestamp_tst_info_missing")?;
-    let tst_octets = econtent
-        .decode_as::<OctetString>()
-        .map_err(|_| "timestamp_tst_info_invalid")?;
+    let TokenParts {
+        signed_data,
+        tst_octets,
+        tst_info,
+    } = parse_token_parts(token_der)?;
     let tst_bytes = tst_octets.as_bytes();
-    let tst_info = TstInfo::from_der(tst_bytes).map_err(|_| "timestamp_tst_info_invalid")?;
 
     let generated_at =
         OffsetDateTime::from_unix_timestamp(tst_info.gen_time.to_unix_duration().as_secs() as i64)
@@ -233,21 +318,8 @@ fn verify_timestamp_token_inner(
         return Err("timestamp_message_digest_mismatch");
     }
 
-    let certificates = signed_data
-        .certificates
-        .as_ref()
-        .ok_or("timestamp_signer_cert_missing")?;
-    let signer_cert = certificates
-        .0
-        .iter()
-        .filter_map(|choice| match choice {
-            CertificateChoices::Certificate(cert) if signer_matches(signer_info, cert) => {
-                Some(cert)
-            }
-            _ => None,
-        })
-        .next()
-        .ok_or("timestamp_signer_cert_missing")?;
+    let signer_cert =
+        signer_certificate(&signed_data, signer_info).ok_or("timestamp_signer_cert_missing")?;
     let signer_der = signer_cert
         .to_der()
         .map_err(|_| "timestamp_signer_cert_invalid")?;
@@ -265,19 +337,31 @@ fn verify_timestamp_token_inner(
         return Err("timestamp_tsa_leaf_profile_invalid");
     }
 
-    let included_der: Vec<Vec<u8>> = certificates
-        .0
-        .iter()
-        .filter_map(|choice| match choice {
-            CertificateChoices::Certificate(cert) => cert.to_der().ok(),
-            _ => None,
+    let included_der: Vec<Vec<u8>> = signed_data
+        .certificates
+        .as_ref()
+        .map(|certificates| {
+            certificates
+                .0
+                .iter()
+                .filter_map(|choice| match choice {
+                    CertificateChoices::Certificate(cert) => cert.to_der().ok(),
+                    _ => None,
+                })
+                .filter(|der| der != &signer_der)
+                .collect()
         })
-        .filter(|der| der != &signer_der)
-        .collect();
+        .unwrap_or_default();
     if tsa_trust.anchors.is_empty() {
         return Err("no_tsa_anchors");
     }
-    let chain = validate_chain(&signer_der, &included_der, tsa_trust, Some(generated_at));
+    let chain = validate_chain(
+        &signer_der,
+        &included_der,
+        tsa_trust,
+        AnchorPurpose::TimeStamping,
+        Some(generated_at),
+    );
     if !chain.chain_validity_ok {
         return Err("timestamp_tsa_outside_validity");
     }
@@ -347,23 +431,12 @@ fn has_strict_timestamping_eku(cert: &Certificate) -> bool {
         .unwrap_or(false)
 }
 
+/// The C2PA end-entity certificate profile as it applies to a TSA signing
+/// certificate. The time-stamping EKU itself is checked by
+/// [`has_strict_timestamping_eku`]; this covers the rest of the profile, which
+/// the spec applies to every certificate regardless of purpose.
 fn tsa_leaf_profile_acceptable(cert: &Certificate) -> bool {
-    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
-        return false;
-    };
-    let is_ca = extensions
-        .iter()
-        .find(|extension| extension.extn_id == OID_EXT_BASIC_CONSTRAINTS)
-        .and_then(|extension| BasicConstraints::from_der(extension.extn_value.as_bytes()).ok())
-        .is_some_and(|constraints| constraints.ca);
-    if is_ca {
-        return false;
-    }
-    extensions
-        .iter()
-        .find(|extension| extension.extn_id == OID_EXT_KEY_USAGE)
-        .and_then(|extension| KeyUsage::from_der(extension.extn_value.as_bytes()).ok())
-        .is_some_and(|usage| usage.digital_signature() && !usage.key_cert_sign())
+    super::profile::profile_violation(cert, super::profile::CertRole::EndEntity).is_none()
 }
 
 fn verify_signer_signature(
@@ -571,7 +644,11 @@ mod tests {
     }
 
     fn trust() -> TrustList {
-        TrustList::from_pem(include_str!("tests/fixtures/rfc3161_root.pem")).unwrap()
+        TrustList::from_pem_for(
+            AnchorPurpose::TimeStamping,
+            include_str!("tests/fixtures/rfc3161_root.pem"),
+        )
+        .unwrap()
     }
 
     fn verification_time() -> OffsetDateTime {
@@ -621,9 +698,7 @@ mod tests {
         let result = verify_timestamp_token(
             &token(),
             PAYLOAD,
-            &TrustList {
-                anchors: vec![vec![0x30, 0x00]],
-            },
+            &TrustList::from_certificates(AnchorPurpose::TimeStamping, [vec![0x30, 0x00]]),
             verification_time(),
         );
 

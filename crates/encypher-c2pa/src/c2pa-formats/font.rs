@@ -1,9 +1,12 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! SFNT fonts (OTF/TTF): JUMBF in a `C2PA` table.
 //!
 //! An SFNT file begins with a header (`sfnt` version, table count, binary-search
 //! hints) followed by a table directory of 16-byte records
-//! (`tag(4) | checksum(4) | offset(4) | length(4)`). C2PA stores the manifest
-//! store as the contents of a table tagged `C2PA`.
+//! (`tag(4) | checksum(4) | offset(4) | length(4)`). The C2PA table record
+//! carries offsets and lengths for an embedded manifest store and a remote URI.
 //!
 //! Both extraction and embedding are supported. Embedding rebuilds the font:
 //! it appends a `C2PA` table (4-byte aligned), recomputes the binary-search
@@ -21,8 +24,9 @@ fn is_sfnt_version(v: &[u8]) -> bool {
     matches!(v, [0x00, 0x01, 0x00, 0x00] | b"OTTO" | b"true" | b"typ1")
 }
 
-/// Extract the manifest store from the `C2PA` SFNT table.
-pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+const C2PA_TABLE_RECORD_LEN: usize = 20;
+
+fn c2pa_table(data: &[u8]) -> Result<Option<&[u8]>, FormatError> {
     if data.len() < 12 || !is_sfnt_version(&data[0..4]) {
         return Err(FormatError::InvalidStructure {
             format: FMT,
@@ -30,26 +34,152 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         });
     }
     let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
-    let dir_start: usize = 12;
-    let dir_end = dir_start
-        .checked_add(num_tables * 16)
-        .filter(|&e| e <= data.len())
+    12usize
+        .checked_add(
+            num_tables
+                .checked_mul(16)
+                .ok_or(FormatError::Truncated(FMT))?,
+        )
+        .filter(|end| *end <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
-    for i in 0..num_tables {
-        let rec = dir_start + i * 16;
-        if &data[rec..rec + 4] != TAG_C2PA {
+    for index in 0..num_tables {
+        let record = 12 + index * 16;
+        if &data[record..record + 4] != TAG_C2PA {
             continue;
         }
-        let offset = be_u32(data, rec + 8).ok_or(FormatError::Truncated(FMT))? as usize;
-        let length = be_u32(data, rec + 12).ok_or(FormatError::Truncated(FMT))? as usize;
+        let offset = be_u32(data, record + 8).ok_or(FormatError::Truncated(FMT))? as usize;
+        let length = be_u32(data, record + 12).ok_or(FormatError::Truncated(FMT))? as usize;
         let end = offset
             .checked_add(length)
-            .filter(|&e| e <= data.len())
+            .filter(|end| *end <= data.len())
             .ok_or(FormatError::Truncated(FMT))?;
-        return Ok(Some(data[offset..end].to_vec()));
+        return Ok(Some(&data[offset..end]));
     }
-    let _ = dir_end;
     Ok(None)
+}
+
+fn table_range<'a>(
+    table: &'a [u8],
+    offset: usize,
+    length: usize,
+    detail: &'static str,
+) -> Result<Option<&'a [u8]>, FormatError> {
+    if offset == 0 && length == 0 {
+        return Ok(None);
+    }
+    if offset < C2PA_TABLE_RECORD_LEN || length == 0 {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail,
+        });
+    }
+    let end = offset
+        .checked_add(length)
+        .filter(|end| *end <= table.len())
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail,
+        })?;
+    Ok(Some(&table[offset..end]))
+}
+
+fn is_legacy_raw_store(table: &[u8]) -> bool {
+    table.len() >= 8 && &table[4..8] == b"jumb"
+}
+
+/// Extract the manifest store from the C2PA 2.4 font-table record.
+///
+/// The raw-store branch preserves assets written by this SDK before it adopted
+/// the table record. It is read compatibility only; conforming tables use the
+/// `manifestStoreOffset` and `manifestStoreLength` fields below.
+pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    let Some(table) = c2pa_table(data)? else {
+        return Ok(None);
+    };
+    if is_legacy_raw_store(table) {
+        return Ok(Some(table.to_vec()));
+    }
+    if table.len() < C2PA_TABLE_RECORD_LEN {
+        return Err(FormatError::Truncated(FMT));
+    }
+    let offset = be_u32(table, 12).ok_or(FormatError::Truncated(FMT))? as usize;
+    let length = be_u32(table, 16).ok_or(FormatError::Truncated(FMT))? as usize;
+    Ok(table_range(
+        table,
+        offset,
+        length,
+        "invalid C2PA font-table manifest-store range",
+    )?
+    .map(ToOwned::to_owned))
+}
+
+/// Return the active-manifest URI declared by a C2PA 2.4 font table.
+pub(crate) fn remote_manifest_uri(data: &[u8]) -> Result<Option<&str>, FormatError> {
+    let Some(table) = c2pa_table(data)? else {
+        return Ok(None);
+    };
+    if is_legacy_raw_store(table) {
+        return Ok(None);
+    }
+    if table.len() < C2PA_TABLE_RECORD_LEN {
+        return Err(FormatError::Truncated(FMT));
+    }
+    let offset = be_u32(table, 4).ok_or(FormatError::Truncated(FMT))? as usize;
+    let length = u16::from_be_bytes([table[8], table[9]]) as usize;
+    let Some(uri) = table_range(
+        table,
+        offset,
+        length,
+        "invalid C2PA font-table active-manifest URI range",
+    )?
+    else {
+        return Ok(None);
+    };
+    std::str::from_utf8(uri)
+        .map(Some)
+        .map_err(|_| FormatError::InvalidStructure {
+            format: FMT,
+            detail: "C2PA font-table active-manifest URI is not UTF-8",
+        })
+}
+
+pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
+    if data.len() < 12 || !is_sfnt_version(&data[0..4]) {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "not an SFNT font",
+        });
+    }
+    let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    12usize
+        .checked_add(
+            num_tables
+                .checked_mul(16)
+                .ok_or(FormatError::Truncated(FMT))?,
+        )
+        .filter(|end| *end <= data.len())
+        .ok_or(FormatError::Truncated(FMT))?;
+    let mut spans = Vec::with_capacity(num_tables);
+    for index in 0..num_tables {
+        let record = 12 + index * 16;
+        let tag = &data[record..record + 4];
+        let start = be_u32(data, record + 8).ok_or(FormatError::Truncated(FMT))? as usize;
+        let length = be_u32(data, record + 12).ok_or(FormatError::Truncated(FMT))? as usize;
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .ok_or(FormatError::Truncated(FMT))?;
+        spans.push(crate::c2pa_formats::BoxSpan::contiguous(
+            if tag == TAG_C2PA {
+                "C2PA".to_string()
+            } else {
+                String::from_utf8_lossy(tag).into_owned()
+            },
+            start,
+            end,
+        ));
+    }
+    Ok(spans)
 }
 
 /// Compute an SFNT table checksum: the wrapping sum of the table's big-endian
@@ -128,7 +258,16 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
             .ok_or(FormatError::Truncated(FMT))?;
         tables.push((tag, asset[offset..end].to_vec()));
     }
-    tables.push((*TAG_C2PA, manifest_store.to_vec()));
+    let mut c2pa_table = Vec::with_capacity(C2PA_TABLE_RECORD_LEN + manifest_store.len());
+    c2pa_table.extend_from_slice(&1u16.to_be_bytes());
+    c2pa_table.extend_from_slice(&0u16.to_be_bytes());
+    c2pa_table.extend_from_slice(&0u32.to_be_bytes());
+    c2pa_table.extend_from_slice(&0u16.to_be_bytes());
+    c2pa_table.extend_from_slice(&0u16.to_be_bytes());
+    c2pa_table.extend_from_slice(&(C2PA_TABLE_RECORD_LEN as u32).to_be_bytes());
+    c2pa_table.extend_from_slice(&(manifest_store.len() as u32).to_be_bytes());
+    c2pa_table.extend_from_slice(manifest_store);
+    tables.push((*TAG_C2PA, c2pa_table));
     // The table directory must be sorted by ascending tag.
     tables.sort_by_key(|a| a.0);
 
@@ -215,23 +354,39 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
         let rec = dir_start + i * 16;
         let tag = &data[rec..rec + 4];
         if tag == TAG_C2PA {
-            let offset = be_u32(data, rec + 8).ok_or(FormatError::Truncated(FMT))? as usize;
-            let length = be_u32(data, rec + 12).ok_or(FormatError::Truncated(FMT))? as usize;
-            if offset
-                .checked_add(length)
-                .filter(|&e| e <= data.len())
-                .is_none()
-            {
-                return Err(FormatError::Truncated(FMT));
-            }
+            let table_offset = be_u32(data, rec + 8).ok_or(FormatError::Truncated(FMT))? as usize;
+            let table_length = be_u32(data, rec + 12).ok_or(FormatError::Truncated(FMT))? as usize;
+            let table_end = table_offset
+                .checked_add(table_length)
+                .filter(|end| *end <= data.len())
+                .ok_or(FormatError::Truncated(FMT))?;
+            let table = &data[table_offset..table_end];
+            let (manifest_offset, manifest_length) = if is_legacy_raw_store(table) {
+                (table_offset, table_length)
+            } else {
+                if table.len() < C2PA_TABLE_RECORD_LEN {
+                    return Err(FormatError::Truncated(FMT));
+                }
+                let offset = be_u32(table, 12).ok_or(FormatError::Truncated(FMT))? as usize;
+                let length = be_u32(table, 16).ok_or(FormatError::Truncated(FMT))? as usize;
+                table_range(
+                    table,
+                    offset,
+                    length,
+                    "invalid C2PA font-table manifest-store range",
+                )?;
+                (table_offset + offset, length)
+            };
             out.push(DataHashExclusion {
                 start: rec + 4,
                 length: 4,
-            }); // C2PA dir checksum
-            out.push(DataHashExclusion {
-                start: offset,
-                length,
-            }); // manifest payload
+            });
+            if manifest_length != 0 {
+                out.push(DataHashExclusion {
+                    start: manifest_offset,
+                    length: manifest_length,
+                });
+            }
         } else if tag == b"head" {
             let offset = be_u32(data, rec + 8).ok_or(FormatError::Truncated(FMT))? as usize;
             if offset
@@ -269,12 +424,56 @@ mod tests {
         v
     }
 
+    /// Build a TrueType font whose C2PA table uses the C2PA 2.4 table record.
+    fn font_with_table_record(manifest: &[u8], remote_uri: Option<&str>) -> Vec<u8> {
+        const RECORD_LEN: usize = 20;
+        let uri = remote_uri.unwrap_or_default().as_bytes();
+        let uri_offset = if uri.is_empty() { 0 } else { RECORD_LEN as u32 };
+        let store_offset = RECORD_LEN + uri.len();
+        let mut table = Vec::with_capacity(store_offset + manifest.len());
+        table.extend_from_slice(&1u16.to_be_bytes());
+        table.extend_from_slice(&0u16.to_be_bytes());
+        table.extend_from_slice(&uri_offset.to_be_bytes());
+        table.extend_from_slice(&(uri.len() as u16).to_be_bytes());
+        table.extend_from_slice(&0u16.to_be_bytes());
+        table.extend_from_slice(
+            &(if manifest.is_empty() {
+                0
+            } else {
+                store_offset as u32
+            })
+            .to_be_bytes(),
+        );
+        table.extend_from_slice(&(manifest.len() as u32).to_be_bytes());
+        table.extend_from_slice(uri);
+        table.extend_from_slice(manifest);
+        font_with_manifest(&table)
+    }
+
     fn bare_font() -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
         v.extend_from_slice(&0u16.to_be_bytes());
         v.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         v
+    }
+
+    #[test]
+    fn box_hash_spans_follow_font_table_directory_order() {
+        let store = crate::c2pa_formats::tests::dummy_manifest_store();
+        let embedded = embed(&font_with_head(), &store).unwrap();
+        let spans = box_spans(&embedded).unwrap();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.name.as_str())
+                .collect::<Vec<_>>(),
+            ["C2PA", "head"]
+        );
+        for span in spans {
+            assert!(span.start() < span.end());
+            assert!(span.end() <= embedded.len());
+        }
     }
 
     #[test]
@@ -341,6 +540,23 @@ mod tests {
         let store = crate::c2pa_formats::tests::dummy_manifest_store();
         let asset = font_with_manifest(&store);
         assert_eq!(extract(&asset).unwrap().as_deref(), Some(store.as_slice()));
+    }
+
+    #[test]
+    fn extracts_manifest_from_c2pa_2_4_table_record() {
+        let store = crate::c2pa_formats::tests::dummy_manifest_store();
+        let asset = font_with_table_record(&store, Some("https://example.test/active.c2pa"));
+        assert_eq!(extract(&asset).unwrap().as_deref(), Some(store.as_slice()));
+    }
+
+    #[test]
+    fn reports_remote_uri_from_remote_only_table_record() {
+        let asset = font_with_table_record(&[], Some("https://example.test/active.c2pa"));
+        assert_eq!(extract(&asset).unwrap(), None);
+        assert_eq!(
+            remote_manifest_uri(&asset).unwrap(),
+            Some("https://example.test/active.c2pa")
+        );
     }
 
     #[test]

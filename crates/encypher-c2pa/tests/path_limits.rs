@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 use encypher_c2pa::{verify_file, Error, VerifyOptions};
 #[cfg(unix)]
 use std::ffi::CString;

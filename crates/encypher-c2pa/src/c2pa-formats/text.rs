@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Text-asset C2PA embedding through the published `c2pa-text` crate.
 //!
 //! Three independent C2PA 2.4 text pipelines, one per [`TextMethod`]:
@@ -46,15 +49,188 @@ impl TextMethod {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextDiagnostic {
+    CorruptedWrapper,
+    StructuredNoManifest,
+    StructuredEmptyReference,
+    StructuredMalformedReference,
+    StructuredMultipleReferences,
+    StructuredNoResolutionPath,
+}
+
+impl TextDiagnostic {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::CorruptedWrapper => "manifest.text.corruptedWrapper",
+            Self::StructuredNoManifest => "manifest.structuredText.noManifest",
+            Self::StructuredEmptyReference => "manifest.structuredText.emptyReference",
+            Self::StructuredMalformedReference => "manifest.structuredText.malformedReference",
+            Self::StructuredMultipleReferences => "manifest.structuredText.multipleReferences",
+            Self::StructuredNoResolutionPath => "manifest.structuredText.noResolutionPath",
+        }
+    }
+}
+
+fn uri_shape_valid(reference: &str) -> bool {
+    let Some((scheme, rest)) = reference.split_once(':') else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic()
+                || (index > 0 && (byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')))
+        })
+        && !rest.is_empty()
+        && !reference.bytes().any(|byte| byte.is_ascii_whitespace())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnstructuredWrapper {
+    start: usize,
+    length: usize,
+    manifest_start: usize,
+    manifest_length: usize,
+}
+
+fn unstructured_wrappers(text: &str) -> Vec<UnstructuredWrapper> {
+    const HEADER_LEN: usize = 13;
+    const MAGIC: &[u8; 8] = b"C2PATXT\0";
+    const VERSION: u8 = 1;
+
+    let mut wrappers = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(relative) = text[search_from..].find('\u{feff}') {
+        let start = search_from + relative;
+        let selectors_start = start + '\u{feff}'.len_utf8();
+        let mut run_end = selectors_start;
+        let mut selector_count = 0usize;
+        let mut header = [0u8; HEADER_LEN];
+        for character in text[selectors_start..].chars() {
+            let Some(byte) = crate::c2pa_formats::text_standard::vs_to_byte(character) else {
+                break;
+            };
+            if selector_count < HEADER_LEN {
+                header[selector_count] = byte;
+            }
+            selector_count += 1;
+            run_end += character.len_utf8();
+        }
+        search_from = run_end.max(selectors_start);
+        if selector_count < HEADER_LEN || &header[..8] != MAGIC || header[8] != VERSION {
+            continue;
+        }
+        let manifest_length =
+            u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
+        if manifest_length > crate::MAX_MANIFEST_STORE_BYTES
+            || selector_count < HEADER_LEN + manifest_length
+        {
+            continue;
+        }
+
+        let mut position = selectors_start;
+        let mut manifest_start = selectors_start;
+        for (index, character) in text[selectors_start..].chars().enumerate() {
+            if index == HEADER_LEN {
+                manifest_start = position;
+            }
+            if index == HEADER_LEN + manifest_length {
+                break;
+            }
+            position += character.len_utf8();
+        }
+
+        let padded_bound = start
+            .checked_add(c2pa_text::worst_case_wrapper_byte_length(manifest_length))
+            .unwrap_or(usize::MAX);
+        for character in text[position..run_end].chars() {
+            match crate::c2pa_formats::text_standard::vs_to_byte(character) {
+                Some(0x00 | 0xff) if position + character.len_utf8() <= padded_bound => {
+                    position += character.len_utf8();
+                }
+                _ => break,
+            }
+        }
+        wrappers.push(UnstructuredWrapper {
+            start,
+            length: position - start,
+            manifest_start,
+            manifest_length,
+        });
+        if search_from <= start {
+            search_from = selectors_start;
+        }
+    }
+    wrappers
+}
+
+pub(crate) fn unstructured_wrapper_spans(
+    data: &[u8],
+) -> Result<Vec<DataHashExclusion>, FormatError> {
+    let text = std::str::from_utf8(data).map_err(|_| TextMethod::Unstructured.invalid_utf8())?;
+    Ok(unstructured_wrappers(text)
+        .into_iter()
+        .map(|wrapper| DataHashExclusion {
+            start: wrapper.start,
+            length: wrapper.length,
+        })
+        .collect())
+}
+
+pub(crate) fn diagnostic(method: TextMethod, data: &[u8]) -> Option<TextDiagnostic> {
+    let text = match std::str::from_utf8(data) {
+        Ok(text) => text,
+        Err(_) => return None,
+    };
+    match method {
+        TextMethod::Unstructured => {
+            let validation = c2pa_text::validate_text(text);
+            match validation.primary_code() {
+                c2pa_text::ValidationCode::Valid => None,
+                c2pa_text::ValidationCode::CorruptedWrapper => {
+                    Some(TextDiagnostic::CorruptedWrapper)
+                }
+                c2pa_text::ValidationCode::MultipleWrappers => None,
+            }
+        }
+        TextMethod::Structured => match c2pa_text::structured::extract_structured(text) {
+            Err(c2pa_text::structured::StructuredError::NoManifest) => {
+                Some(TextDiagnostic::StructuredNoManifest)
+            }
+            Err(c2pa_text::structured::StructuredError::EmptyReference) => {
+                Some(TextDiagnostic::StructuredEmptyReference)
+            }
+            Err(c2pa_text::structured::StructuredError::MultipleReferences) => {
+                Some(TextDiagnostic::StructuredMultipleReferences)
+            }
+            Ok(extracted) if extracted.manifest.is_some() => None,
+            Ok(extracted) if extracted.reference.starts_with("data:") => {
+                Some(TextDiagnostic::StructuredMalformedReference)
+            }
+            Ok(extracted) if !uri_shape_valid(&extracted.reference) => {
+                Some(TextDiagnostic::StructuredMalformedReference)
+            }
+            Ok(_) => Some(TextDiagnostic::StructuredNoResolutionPath),
+        },
+        TextMethod::Html => None,
+    }
+}
+
 /// Extract the raw manifest-store bytes from a text asset using `method`.
 pub(crate) fn extract(method: TextMethod, data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     let text = std::str::from_utf8(data).map_err(|_| method.invalid_utf8())?;
     match method {
-        TextMethod::Unstructured => match c2pa_text::extract_manifest(text) {
-            Ok(res) => Ok(res.manifest),
-            // No wrapper present is "no manifest", not a malformed container.
-            Err(_) => Ok(None),
-        },
+        TextMethod::Unstructured => {
+            let Some(wrapper) = unstructured_wrappers(text).into_iter().next() else {
+                return Ok(None);
+            };
+            let manifest = text[wrapper.manifest_start..]
+                .chars()
+                .take(wrapper.manifest_length)
+                .filter_map(crate::c2pa_formats::text_standard::vs_to_byte)
+                .collect();
+            Ok(Some(manifest))
+        }
         TextMethod::Structured => match c2pa_text::structured::extract_structured(text) {
             // Only the inline `data:` reference carries bytes; a URL reference
             // resolves elsewhere and yields no embedded manifest here.
@@ -169,13 +345,10 @@ pub(crate) fn exclusions(
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
     let text = std::str::from_utf8(data).map_err(|_| method.invalid_utf8())?;
     let range = match method {
-        TextMethod::Unstructured => match c2pa_text::extract_manifest(text) {
-            Ok(res) => match (res.offset, res.length) {
-                (Some(start), Some(length)) => Some((start, length)),
-                _ => None,
-            },
-            Err(_) => None,
-        },
+        TextMethod::Unstructured => unstructured_wrappers(text)
+            .into_iter()
+            .next()
+            .map(|wrapper| (wrapper.start, wrapper.length)),
         TextMethod::Structured => structured_block_span(text),
         TextMethod::Html => locate_span(text, "<script type=\"application/c2pa\"", "</script>"),
     };
@@ -233,6 +406,63 @@ mod tests {
         (0u8..64)
             .map(|i| i.wrapping_mul(7).wrapping_add(3))
             .collect()
+    }
+
+    #[test]
+    fn unstructured_diagnostics_reject_corrupt_but_defer_multiple_wrappers() {
+        let mut corrupted = c2pa_text::encode_wrapper(&[1, 2, 3]);
+        corrupted.pop();
+        assert_eq!(
+            diagnostic(TextMethod::Unstructured, corrupted.as_bytes()),
+            Some(TextDiagnostic::CorruptedWrapper)
+        );
+
+        let wrapper = c2pa_text::encode_wrapper(&[1]);
+        let multiple = format!("{wrapper}text{wrapper}");
+        assert_eq!(
+            diagnostic(TextMethod::Unstructured, multiple.as_bytes()),
+            None,
+            "the data-hash exclusions select the matching wrapper"
+        );
+    }
+
+    #[test]
+    fn structured_diagnostics_keep_failure_reasons_distinct() {
+        use c2pa_text::structured::{BEGIN_DELIMITER as BEGIN, END_DELIMITER as END};
+
+        assert_eq!(
+            diagnostic(TextMethod::Structured, b"no manifest"),
+            Some(TextDiagnostic::StructuredNoManifest)
+        );
+        assert_eq!(
+            diagnostic(
+                TextMethod::Structured,
+                format!("{BEGIN}   {END}").as_bytes()
+            ),
+            Some(TextDiagnostic::StructuredEmptyReference)
+        );
+        assert_eq!(
+            diagnostic(
+                TextMethod::Structured,
+                format!("{BEGIN} not a uri {END}").as_bytes()
+            ),
+            Some(TextDiagnostic::StructuredMalformedReference)
+        );
+        assert_eq!(
+            diagnostic(
+                TextMethod::Structured,
+                format!("{BEGIN} https://example.invalid/manifest.c2pa {END}").as_bytes()
+            ),
+            Some(TextDiagnostic::StructuredNoResolutionPath)
+        );
+        assert_eq!(
+            diagnostic(
+                TextMethod::Structured,
+                format!("{BEGIN} data:application/c2pa;base64,AA== {END}{BEGIN} data:application/c2pa;base64,AQ== {END}")
+                    .as_bytes()
+            ),
+            Some(TextDiagnostic::StructuredMultipleReferences)
+        );
     }
 
     /// Parse a hex string to bytes.

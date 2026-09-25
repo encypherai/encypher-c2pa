@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! JPEG: JUMBF carried in `APP11` (`0xFFEB`) marker segments.
 //!
 //! A C2PA manifest store may exceed a single 64 KiB JPEG marker, so it is
@@ -160,23 +163,20 @@ fn entropy_end(data: &[u8], from: usize) -> usize {
 pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
     check_soi(data)?;
     let c2pa_spans = valid_app11_spans(data)?;
-    let mut spans: Vec<crate::c2pa_formats::BoxSpan> = vec![crate::c2pa_formats::BoxSpan {
-        name: "SOI".into(),
-        start: 0,
-        end: 2,
-    }];
+    let mut spans: Vec<crate::c2pa_formats::BoxSpan> =
+        vec![crate::c2pa_formats::BoxSpan::contiguous("SOI", 0, 2)];
     let push =
         |spans: &mut Vec<crate::c2pa_formats::BoxSpan>, name: String, start: usize, end: usize| {
             // Merge the contiguous C2PA APP11 run into a single span.
             if name == "C2PA" {
                 if let Some(last) = spans.last_mut() {
-                    if last.name == "C2PA" && last.end == start {
-                        last.end = end;
+                    if last.name == "C2PA" && last.end() == start {
+                        last.extend_to(end);
                         return;
                     }
                 }
             }
-            spans.push(crate::c2pa_formats::BoxSpan { name, start, end });
+            spans.push(crate::c2pa_formats::BoxSpan::contiguous(name, start, end));
         };
     let mut pos = 2;
     while pos + 1 < data.len() {
@@ -242,6 +242,42 @@ pub(crate) fn box_spans(data: &[u8]) -> Result<Vec<crate::c2pa_formats::BoxSpan>
         };
         push(&mut spans, name, pos, end);
         pos = end;
+    }
+    Ok(spans)
+}
+/// Reproduce the historical c2pa-rs JPEG restart-marker layout.
+///
+/// That implementation hashes the `SOS` marker, its header, and the complete
+/// entropy-coded scan (including every restart marker), then also exposes each
+/// `RSTn` marker as a separate two-byte box. The ranges overlap, unlike the
+/// C2PA 2.4 layout returned by [`box_spans`].
+pub(crate) fn box_spans_with_overlapping_restart_segments(
+    data: &[u8],
+) -> Result<Vec<crate::c2pa_formats::BoxSpan>, FormatError> {
+    let mut spans = box_spans(data)?;
+    let mut index = 0usize;
+    while index < spans.len() {
+        if spans[index].name != "SOS" {
+            index += 1;
+            continue;
+        }
+        let scan_start = spans[index].start();
+        let mut scan_end = spans[index].end();
+        let mut restart = index + 1;
+        while restart < spans.len() && spans[restart].name.starts_with("RST") {
+            let marker_start = spans[restart].start();
+            scan_end = spans[restart].end();
+            spans[restart] = crate::c2pa_formats::BoxSpan::contiguous(
+                spans[restart].name.clone(),
+                marker_start,
+                marker_start.saturating_add(2).min(data.len()),
+            );
+            restart += 1;
+        }
+        if restart > index + 1 {
+            spans[index] = crate::c2pa_formats::BoxSpan::contiguous("SOS", scan_start, scan_end);
+        }
+        index = restart;
     }
     Ok(spans)
 }
@@ -317,10 +353,9 @@ fn app11_family_is_valid(family: &[App11Packet<'_>]) -> Result<bool, FormatError
         return Ok(false);
     }
     super::ensure_manifest_store_size(FMT, assembled_len)?;
-    Ok(
-        crate::c2pa_core::jumbf::parse_manifest_store(&assemble_family(family))
-            .is_ok_and(|store| !store.manifests.is_empty()),
-    )
+    Ok(crate::c2pa_core::jumbf::store_carries_manifest(
+        &assemble_family(family),
+    ))
 }
 
 /// Return only complete, contiguous JUMBF APP11 families. A payload merely
@@ -534,6 +569,52 @@ mod tests {
         v.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // entropy
         v.extend_from_slice(&[0xFF, 0xD9]); // EOI
         v
+    }
+    /// Minimal restart-interval JPEG used to exercise both the C2PA 2.4 and
+    /// historical c2pa-rs box layouts.
+    pub(crate) fn restart_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xDA, 0x00, 0x02, // SOS with an empty synthetic header
+            0x11, 0x22, // first entropy-coded segment
+            0xFF, 0xD0, 0x33, 0xFF, 0x00, 0x44, // RST0 + stuffed entropy bytes
+            0xFF, 0xD1, 0x55, // RST1 + final entropy-coded segment
+            0xFF, 0xD9, // EOI
+        ]
+    }
+
+    #[test]
+    fn restart_markers_follow_spec_and_legacy_layouts() {
+        let asset = restart_jpeg();
+        let strict = box_spans(&asset).unwrap();
+        assert_eq!(
+            strict
+                .iter()
+                .map(|span| (span.name.as_str(), span.start(), span.end()))
+                .collect::<Vec<_>>(),
+            [
+                ("SOI", 0, 2),
+                ("SOS", 2, 8),
+                ("RST0", 8, 14),
+                ("RST1", 14, 17),
+                ("EOI", 17, 19),
+            ]
+        );
+
+        let overlapping = box_spans_with_overlapping_restart_segments(&asset).unwrap();
+        assert_eq!(
+            overlapping
+                .iter()
+                .map(|span| (span.name.as_str(), span.start(), span.end()))
+                .collect::<Vec<_>>(),
+            [
+                ("SOI", 0, 2),
+                ("SOS", 2, 17),
+                ("RST0", 8, 10),
+                ("RST1", 14, 16),
+                ("EOI", 17, 19),
+            ]
+        );
     }
 
     #[test]

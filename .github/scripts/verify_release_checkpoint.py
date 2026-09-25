@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Encypher Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate the GitHub release bound to an interrupted release run."""
 
 from __future__ import annotations

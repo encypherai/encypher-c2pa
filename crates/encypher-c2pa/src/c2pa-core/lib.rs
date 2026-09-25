@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! C2PA core data structures: JUMBF boxes, claim assembly, and parsing.
 //!
 //! This crate is I/O-free. It builds and parses the JUMBF/CBOR layer used by

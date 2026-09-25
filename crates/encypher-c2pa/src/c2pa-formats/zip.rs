@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! ZIP (EPUB/DOCX/ODT/OXPS): JUMBF in entry `META-INF/content_credential.c2pa`.
 //!
 //! The manifest store is a *stored* (uncompressed) ZIP entry whose name is

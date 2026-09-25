@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! TIFF / DNG: JUMBF in IFD tag `0xCD41` (52545).
 //!
 //! TIFF is a header (`II`/`MM` byte order, magic `42`, offset to the first IFD)
@@ -62,6 +65,22 @@ fn parse_header(data: &[u8]) -> Result<(Endian, usize), FormatError> {
 
 /// Extract the manifest store from IFD tag `0xCD41`. Follows the IFD chain.
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    Ok(tag_bytes(data, TAG_C2PA)?.map(<[u8]>::to_vec))
+}
+
+/// The XMP packet stored in IFD tag 700, if the asset carries one.
+///
+/// Discovery is best-effort and total: a malformed IFD chain yields no packet
+/// rather than an error, so reading the optional remote-manifest declaration
+/// can never change how a well-formed asset validates.
+pub(crate) fn xmp_packet(data: &[u8]) -> Option<&[u8]> {
+    tag_bytes(data, crate::c2pa_formats::xmp::TIFF_XMP_TAG)
+        .ok()
+        .flatten()
+}
+
+/// Value bytes of the first IFD entry carrying `tag_id`. Follows the IFD chain.
+fn tag_bytes(data: &[u8], tag_id: u16) -> Result<Option<&[u8]>, FormatError> {
     let (endian, mut ifd_off) = parse_header(data)?;
     // Guard against cyclic IFD chains.
     let mut visited = 0;
@@ -79,22 +98,78 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         for i in 0..count {
             let e = entries_start + i * 12;
             let tag = endian.u16(&data[e..e + 2]);
-            if tag != TAG_C2PA {
+            if tag != tag_id {
                 continue;
             }
             let value_count = endian.u32(&data[e + 4..e + 8]) as usize;
             // For type UNDEFINED/BYTE the element size is 1.
             if value_count <= 4 {
-                return Ok(Some(data[e + 8..e + 8 + value_count].to_vec()));
+                return Ok(Some(&data[e + 8..e + 8 + value_count]));
             }
             let off = endian.u32(&data[e + 8..e + 12]) as usize;
             let end = off
                 .checked_add(value_count)
                 .filter(|&x| x <= data.len())
                 .ok_or(FormatError::Truncated(FMT))?;
-            return Ok(Some(data[off..end].to_vec()));
+            return Ok(Some(&data[off..end]));
         }
         ifd_off = endian.u32(&data[entries_end..entries_end + 4]) as usize;
+    }
+    Ok(None)
+}
+
+pub(crate) fn placement_error(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    let (endian, mut ifd_offset) = parse_header(data)?;
+    let mut visited = Vec::new();
+    let mut manifest_ifds = Vec::new();
+    let mut last_ifd = None;
+    while ifd_offset != 0 {
+        if visited.contains(&ifd_offset) {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "TIFF main-IFD chain contains a cycle",
+            });
+        }
+        visited.push(ifd_offset);
+        if visited.len() > 64 {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "TIFF main-IFD chain exceeds verifier bound",
+            });
+        }
+        let count_bytes = data
+            .get(ifd_offset..ifd_offset + 2)
+            .ok_or(FormatError::Truncated(FMT))?;
+        let count = endian.u16(count_bytes) as usize;
+        let entries_start = ifd_offset + 2;
+        let entries_end = entries_start
+            .checked_add(count.checked_mul(12).ok_or(FormatError::Truncated(FMT))?)
+            .filter(|end| end.checked_add(4).is_some_and(|end| end <= data.len()))
+            .ok_or(FormatError::Truncated(FMT))?;
+        for index in 0..count {
+            let entry = entries_start + index * 12;
+            if endian.u16(&data[entry..entry + 2]) == TAG_C2PA {
+                manifest_ifds.push((ifd_offset, count));
+            }
+        }
+        last_ifd = Some(ifd_offset);
+        ifd_offset = endian.u32(&data[entries_end..entries_end + 4]) as usize;
+    }
+    if manifest_ifds.len() > 1 {
+        return Ok(Some(
+            "TIFF main-IFD chain contains more than one C2PA entry",
+        ));
+    }
+    let Some(&(manifest_ifd, entry_count)) = manifest_ifds.first() else {
+        return Ok(None);
+    };
+    if Some(manifest_ifd) != last_ifd {
+        return Ok(Some("TIFF C2PA entry is not in the last main IFD"));
+    }
+    if visited.len() > 1 && entry_count != 1 {
+        return Ok(Some(
+            "TIFF C2PA entry is not the only entry in its main IFD",
+        ));
     }
     Ok(None)
 }
@@ -295,6 +370,7 @@ mod tests {
         let store = crate::c2pa_formats::tests::dummy_manifest_store();
         let asset = tiff_with_manifest(&store);
         assert_eq!(extract(&asset).unwrap().as_deref(), Some(store.as_slice()));
+        assert_eq!(placement_error(&asset).unwrap(), None);
     }
 
     #[test]
@@ -395,6 +471,17 @@ mod tests {
             })
             .count();
         assert_eq!(c2pa, 1);
+    }
+
+    #[test]
+    fn strict_placement_requires_manifest_in_last_main_ifd() {
+        let store = crate::c2pa_formats::tests::dummy_manifest_store();
+        let mut asset = tiff_with_manifest(&store);
+        let second_ifd = asset.len() as u32;
+        asset[22..26].copy_from_slice(&second_ifd.to_le_bytes());
+        asset.extend_from_slice(&0u16.to_le_bytes());
+        asset.extend_from_slice(&0u32.to_le_bytes());
+        assert!(placement_error(&asset).unwrap().is_some());
     }
 
     #[test]

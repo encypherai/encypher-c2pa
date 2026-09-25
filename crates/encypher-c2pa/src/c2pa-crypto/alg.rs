@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! COSE algorithm identifiers (IANA COSE Algorithms registry).
 
 /// A COSE signature algorithm supported by this crate.

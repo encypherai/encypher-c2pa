@@ -26,26 +26,32 @@ VALIDATION_TIME: Final = "2025-05-01T00:00:00Z"
 # vectors pin a later clock so the observation reflects the targeted failure
 # mode rather than a clock artifact.
 LATE_VALIDATION_TIME: Final = "2025-09-01T00:00:00Z"
+TRAINING_MINING_EFFECTIVE_USE: Final = (
+    "com.encypher.cawg.trainingMining.effectiveUse"
+)
 
 X509_EXPECTED: Final = {
     "duplicate_assertion_reference": ["cawg.identity.assertion.duplicate"],
     "extra_assertion_claim_v1": ["cawg.identity.assertion.mismatch"],
-    "extra_field": ["cawg.identity.well-formed"],
+    "extra_field": [
+        "cawg.x509.signature.validated",
+        "cawg.x509.credential.untrusted",
+        "cawg.x509.ocsp.skipped",
+        "com.encypher.cawg.legacyProfile",
+    ],
     "invalid_sig_type": ["cawg.identity.sig_type.unknown"],
     "malformed_cbor": ["cawg.identity.cbor.invalid"],
-    "no_hard_binding": ["cawg.identity.hard_binding_missing"],
+    "no_hard_binding": ["cawg.identity.cbor.invalid"],
     "pad1_invalid": ["cawg.identity.pad.invalid"],
     "pad2_invalid": ["cawg.identity.pad.invalid"],
 }
-# What this SDK observes today; kept separate so any future divergence is an
-# explicit, reviewed override rather than a silent expectation change.
 X509_OBSERVED: Final = {**X509_EXPECTED}
-# Upstream c2pa-rs (pinned commit) test expectations where they differ from our
-# normative codes: the extra_field test asserts ZERO logged items (no failure
-# and, temporarily, no success status), while our verifier reports its
-# well-formed/trusted verdict explicitly.
-X509_UPSTREAM: Final = {**X509_EXPECTED, "extra_field": []}
-ICA_EXPECTED: Final = {
+X509_UPSTREAM: Final = {
+    **X509_EXPECTED,
+    "extra_field": [],
+    "no_hard_binding": ["cawg.identity.hard_binding_missing"],
+}
+ICA_UPSTREAM: Final = {
     "did_doc_without_assertion_method": ["cawg.ica.invalid_did_document"],
     "invalid_content_type": ["cawg.ica.invalid_content_type"],
     "invalid_content_type_assigned": ["cawg.ica.invalid_content_type"],
@@ -75,10 +81,38 @@ ICA_EXPECTED: Final = {
     "valid_until_in_future": ["cawg.ica.credential_valid"],
     "valid_until_in_past": ["cawg.ica.valid_until.invalid"],
 }
-# What this SDK observes today. did:web ICA vectors resolve through the pinned
-# offline DID-document store under did/ (fetched once from the public
-# .well-known endpoints and frozen); an issuer absent from the store fails
-# closed with cawg.ica.did_unavailable.
+ICA_LEGACY_BASE: Final = [
+    "cawg.ica.signer_payload.mismatch",
+    "cawg.ica.untrusted_issuer",
+    "cawg.ica.verified_identities.invalid",
+]
+ICA_EXPECTED: Final = {
+    "did_doc_without_assertion_method": [
+        "cawg.ica.invalid_did_document",
+        *ICA_LEGACY_BASE,
+    ],
+    "invalid_content_type": ["cawg.ica.invalid_content_type", *ICA_LEGACY_BASE],
+    "invalid_content_type_assigned": ["cawg.ica.invalid_content_type", *ICA_LEGACY_BASE],
+    "invalid_cose_sign1": ["cawg.ica.invalid_cose_sign1"],
+    "invalid_cose_sign_alg": ["cawg.ica.invalid_alg", *ICA_LEGACY_BASE],
+    "invalid_issuer_did": ["cawg.ica.invalid_issuer", *ICA_LEGACY_BASE],
+    "invalid_time_stamp": ["cawg.ica.time_stamp.invalid", *ICA_LEGACY_BASE],
+    "invalid_vc": ["cawg.ica.invalid_verifiable_credential"],
+    "missing_content_type": ["cawg.ica.invalid_content_type", *ICA_LEGACY_BASE],
+    "missing_cose_sign_alg": ["cawg.ica.invalid_alg", *ICA_LEGACY_BASE],
+    "missing_vc": ["cawg.ica.invalid_verifiable_credential"],
+    "signature_mismatch": ["cawg.ica.signature_mismatch", *ICA_LEGACY_BASE],
+    "signer_payload_mismatch": ICA_LEGACY_BASE,
+    "success": ICA_LEGACY_BASE,
+    "unresolvable_did": ["cawg.identity.network_traffic_blocked", *ICA_LEGACY_BASE],
+    "unsupported_did_method": ["cawg.ica.did_unsupported_method", *ICA_LEGACY_BASE],
+    "valid_from_after_time_stamp": ["cawg.ica.time_stamp.invalid", *ICA_LEGACY_BASE],
+    "valid_from_in_future": ["cawg.ica.valid_from.invalid", *ICA_LEGACY_BASE],
+    "valid_from_missing": ["cawg.ica.valid_from.missing", *ICA_LEGACY_BASE],
+    "valid_time_stamp": ["cawg.ica.time_stamp.invalid", *ICA_LEGACY_BASE],
+    "valid_until_in_future": ICA_LEGACY_BASE,
+    "valid_until_in_past": ["cawg.ica.valid_until.invalid", *ICA_LEGACY_BASE],
+}
 ICA_OBSERVED: Final = {**ICA_EXPECTED}
 # Pinned DID documents (relative to this directory) per fixture, passed to the
 # verifier through --cawg-did-documents.
@@ -112,6 +146,9 @@ class Vector:
     notes: str | None = None
     validation_time: str = VALIDATION_TIME
     did_documents: tuple[str, ...] = ()
+    # Expected codes under --strict-conformance, when they differ from the
+    # default posture and the strict run still reaches CAWG evaluation.
+    strict_required_codes: tuple[str, ...] | None = None
 
     @property
     def raw_url(self) -> str:
@@ -135,6 +172,7 @@ def _rs_vector(
     notes: str | None = None,
     validation_time: str = VALIDATION_TIME,
     did_documents: tuple[str, ...] = (),
+    strict: list[str] | tuple[str, ...] | None = None,
 ) -> Vector:
     return Vector(
         vector_id=vector_id,
@@ -152,6 +190,7 @@ def _rs_vector(
         notes=notes,
         validation_time=validation_time,
         did_documents=tuple(did_documents),
+        strict_required_codes=None if strict is None else tuple(strict),
     )
 
 
@@ -163,11 +202,13 @@ def vectors() -> list[Vector]:
         notes = None
         if name == "extra_field":
             notes = (
-                "Top-level extra field is tolerated per CAWG 1.2 §5.2; the COSE signature "
-                "verifies over the stored (serde field-order, definite-length) signer_payload "
-                "bytes. No failure codes; well-formed rather than trusted because the "
-                "emailProtection-EKU test leaf lacks the trusted timestamp required by the "
-                "CAWG 1.2 interim S/MIME policy."
+                "Top-level extra fields remain tolerated. Its COSE signature covers "
+                "the serde field-order signer_payload encoding that c2pa-rs writes, "
+                "which the default posture accepts with com.encypher.cawg.legacyProfile. "
+                "The signer certificate reaches no configured CAWG trust anchor, which "
+                "CAWG Identity 1.3 reports as cawg.x509.credential.untrusted. Under "
+                "--strict-conformance the v1 claim already fails the 2.4 target, so "
+                "CAWG is not evaluated."
             )
         result.append(
             _rs_vector(
@@ -175,7 +216,11 @@ def vectors() -> list[Vector]:
                 vector_id=f"c2pa-rs-x509-{name.replace('_', '-')}",
                 credential_type="x509",
                 spec_profile="CAWG Identity 1.1 draft-derived",
-                audit_state="known-upstream-divergence" if observed != expected else "imported",
+                audit_state=(
+                    "known-upstream-divergence"
+                    if observed != expected or X509_UPSTREAM[name] != expected
+                    else "imported"
+                ),
                 upstream=X509_UPSTREAM[name],
                 normative=expected,
                 observed=observed,
@@ -188,21 +233,36 @@ def vectors() -> list[Vector]:
         observed = ICA_OBSERVED[name]
         notes = None
         if name == "success":
-            notes = "Legacy CAWG 1.1 context; c2paAsset hashes are JSON byte arrays of the base64 text rather than the base64 strings required by CAWG Identity 1.2; both encodings decode to the same digest. The validator surfaces both legacy aspects via the informational com.encypher.cawg.legacyProfile status (refused under --cawg-strict-encoding)."
+            notes = (
+                "Uses the required CAWG 1.1 ICA context, but the c2paAsset hashes "
+                "are JSON byte arrays rather than RFC 4648 strings, its verified "
+                "identity entries do not meet the 1.3 schema, and no ICA issuer "
+                "trust is configured. CAWG Identity 1.3 therefore rejects it."
+            )
         elif name == "unsupported_did_method":
             notes = "Present in the pinned fixture tree but not consumed by the pinned upstream test module."
         elif name == "did_doc_without_assertion_method":
             notes = "did:web issuer resolved through the pinned DID document published at cawg-test-data.github.io; the document deliberately lacks an assertionMethod."
         elif name == "unresolvable_did":
-            notes = "VC validFrom (2025-08-04) postdates the default corpus clock; validated at the late clock so only the DID-resolution failure is observed."
+            notes = (
+                "VC validFrom (2025-08-04) postdates the default corpus clock; "
+                "validated at the late clock so the 1.3 failures are not obscured "
+                "by a clock artifact. The did:web issuer has no pinned DID document "
+                "and this verifier performs no network resolution, which 1.3 reports "
+                "as cawg.identity.network_traffic_blocked."
+            )
         result.append(
             _rs_vector(
                 f"{ica_base}/{name}.jpg",
                 vector_id=f"c2pa-rs-ica-{name.replace('_', '-')}",
                 credential_type="ica",
                 spec_profile="CAWG Identity 1.1 draft-derived",
-                audit_state="known-upstream-divergence" if observed != expected else "imported",
-                upstream=expected,
+                audit_state=(
+                    "known-upstream-divergence"
+                    if observed != expected or ICA_UPSTREAM[name] != expected
+                    else "imported"
+                ),
+                upstream=ICA_UPSTREAM[name],
                 normative=expected,
                 observed=observed,
                 notes=notes,
@@ -218,14 +278,24 @@ def vectors() -> list[Vector]:
                 vector_id=f"c2pa-rs-ica-interop-{name.replace('_', '-')}",
                 credential_type="ica",
                 spec_profile="legacy interoperability sample",
-                audit_state="imported",
-                normative=["cawg.ica.credential_valid"],
-                observed=["cawg.ica.credential_valid"],
+                audit_state="known-upstream-divergence",
+                normative=[
+                    "cawg.ica.invalid_did_document",
+                    "cawg.ica.signer_payload.mismatch",
+                    "cawg.ica.untrusted_issuer",
+                    TRAINING_MINING_EFFECTIVE_USE,
+                ],
+                observed=[
+                    "cawg.ica.invalid_did_document",
+                    "cawg.ica.signer_payload.mismatch",
+                    "cawg.ica.untrusted_issuer",
+                    TRAINING_MINING_EFFECTIVE_USE,
+                ],
                 notes=(
-                    "Issued by Adobe's stage connected-identities aggregator; validates "
-                    "offline against the pinned did:web document fetched from the public "
-                    ".well-known endpoint (2026-08-04). Use the fixed validation clock so "
-                    "the enclosing C2PA claim is inside certificate validity."
+                    "Issued by Adobe's stage aggregator. The pinned DID document "
+                    "uses the unsupported JsonWebKey method type, the c2paAsset is "
+                    "not an exact signer_payload conversion, and no ICA issuer trust "
+                    "is configured."
                 ),
                 did_documents=(DID_ADOBE_STAGE,),
             )
@@ -237,16 +307,33 @@ def vectors() -> list[Vector]:
             vector_id="c2pa-rs-cli-cawg-data",
             credential_type="x509",
             spec_profile="legacy non-deterministic signer_payload encoding",
-            audit_state="imported",
-            normative=["cawg.identity.well-formed"],
-            observed=["cawg.identity.well-formed"],
+            audit_state="known-upstream-divergence",
+            normative=[
+                "cawg.x509.signature.validated",
+                "cawg.x509.credential.untrusted",
+                "cawg.x509.ocsp.skipped",
+                "com.encypher.cawg.legacyProfile",
+                TRAINING_MINING_EFFECTIVE_USE,
+            ],
+            observed=[
+                "cawg.x509.signature.validated",
+                "cawg.x509.credential.untrusted",
+                "cawg.x509.ocsp.skipped",
+                "com.encypher.cawg.legacyProfile",
+                TRAINING_MINING_EFFECTIVE_USE,
+            ],
+            strict=[
+                "cawg.x509.signature.mismatch",
+                "cawg.x509.ocsp.skipped",
+                TRAINING_MINING_EFFECTIVE_USE,
+            ],
             notes=(
-                "COSE signature verifies over the stored (serde field-order) signer_payload "
-                "encoding, which the validator accepts alongside canonical CBOR and surfaces "
-                "via the informational com.encypher.cawg.legacyProfile status (refused under "
-                "--cawg-strict-encoding). Well-formed "
-                "rather than trusted: the identity leaf carries no trusted timestamp, so the "
-                "CAWG 1.2 interim S/MIME policy withholds trust."
+                "The COSE signature covers the serde field-order signer_payload "
+                "encoding that c2pa-rs writes. The default posture accepts it with "
+                "com.encypher.cawg.legacyProfile, and the signer reaches no configured "
+                "CAWG trust anchor, so CAWG Identity 1.3 reports "
+                "cawg.x509.credential.untrusted; --strict-conformance requires the 1.3 "
+                "deterministic CBOR and reports cawg.x509.signature.mismatch."
             ),
         )
     )
@@ -260,14 +347,23 @@ def vectors() -> list[Vector]:
             license_expression="Apache-2.0",
             credential_type="ica",
             spec_profile="legacy Adobe connected-identities sample",
-            audit_state="imported",
-            normative_required_codes=("cawg.ica.credential_valid",),
-            observed_required_codes=("cawg.ica.credential_valid",),
+            audit_state="known-upstream-divergence",
+            normative_required_codes=(
+                "cawg.ica.invalid_did_document",
+                "cawg.ica.signer_payload.mismatch",
+                "cawg.ica.untrusted_issuer",
+                TRAINING_MINING_EFFECTIVE_USE,
+            ),
+            observed_required_codes=(
+                "cawg.ica.invalid_did_document",
+                "cawg.ica.signer_payload.mismatch",
+                "cawg.ica.untrusted_issuer",
+                TRAINING_MINING_EFFECTIVE_USE,
+            ),
             notes=(
-                "Legacy did:web sample issued by Adobe's production connected-identities "
-                "aggregator; validates offline against the pinned did:web document fetched "
-                "from the public .well-known endpoint (2026-08-04). Validated at the late "
-                "clock because the VC validFrom (2025-05-30) postdates the default corpus clock."
+                "Legacy Adobe sample. The pinned DID document uses the unsupported "
+                "JsonWebKey method type, the c2paAsset is not an exact signer_payload "
+                "conversion, and no ICA issuer trust is configured."
             ),
             validation_time=LATE_VALIDATION_TIME,
             did_documents=(DID_ADOBE_PROD,),
@@ -311,6 +407,8 @@ def _entry(vector: Vector) -> dict[str, object]:
         "normative_expected": {"required_codes": list(vector.normative_required_codes)},
         "current_sdk_observation": {"required_codes": list(vector.observed_required_codes)},
     }
+    if vector.strict_required_codes is not None:
+        entry["strict_expected"] = {"required_codes": list(vector.strict_required_codes)}
     if vector.notes:
         entry["notes"] = vector.notes
     return entry

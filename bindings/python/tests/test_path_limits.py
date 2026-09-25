@@ -1,3 +1,6 @@
+# Copyright 2026 Encypher Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 import errno
 import json
 import os
@@ -20,7 +23,9 @@ native.formats_json = lambda: "[]"
 native.get_telemetry_preference = lambda: None
 native.set_telemetry_preference = lambda enabled: None
 native.verify_bytes = lambda *args: "{}"
+native.verify_detached_bytes = lambda *args: "{}"
 native.verify_fragmented_bytes = lambda *args: "{}"
+native.verify_stream_bytes = lambda *args: "{}"
 sys.modules.setdefault("encypher_c2pa._native", native)
 
 import encypher_c2pa

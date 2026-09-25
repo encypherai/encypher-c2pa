@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! Sales-funnel edge instrumentation lives on the CLI's human output only.
 //!
 //! These tests pin two contracts: `explain` of a known code prints the

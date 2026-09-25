@@ -1,3 +1,6 @@
+// Copyright 2026 Encypher Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 //! PDF: C2PA manifests are carried as an embedded file stream (Subtype
 //! `application/c2pa`, `AFRelationship` `C2PA_Manifest`).
 //!
@@ -8,13 +11,14 @@
 //! array. A fresh classic `xref` section plus a `trailer` carrying `/Prev`
 //! (chained to the prior cross-reference section), the updated `/Root`, and the
 //! original `/ID` (when present) complete the update, followed by
-//! `startxref`/`%%EOF`. Source PDFs that use cross-reference *streams* (i.e.
-//! have no `trailer` keyword) are rejected with
-//! [`FormatError::UnsupportedVariant`]; classic `xref` tables are supported.
+//! `startxref`/`%%EOF`. The test-only writer rejects source PDFs that use
+//! cross-reference streams; the verification reader supports both classic
+//! xref tables and xref streams.
 //!
-//! Extraction (the verifier path) resolves the manifest the way the PDF spec
-//! declares it: newest classic trailer `/Root` -> newest catalog definition ->
-//! `/AF` array -> `/Filespec` with `AFRelationship /C2PA_Manifest` -> `/EF /F`
+//! Extraction resolves the manifest the way the PDF spec declares it: the
+//! newest xref table trailer or xref-stream dictionary `/Root` -> newest
+//! catalog definition -> `/AF` array -> `/Filespec` with
+//! `AFRelationship /C2PA_Manifest` -> `/EF /F`
 //! embedded-file stream. The store is then sliced by its own JUMBF `LBox`
 //! (legacy signers zero-pad the stream past the store). A raw JUMBF byte-scan
 //! is deliberately NOT used: a PDF whose *embedded images* carry their own
@@ -24,10 +28,71 @@
 //! is reported as [`FormatError::UnsupportedVariant`] rather than silently
 //! skipped.
 
+use std::ops::Range;
+
 use crate::c2pa_core::jumbf::UUID_MANIFEST_STORE;
 use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
 
 const FMT: AssetFormat = AssetFormat::Pdf;
+const MAX_PDF_REVISIONS: usize = 64;
+const MAX_AF_ENTRIES: usize = 4_096;
+const DUPLICATE_STORES: &str = "PDF update section contains more than one C2PA Manifest Store";
+
+/// One C2PA Manifest Store introduced by a PDF incremental update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdfManifestStoreSection {
+    pub section_index: usize,
+    pub section_end: usize,
+    store_span: Option<(usize, usize)>,
+    pub defect: Option<&'static str>,
+}
+
+impl PdfManifestStoreSection {
+    pub fn store<'a>(&self, asset: &'a [u8]) -> Option<&'a [u8]> {
+        let (start, length) = self.store_span?;
+        asset.get(start..start.checked_add(length)?)
+    }
+}
+
+/// Enumerate retained PDF manifest stores in update order.
+///
+/// Revision boundaries come from the bounded classic `xref` `/Prev` chain,
+/// never from scanning arbitrary stream contents for `%%EOF`.
+pub(crate) fn manifest_store_sections(
+    data: &[u8],
+) -> Result<Vec<PdfManifestStoreSection>, FormatError> {
+    if find_root(data)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let ends = revision_ends(data)?;
+    let mut sections = Vec::new();
+    let mut seen = Vec::new();
+    let mut previous_end = 0usize;
+    for (section_index, &section_end) in ends.iter().enumerate() {
+        let rendition = &data[..section_end];
+        let section = previous_end..section_end;
+        previous_end = section_end;
+        match locate_store_in_section(rendition, section) {
+            Ok(Some(span)) if !seen.contains(&span) => {
+                seen.push(span);
+                sections.push(PdfManifestStoreSection {
+                    section_index,
+                    section_end,
+                    store_span: Some(span),
+                    defect: None,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => sections.push(PdfManifestStoreSection {
+                section_index,
+                section_end,
+                store_span: None,
+                defect: Some(defect_detail(&error)),
+            }),
+        }
+    }
+    Ok(sections)
+}
 
 /// Extract the C2PA manifest store declared by the document catalog's `/AF`
 /// entry, if any.
@@ -45,16 +110,27 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 }
 
 /// Resolve the `(start, length)` span of the document's C2PA manifest store by
-/// walking the spec-declared path: trailer `/Root` -> catalog `/AF` ->
+/// walking the spec-declared path: xref trailer `/Root` -> catalog `/AF` ->
 /// `/Filespec` (`AFRelationship /C2PA_Manifest`) -> `/EF /F` stream.
 ///
-/// Returns `Ok(None)` when the document declares no manifest (no classic
-/// trailer, no `/AF`, or no C2PA filespec) -- embedded images with their own
-/// manifests are invisible to this resolver by design. Errors only when a
-/// declared manifest exists but cannot be read (compressed stream, indirect
-/// length, malformed store).
+/// Returns `Ok(None)` when the document declares no `/Root`, `/AF`, or C2PA
+/// filespec. Embedded images with their own manifests are invisible to this
+/// resolver by design. Malformed xref streams and declared manifests that
+/// cannot be read fail closed.
 fn locate_store_span(data: &[u8]) -> Result<Option<(usize, usize)>, FormatError> {
-    let Some((root_num, root_gen)) = find_root(data) else {
+    if find_root(data)?.is_none() {
+        return Ok(None);
+    }
+    // Active extraction preserves the existing tolerant reader behavior. The
+    // incremental-history path separately uses xref-defined section ranges.
+    locate_store_in_section(data, 0..data.len())
+}
+
+fn locate_store_in_section(
+    data: &[u8],
+    section: Range<usize>,
+) -> Result<Option<(usize, usize)>, FormatError> {
+    let Some((root_num, root_gen)) = find_root(data)? else {
         return Ok(None);
     };
     let Some(cat_pos) = find_obj_last(data, root_num, root_gen) else {
@@ -64,27 +140,26 @@ fn locate_store_span(data: &[u8]) -> Result<Option<(usize, usize)>, FormatError>
         return Ok(None);
     };
     let cat = &data[cat_open..cat_close];
-
-    // Last /AF key wins: dictionaries written by older embeds may carry
-    // duplicate /AF keys, and PDF readers conventionally keep the last.
     let Some(af_pos) = find_name_last(cat, b"/AF") else {
         return Ok(None);
     };
     let refs = parse_ref_array(cat, af_pos + 3);
+    if refs.len() > MAX_AF_ENTRIES {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "PDF catalog /AF has too many entries",
+        });
+    }
 
-    // The C2PA filespec: AFRelationship /C2PA_Manifest. When several match
-    // (non-conformant, but possible across foreign incremental updates), the
-    // last declared one wins, matching the "newest state" rule used
-    // everywhere else in this resolver.
-    let mut stream_ref: Option<(u64, u64)> = None;
+    let mut stream_refs = Vec::new();
     for &(n, g) in &refs {
         let Some(pos) = find_obj_last(data, n, g) else {
             continue;
         };
-        let Some((o, c)) = dict_span(data, pos) else {
+        let Some((open, close)) = dict_span(data, pos) else {
             continue;
         };
-        let spec = &data[o..c];
+        let spec = &data[open..close];
         if !has_name_value(spec, b"/AFRelationship", b"/C2PA_Manifest") {
             continue;
         }
@@ -99,13 +174,47 @@ fn locate_store_span(data: &[u8]) -> Result<Option<(usize, usize)>, FormatError>
             continue;
         };
         if let Some((num, gen, _)) = read_ref(ef, f_pos + 2) {
-            stream_ref = Some((num, gen));
+            if !stream_refs.contains(&(num, gen)) {
+                stream_refs.push((num, gen));
+            }
         }
     }
-    let Some((snum, sgen)) = stream_ref else {
-        return Ok(None);
-    };
-    manifest_stream_span(data, snum, sgen).map(Some)
+
+    let mut stores = Vec::with_capacity(stream_refs.len());
+    for (num, generation) in stream_refs {
+        let object = find_obj_last(data, num, generation).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "C2PA filespec references a missing stream object",
+        })?;
+        match manifest_stream_span(data, num, generation) {
+            Ok(span) => stores.push(span),
+            Err(error) if section.contains(&object) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    let introduced: Vec<_> = stores
+        .iter()
+        .copied()
+        .filter(|(start, _)| section.contains(start))
+        .collect();
+    if introduced.len() > 1 {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: DUPLICATE_STORES,
+        });
+    }
+    Ok(introduced
+        .first()
+        .copied()
+        .or_else(|| stores.last().copied()))
+}
+
+fn defect_detail(error: &FormatError) -> &'static str {
+    match error {
+        FormatError::InvalidStructure { detail, .. }
+        | FormatError::UnsupportedVariant { detail, .. } => detail,
+        _ => "PDF update section declares an unreadable C2PA Manifest Store",
+    }
 }
 
 /// The `(start, length)` of the manifest store inside the embedded-file stream
@@ -182,24 +291,266 @@ fn manifest_stream_span(data: &[u8], snum: u64, sgen: u64) -> Result<(usize, usi
     Ok((s, lbox))
 }
 
-/// The newest `/Root` reference from the classic trailer chain, or `None`
-/// when the PDF has no classic trailer (cross-reference stream PDFs).
-fn find_root(data: &[u8]) -> Option<(u64, u64)> {
-    let mut root: Option<(u64, u64)> = None;
-    let mut search = 0usize;
-    while let Some(p) = find_from(data, b"trailer", search) {
-        search = p + 7;
-        let Some((open, close)) = dict_span(data, p) else {
-            continue;
-        };
+/// Historical rendition ends, oldest first, from the classic `/Prev` chain.
+fn revision_ends(data: &[u8]) -> Result<Vec<usize>, FormatError> {
+    let startxref = rfind(data, b"startxref").ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF is missing startxref",
+    })?;
+    let (offset, _) = read_uint(data, startxref + 9).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF startxref offset is not a number",
+    })?;
+    let mut next = Some(
+        usize::try_from(offset)
+            .ok()
+            .filter(|offset| *offset < data.len())
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference offset is out of range",
+            })?,
+    );
+    let mut visited = Vec::new();
+    let mut ends = Vec::new();
+    while let Some(offset) = next {
+        if visited.contains(&offset) {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference chain contains a cycle",
+            });
+        }
+        visited.push(offset);
+        if visited.len() > MAX_PDF_REVISIONS {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF has too many incremental update sections",
+            });
+        }
+        if data.get(offset..offset.saturating_add(4)) != Some(b"xref") {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "cross-reference streams are not supported",
+            });
+        }
+        let trailer =
+            find_from(data, b"trailer", offset + 4).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference table has no trailer",
+            })?;
+        let (open, close) = dict_span(data, trailer).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF trailer has no dictionary",
+        })?;
         let dict = &data[open..close];
-        if let Some(k) = find_name(dict, b"/Root") {
-            if let Some((n, g, _)) = read_ref(dict, k + 5) {
-                root = Some((n, g));
-            }
+        let previous = find_name(dict, b"/Prev")
+            .map(|position| {
+                read_uint(dict, position + 5)
+                    .and_then(|(value, _)| usize::try_from(value).ok())
+                    .ok_or(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF trailer /Prev is not a valid offset",
+                    })
+            })
+            .transpose()?;
+        if previous.is_some_and(|previous| previous >= offset) {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "forward PDF revision references are not supported",
+            });
+        }
+        let keyword =
+            find_from(data, b"startxref", close).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF revision has no startxref",
+            })?;
+        let (declared, mut cursor) =
+            read_uint(data, keyword + 9).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF revision startxref is not a number",
+            })?;
+        if declared != offset as u64 {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF revision startxref does not match its cross-reference section",
+            });
+        }
+        while data.get(cursor).is_some_and(|byte| is_ws(*byte)) {
+            cursor += 1;
+        }
+        if data.get(cursor..cursor.saturating_add(5)) != Some(b"%%EOF") {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF revision has no EOF marker",
+            });
+        }
+        cursor += 5;
+        while data.get(cursor).is_some_and(|byte| is_ws(*byte)) {
+            cursor += 1;
+        }
+        ends.push(cursor);
+        next = previous;
+    }
+    ends.reverse();
+    if ends.last().copied() != Some(data.len()) {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF final trailer does not terminate the file",
+        });
+    }
+    Ok(ends)
+}
+
+/// Return the trailer dictionary at an exact `startxref` target.
+///
+/// ISO 32000-1 section 7.5.8 puts trailer entries such as `/Root` and `/Prev`
+/// directly in an xref-stream dictionary. The stream entries themselves are
+/// not needed for catalog discovery because this verifier resolves indirect
+/// objects from the bounded file bytes, but the xref stream is still checked
+/// for its mandatory structural fields and a complete declared stream body.
+fn xref_dictionary(data: &[u8], offset: usize) -> Result<&[u8], FormatError> {
+    if data.get(offset..offset.saturating_add(4)) == Some(b"xref") {
+        let trailer =
+            find_from(data, b"trailer", offset + 4).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference table has no trailer",
+            })?;
+        let (open, close) = dict_span(data, trailer).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF trailer has no dictionary",
+        })?;
+        return Ok(&data[open..close]);
+    }
+
+    let (_, after_number) = read_uint(data, offset).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF xref stream does not begin with an indirect object",
+    })?;
+    let (_, after_generation) =
+        read_uint(data, after_number).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no generation number",
+        })?;
+    let mut cursor = after_generation;
+    while data.get(cursor).is_some_and(|byte| is_ws(*byte)) {
+        cursor += 1;
+    }
+    if data.get(cursor..cursor.saturating_add(3)) != Some(b"obj")
+        || data
+            .get(cursor + 3)
+            .is_some_and(|byte| !is_ws(*byte) && !is_delim(*byte))
+    {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no indirect-object marker",
+        });
+    }
+    let (open, close) = dict_span(data, cursor + 3).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF xref stream has no dictionary",
+    })?;
+    let dict = &data[open..close];
+    if !has_name_value(dict, b"/Type", b"/XRef") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF startxref target is neither a table nor an xref stream",
+        });
+    }
+    for required in [b"/Size".as_slice(), b"/W".as_slice(), b"/Length".as_slice()] {
+        if find_name(dict, required).is_none() {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF xref stream is missing a required dictionary field",
+            });
         }
     }
-    root
+    let length_at = find_name(dict, b"/Length").unwrap();
+    let (stream_len, _) =
+        read_uint(dict, length_at + b"/Length".len()).ok_or(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "indirect PDF xref-stream lengths are not supported",
+        })?;
+    let stream_len = usize::try_from(stream_len).map_err(|_| FormatError::Truncated(FMT))?;
+    let stream_keyword =
+        find_from(data, b"stream", close).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no stream body",
+        })?;
+    let mut stream_start = stream_keyword + b"stream".len();
+    match data.get(stream_start..stream_start.saturating_add(2)) {
+        Some(b"\r\n") => stream_start += 2,
+        _ if data.get(stream_start) == Some(&b'\n') => stream_start += 1,
+        _ if data.get(stream_start) == Some(&b'\r') => stream_start += 1,
+        _ => {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF xref stream keyword is not followed by an end-of-line marker",
+            })
+        }
+    }
+    stream_start
+        .checked_add(stream_len)
+        .filter(|end| *end <= data.len())
+        .ok_or(FormatError::Truncated(FMT))?;
+    Ok(dict)
+}
+
+/// Resolve the newest inherited `/Root` through classic trailers or ISO 32000
+/// cross-reference streams. The `/Prev` chain is cycle-checked and bounded.
+fn find_root(data: &[u8]) -> Result<Option<(u64, u64)>, FormatError> {
+    let Some(startxref) = rfind(data, b"startxref") else {
+        return Ok(None);
+    };
+    let (offset, _) =
+        read_uint(data, startxref + b"startxref".len()).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF startxref offset is not a number",
+        })?;
+    let mut next = Some(
+        usize::try_from(offset)
+            .ok()
+            .filter(|offset| *offset < data.len())
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference offset is out of range",
+            })?,
+    );
+    let mut visited = Vec::new();
+    while let Some(offset) = next {
+        if visited.contains(&offset) {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference chain contains a cycle",
+            });
+        }
+        visited.push(offset);
+        if visited.len() > MAX_PDF_REVISIONS {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF has too many incremental update sections",
+            });
+        }
+        let dict = xref_dictionary(data, offset)?;
+        if let Some(position) = find_name(dict, b"/Root") {
+            return read_ref(dict, position + b"/Root".len())
+                .map(|(number, generation, _)| Some((number, generation)))
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF trailer /Root is not an indirect reference",
+                });
+        }
+        next = find_name(dict, b"/Prev")
+            .map(|position| {
+                read_uint(dict, position + b"/Prev".len())
+                    .and_then(|(value, _)| usize::try_from(value).ok())
+                    .filter(|previous| *previous < offset)
+                    .ok_or(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF trailer /Prev is not a valid backward offset",
+                    })
+            })
+            .transpose()?;
+    }
+    Ok(None)
 }
 
 /// True for the PDF white-space bytes (PDF 32000-1 §7.2.2).
@@ -315,7 +666,6 @@ fn find_obj_last(data: &[u8], num: u64, gen: u64) -> Option<usize> {
 }
 
 /// Find the last occurrence of `needle` in `data`.
-#[cfg(test)]
 fn rfind(data: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || data.len() < needle.len() {
         return None;
@@ -688,6 +1038,62 @@ mod tests {
         pdf
     }
 
+    fn pdf_with_xref_stream(manifest_store: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /AF [2 0 R] >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 3 0 R >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fc2pa /Length {} >>\nstream\n",
+                manifest_store.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(manifest_store);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_offset = pdf.len();
+        // The stream body is structurally bounded but its entries need not be
+        // consulted to resolve trailer key /Root.
+        let entries = [0u8; 35];
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 4 2] /Length {} >>\nstream\n",
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&entries);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn extracts_manifest_when_newest_revision_uses_xref_stream() {
+        let store = dummy_manifest_store();
+        let pdf = pdf_with_xref_stream(&store);
+        assert_eq!(extract(&pdf).unwrap().as_deref(), Some(store.as_slice()));
+        let output = crate::c2pa_validate::verify(&crate::c2pa_validate::VerifyInput {
+            data: &pdf,
+            mime: "application/pdf",
+            claim_signer_trust: None,
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: None,
+            profile: crate::c2pa_core::EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        })
+        .unwrap();
+        assert_ne!(
+            output.validation_state,
+            crate::c2pa_validate::ValidationState::None,
+            "xref-stream PDFs must reach manifest validation, not no-provenance"
+        );
+    }
+
     #[test]
     fn embed_round_trips_via_incremental_update() {
         let pdf = minimal_pdf();
@@ -762,9 +1168,10 @@ mod tests {
             err,
             FormatError::UnsupportedVariant { format: FMT, .. }
         ));
-        // Extraction on the same input is a clean None, not an error: a
-        // verifier must not hard-fail on PDFs we cannot embed into.
-        assert_eq!(extract(pdf).unwrap(), None);
+        // The bytes claim that the catalog object itself is an xref stream.
+        // Discovery fails closed instead of treating that malformed target as
+        // a clean PDF with no provenance.
+        assert!(extract(pdf).is_err());
     }
 
     #[test]
@@ -820,6 +1227,83 @@ mod tests {
         assert_eq!(count, 1, "catalog must have exactly one /AF key");
     }
 
+    #[test]
+    fn rejects_two_stores_introduced_by_one_update_section() {
+        let base = minimal_pdf();
+        let store = dummy_manifest_store();
+        let previous_xref = rfind(&base, b"startxref")
+            .and_then(|position| read_uint(&base, position + 9))
+            .map(|(offset, _)| offset)
+            .unwrap();
+        let mut pdf = base;
+        let mut offsets = Vec::new();
+        for (stream_number, filespec_number) in [(4u64, 5u64), (6, 7)] {
+            let stream_offset = pdf.len();
+            pdf.extend_from_slice(
+                format!(
+                    "{stream_number} 0 obj\n<< /Type /EmbeddedFile /Length {} >>\nstream\n",
+                    store.len()
+                )
+                .as_bytes(),
+            );
+            pdf.extend_from_slice(&store);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+            offsets.push((stream_number, stream_offset));
+            let filespec_offset = pdf.len();
+            pdf.extend_from_slice(
+                format!(
+                    "{filespec_number} 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F {stream_number} 0 R >> >>\nendobj\n"
+                )
+                .as_bytes(),
+            );
+            offsets.push((filespec_number, filespec_offset));
+        }
+        let catalog_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AF [5 0 R 7 0 R] >>\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n1 1\n");
+        pdf.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(b"4 4\n");
+        offsets.sort_by_key(|(number, _)| *number);
+        for (_, offset) in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 8 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let sections = manifest_store_sections(&pdf).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].defect, Some(DUPLICATE_STORES));
+        assert!(matches!(
+            extract(&pdf),
+            Err(FormatError::InvalidStructure {
+                detail: DUPLICATE_STORES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn history_keeps_valid_earlier_store_when_later_store_is_malformed() {
+        let pdf = minimal_pdf();
+        let first_store = dummy_manifest_store();
+        let first = embed(&pdf, &first_store).unwrap();
+        let malformed = embed(&first, b"not a manifest store").unwrap();
+
+        let sections = manifest_store_sections(&malformed).unwrap();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].store(&malformed), Some(first_store.as_slice()));
+        assert_eq!(sections[0].defect, None);
+        assert!(sections[1].store(&malformed).is_none());
+        assert!(sections[1].defect.is_some());
+    }
+
     /// Legacy two-pass signers (the pypdf path) write the store into a larger
     /// zero-padded placeholder stream: the store must be sliced by its own
     /// LBox, not the stream /Length.
@@ -847,6 +1331,15 @@ mod tests {
         padded.extend_from_slice(&store);
         padded.extend_from_slice(&[0u8; 64]);
         padded.extend_from_slice(&out[data_start + store.len()..]);
+        // The appended bytes move the classic xref table by the padding length.
+        // Keep the hand-built fixture structurally valid by rebasing startxref.
+        let startxref = rfind(&padded, b"startxref").unwrap();
+        let (old_xref, digits_end) = read_uint(&padded, startxref + 9).unwrap();
+        let digits_start = digits_end - old_xref.to_string().len();
+        padded.splice(
+            digits_start..digits_end,
+            (old_xref + 64).to_string().into_bytes(),
+        );
         let got = extract(&padded).unwrap().expect("store found");
         assert_eq!(got, store, "store must be sliced by its own LBox");
     }
