@@ -20,6 +20,7 @@ All notable changes to this project are recorded here.
 - Fragments presented out of their signed order, or with a gap inside the supplied run, are `assertion.bmffHash.mismatch`, as C2PA 2.4 VAL-CONT-0007/0008 require, unless the caller signals the seek.
 - Hashed URIs inside assertions (ingredient thumbnails and data, action ingredient and related-assertion references, software agent and template icons) were not checked, so a retargeted thumbnail reference still read as valid. They are now resolved and hashed: `hashedURI.missing` or `hashedURI.mismatch`. The assertion `metadata` subtree stays unvalidated, as C2PA 2.4 requires.
 - Redaction declarations are checked: a claim may not redact its own assertion (`assertion.selfRedacted`), an actions assertion (`assertion.action.redacted`), or a hard binding (`assertion.hardBinding.redacted`), and an assertion declared redacted but still present is `assertion.notRedacted`. Only a lawful redaction lets an ingredient be authenticated through its claim signature.
+- The TLS stack used by online checks, telemetry, and the update check moves to rustls 0.23.45, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption levels).
 
 ### Added
 
