@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "boon",
  "brotli",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-ffi"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "encypher-c2pa",
  "serde_json",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-python"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "encypher-c2pa",
  "pyo3",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "encypher-c2pa-wasm"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "encypher-c2pa",
  "js-sys",

@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 readme.workspace = true
-description = "Offline, verification-only C2PA SDK"
+description = "Verification-only C2PA 2.4 and CAWG SDK, offline by default"
 keywords = ["c2pa", "content-credentials", "provenance", "verification"]
 categories = ["cryptography", "multimedia"]
 # The two integration suites load fixtures from the workspace `tests/fixtures`

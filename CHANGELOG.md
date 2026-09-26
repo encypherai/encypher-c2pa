@@ -2,11 +2,16 @@
 
 All notable changes to this project are recorded here.
 
-## Unreleased
+## 1.2.0 - 2026-09-26
 
 ### Added
 
+- Python wheels for musl Linux (`musllinux_1_2`, x86_64 and aarch64). Alpine and other musl images install a prebuilt wheel instead of building from source with a Rust toolchain.
 - A trusted CAWG X.509 identity reports `anchor_fingerprint` in its status details: the SHA-256 of the configured certificate that accepted it, which is the anchor its chain ends at or the allowed certificate it matched. `trust_source` names the configuration entry; the fingerprint names the root within it, so an Encypher-root chain can be told apart from another accepted root.
+
+### Changed
+
+- Package descriptions on crates.io, PyPI, and npm no longer call the SDK offline-only. Verification is offline by default; online checks and the CLI update check are opt-out or opt-in as documented.
 
 ## 1.1.0 - 2026-09-25
 

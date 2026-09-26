@@ -114,6 +114,41 @@ jobs:
           assert custom_only["trust"]["status"] == "not_evaluated"
           PY
 
+  python-musl:
+    name: Python musllinux wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Built exactly as the release builds them, so a musl break surfaces on
+      # the pull request instead of blocking the PyPI publish at tag time.
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: build
+          target: x86_64
+          args: --release --manifest-path bindings/python/Cargo.toml --out dist/musl
+          manylinux: musllinux_1_2
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: build
+          target: aarch64
+          args: --release --manifest-path bindings/python/Cargo.toml --out dist/musl
+          manylinux: musllinux_1_2
+        env:
+          CFLAGS_aarch64_unknown_linux_musl: -D__ARM_ARCH=8
+      - name: Verify with the x86_64 wheel on Alpine
+        run: |
+          ls dist/musl
+          docker run --rm -v "$PWD:/w" -w /w python:3.12-alpine sh -euc '
+            pip install --no-deps dist/musl/*musllinux_1_2_x86_64.whl
+            python - <<PY
+          import encypher_c2pa as c
+          report = c.verify("tests/fixtures/signed_test.jpg")
+          assert report["integrity"] == "valid", report["integrity"]
+          assert report["trust"]["basis"] == "bundled_static_material"
+          print("musllinux wheel verifies on Alpine")
+          PY
+          '
+
   wasm:
     name: Browser WASM
     runs-on: ubuntu-latest

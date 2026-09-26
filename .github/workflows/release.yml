@@ -641,6 +641,14 @@ jobs:
             target: x86_64
           - os: ubuntu-latest
             target: aarch64
+          # musllinux wheels serve Alpine and other musl images, which
+          # otherwise fall back to the sdist and need a Rust toolchain.
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: musllinux_1_2
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: musllinux_1_2
           # macOS x86_64 cross-builds from the arm64 image. The macos-13
           # Intel runner is retired: its job sat unassigned until the run
           # timed out, and because `pypi` needs every wheel, that one
@@ -659,7 +667,7 @@ jobs:
           command: build
           target: ${{ matrix.target }}
           args: --release --manifest-path bindings/python/Cargo.toml --out dist
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux || 'auto' }}
         env:
           # ring's C sources read __ARM_ARCH to select the ARM assembler
           # profile. The aarch64 cross-gcc inside maturin's manylinux
@@ -668,6 +676,7 @@ jobs:
           # aarch64 wheel never builds. Native aarch64 compilers define it
           # themselves, which is why only the cross build failed.
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+          CFLAGS_aarch64_unknown_linux_musl: -D__ARM_ARCH=8
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-${{ matrix.os }}-${{ matrix.target }}-${{ strategy.job-index }}
@@ -721,6 +730,8 @@ jobs:
           EXPECTED_PLATFORMS = {
               "linux-aarch64",
               "linux-x86_64",
+              "linux-musl-aarch64",
+              "linux-musl-x86_64",
               "macos-arm64",
               "macos-x86_64",
               "windows-amd64",
@@ -780,6 +791,8 @@ jobs:
               patterns = {
                   "linux-aarch64": r"manylinux(?:_[0-9]+_[0-9]+|[0-9]+)_aarch64",
                   "linux-x86_64": r"manylinux(?:_[0-9]+_[0-9]+|[0-9]+)_x86_64",
+                  "linux-musl-aarch64": r"musllinux_[0-9]+_[0-9]+_aarch64",
+                  "linux-musl-x86_64": r"musllinux_[0-9]+_[0-9]+_x86_64",
                   "macos-arm64": r"macosx_[0-9]+_[0-9]+_arm64",
                   "macos-x86_64": r"macosx_[0-9]+_[0-9]+_x86_64",
                   "windows-amd64": r"win_amd64",
@@ -889,9 +902,9 @@ jobs:
                       "unexpected artifact file(s): "
                       + ", ".join(str(path) for path in sorted(unexpected))
                   )
-              if len(wheels) != 5 or len(sdists) != 1 or len(files) != 6:
+              if len(wheels) != 7 or len(sdists) != 1 or len(files) != 8:
                   fail(
-                      "expected exactly five wheels and one sdist; found "
+                      "expected exactly seven wheels and one sdist; found "
                       f"{len(wheels)} wheel(s), {len(sdists)} sdist(s), "
                       f"{len(files)} total file(s)"
                   )
@@ -907,7 +920,7 @@ jobs:
                       verify_wheel(path)
                   else:
                       verify_sdist(path)
-              if set(platforms) != EXPECTED_PLATFORMS or len(set(platforms)) != 5:
+              if set(platforms) != EXPECTED_PLATFORMS or len(set(platforms)) != 7:
                   fail(
                       "wheel platforms do not match the expected release set: "
                       + ", ".join(platforms)
@@ -1333,18 +1346,18 @@ jobs:
           crates = [path for path in files if path.name.endswith(".crate")]
           expected = wheels + sdists + npm + crates
           if (
-              len(wheels) != 5
+              len(wheels) != 7
               or len(sdists) != 1
               or len(npm) != 1
               or len(crates) != 2
           ):
               raise SystemExit(
-                  "expected five wheels, one Python sdist, one npm package, "
+                  "expected seven wheels, one Python sdist, one npm package, "
                   "and two Rust crates; "
                   f"found {len(wheels)}, {len(sdists)}, {len(npm)}, "
                   f"and {len(crates)}"
               )
-          if len(files) != 9 or len(expected) != len(files):
+          if len(files) != 11 or len(expected) != len(files):
               raise SystemExit(f"unexpected release artifacts: {files!r}")
           names = [path.name for path in files]
           if len(names) != len(set(names)):
@@ -1688,7 +1701,7 @@ jobs:
               "npm": len([path for path in files if path.name.endswith(".tgz")]),
               "crate": len([path for path in files if path.name.endswith(".crate")]),
           }
-          if len(files) != 9 or counts != {"wheel": 5, "sdist": 1, "npm": 1, "crate": 2}:
+          if len(files) != 11 or counts != {"wheel": 7, "sdist": 1, "npm": 1, "crate": 2}:
               raise SystemExit(f"invalid recovered release inventory: {counts!r}, files={files!r}")
           if any(path.is_symlink() or path.stat().st_size <= 0 for path in files):
               raise SystemExit("recovered release inventory contains an invalid file")
