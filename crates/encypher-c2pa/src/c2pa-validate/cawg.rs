@@ -19,7 +19,8 @@ use crate::c2pa_crypto::{
 };
 use crate::c2pa_trust::{
     certificate_eku_oids_der, certificate_policy_oids_der, certificate_valid_at,
-    leaf_profile_acceptable_der, validate_chain, AnchorPurpose, CawgTrustSource, TrustList,
+    leaf_profile_acceptable_der, validate_chain, AnchorPurpose, CawgTrustSource, TrustAnchor,
+    TrustList,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -716,6 +717,7 @@ fn verify_identity_assertion(
                 "trust_source": trust.source,
                 "accepted_eku": trust.accepted_eku,
                 "certificate_policy": trust.certificate_policy,
+                "anchor_fingerprint": trust.anchor_fingerprint,
                 "trusted_at": at.to_string(),
                 "timestamp_trusted": timestamp_trusted,
                 "revocation_status": revocation_status.as_str(),
@@ -1221,6 +1223,9 @@ struct IdentityTrustEvidence {
     source: &'static str,
     accepted_eku: Option<&'static str>,
     certificate_policy: Option<String>,
+    /// SHA-256 of the configured certificate that accepted the credential: the
+    /// anchor its chain terminates at, or the allowed certificate it matched.
+    anchor_fingerprint: Option<String>,
 }
 
 /// Evaluate one identity credential against the CAWG trust configuration.
@@ -1265,22 +1270,24 @@ fn identity_certificate_trust(
     identity_timestamp_trusted: bool,
 ) -> Result<IdentityTrustEvidence, &'static str> {
     let ekus = certificate_eku_oids_der(leaf).unwrap_or_default();
-    let chain_source = || chain_trust_source(leaf, intermediates, at, trust);
+    let chain_anchor = || chain_trust_anchor(leaf, intermediates, at, trust);
 
     if ekus.iter().any(|oid| oid == OID_KP_DOCUMENT_SIGNING) {
-        let trusted = allowed.is_some_and(|list| list.contains_certificate(leaf));
-        if trusted {
+        if let Some(entry) = allowed.and_then(|list| list.find_certificate(leaf)) {
             return Ok(IdentityTrustEvidence {
                 source: "allowed_list",
                 accepted_eku: Some(OID_KP_DOCUMENT_SIGNING),
                 certificate_policy: None,
+                anchor_fingerprint: Some(entry.fingerprint()),
             });
         }
-        if !document_signing_require_anchor || chain_source().is_some() {
+        let anchor = chain_anchor();
+        if !document_signing_require_anchor || anchor.is_some() {
             return Ok(IdentityTrustEvidence {
                 source: "document_signing",
                 accepted_eku: Some(OID_KP_DOCUMENT_SIGNING),
                 certificate_policy: None,
+                anchor_fingerprint: anchor.map(TrustAnchor::fingerprint),
             });
         }
         return Err("document_signing_anchor_required");
@@ -1305,11 +1312,11 @@ fn identity_certificate_trust(
     // conditions refuse does the reason become an interim one.
     let direct = allowed
         .and_then(|list| list.find_certificate(leaf))
-        .map(|anchor| ("allowed_list", anchor.cawg_source));
-    let chained = chain_source().map(|source| (source.label(), source));
+        .map(|anchor| ("allowed_list", anchor));
+    let chained = chain_anchor().map(|anchor| (anchor.cawg_source.label(), anchor));
     let mut refused = None;
-    for (label, source) in direct.into_iter().chain(chained) {
-        if source.interim() && !interim_satisfied {
+    for (label, anchor) in direct.into_iter().chain(chained) {
+        if anchor.cawg_source.interim() && !interim_satisfied {
             // Past the cutoff, the only surviving disjunct is a trusted time
             // stamp attesting an earlier signature: absent one, that is what
             // the credential lacked; present one, it attested too late.
@@ -1324,18 +1331,19 @@ fn identity_certificate_trust(
             source: label,
             accepted_eku: Some(OID_KP_EMAIL_PROTECTION),
             certificate_policy: Some(policy),
+            anchor_fingerprint: Some(anchor.fingerprint()),
         });
     }
     Err(refused.unwrap_or("credential_untrusted"))
 }
 
-/// The configuration entry whose anchors a chain from `leaf` terminates at.
-fn chain_trust_source(
+/// The configured anchor a chain from `leaf` terminates at.
+fn chain_trust_anchor<'a>(
     leaf: &[u8],
     intermediates: &[Vec<u8>],
     at: OffsetDateTime,
-    trust: Option<&TrustList>,
-) -> Option<CawgTrustSource> {
+    trust: Option<&'a TrustList>,
+) -> Option<&'a TrustAnchor> {
     let anchors = trust?;
     let result = validate_chain(
         leaf,
@@ -1348,7 +1356,6 @@ fn chain_trust_source(
         .trusted
         .then(|| result.terminating_anchor(anchors))
         .flatten()
-        .map(|anchor| anchor.cawg_source)
 }
 
 /// The accepted EKU and certificate policy a credential presents, for the
@@ -3271,6 +3278,13 @@ mod tests {
         assert!(results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
         let details = trusted_details(&results);
         assert_eq!(details["trust_source"], "caller_supplied");
+        // The anchor that accepted the chain, so a consumer can tell one root
+        // from another inside the same configuration entry.
+        let root_der = trust.certificates().next().expect("one anchor");
+        assert_eq!(
+            details["anchor_fingerprint"],
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(root_der))
+        );
         assert_eq!(details["accepted_eku"], OID_KP_EMAIL_PROTECTION);
         assert_eq!(details["certificate_policy"], "2.23.140.1.5.2.3");
         assert_eq!(details["timestamp_trusted"], false);
