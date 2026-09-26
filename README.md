@@ -29,7 +29,7 @@ The SDK implements the open standards: [C2PA 2.4](https://spec.c2pa.org/specific
 ### Command line
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.1.0
+cargo install encypher-c2pa-cli --version 1.2.0
 encypher-c2pa verify photo.jpg
 encypher-c2pa verify photo.jpg --json
 encypher-c2pa formats
@@ -41,7 +41,7 @@ The MIME type comes from the file extension; pass `--mime` for a file whose name
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.1.0"
+encypher-c2pa = "1.2.0"
 ```
 
 ```rust
@@ -65,7 +65,7 @@ report = verify("photo.jpg")
 print(report["integrity"], report["trust"]["status"])
 ```
 
-The wheel supports Python 3.9 and later.
+The wheel supports Python 3.9 and later on Linux (glibc and musl, x86_64 and aarch64), macOS, and Windows x64.
 
 ### Browser JavaScript
 
@@ -294,12 +294,12 @@ Build without the fetcher entirely with `--no-default-features --features teleme
 Each release carries verification fixes and a refreshed trust snapshot, so an old copy judges files against old trust lists. The command line checks for a newer release once a day, when a person is at the terminal, and offers to install it:
 
 ```text
-encypher-c2pa 1.1.1 is available. You have 1.1.0, with trust lists dated 2026-09-24.
+encypher-c2pa 1.2.1 is available. You have 1.2.0, with trust lists dated 2026-09-24.
 Releases carry verification fixes and refreshed trust lists.
 Update now? [y] yes  [N] not now  [s] skip this version  [o] stop checking
 ```
 
-`y` runs `cargo install encypher-c2pa-cli --version 1.1.1 --locked`, then runs your command again on the new version. `s` skips that release; a later one is still offered. `o` turns the check off.
+`y` runs `cargo install encypher-c2pa-cli --version 1.2.1 --locked`, then runs your command again on the new version. `s` skips that release; a later one is still offered. `o` turns the check off.
 
 The check is one request for the crate's public entry in the crates.io index. It carries no file, path, or identifier, gives up after two seconds, and fails silently. Runs with nobody at the terminal (pipes, CI, cron) never check, and `--offline` skips the check for that run. The libraries never check; update them through your package manager.
 

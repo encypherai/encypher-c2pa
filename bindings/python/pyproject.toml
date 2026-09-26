@@ -7,7 +7,7 @@ name = "encypher-c2pa"
 # No version here: maturin takes it from the Rust workspace. A duplicated
 # PEP 440 string silently drifted to 1.0.0rc6 while the crates moved on.
 dynamic = ["version"]
-description = "Offline, verification-only C2PA SDK"
+description = "Verification-only C2PA 2.4 and CAWG SDK, offline by default"
 readme = "../../README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
