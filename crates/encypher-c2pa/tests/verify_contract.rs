@@ -107,6 +107,38 @@ fn signed_mp4_uses_the_same_public_report_contract() {
     assert_eq!(report.hard_binding, "match");
 }
 
+/// Real Encypher-signed BigTIFFs, one per byte order and one per conformant
+/// placement: the little-endian file carries the C2PA entry inside its single
+/// main IFD (C2PA 2.4 A.3.6) and the big-endian one is multi-page with a
+/// dedicated last IFD (2.2 A.3.5). Both failed outright before BigTIFF was
+/// read, with `not a valid Tiff asset: bad TIFF magic`.
+#[test]
+fn signed_bigtiff_verifies_in_both_byte_orders_and_placements() {
+    for name in [
+        "signed_bigtiff_le_single_page.tif",
+        "signed_bigtiff_be_multi_page.tif",
+    ] {
+        let report = verify(&fixture(name), "image/tiff").expect("verification succeeds");
+
+        assert!(report.present, "{name}");
+        assert_eq!(report.integrity, "valid", "{name}");
+        assert_eq!(report.signature, "valid", "{name}");
+        assert_eq!(report.hard_binding, "match", "{name}");
+    }
+}
+
+/// A byte changed in the image data of a signed BigTIFF, well away from the
+/// manifest carrier, must not still read as valid.
+#[test]
+fn a_tampered_bigtiff_page_is_not_reported_as_valid_integrity() {
+    let mut asset = fixture("signed_bigtiff_le_single_page.tif");
+    asset[2048] ^= 0x01;
+
+    let report = verify(&asset, "image/tiff").expect("verification succeeds");
+    assert_ne!(report.integrity, "valid");
+    assert_eq!(report.hard_binding, "mismatch");
+}
+
 #[test]
 fn tampering_is_not_reported_as_valid_integrity() {
     let mut asset = fixture("signed_test.jpg");

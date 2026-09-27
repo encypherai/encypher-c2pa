@@ -55,4 +55,4 @@ Format-specific rules the verifier applies:
 
 ## Test fixtures
 
-`tests/fixtures/signed_test.jpg` and `signed_test.mp4` exercise the public report contract. The deeper engine suite covers format extraction, claim parsing, signature algorithms, data hash, BMFF hash, boxes hash, collection hash, multipart bindings, ingredients, trust, OCSP, and malformed input boundaries.
+`tests/fixtures/signed_test.jpg` and `signed_test.mp4` exercise the public report contract, together with `signed_bigtiff_le_single_page.tif` (C2PA 2.4 A.3.6, the entry inside the single main IFD) and `signed_bigtiff_be_multi_page.tif` (2.2 A.3.5, a big-endian multi-page asset with a dedicated last IFD). The deeper engine suite covers format extraction, claim parsing, signature algorithms, data hash, BMFF hash, boxes hash, collection hash, multipart bindings, ingredients, trust, OCSP, and malformed input boundaries.
