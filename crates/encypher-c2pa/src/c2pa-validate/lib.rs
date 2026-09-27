@@ -15390,6 +15390,18 @@ mod tests {
         data: &[u8],
         exclusions: &[(usize, usize)],
     ) -> ValidationResults {
+        data_hash_binding_over(format, data, data, exclusions)
+    }
+
+    /// As [`data_hash_binding`], but the digest is taken over `signed` while
+    /// the binding is evaluated against `data`, so a tampered copy meets a
+    /// binding computed before the tamper.
+    fn data_hash_binding_over(
+        format: AssetFormat,
+        signed: &[u8],
+        data: &[u8],
+        exclusions: &[(usize, usize)],
+    ) -> ValidationResults {
         let declared = Value::Array(
             exclusions
                 .iter()
@@ -15401,7 +15413,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let hash = hash_with_exclusions("sha256", data, exclusions).expect("hash");
+        let hash = hash_with_exclusions("sha256", signed, exclusions).expect("hash");
         let cbor = enc(&vmap(vec![
             ("alg", Value::Text("sha256".into())),
             ("hash", Value::Bytes(hash)),
@@ -15578,6 +15590,113 @@ mod tests {
             }
         }
         !crc
+    }
+
+    /// A single-page BigTIFF (C2PA 2.4 A.3.6: the C2PA entry inside the one
+    /// main IFD) carrying `store`, with the store's resolved carrier span.
+    ///
+    /// Written by hand at BigTIFF's own widths - magic 43, 8-byte entry count,
+    /// 20-byte entries, 8-byte offsets - which a classic-TIFF reader cannot
+    /// parse at all.
+    fn signed_bigtiff(store: &[u8]) -> (Vec<u8>, crate::c2pa_formats::DataHashExclusion) {
+        let entry = |tag: u16, tag_type: u16, count: u64, value: u64| {
+            let mut row = Vec::with_capacity(20);
+            row.extend_from_slice(&tag.to_le_bytes());
+            row.extend_from_slice(&tag_type.to_le_bytes());
+            row.extend_from_slice(&count.to_le_bytes());
+            row.extend_from_slice(&value.to_le_bytes());
+            row
+        };
+        let description = b"bigtiff-page";
+        // 16-byte header, then count + two entries + next-IFD pointer.
+        let description_off = 16 + 8 + 2 * 20 + 8;
+        let store_off = description_off + description.len();
+        let mut asset = b"II".to_vec();
+        asset.extend_from_slice(&43u16.to_le_bytes()); // BigTIFF magic
+        asset.extend_from_slice(&8u16.to_le_bytes()); // offset bytesize
+        asset.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        asset.extend_from_slice(&16u64.to_le_bytes()); // first IFD
+        asset.extend_from_slice(&2u64.to_le_bytes()); // entry count
+        asset.extend_from_slice(&entry(
+            0x010E,
+            2,
+            description.len() as u64,
+            description_off as u64,
+        ));
+        asset.extend_from_slice(&entry(0xCD41, 7, store.len() as u64, store_off as u64));
+        asset.extend_from_slice(&0u64.to_le_bytes()); // next IFD
+        asset.extend_from_slice(description);
+        asset.extend_from_slice(store);
+        let carrier = crate::c2pa_formats::compute_data_hash_exclusions(AssetFormat::Tiff, &asset)
+            .expect("carrier");
+        assert_eq!(carrier.len(), 1, "one resolved BigTIFF carrier");
+        assert_eq!(carrier[0].start, store_off);
+        (asset, carrier[0])
+    }
+
+    /// The BigTIFF carrier is resolved like any other: an exact exclusion
+    /// validates, and a byte changed outside it fails the binding.
+    #[test]
+    fn a_bigtiff_carrier_verifies_and_a_tampered_page_does_not() {
+        let store = build_manifest_store(&[build_manifest(
+            "urn:c2pa:test:0001",
+            &[],
+            &[0xa0],
+            &[0xd2, 0x84],
+        )]);
+        let (asset, carrier) = signed_bigtiff(&store);
+        assert_eq!(
+            crate::c2pa_formats::extract_manifest(AssetFormat::Tiff, &asset)
+                .expect("extract")
+                .as_deref(),
+            Some(store.as_slice()),
+            "the store reads back out of the BigTIFF"
+        );
+
+        let intact = data_hash_binding(
+            AssetFormat::Tiff,
+            &asset,
+            &[(carrier.start, carrier.length)],
+        );
+        assert!(intact.has_success(ASSERTION_DATA_HASH_MATCH), "{intact:?}");
+
+        let mut tampered = asset.clone();
+        let page_byte = carrier.start - 1;
+        tampered[page_byte] ^= 0xFF;
+        let after = data_hash_binding_over(
+            AssetFormat::Tiff,
+            &asset,
+            &tampered,
+            &[(carrier.start, carrier.length)],
+        );
+        assert!(after.has_failure(ASSERTION_DATA_HASH_MISMATCH), "{after:?}");
+        assert!(!after.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    /// C2PA 2.4 "Validating a data hash" applies to the BigTIFF carrier too: an
+    /// exclusion widened over real page bytes hides them from the digest, so it
+    /// is rejected even though the digest itself matches.
+    #[test]
+    fn page_bytes_hidden_inside_a_bigtiff_exclusion_are_rejected() {
+        let store = build_manifest_store(&[build_manifest(
+            "urn:c2pa:test:0001",
+            &[],
+            &[0xa0],
+            &[0xd2, 0x84],
+        )]);
+        let (asset, carrier) = signed_bigtiff(&store);
+        let widened = (carrier.start - 4, carrier.length + 4);
+        assert!(
+            asset[widened.0..carrier.start]
+                .iter()
+                .any(|byte| *byte != 0),
+            "the widened bytes must be real page content, not padding"
+        );
+        let results = data_hash_binding(AssetFormat::Tiff, &asset, &[widened]);
+        assert!(
+            results.has_failure(ASSERTION_DATA_HASH_MISMATCH),
+            "{results:?}"
+        );
     }
 
     // ---- general box hash on GIF, RIFF, and Ogg (C2PA 2.4 BoxesHash) ----

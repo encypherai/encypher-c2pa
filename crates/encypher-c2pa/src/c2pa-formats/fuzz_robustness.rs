@@ -59,6 +59,8 @@ const MAGICS: &[&[u8]] = &[
     b"RIFF",                           // RIFF
     b"II*\x00",                        // TIFF LE
     b"MM\x00*",                        // TIFF BE
+    b"II+\x00\x08\x00\x00\x00",        // BigTIFF LE
+    b"MM\x00+\x00\x08\x00\x00",        // BigTIFF BE
     b"GIF89a",                         // GIF
     b"<?xml version=\"1.0\"?><svg",    // SVG
     b"%PDF-1.7",                       // PDF
@@ -125,6 +127,20 @@ fn parsers_never_panic_on_hostile_lengths() {
         },
         // JPEG APP11 segment with max length and no body.
         vec![0xFF, 0xD8, 0xFF, 0xEB, 0xFF, 0xFF],
+        // BigTIFF IFD declaring a 64-bit entry count no file can hold.
+        {
+            let mut v = b"II+\x00\x08\x00\x00\x00".to_vec();
+            v.extend_from_slice(&16u64.to_le_bytes()); // first IFD
+            v.extend_from_slice(&u64::MAX.to_le_bytes()); // entry count
+            v
+        },
+        // BigTIFF chain pointing an IFD back at the fixed header.
+        {
+            let mut v = b"MM\x00+\x00\x08\x00\x00".to_vec();
+            v.extend_from_slice(&8u64.to_be_bytes());
+            v.extend_from_slice(&1u64.to_be_bytes());
+            v
+        },
         // Deeply truncated everything.
         vec![],
         vec![0x00],
