@@ -22,7 +22,7 @@ Run `encypher-c2pa formats` to read the canonical MIME types covered by the inst
 
 A listed MIME type has a container reader and a C2PA hard-binding path in this build. The exact binding depends on the format:
 
-- JPEG APP11 and PNG/WebP/TIFF-family manifest carriers;
+- JPEG APP11 and PNG/WebP/TIFF-family manifest carriers, TIFF covering both classic TIFF and BigTIFF;
 - ISO BMFF box hashing for MP4, MOV, HEIF, HEIC, AVIF, M4A, and related formats, plus C2PA A.5.4 Merkle verification for fragmented fMP4 and CMAF streams;
 - RIFF and chunk hashing for WAV and AVI;
 - native carriers for FLAC, MP3, GIF, SVG, JPEG XL, PDF, fonts, and EPUB;
@@ -30,6 +30,8 @@ A listed MIME type has a container reader and a C2PA hard-binding path in this b
 - standardized structured-text carriers.
 
 Coverage does not promise recovery from arbitrary container corruption. Unsupported variants return a typed error or a failed validation status. The engine never accepts a format by extension alone: callers provide a MIME type, and file helpers use an extension only to select that MIME type.
+
+`image/tiff` and `image/x-adobe-dng` cover classic TIFF (magic 42) and BigTIFF (magic 43, 8-byte offsets, 20-byte IFD entries, 8-byte entry counts) in both byte orders. The manifest store is read from IFD tag 52545 with tag type UNDEFINED, in either placement the specification allows: the dedicated last IFD of C2PA 2.2 A.3.5, and the single-page in-IFD form C2PA 2.4 A.3.6 adds. A differently typed tag 52545 entry, a cyclic or overlapping IFD chain, an IFD pointed inside the fixed header, and a directory larger than the verifier's budget are all refused rather than read.
 
 Fragmented verification takes the signed initialization segment and the media segments available, in playback order. Missing trailing segments are not a failure; an unsignalled gap or reordering inside the supplied run is `assertion.bmffHash.mismatch`, unless the caller marks the jump with `expected_seek_positions`. Both fMP4 and CMAF use `video/mp4`; they are verification modes, not additional MIME types. Supplied segments that no binding covers fail verification.
 
@@ -53,4 +55,4 @@ Format-specific rules the verifier applies:
 
 ## Test fixtures
 
-`tests/fixtures/signed_test.jpg` and `signed_test.mp4` exercise the public report contract. The deeper engine suite covers format extraction, claim parsing, signature algorithms, data hash, BMFF hash, boxes hash, collection hash, multipart bindings, ingredients, trust, OCSP, and malformed input boundaries.
+`tests/fixtures/signed_test.jpg` and `signed_test.mp4` exercise the public report contract, together with `signed_bigtiff_le_single_page.tif` (C2PA 2.4 A.3.6, the entry inside the single main IFD) and `signed_bigtiff_be_multi_page.tif` (2.2 A.3.5, a big-endian multi-page asset with a dedicated last IFD). The deeper engine suite covers format extraction, claim parsing, signature algorithms, data hash, BMFF hash, boxes hash, collection hash, multipart bindings, ingredients, trust, OCSP, and malformed input boundaries.

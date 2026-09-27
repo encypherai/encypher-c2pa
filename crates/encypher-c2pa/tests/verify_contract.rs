@@ -107,6 +107,69 @@ fn signed_mp4_uses_the_same_public_report_contract() {
     assert_eq!(report.hard_binding, "match");
 }
 
+/// Real Encypher-signed BigTIFFs, one per byte order and one per conformant
+/// placement: the little-endian file carries the C2PA entry inside its single
+/// main IFD (C2PA 2.4 A.3.6) and the big-endian one is multi-page with a
+/// dedicated last IFD (2.2 A.3.5). Both failed outright before BigTIFF was
+/// read, with `not a valid Tiff asset: bad TIFF magic`.
+#[test]
+fn signed_bigtiff_verifies_in_both_byte_orders_and_placements() {
+    for name in [
+        "signed_bigtiff_le_single_page.tif",
+        "signed_bigtiff_be_multi_page.tif",
+    ] {
+        let report = verify(&fixture(name), "image/tiff").expect("verification succeeds");
+
+        assert!(report.present, "{name}");
+        assert_eq!(report.integrity, "valid", "{name}");
+        assert_eq!(report.signature, "valid", "{name}");
+        assert_eq!(report.hard_binding, "match", "{name}");
+    }
+}
+
+/// Offset and length of the manifest store inside a little-endian BigTIFF,
+/// read from IFD tag 52545, so a tamper test can prove the byte it changes is
+/// outside the carrier rather than assume it.
+fn bigtiff_le_carrier(asset: &[u8]) -> (usize, usize) {
+    assert_eq!(&asset[..4], b"II+\x00", "little-endian BigTIFF");
+    let u16_at = |at: usize| u16::from_le_bytes(asset[at..at + 2].try_into().unwrap());
+    let u64_at = |at: usize| {
+        usize::try_from(u64::from_le_bytes(asset[at..at + 8].try_into().unwrap())).unwrap()
+    };
+    let mut ifd = u64_at(8);
+    while ifd != 0 {
+        let count = u64_at(ifd);
+        for index in 0..count {
+            let entry = ifd + 8 + index * 20;
+            if u16_at(entry) == 0xCD41 {
+                return (u64_at(entry + 12), u64_at(entry + 4));
+            }
+        }
+        ifd = u64_at(ifd + 8 + count * 20);
+    }
+    panic!("the fixture carries a C2PA entry");
+}
+
+/// A byte changed in the image data of a signed BigTIFF, outside the resolved
+/// manifest carrier, must not still read as valid.
+#[test]
+fn a_tampered_bigtiff_page_is_not_reported_as_valid_integrity() {
+    let mut asset = fixture("signed_bigtiff_le_single_page.tif");
+    let (carrier_start, carrier_length) = bigtiff_le_carrier(&asset);
+    // Half way into the image data the page entries point at, well before the
+    // store appended at the end of the file.
+    let page_byte = carrier_start / 2;
+    assert!(
+        page_byte < carrier_start || page_byte >= carrier_start + carrier_length,
+        "the flipped byte must lie outside the manifest carrier"
+    );
+    asset[page_byte] ^= 0x01;
+
+    let report = verify(&asset, "image/tiff").expect("verification succeeds");
+    assert_ne!(report.integrity, "valid");
+    assert_eq!(report.hard_binding, "mismatch");
+}
+
 #[test]
 fn tampering_is_not_reported_as_valid_integrity() {
     let mut asset = fixture("signed_test.jpg");

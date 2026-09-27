@@ -2,6 +2,21 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Added
+
+- BigTIFF verification. A BigTIFF (magic 43, 8-byte offsets, 20-byte IFD entries, 8-byte entry counts) failed every verification with `not a valid Tiff asset: bad TIFF magic`; `image/tiff` and `image/x-adobe-dng` now read both container generations in both byte orders, in either C2PA placement: the dedicated last IFD of 2.2 A.3.5 and the single-page in-IFD form of 2.4 A.3.6.
+
+### Security
+
+- The TIFF reader resolves a manifest carrier only through an IFD tag 52545 entry whose tag type is UNDEFINED, as C2PA 2.4 A.3.6 requires. A differently typed entry was previously read as a manifest store, so this verifier and a conformant one could disagree about where the store is.
+- TIFF IFD chain walking is bounded and checked: an IFD may not be revisited or overlap one already read, may not start inside the fixed header, and a chain is capped in both length and total directory bytes. A doctored chain could previously be walked repeatedly over one shared entry table.
+
+### Changed
+
+- The stricter TIFF reading rules apply to classic TIFF as well as BigTIFF, so a classic asset whose tag 52545 entry declares a tag type other than UNDEFINED, or whose IFD chain is malformed anywhere the walk reaches, is now refused instead of read. Assets written by conformant TIFF signers are unaffected. A TIFF XMP packet (tag 700) is read only when its tag type is BYTE or UNDEFINED, the two types whose value count is a byte length.
+
 ## 1.2.0 - 2026-09-26
 
 ### Added
