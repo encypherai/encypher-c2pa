@@ -32,6 +32,9 @@ const FMT: AssetFormat = AssetFormat::Tiff;
 const TAG_C2PA: u16 = 0xCD41;
 /// C2PA 2.4 A.3.6: the C2PA IFD entry is stored "with a tag type of 7".
 const TYPE_UNDEFINED: u16 = 7;
+/// TIFF tag type BYTE, the other one-byte-per-element type an XMP packet may
+/// legitimately use.
+const TYPE_BYTE: u16 = 1;
 /// Bound on how many IFDs one walk will read. Real assets use a handful (one
 /// per page); the cap only exists so a doctored chain cannot make the walk
 /// unbounded once the visited-span map has ruled out cycles.
@@ -277,28 +280,34 @@ fn read_ifd<'a>(
         .get(count_start..)
         .and_then(|tail| tail.get(..t.count_len()))
         .ok_or(FormatError::Truncated(FMT))?;
-    let count = t
+    let declared = t
         .count_at(count_field, 0)
-        .and_then(|count| usize::try_from(count).ok())
         .ok_or(FormatError::Truncated(FMT))?;
     let entries_start = offset
         .checked_add(t.count_len() as u64)
         .ok_or(FormatError::Truncated(FMT))?;
-    let entry_bytes = count
-        .checked_mul(t.entry_len())
+    // The declared table size is charged in the container's own width, before
+    // anything is narrowed to `usize`, so a 32-bit target refuses an oversized
+    // directory with the same error a 64-bit one gives rather than an
+    // incidental conversion failure.
+    let table_bytes = declared
+        .checked_mul(t.entry_len() as u64)
+        .and_then(|bytes| bytes.checked_add(t.offset_len() as u64))
         .ok_or(FormatError::Truncated(FMT))?;
-    let table_len = entry_bytes
-        .checked_add(t.offset_len())
-        .ok_or(FormatError::Truncated(FMT))?;
-    let end = entries_start
-        .checked_add(table_len as u64)
-        .ok_or(FormatError::Truncated(FMT))?;
-    let Some(budget) = state.budget.checked_sub(table_len as u64) else {
+    let Some(budget) = state.budget.checked_sub(table_bytes) else {
         return Err(invalid(
             "TIFF IFD chain exceeds the supported directory size",
         ));
     };
     state.budget = budget;
+    let end = entries_start
+        .checked_add(table_bytes)
+        .ok_or(FormatError::Truncated(FMT))?;
+    // The budget bounds the table at 64 MiB, so the count and every table
+    // offset below fit `usize` on every target this crate builds for.
+    let count = usize::try_from(declared).map_err(|_| FormatError::Truncated(FMT))?;
+    let entry_bytes = count * t.entry_len();
+    let table_len = entry_bytes + t.offset_len();
     if state.overlaps(offset, end) {
         return Err(invalid("overlapping TIFF IFD tables"));
     }
@@ -398,12 +407,22 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 /// Discovery is best-effort and total: a malformed IFD chain yields no packet
 /// rather than an error, so reading the optional remote-manifest declaration
 /// can never change how a well-formed asset validates.
+///
+/// Tag 700 is BYTE or UNDEFINED, so its value count is its byte length. Any
+/// other tag type is a packet this reader will not interpret, because
+/// [`value_span`] would then be reading an element count as a length.
 pub(crate) fn xmp_packet(data: &[u8]) -> Option<&[u8]> {
     let t = read_header(data).ok()?;
     for ifd in walk(data, t, false).ok()? {
         for index in 0..ifd.count {
             if ifd.tag(t, index) != crate::c2pa_formats::xmp::TIFF_XMP_TAG {
                 continue;
+            }
+            if !matches!(
+                t.u16_at(ifd.entry(t, index), 2),
+                Some(TYPE_BYTE | TYPE_UNDEFINED)
+            ) {
+                return None;
             }
             let (start, length) = value_span(data, t, &ifd, index)?;
             return data.get(start..start + length);
@@ -923,6 +942,33 @@ mod tests {
                 length: 8
             }]
         );
+    }
+
+    /// An XMP packet is a byte string: tag 700 is BYTE or UNDEFINED, and its
+    /// value count is then its byte length. Any other tag type counts elements
+    /// wider than a byte, so reading the count as a length would hand the XMP
+    /// parser the wrong span.
+    #[test]
+    fn reads_a_bigtiff_xmp_packet_only_when_it_is_byte_typed() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta>";
+        let little = true;
+        let build = |tag_type: u16| {
+            let row = big_entry(
+                little,
+                crate::c2pa_formats::xmp::TIFF_XMP_TAG,
+                tag_type,
+                packet.len() as u64,
+                big_offset(little, (16 + 8 + 20 + 8) as u64),
+            );
+            let mut asset = big_header(little, 16);
+            asset.extend_from_slice(&big_ifd(little, &[row], 0));
+            asset.extend_from_slice(packet);
+            asset
+        };
+        assert_eq!(xmp_packet(&build(TYPE_BYTE)).unwrap(), &packet[..]);
+        assert_eq!(xmp_packet(&build(TYPE_UNDEFINED)).unwrap(), &packet[..]);
+        // SHORT: the count would be elements, not bytes.
+        assert_eq!(xmp_packet(&build(3)), None);
     }
 
     /// C2PA 2.4 A.3.6 fixes the tag type at `UNDEFINED`. A differently typed
