@@ -3729,7 +3729,6 @@ fn verify_spec_version_metadata(
 }
 
 #[allow(clippy::too_many_arguments)] // internal structural gate; grouping obscures inputs
-#[allow(clippy::too_many_arguments)]
 fn verify_claim_structure(
     manifest: &ParsedManifest,
     store: StoreContext<'_>,
@@ -3770,8 +3769,9 @@ fn claim_structure_first_fatal(
     profile: EngineProfile,
     results: &mut ValidationResults,
 ) -> Option<String> {
-    // Returns false when a fatal structural defect (multiple claims / malformed
-    // claim) means the signature must not be reported as validated/trusted.
+    // Some(code of the first fatal status) when a structural defect (multiple
+    // claims, malformed claim, ambiguous binding) means the signature must not
+    // be reported as validated or trusted; None when the structure is sound.
     let mut fatal: Option<String> = None;
     // claim.multiple: more than one claim box in the manifest.
     if manifest.claim_count > 1 {
@@ -12018,16 +12018,14 @@ mod tests {
 
     /// The deferred-binding gate reports the status that closed it. The
     /// reference bound exits early without a `fatal` assignment, so it must
-    /// still name its own code.
+    /// still name its own code. The over-bound claim is otherwise complete,
+    /// so no earlier fatal status can stand in for the bound's own.
     #[test]
     fn first_fatal_names_the_gating_status_including_the_reference_bound_exit() {
-        let over_bound = vmap(vec![
-            ("instanceID", Value::Text("xmp:iid:test".into())),
-            (
-                "created_assertions",
-                Value::Array(vec![valid_hashed_uri(); MAX_CLAIM_ASSERTION_REFERENCES + 1]),
-            ),
-        ]);
+        let within_bound = complete_claim(vec![valid_hashed_uri()]);
+        assert_eq!(first_fatal(&within_bound, false), None);
+        let over_bound =
+            complete_claim(vec![valid_hashed_uri(); MAX_CLAIM_ASSERTION_REFERENCES + 1]);
         assert_eq!(
             first_fatal(&over_bound, false).as_deref(),
             Some(CLAIM_MALFORMED)
@@ -17386,6 +17384,53 @@ mod tests {
                 Some(CLAIM_SIGNATURE_OUTSIDE_VALIDITY),
                 "the validity failure under a strict profile"
             );
+        }
+
+        /// R-REFBOUND: a correctly signed claim whose only defect is an
+        /// assertion-reference count over the verifier bound closes the gate
+        /// with `claim.malformed`, and no identity result is returned. The
+        /// bound exits claim structure early, so the gate code comes only
+        /// from the bound's own fatal record.
+        #[test]
+        fn a_claim_over_the_reference_bound_closes_the_gate_with_claim_malformed() {
+            let data = data_hash();
+            let data_reference = local_reference("c2pa.hash.data", &data);
+            let fixture = Fixture::new(data_reference.clone());
+            let (action_label, action) = created_action();
+            let identity = fixture.cawg.identity.clone();
+            let signed_store = |repeats: usize| {
+                let mut references = vec![data_reference.clone(); repeats];
+                references.push(local_reference(action_label, &action));
+                references.push(local_reference("cawg.identity", &identity));
+                let claim = enc(&vmap(vec![
+                    ("instanceID", Value::Text("xmp:iid:deferred".into())),
+                    (
+                        "claim_generator_info",
+                        vmap(vec![("name", Value::Text("Encypher Fixture".into()))]),
+                    ),
+                    ("created_assertions", Value::Array(references)),
+                    ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+                ]));
+                let boxes = [
+                    assertion_box("c2pa.hash.data", &data, None),
+                    assertion_box(action_label, &action, None),
+                    assertion_box("cawg.identity", &identity, None),
+                ];
+                build_manifest_store(&[build_manifest(
+                    ACTIVE,
+                    &boxes,
+                    &claim,
+                    &fixture.signer.sign(&claim),
+                )])
+            };
+
+            let within = fixture.evaluate(&signed_store(1), false);
+            assert_eq!(within.gate_code, None);
+            assert!(identity_codes(&within).contains(&"cawg.identity.trusted"));
+
+            let over = fixture.evaluate(&signed_store(MAX_CLAIM_ASSERTION_REFERENCES), false);
+            assert_eq!(over.gate_code.as_deref(), Some(CLAIM_MALFORMED));
+            assert!(over.identity.is_none());
         }
     }
 }
