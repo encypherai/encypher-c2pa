@@ -16,8 +16,12 @@ use encypher_c2pa::{
 };
 
 fn vector(path: &str) -> Vec<u8> {
-    fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/vectors/cawg").join(path))
-        .unwrap_or_else(|error| panic!("{path}: {error}"))
+    fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/cawg")
+            .join(path),
+    )
+    .unwrap_or_else(|error| panic!("{path}: {error}"))
 }
 
 fn text(path: &str) -> String {
@@ -93,7 +97,10 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
         .expect("evaluation");
     let returned = codes(&evaluation);
 
-    assert!(returned.contains(&"cawg.identity.trusted".to_string()), "{returned:?}");
+    assert!(
+        returned.contains(&"cawg.identity.trusted".to_string()),
+        "{returned:?}"
+    );
     assert!(
         returned
             .iter()
@@ -102,11 +109,18 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
     );
 
     let full = verify_with_options(&asset, "image/jpeg", &es256_options()).expect("full verify");
-    let mut expected: Vec<String> = full.cawg_statuses().iter().map(|s| s.code.clone()).collect();
+    let mut expected: Vec<String> = full
+        .cawg_statuses()
+        .iter()
+        .map(|s| s.code.clone())
+        .collect();
     let mut actual = returned.clone();
     expected.sort();
     actual.sort();
-    assert_eq!(actual, expected, "same identity outcome as the full verifier");
+    assert_eq!(
+        actual, expected,
+        "same identity outcome as the full verifier"
+    );
 
     let CawgEvaluation::Evaluated {
         manifest_label,

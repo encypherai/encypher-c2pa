@@ -472,6 +472,25 @@ pub fn compress_manifest(manifest_superbox: &[u8]) -> Result<Vec<u8>, JumbfError
     ))
 }
 
+/// Wrap a standard manifest as a compressed manifest in the type-prefixed
+/// `brob` layout the Encypher signer writes: `jumb`, then the Brotli stream
+/// of the whole manifest superbox. Fixture generation only.
+#[cfg(test)]
+pub fn compress_manifest_type_prefixed(manifest_superbox: &[u8]) -> Result<Vec<u8>, JumbfError> {
+    let parsed = parse_superbox(manifest_superbox)?;
+    if !matches!(parsed.type_uuid, UUID_MANIFEST | UUID_LEGACY_MANIFEST) {
+        return Err(JumbfError::NotAManifestSuperbox);
+    }
+    let mut payload = TYPE_JUMB.to_vec();
+    payload.extend_from_slice(&brotli_compress(manifest_superbox));
+    Ok(superbox(
+        &UUID_COMPRESSED_MANIFEST,
+        &parsed.label,
+        &[box_bytes(TYPE_BROB, &payload)],
+        None,
+    ))
+}
+
 #[cfg(test)]
 fn compress_manifest_kind(manifest_superbox: &[u8]) -> Result<Vec<u8>, JumbfError> {
     let parsed = parse_superbox(manifest_superbox)?;
@@ -1944,14 +1963,7 @@ mod tests {
     #[test]
     fn type_prefixed_brob_payload_expands_with_its_stored_hash_domain() {
         let manifest = build_manifest("urn:c2pa:prefixed", &[], &[0xa0], &[0xd2, 0x84]);
-        let mut payload = TYPE_JUMB.to_vec();
-        payload.extend_from_slice(&brotli_compress(&manifest));
-        let compressed = superbox(
-            &UUID_COMPRESSED_MANIFEST,
-            "urn:c2pa:prefixed",
-            &[box_bytes(TYPE_BROB, &payload)],
-            None,
-        );
+        let compressed = compress_manifest_type_prefixed(&manifest).unwrap();
         let stored_content = superbox_content(&compressed).unwrap().to_vec();
         let store = build_manifest_store(&[compressed]);
 

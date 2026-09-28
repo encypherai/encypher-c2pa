@@ -3140,7 +3140,7 @@ fn verify_manifest_bound<'a>(
                 claim_refs.binding_plan(binding.compound_ok()).primary(),
                 &certificate_statuses.payloads,
             );
-            if let Some(capture) = capture.as_deref_mut() {
+            if let Some(capture) = capture {
                 capture.identity = Some(ValidationResults {
                     success: results.success[identity_start.0..].to_vec(),
                     informational: results.informational[identity_start.1..].to_vec(),
@@ -12028,7 +12028,10 @@ mod tests {
                 Value::Array(vec![valid_hashed_uri(); MAX_CLAIM_ASSERTION_REFERENCES + 1]),
             ),
         ]);
-        assert_eq!(first_fatal(&over_bound, false).as_deref(), Some(CLAIM_MALFORMED));
+        assert_eq!(
+            first_fatal(&over_bound, false).as_deref(),
+            Some(CLAIM_MALFORMED)
+        );
 
         let two_primaries = complete_claim(vec![
             hashed_uri_for_assertion("c2pa.hash.data"),
@@ -16894,5 +16897,495 @@ mod tests {
             EngineProfile::strict(SpecVersion::V2_4),
         )
         .has_failure(ASSERTION_EXTERNAL_REFERENCE_CREATED));
+    }
+
+    /// Deferred-binding identity evaluation over real, signed manifest
+    /// stores: which binding CAWG receives, how the host fixes `compound_ok`,
+    /// what the gate reports when it closes, and what never leaks into the
+    /// identity slice.
+    mod caller_verified_binding {
+        use super::super::signature_conformance_tests::Signer;
+        use super::*;
+        use crate::c2pa_core::jumbf::{
+            assertion_box, compress_manifest_type_prefixed, parse_superbox, UUID_UPDATE_MANIFEST,
+        };
+
+        const ACTIVE: &str = "urn:c2pa:deferred-active";
+        const PARENT: &str = "urn:c2pa:deferred-parent";
+
+        /// A claim-signing identity and a trusted, time-stamped CAWG identity
+        /// valid at [`validation_time`].
+        struct Fixture {
+            signer: Signer,
+            claim_trust: TrustList,
+            cawg: cawg::tests::online_ocsp::StoreWideStatusFixture,
+        }
+
+        impl Fixture {
+            /// `binding` is the hashed URI the identity signs as its hard
+            /// binding.
+            fn new(binding: Value) -> Self {
+                let signer = Signer::conformant();
+                let chain = extract_x5chain(&signer.sign(b"probe")).expect("claim x5chain");
+                let claim_trust = TrustList::from_certificates(
+                    crate::c2pa_trust::AnchorPurpose::ClaimSigning,
+                    [chain.last().expect("claim root").clone()],
+                );
+                let cawg = cawg::tests::online_ocsp::store_wide_revoked_ca_fixture(binding);
+                Self {
+                    signer,
+                    claim_trust,
+                    cawg,
+                }
+            }
+
+            fn evaluate_at(
+                &self,
+                store: &[u8],
+                host_less: bool,
+                profile: EngineProfile,
+                validation_time: OffsetDateTime,
+            ) -> DeferredIdentityOutput {
+                let input = VerifyInput {
+                    data: &[],
+                    mime: "",
+                    claim_signer_trust: Some(&self.claim_trust),
+                    tsa_trust: Some(&self.cawg.tsa_trust),
+                    allowed_certs: None,
+                    validation_time: Some(validation_time),
+                    profile,
+                    evidence: Default::default(),
+                    cawg_strict_encoding: false,
+                };
+                verify_identity_with_caller_verified_binding(
+                    store,
+                    host_less,
+                    &input,
+                    CawgTrustInputs {
+                        trust: Some(&self.cawg.cawg_trust),
+                        allowed_certs: None,
+                        document_signing_require_anchor: true,
+                        did_documents: None,
+                        ica_trusted_issuers: None,
+                        ica_trust_anchors: None,
+                        ica_status_lists: None,
+                    },
+                )
+                .expect("store parses")
+            }
+
+            fn evaluate(&self, store: &[u8], host_less: bool) -> DeferredIdentityOutput {
+                self.evaluate_at(store, host_less, EngineProfile::GENEROUS, validation_time())
+            }
+
+            /// A signed manifest whose claim declares `assertions` in
+            /// `created_assertions` and `gathered` in `gathered_assertions`.
+            fn manifest(
+                &self,
+                label: &str,
+                assertions: &[(&str, Vec<u8>)],
+                gathered: &[(&str, Vec<u8>)],
+            ) -> Vec<u8> {
+                let claim = claim_over(assertions, gathered, true);
+                let boxes: Vec<Vec<u8>> = assertions
+                    .iter()
+                    .chain(gathered)
+                    .map(|(name, payload)| assertion_box(name, payload, None))
+                    .collect();
+                build_manifest(label, &boxes, &claim, &self.signer.sign(&claim))
+            }
+        }
+
+        fn validation_time() -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp(1_811_808_000).expect("2027-06-01 UTC")
+        }
+
+        /// The claim's hashed URI for an assertion stored in its own manifest.
+        fn local_reference(label: &str, payload: &[u8]) -> Value {
+            let stored = assertion_box(label, payload, None);
+            vmap(vec![
+                (
+                    "url",
+                    Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                ),
+                ("alg", Value::Text("sha256".into())),
+                (
+                    "hash",
+                    Value::Bytes(sha(superbox_content(&stored).expect("assertion content"))),
+                ),
+            ])
+        }
+
+        fn claim_over(
+            assertions: &[(&str, Vec<u8>)],
+            gathered: &[(&str, Vec<u8>)],
+            local_signature: bool,
+        ) -> Vec<u8> {
+            let references = |items: &[(&str, Vec<u8>)]| {
+                Value::Array(
+                    items
+                        .iter()
+                        .map(|(name, payload)| local_reference(name, payload))
+                        .collect(),
+                )
+            };
+            let mut fields = vec![
+                ("instanceID", Value::Text("xmp:iid:deferred".into())),
+                (
+                    "claim_generator_info",
+                    vmap(vec![("name", Value::Text("Encypher Fixture".into()))]),
+                ),
+                ("created_assertions", references(assertions)),
+            ];
+            if !gathered.is_empty() {
+                fields.push(("gathered_assertions", references(gathered)));
+            }
+            if local_signature {
+                fields.push(("signature", Value::Text("self#jumbf=c2pa.signature".into())));
+            }
+            enc(&vmap(fields))
+        }
+
+        fn data_hash() -> Vec<u8> {
+            enc(&vmap(vec![
+                ("exclusions", Value::Array(Vec::new())),
+                ("alg", Value::Text("sha256".into())),
+                ("hash", Value::Bytes(sha(b"the host asset"))),
+            ]))
+        }
+
+        fn compound_content() -> Vec<u8> {
+            enc(&vmap(vec![("components", Value::Array(Vec::new()))]))
+        }
+
+        fn created_action() -> (&'static str, Vec<u8>) {
+            (
+                "c2pa.actions.v2",
+                enc(&vmap(vec![(
+                    "actions",
+                    Value::Array(vec![vmap(vec![
+                        ("action", Value::Text("c2pa.created".into())),
+                        (
+                            "digitalSourceType",
+                            Value::Text(
+                                "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture"
+                                    .into(),
+                            ),
+                        ),
+                    ])]),
+                )])),
+            )
+        }
+
+        /// A v3 ingredient naming `stored` (the manifest as the store holds
+        /// it) and the signature box of `plain` (the same manifest expanded).
+        fn ingredient(relationship: &str, label: &str, stored: &[u8], plain: &[u8]) -> Vec<u8> {
+            let reference = |url: String, hashed: &[u8]| {
+                vmap(vec![
+                    ("url", Value::Text(url)),
+                    ("alg", Value::Text("sha256".into())),
+                    ("hash", Value::Bytes(sha(hashed))),
+                ])
+            };
+            let children = parse_superbox(plain).expect("manifest superbox").content;
+            let (_, signature_box) = children.last().expect("signature box");
+            enc(&vmap(vec![
+                ("relationship", Value::Text(relationship.into())),
+                (
+                    "activeManifest",
+                    reference(
+                        format!("self#jumbf=/c2pa/{label}"),
+                        superbox_content(stored).expect("manifest"),
+                    ),
+                ),
+                (
+                    "claimSignature",
+                    reference(
+                        format!("self#jumbf=/c2pa/{label}/c2pa.signature"),
+                        signature_box,
+                    ),
+                ),
+            ]))
+        }
+
+        fn as_update_manifest(standard: &[u8]) -> Vec<u8> {
+            let parsed = parse_superbox(standard).expect("manifest superbox");
+            let children: Vec<Vec<u8>> = parsed
+                .content
+                .iter()
+                .map(|(kind, payload)| {
+                    let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+                    bytes.extend_from_slice(kind);
+                    bytes.extend_from_slice(payload);
+                    bytes
+                })
+                .collect();
+            superbox(&UUID_UPDATE_MANIFEST, &parsed.label, &children, None)
+        }
+
+        fn identity_codes(output: &DeferredIdentityOutput) -> Vec<&str> {
+            let identity = output
+                .identity
+                .as_ref()
+                .unwrap_or_else(|| panic!("gate closed: {:?}", output.gate_code));
+            identity
+                .success
+                .iter()
+                .chain(&identity.informational)
+                .chain(&identity.failure)
+                .map(|status| status.code.as_str())
+                .collect()
+        }
+
+        /// The host decides whether `c2pa.compound.content` is a primary
+        /// binding. On a host carrier a data hash beside it is the one
+        /// primary binding, and the identity bound to it is trusted. Host-less,
+        /// the same claim has two primary bindings, which is fatal, so the
+        /// identity is withheld and the gate names the fatal status.
+        #[test]
+        fn the_host_decides_whether_compound_content_is_a_primary_binding() {
+            let data = data_hash();
+            let fixture = Fixture::new(local_reference("c2pa.hash.data", &data));
+            let store = build_manifest_store(&[fixture.manifest(
+                ACTIVE,
+                &[
+                    ("c2pa.hash.data", data),
+                    ("c2pa.compound.content", compound_content()),
+                    created_action(),
+                    ("cawg.identity", fixture.cawg.identity.clone()),
+                ],
+                &[],
+            )]);
+
+            let asset = fixture.evaluate(&store, false);
+            assert_eq!(asset.gate_code, None);
+            assert!(
+                identity_codes(&asset).contains(&"cawg.identity.trusted"),
+                "{:?}",
+                identity_codes(&asset)
+            );
+
+            let host_less = fixture.evaluate(&store, true);
+            assert_eq!(
+                host_less.gate_code.as_deref(),
+                Some(ASSERTION_MULTIPLE_HARD_BINDINGS)
+            );
+            assert!(host_less.identity.is_none());
+        }
+
+        /// A host-less store whose only binding is `c2pa.compound.content`
+        /// passes the gate, and the identity bound to that compound binding
+        /// is judged by the identity step: CAWG names no such binding.
+        #[test]
+        fn a_compound_only_host_less_identity_is_evaluated_without_a_hard_binding() {
+            let compound = compound_content();
+            let fixture = Fixture::new(local_reference("c2pa.compound.content", &compound));
+            let store = build_manifest_store(&[fixture.manifest(
+                ACTIVE,
+                &[
+                    ("c2pa.compound.content", compound),
+                    created_action(),
+                    ("cawg.identity", fixture.cawg.identity.clone()),
+                ],
+                &[],
+            )]);
+
+            let output = fixture.evaluate(&store, true);
+            assert_eq!(output.gate_code, None);
+            let codes = identity_codes(&output);
+            assert!(
+                codes.contains(&cawg::CAWG_IDENTITY_HARD_BINDING_MISSING),
+                "{codes:?}"
+            );
+            assert!(!codes.contains(&"cawg.identity.trusted"), "{codes:?}");
+        }
+
+        /// An identity in an update manifest is bound to the hard binding of
+        /// the standard manifest its parentOf ingredient reaches.
+        #[test]
+        fn an_update_manifest_identity_uses_the_inherited_hard_binding() {
+            let data = data_hash();
+            let parent_binding = local_reference("c2pa.hash.data", &data);
+            let Value::Map(mut fields) = parent_binding.clone() else {
+                unreachable!("hashed URI is a map");
+            };
+            fields[0].1 = Value::Text(format!(
+                "self#jumbf=/c2pa/{PARENT}/c2pa.assertions/c2pa.hash.data"
+            ));
+            let fixture = Fixture::new(Value::Map(fields));
+            let parent =
+                fixture.manifest(PARENT, &[("c2pa.hash.data", data), created_action()], &[]);
+            let update = as_update_manifest(&fixture.manifest(
+                ACTIVE,
+                &[
+                    (
+                        "c2pa.ingredient.v3",
+                        ingredient("parentOf", PARENT, &parent, &parent),
+                    ),
+                    ("cawg.identity", fixture.cawg.identity.clone()),
+                ],
+                &[],
+            ));
+            let store = build_manifest_store(&[parent, update]);
+
+            let output = fixture.evaluate(&store, false);
+            assert_eq!(output.gate_code, None);
+            let codes = identity_codes(&output);
+            assert!(codes.contains(&"cawg.identity.trusted"), "{codes:?}");
+            assert!(
+                !codes.contains(&cawg::CAWG_IDENTITY_HARD_BINDING_MISSING),
+                "{codes:?}"
+            );
+        }
+
+        /// A compressed ingredient manifest in either `brob` layout expands,
+        /// the identity is evaluated, and the store digest the caller compares
+        /// is the SHA-256 of the expanded manifest, whatever the layout.
+        #[test]
+        fn a_compressed_ingredient_in_either_brob_layout_yields_its_expanded_digest() {
+            let data = data_hash();
+            let fixture = Fixture::new(local_reference("c2pa.hash.data", &data));
+            let parent = fixture.manifest(
+                PARENT,
+                &[("c2pa.hash.data", data_hash()), created_action()],
+                &[],
+            );
+            let expanded_digest: [u8; 32] =
+                Sha256::digest(superbox_content(&parent).expect("manifest")).into();
+            for compressed in [
+                compress_manifest(&parent).expect("literal layout"),
+                compress_manifest_type_prefixed(&parent).expect("prefixed layout"),
+            ] {
+                let active = fixture.manifest(
+                    ACTIVE,
+                    &[
+                        ("c2pa.hash.data", data.clone()),
+                        created_action(),
+                        (
+                            "c2pa.ingredient.v3",
+                            ingredient("componentOf", PARENT, &compressed, &parent),
+                        ),
+                        ("cawg.identity", fixture.cawg.identity.clone()),
+                    ],
+                    &[],
+                );
+                let store = build_manifest_store(&[compressed, active.clone()]);
+
+                let output = fixture.evaluate(&store, false);
+                assert_eq!(output.gate_code, None);
+                assert!(identity_codes(&output).contains(&"cawg.identity.trusted"));
+                let active_digest: [u8; 32] =
+                    Sha256::digest(superbox_content(&active).expect("manifest")).into();
+                assert_eq!(
+                    output.store_manifest_sha256,
+                    vec![
+                        (PARENT.to_string(), expanded_digest),
+                        (ACTIVE.to_string(), active_digest),
+                    ]
+                );
+            }
+        }
+
+        /// Offline, an unread `c2pa.cloud-data` assertion is an
+        /// `assertion.inaccessible` failure outside claim structure. It
+        /// neither closes the gate nor enters the identity slice: the
+        /// caller's engine reports external data itself.
+        #[test]
+        fn offline_cloud_data_neither_gates_nor_is_returned() {
+            let data = data_hash();
+            let fixture = Fixture::new(local_reference("c2pa.hash.data", &data));
+            let store = build_manifest_store(&[fixture.manifest(
+                ACTIVE,
+                &[
+                    ("c2pa.hash.data", data),
+                    created_action(),
+                    ("cawg.identity", fixture.cawg.identity.clone()),
+                ],
+                &[("c2pa.cloud-data", enc(&cloud_data("c2pa.metadata")))],
+            )]);
+
+            let output = fixture.evaluate(&store, false);
+            assert_eq!(output.gate_code, None);
+            let codes = identity_codes(&output);
+            assert!(codes.contains(&"cawg.identity.trusted"), "{codes:?}");
+            assert!(!codes.contains(&ASSERTION_INACCESSIBLE), "{codes:?}");
+        }
+
+        /// When the gate closes, the reported status follows the documented
+        /// precedence: an early return beats an earlier fatal status, a fatal
+        /// structure status beats the signature block, the signature block's
+        /// first failure beats the validity failure, and the validity failure
+        /// is reported last.
+        #[test]
+        fn a_closed_gate_reports_the_status_the_precedence_selects() {
+            let data = data_hash();
+            let fixture = Fixture::new(local_reference("c2pa.hash.data", &data));
+            // Declaring the same assertion twice is a fatal `claim.malformed`.
+            let duplicated = [
+                ("c2pa.hash.data", data.clone()),
+                ("c2pa.hash.data", data.clone()),
+            ];
+            let boxes = [assertion_box("c2pa.hash.data", &data, None)];
+            let gate = |manifest: Vec<u8>, profile: EngineProfile, at: OffsetDateTime| {
+                fixture
+                    .evaluate_at(&build_manifest_store(&[manifest]), false, profile, at)
+                    .gate_code
+            };
+            let generous = EngineProfile::GENEROUS;
+
+            let unsigned_reference = claim_over(&duplicated, &[], false);
+            assert_eq!(
+                gate(
+                    build_manifest(
+                        ACTIVE,
+                        &boxes,
+                        &unsigned_reference,
+                        &fixture.signer.sign(&unsigned_reference),
+                    ),
+                    generous,
+                    validation_time(),
+                )
+                .as_deref(),
+                Some(CLAIM_SIGNATURE_MISSING),
+                "an early return wins over the earlier claim.malformed"
+            );
+
+            let malformed = claim_over(&duplicated, &[], true);
+            assert_eq!(
+                gate(
+                    build_manifest(ACTIVE, &boxes, &malformed, &[0xd2, 0x84]),
+                    generous,
+                    validation_time(),
+                )
+                .as_deref(),
+                Some(CLAIM_MALFORMED),
+                "the fatal structure status wins over the signature block"
+            );
+
+            let sound = claim_over(&[("c2pa.hash.data", data.clone())], &[], true);
+            assert_eq!(
+                gate(
+                    build_manifest(ACTIVE, &boxes, &sound, &[0xd2, 0x84]),
+                    generous,
+                    validation_time(),
+                )
+                .as_deref(),
+                Some(SIGNING_CREDENTIAL_INVALID),
+                "the signature block's first failure"
+            );
+
+            let after_expiry =
+                OffsetDateTime::from_unix_timestamp(1_924_992_000).expect("2031-01-01 UTC");
+            assert_eq!(
+                gate(
+                    build_manifest(ACTIVE, &boxes, &sound, &fixture.signer.sign(&sound)),
+                    EngineProfile::strict(SpecVersion::V2_4),
+                    after_expiry,
+                )
+                .as_deref(),
+                Some(CLAIM_SIGNATURE_OUTSIDE_VALIDITY),
+                "the validity failure under a strict profile"
+            );
+        }
     }
 }

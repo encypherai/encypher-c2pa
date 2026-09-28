@@ -73,10 +73,10 @@ pub use stream::{
     verify_stream, verify_stream_with_options, SegmentReport, StreamEncapsulation, StreamMethod,
     StreamVerificationReport,
 };
-mod telemetry;
-mod telemetry_consent;
 #[cfg(feature = "caller-verified-binding")]
 mod caller_verified_binding;
+mod telemetry;
+mod telemetry_consent;
 #[cfg(feature = "caller-verified-binding")]
 pub use caller_verified_binding::{CawgEvaluation, CawgEvaluator, CawgProfile, CawgStoreHost};
 pub use config_dir::config_directory;
