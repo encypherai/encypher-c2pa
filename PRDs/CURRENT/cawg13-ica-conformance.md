@@ -1,6 +1,6 @@
 # CAWG Identity 1.3 ICA Conformance Closure
 
-**Status:** gate cycle 2
+**Status:** combined plan and completion gate cleared at cycle 2 on `284ff58` (correctness/simplification/security: 10/10/10 and 9.6/9.6/9.7)
 **Current Goal:** close the listed CAWG Identity 1.3 ICA rows in the public verifier: each rule in the closed list below is checked by `cawg_ica.rs` and defended by a test that fails when the rule is dropped. Full W3C VC 1.1/2.0 data-model conformance (CAWG-ID13-ICA-TECH-A-004) is not claimed here; it is the stacked follow-up TEAM_467.
 
 ## Overview
