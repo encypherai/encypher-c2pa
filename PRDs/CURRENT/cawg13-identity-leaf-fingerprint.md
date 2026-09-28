@@ -1,10 +1,12 @@
 # CAWG Identity Leaf Fingerprint
 
 **Date:** 2026-09-28
-**Status:** PLAN GATE CLEARED - CYCLE 2 (`0c52b73`; astra6 9.5/10/10, opus55 9.5/9.5/9.5)
+**Status:** COMPLETE - PLAN AND COMPLETION GATES CLEARED
 **Owner:** PublicLeafFingerprint
 **Base:** `feat/cawg13-x509-conformance` at `3596a547f`
 **Dependency:** TEAM_466 / PR #30 (`feat/cawg-identity-subject-details` at `d5dd24e`)
+**Plan gate:** Cycle 2 cleared on `0c52b73`: astra6 9.5/10/10; opus55 9.5/9.5/9.5.
+**Completion gate:** Cleared on `36fbb963`: astra6 10/9.5/10; opus55 9.5/9.5/9.5. Low-only follow-ups preserve behavior.
 
 ## Problem
 

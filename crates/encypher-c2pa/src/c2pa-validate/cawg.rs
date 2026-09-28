@@ -604,7 +604,7 @@ fn verify_identity_assertion(
                     url,
                     revocation_status,
                     false,
-                    credential_sha256.as_deref(),
+                    credential_sha256,
                     reason,
                 );
             } else {
@@ -619,7 +619,7 @@ fn verify_identity_assertion(
                             "chain_trusted": false,
                             "revocation_status": revocation_status.as_str(),
                         }),
-                        credential_sha256.as_deref(),
+                        credential_sha256,
                     ),
                 );
             }
@@ -680,7 +680,7 @@ fn verify_identity_assertion(
                     url,
                     revocation_status,
                     false,
-                    credential_sha256.as_deref(),
+                    credential_sha256,
                     "ca_revoked",
                 );
                 return;
@@ -694,7 +694,7 @@ fn verify_identity_assertion(
                 terminal_identity_details(
                     parsed_leaf.as_ref(),
                     false,
-                    credential_sha256.as_deref(),
+                    credential_sha256,
                     json!({
                         "trust_source": "none",
                         "accepted_eku": accepted_eku,
@@ -738,7 +738,7 @@ fn verify_identity_assertion(
             url,
             revocation_status,
             trust.anchor_fingerprint.is_some(),
-            credential_sha256.as_deref(),
+            credential_sha256,
             "ca_revoked",
         );
         return;
@@ -756,7 +756,7 @@ fn verify_identity_assertion(
                 url,
                 IdentityRevocationStatus::CaRevoked,
                 trust.anchor_fingerprint.is_some(),
-                credential_sha256.as_deref(),
+                credential_sha256,
                 "ca_revoked",
             );
             return;
@@ -768,14 +768,9 @@ fn verify_identity_assertion(
             "anchor_fingerprint": trust.anchor_fingerprint,
         });
         let details = if chain_trusted {
-            terminal_identity_details(
-                parsed_leaf.as_ref(),
-                true,
-                credential_sha256.as_deref(),
-                details,
-            )
+            terminal_identity_details(parsed_leaf.as_ref(), true, credential_sha256, details)
         } else {
-            with_credential_sha256(details, credential_sha256.as_deref())
+            with_credential_sha256(details, credential_sha256)
         };
         ctx.results.push_failure_with_details(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
@@ -802,7 +797,7 @@ fn verify_identity_assertion(
             url,
             IdentityRevocationStatus::CaRevoked,
             trust.anchor_fingerprint.is_some(),
-            credential_sha256.as_deref(),
+            credential_sha256,
             "ca_revoked",
         );
         return;
@@ -891,14 +886,9 @@ fn verify_identity_assertion(
             "anchor_fingerprint": trust.anchor_fingerprint,
         });
         let details = if chain_trusted {
-            terminal_identity_details(
-                parsed_leaf.as_ref(),
-                true,
-                credential_sha256.as_deref(),
-                details,
-            )
+            terminal_identity_details(parsed_leaf.as_ref(), true, credential_sha256, details)
         } else {
-            with_credential_sha256(details, credential_sha256.as_deref())
+            with_credential_sha256(details, credential_sha256)
         };
         ctx.results.push_failure_with_details(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
@@ -916,7 +906,7 @@ fn verify_identity_assertion(
         terminal_identity_details(
             parsed_leaf.as_ref(),
             true,
-            credential_sha256.as_deref(),
+            credential_sha256,
             json!({
                 "trust_source": trust.source,
                 "accepted_eku": trust.accepted_eku,
@@ -931,6 +921,9 @@ fn verify_identity_assertion(
     );
 }
 
+/// Digest eligibility is exactly the retained result of decoding the selected
+/// leaf as X.509. Terminal callers pass that same parsed certificate onward for
+/// subject extraction, so no later decode can disagree about field presence.
 fn leaf_credential_sha256(
     leaf: &[u8],
     certificate: Option<&x509_cert::Certificate>,
@@ -949,7 +942,7 @@ fn leaf_credential_sha256(
 fn terminal_identity_details(
     certificate: Option<&x509_cert::Certificate>,
     certificate_trusted: bool,
-    credential_sha256: Option<&str>,
+    credential_sha256: Option<String>,
     details: serde_json::Value,
 ) -> serde_json::Value {
     let mut details = with_credential_sha256(details, credential_sha256);
@@ -986,12 +979,12 @@ fn terminal_identity_details(
 
 fn with_credential_sha256(
     mut details: serde_json::Value,
-    credential_sha256: Option<&str>,
+    credential_sha256: Option<String>,
 ) -> serde_json::Value {
     if let (Some(object), Some(credential_sha256)) = (details.as_object_mut(), credential_sha256) {
         object.insert(
             "credential_sha256".into(),
-            serde_json::Value::String(credential_sha256.to_owned()),
+            serde_json::Value::String(credential_sha256),
         );
     }
     details
@@ -1481,7 +1474,7 @@ fn report_identity_ca_revoked(
     url: &str,
     revocation_status: IdentityRevocationStatus,
     chain_trusted: bool,
-    credential_sha256: Option<&str>,
+    credential_sha256: Option<String>,
     reason: &str,
 ) {
     debug_assert!(revocation_status.ca_revoked());
@@ -7015,6 +7008,47 @@ pub(crate) mod tests {
             assert!(details.get("subject_organization").is_none());
             assert!(details.get("subject_common_name").is_none());
             assert!(details.get("certificate_trusted").is_none());
+        }
+
+        #[test]
+        fn online_anchorless_document_signing_revocation_stays_unattributed() {
+            let chain = ocsp_chain_with_leaf_eku(ExtendedKeyUsagePurpose::Other(
+                OID_KP_DOCUMENT_SIGNING
+                    .split('.')
+                    .map(|part| part.parse::<u64>().expect("OID component"))
+                    .collect(),
+            ));
+            let responses =
+                HashMap::from([leaf_response(&chain, FixtureStatus::RevokedAt(REVOKED_AT))]);
+            let results = identity_verdict_full(
+                &identity_assertion(&chain),
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                None,
+                None,
+                false,
+                None,
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                None,
+                OnlineEvidence {
+                    ocsp_responses: Some(&responses),
+                    ..OnlineEvidence::default()
+                },
+            );
+
+            assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            let details = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_IDENTITY_CREDENTIAL_REVOKED)
+                .and_then(|status| status.details.as_ref())
+                .expect("online document-signing revocation details");
+            assert_eq!(details["chain_trusted"], false);
+            assert_eq!(details["trust_source"], "document_signing");
+            assert!(details["anchor_fingerprint"].is_null());
+            assert_credential_digest_without_subject(details, &chain.leaf_der);
         }
 
         /// Chain validity precedes revocation even when direct allow-list or
