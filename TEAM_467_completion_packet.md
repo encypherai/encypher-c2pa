@@ -40,7 +40,7 @@ Behavior, per PRD row:
 | Private Adobe smoke (`adobe-cai-prod-ica-es-266-1236.jpg`, `--time 2026-08-05T00:00:00Z`, pinned Adobe DID doc) | JSON report byte-identical to the base-code report (`cmp` equal). CAWG codes before and after are the same pre-existing trio: `invalid_did_document`, `signer_payload.mismatch`, and `untrusted_issuer` |
 | Mutation check (`/tmp/vc467/mutate.sh`) | 7 of 7 mutations caught: no body walk, no unsupported-context rule, no provider exception, no V-22, no leap rule, untrimmed validation fraction, zoneless read as UTC |
 | Real-credential inventory (`/tmp/vc467/ica_inventory.json`, script `/tmp/vc467/extract_ica_inventory.py`) | 24 credentials: 0 unpinned/inline contexts, 0 keyword or IRI keys, 1 repeated description (the Adobe provider pair, admitted by the exception) |
-| PR #31 CI | previous packet head `4ad68a98` had 7/7 green checks; cycle-1 head pending at packet update time |
+| PR #31 CI | all 7 checks green on cycle-1 head `13532ed`, run [36369702922](https://github.com/encypherai/encypher-c2pa/actions/runs/36369702922): Rust core/CLI, Rust 1.88, Browser WASM, public API, Go, Python wheel, and musllinux |
 
 ## Coverage claim for CAWG-ID13-ICA-TECH-A-004
 
