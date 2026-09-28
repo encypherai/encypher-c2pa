@@ -1580,6 +1580,44 @@ mod tests {
         }
     }
 
+    /// CAWG-ID13-X509-VALIDATING-A-062: the `responses` array is searched for
+    /// a qualifying `SingleResponse`; an unrelated first entry does not make
+    /// the signed OCSP response unusable.
+    #[test]
+    fn a_matching_later_single_response_is_not_rejected() {
+        let (issuer, issuer_key) = make_ca("Test Issuer");
+        let issuer_der = issuer.der().as_ref().to_vec();
+        let (responder, responder_key) = make_responder(&issuer, &issuer_key, true);
+        let responder_der = responder.der().as_ref().to_vec();
+
+        let single = |mutation| {
+            let mut body = cert_id(&issuer_der, &responder_der, mutation);
+            body.extend(tlv(0x80, &[]));
+            body.extend(tlv(0x18, b"20260101000000Z"));
+            body.extend(tlv(0xa0, &tlv(0x18, b"20270101000000Z")));
+            tlv(0x30, &body)
+        };
+        let responses = tlv(
+            0x30,
+            &[
+                single(CertIdMutation::Serial),
+                single(CertIdMutation::None),
+            ]
+            .concat(),
+        );
+        let mut response_data = responder_id(&responder_der, true);
+        response_data.extend(tlv(0x18, b"20260101000000Z"));
+        response_data.extend(responses);
+        let tbs = tlv(0x30, &response_data);
+        let signature = sign_p256(&responder_key, &tbs);
+        let response = assemble(&tbs, &signature, Some(&responder_der));
+
+        assert_eq!(
+            evaluate_verified(&response, &issuer_der, &responder_der, AT),
+            Some(OcspStatus::Good)
+        );
+    }
+
     #[test]
     fn verified_rejects_non_basic_ocsp_response_type() {
         let (issuer, issuer_key) = make_ca("Test Issuer");
