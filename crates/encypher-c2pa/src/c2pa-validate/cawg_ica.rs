@@ -579,7 +579,7 @@ fn verified_identity_defect(value: &Json) -> Option<&'static str> {
     let Some(identity_type) = identity
         .get("type")
         .and_then(Json::as_str)
-        .filter(|v| !v.is_empty())
+        .filter(|v| is_label(v))
     else {
         return Some("type");
     };
@@ -599,7 +599,7 @@ fn verified_identity_defect(value: &Json) -> Option<&'static str> {
     }
     if provider
         .get("id")
-        .is_some_and(|id| id.as_str().is_none_or(|id| !has_uri_scheme(id)))
+        .is_some_and(|id| id.as_str().is_none_or(|id| !is_uri(id)))
     {
         return Some("provider.id");
     }
@@ -612,12 +612,18 @@ fn verified_identity_defect(value: &Json) -> Option<&'static str> {
         }
     }
     if identity
+        .get("method")
+        .and_then(Json::as_str)
+        .is_some_and(|method| !is_label(method))
+    {
+        return Some("method");
+    }
+    if identity
         .get("uri")
-        .is_some_and(|value| value.as_str().is_none_or(|uri| !has_uri_scheme(uri)))
+        .is_some_and(|value| value.as_str().is_none_or(|uri| !is_uri(uri)))
     {
         return Some("uri");
     }
-    // Every present field is now a valid string, so presence is enough.
     let required = match identity_type {
         "cawg.document_verification" => "name",
         "cawg.web_site" => "uri",
@@ -625,7 +631,30 @@ fn verified_identity_defect(value: &Json) -> Option<&'static str> {
         "cawg.crypto_wallet" => "address",
         _ => return None,
     };
-    (!identity.contains_key(required)).then_some(required)
+    let Some(value) = identity.get(required).and_then(Json::as_str) else {
+        return Some(required);
+    };
+    // A wallet address "MUST be the unique alphanumeric string" for the
+    // service. The social-media username carries the same words, but
+    // production aggregators put display names such as "Eric Scouten" there,
+    // so it keeps only the non-empty-string rule as an interop decision.
+    (identity_type == "cawg.crypto_wallet" && !value.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some("address")
+}
+
+/// CAWG Identity 1.3 labels ABNF: two or more period-separated components,
+/// each `1( DIGIT / ALPHA ) *( DIGIT / ALPHA / "-" / "_" )`.
+fn is_label(text: &str) -> bool {
+    text.contains('.')
+        && text.split('.').all(|component| {
+            component
+                .bytes()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphanumeric())
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
 }
 
 fn natural_language_string(value: Option<&Json>) -> bool {
@@ -641,17 +670,96 @@ fn natural_language_string(value: Option<&Json>) -> bool {
     }
 }
 
-fn has_uri_scheme(text: &str) -> bool {
-    let Some((scheme, _)) = text.split_once(':') else {
+/// RFC 3986 section 3 `URI`: `scheme ":" hier-part [ "?" query ] [ "#"
+/// fragment ]`, ASCII only.
+fn is_uri(text: &str) -> bool {
+    let Some((scheme, rest)) = text.split_once(':') else {
         return false;
     };
-    let mut chars = scheme.chars();
-    chars
+    let mut scheme = scheme.bytes();
+    if !scheme
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic())
-        && chars.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-        })
+        || !scheme.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (hier_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let pchar = |byte: u8| matches!(byte, b':' | b'@');
+    let query_char = |byte: u8| matches!(byte, b':' | b'@' | b'/' | b'?');
+    if !uri_component(query, query_char) || !uri_component(fragment, query_char) {
+        return false;
+    }
+    let path_char = |byte: u8| pchar(byte) || byte == b'/';
+    match hier_part.strip_prefix("//") {
+        Some(after) => {
+            let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
+            is_uri_authority(authority) && uri_component(path, path_char)
+        }
+        None => uri_component(hier_part, path_char),
+    }
+}
+
+/// RFC 3986 `authority`: `[ userinfo "@" ] host [ ":" port ]`.
+fn is_uri_authority(authority: &str) -> bool {
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    if userinfo.is_some_and(|userinfo| !uri_component(userinfo, |byte| byte == b':')) {
+        return false;
+    }
+    let (host_ok, port) = match host_port.strip_prefix('[') {
+        Some(literal) => {
+            let Some((address, port)) = literal.split_once(']') else {
+                return false;
+            };
+            (is_ip_literal(address), port)
+        }
+        None => {
+            let (host, port) = host_port.split_at(host_port.find(':').unwrap_or(host_port.len()));
+            (uri_component(host, |_| false), port)
+        }
+    };
+    host_ok
+        && (port.is_empty()
+            || port
+                .strip_prefix(':')
+                .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_digit())))
+}
+
+/// RFC 3986 `IP-literal` contents: an IPv6 address or `IPvFuture`.
+fn is_ip_literal(address: &str) -> bool {
+    match address.strip_prefix(['v', 'V']) {
+        Some(future) => future.split_once('.').is_some_and(|(version, rest)| {
+            !version.is_empty()
+                && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&byte))
+        }),
+        None => address.parse::<std::net::Ipv6Addr>().is_ok(),
+    }
+}
+
+/// Every byte of `text` is unreserved, a sub-delimiter, a valid
+/// percent-encoding, or accepted by `extra`.
+fn uri_component(text: &str, extra: impl Fn(u8) -> bool) -> bool {
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        let valid = if byte == b'%' {
+            bytes.next().is_some_and(|hex| hex.is_ascii_hexdigit())
+                && bytes.next().is_some_and(|hex| hex.is_ascii_hexdigit())
+        } else {
+            byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte) || extra(byte)
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 
 struct IssuerFailure {
@@ -1894,7 +2002,10 @@ mod tests {
     fn credential_type_must_contain_both_ica_types() {
         let cases: [(&str, Option<Json>); 3] = [
             ("type missing", None),
-            ("only VerifiableCredential", Some(json!(["VerifiableCredential"]))),
+            (
+                "only VerifiableCredential",
+                Some(json!(["VerifiableCredential"])),
+            ),
             (
                 "only IdentityClaimsAggregationCredential",
                 Some(json!(["IdentityClaimsAggregationCredential"])),
@@ -2014,8 +2125,14 @@ mod tests {
                 set("type", json!("cawg.document_verification")),
             ),
             ("TECH-A-019 username empty", set("username", json!(""))),
-            ("TECH-A-019 username not a string", set("username", json!(7))),
-            ("TECH-A-020 social_media without username", remove("username")),
+            (
+                "TECH-A-019 username not a string",
+                set("username", json!(7)),
+            ),
+            (
+                "TECH-A-020 social_media without username",
+                remove("username"),
+            ),
             ("TECH-A-022 address empty", set("address", json!(""))),
             ("TECH-A-022 address not a string", set("address", json!(7))),
             (
@@ -2032,7 +2149,10 @@ mod tests {
                 set("type", json!("cawg.web_site")),
             ),
             ("TECHNICAL-B-003 method empty", set("method", json!(""))),
-            ("TECHNICAL-B-003 method not a string", set("method", json!(7))),
+            (
+                "TECHNICAL-B-003 method not a string",
+                set("method", json!(7)),
+            ),
             ("TECHNICAL-B-007 verifiedAt missing", remove("verifiedAt")),
             (
                 "TECHNICAL-B-007 verifiedAt not RFC 3339",
@@ -2073,7 +2193,10 @@ mod tests {
                     provider.insert("name".into(), json!({"en": ""}));
                 }),
             ),
-            ("VALIDATING-B-010 entry not an object", json!("cawg.social_media")),
+            (
+                "VALIDATING-B-010 entry not an object",
+                json!("cawg.social_media"),
+            ),
         ];
         for (case, entry) in cases {
             let results = validate_identities(json!([entry]));
@@ -2222,7 +2345,7 @@ mod tests {
     fn c2pa_asset_hashes_with_line_breaks_are_a_mismatch() {
         for broken in [
             format!("{}\n{}", &STANDARD_HASH[..20], &STANDARD_HASH[20..]),
-            format!("{}\r\n", STANDARD_HASH),
+            format!("{STANDARD_HASH}\r\n"),
         ] {
             let results =
                 validate_c2pa_asset(c2pa_asset(&broken, "referenced_assertions", "sig_type"));
@@ -2539,7 +2662,10 @@ mod tests {
             now,
             manifest,
         );
-        assert_eq!(codes(&malformed.failure), vec![CAWG_ICA_VALID_UNTIL_INVALID]);
+        assert_eq!(
+            codes(&malformed.failure),
+            vec![CAWG_ICA_VALID_UNTIL_INVALID]
+        );
 
         // A VC 2.0 field does not stand in for the VC 1.1 effective date.
         let wrong_version_field = validate_dates(
@@ -2598,5 +2724,147 @@ mod tests {
                 CAWG_ICA_VERIFIED_IDENTITIES_INVALID,
             ]
         );
+    }
+
+    /// Validate one social-media identity carrying `field: value`, and
+    /// return the `details.invalid_entries` fields it was rejected for.
+    fn rejected_fields(field: &str, value: &str) -> Vec<String> {
+        let mut entry = identity(json!({"type": "cawg.social_media", "username": "user"}));
+        entry[field] = json!(value);
+        let results = validate_identities(json!([entry]));
+        results
+            .failure
+            .iter()
+            .filter(|status| status.code == CAWG_ICA_VERIFIED_IDENTITIES_INVALID)
+            .flat_map(|status| {
+                status.details.as_ref().unwrap()["invalid_entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["field"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-014 and TECHNICAL-B-006: values other than the
+    /// defined `type` and `method` values MAY be used "subject to
+    /// restrictions described in Labels". The labels ABNF requires two or
+    /// more period-separated components, each `1(DIGIT / ALPHA) *(DIGIT /
+    /// ALPHA / "-" / "_")`.
+    #[test]
+    fn identity_type_and_method_must_be_namespaced_labels() {
+        for field in ["type", "method"] {
+            for label in [
+                "cawg.social_media",
+                "cawg.idv",
+                "com.example.passport_check",
+                "net.fine-art-school.v2",
+                "com.example.2fa",
+            ] {
+                assert!(rejected_fields(field, label).is_empty(), "{field} {label}");
+            }
+            for label in [
+                "passport",
+                "cawg.",
+                ".cawg",
+                "cawg..idv",
+                "com.example.-x",
+                "com.example._x",
+                "com example.x",
+                "com.exämple.x",
+                "com.example.x!",
+            ] {
+                assert_eq!(
+                    rejected_fields(field, label),
+                    vec![field],
+                    "{field} {label}"
+                );
+            }
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-025 and TECHNICAL-B-012: `uri` and `provider.id`
+    /// MUST be valid URIs, which is the RFC 3986 `URI` production, not
+    /// merely a scheme followed by a colon.
+    #[test]
+    fn uri_and_provider_id_must_be_rfc_3986_uris() {
+        let valid = [
+            "https://www.linkedin.com/profile-thirdparty-redirect/AgEvmWjOfQ_D-2mp",
+            "https://user:pw@host.example:8443/a/b;c?q=1&r=%2F#frag/ment?",
+            "https://[2001:db8::1]:443/",
+            "https://192.0.2.1/",
+            "did:web:idp.example",
+            "mailto:actor@named.example",
+            "urn:uuid:F9168C5E-CEB2-4faa-B6BF-329BF39FA1E4",
+        ];
+        let invalid = [
+            "https://named actor.example/",
+            "https://named.example/a b",
+            "https://named.example/%zz",
+            "https://named.example/%4",
+            "https://named.example/#a#b",
+            "https://named.example:80a/",
+            "https://[2001:db8::zz]/",
+            "https://named.example/<script>",
+            "https://exämple.example/",
+            "1https://named.example/",
+        ];
+        for uri in valid {
+            assert!(rejected_fields("uri", uri).is_empty(), "uri {uri}");
+            let provider = validate_identities(json!([identity(json!({
+                "type": "cawg.social_media",
+                "username": "user",
+                "provider": {"id": uri, "name": "Example IdP"},
+            }))]));
+            assert_credential_valid(&provider, uri);
+        }
+        for uri in invalid {
+            assert_eq!(rejected_fields("uri", uri), vec!["uri"], "uri {uri}");
+            let provider = validate_identities(json!([identity(json!({
+                "type": "cawg.social_media",
+                "username": "user",
+                "provider": {"id": uri, "name": "Example IdP"},
+            }))]));
+            assert_eq!(
+                codes(&provider.failure),
+                vec![CAWG_ICA_VERIFIED_IDENTITIES_INVALID],
+                "provider.id {uri}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-023: a `cawg.crypto_wallet` `address` MUST be an
+    /// alphanumeric string. CAWG-ID13-ICA-TECH-A-020 uses the same words for
+    /// a `cawg.social_media` `username`, but production aggregators emit
+    /// display names there (Adobe: `"Eric Scouten"`), so the username keeps
+    /// only its non-empty-string rule as a deliberate interop decision.
+    #[test]
+    fn crypto_wallet_address_must_be_alphanumeric_but_username_need_not_be() {
+        let wallet = |address: &str| {
+            validate_identities(json!([identity(json!({
+                "type": "cawg.crypto_wallet",
+                "address": address,
+            }))]))
+        };
+        for address in [
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        ] {
+            assert_credential_valid(&wallet(address), address);
+        }
+        for address in [
+            "0x5aAeb6053F 3E94",
+            "eip155:1:0xab16a96D",
+            "wallet.eth",
+            "ädress",
+        ] {
+            assert_eq!(
+                codes(&wallet(address).failure),
+                vec![CAWG_ICA_VERIFIED_IDENTITIES_INVALID],
+                "{address}"
+            );
+        }
+        assert!(rejected_fields("username", "Eric Scouten").is_empty());
     }
 }
