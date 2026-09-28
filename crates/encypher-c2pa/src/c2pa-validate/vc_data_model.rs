@@ -5,7 +5,7 @@
 //! aggregation credentials (CAWG-ID13-ICA-TECH-A-004).
 //!
 //! The verifier performs VC 2.0 section 6.3 "type-specific credential
-//! processing": it understands exactly three JSON-LD contexts, pinned by the
+//! processing": it understands exactly four JSON-LD contexts, pinned by the
 //! SHA-256 of their served bytes and embedded here, never retrieves a context,
 //! and performs no JSON-LD expansion. What that profile cannot establish fails
 //! closed. The V-nn ids refer to the requirement rows of
@@ -20,14 +20,15 @@ use serde_json::{Map, Value as Json};
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use time::OffsetDateTime;
 
-use super::cawg_ica::{base64_decode, is_uri};
+use super::cawg_ica::{base64_decode, is_uri, json_type_contains};
 
 pub(super) const VC_CONTEXT_V1: &str = "https://www.w3.org/2018/credentials/v1";
 pub(super) const VC_CONTEXT_V2: &str = "https://www.w3.org/ns/credentials/v2";
 pub(super) const CAWG_ICA_CONTEXT: &str = "https://cawg.io/identity/1.1/ica/context/";
+pub(super) const STATUS_CONTEXT_V1: &str = "https://www.w3.org/ns/credentials/status/v1";
 
 /// The pinned context documents, byte for byte as served.
-const PINNED_CONTEXTS: [(&str, &[u8]); 3] = [
+const PINNED_CONTEXTS: [(&str, &[u8]); 4] = [
     (
         VC_CONTEXT_V1,
         include_bytes!("contexts/credentials-v1.jsonld"),
@@ -39,6 +40,10 @@ const PINNED_CONTEXTS: [(&str, &[u8]); 3] = [
     (
         CAWG_ICA_CONTEXT,
         include_bytes!("contexts/cawg-ica-1.1.jsonld"),
+    ),
+    (
+        STATUS_CONTEXT_V1,
+        include_bytes!("contexts/credentials-status-v1.jsonld"),
     ),
 ];
 
@@ -108,36 +113,41 @@ pub(super) fn is_type_name(value: &str, version: VcVersion) -> bool {
 /// V-03, V-05, V-06, V-07: items after the base context are pinned URLs,
 /// unique, with one base context. Object items are outside the profile.
 pub(super) fn check_context_list(contexts: &[Json], version: VcVersion) -> Checked {
-    let mut unsupported = Vec::new();
-    for (index, item) in contexts.iter().enumerate().skip(1) {
+    let mut seen = HashSet::new();
+    if let Some(base) = contexts.first().and_then(Json::as_str) {
+        seen.insert(base);
+    }
+    for item in contexts.iter().skip(1) {
         match item {
             Json::String(url) => {
                 if !is_identifier(url, version) {
                     return Err("@context item is not a URL".into());
                 }
-                if contexts[..index].contains(item) {
+                if !seen.insert(url.as_str()) {
                     return Err("@context repeats an item".into());
                 }
                 if url == VC_CONTEXT_V1 || url == VC_CONTEXT_V2 {
                     return Err("@context lists more than one data-model base context".into());
                 }
-                if url != CAWG_ICA_CONTEXT {
-                    unsupported.push(url.clone());
+                if url != CAWG_ICA_CONTEXT && url != STATUS_CONTEXT_V1 {
+                    // Stop at the first unknown context. This bounds both
+                    // pre-authentication work and report growth.
+                    return Err(CredentialDefect::UnsupportedContext(vec![url.clone()]));
                 }
             }
-            Json::Object(_) => unsupported.push("<inline>".to_string()),
+            Json::Object(_) => {
+                return Err(CredentialDefect::UnsupportedContext(vec![
+                    "<inline>".to_string()
+                ]));
+            }
             _ => return Err("@context item is neither a URL nor a context object".into()),
         }
     }
-    if unsupported.is_empty() {
-        Ok(())
-    } else {
-        Err(CredentialDefect::UnsupportedContext(unsupported))
-    }
+    Ok(())
 }
 
-/// Term IRIs and prefixes of one pinned pair (base context plus CAWG), taken
-/// from every scope of the vendored documents.
+/// Term IRIs and prefixes of an active pinned context set, taken from every
+/// scope of its vendored documents.
 struct PinnedTerms {
     /// The IRI each term definition maps to.
     iris: HashSet<String>,
@@ -145,19 +155,35 @@ struct PinnedTerms {
     prefixes: HashMap<String, String>,
 }
 
-/// The pinned VC 1.1 and VC 2.0 pairs, each with the CAWG ICA context.
-static PINNED_TERMS: LazyLock<[PinnedTerms; 2]> = LazyLock::new(|| {
+/// Pinned term sets for each base context, with and without the optional
+/// Bitstring Status List context.
+static PINNED_TERMS: LazyLock<[PinnedTerms; 4]> = LazyLock::new(|| {
     [
         PinnedTerms::from_documents(&[PINNED_CONTEXTS[0].1, PINNED_CONTEXTS[2].1]),
+        PinnedTerms::from_documents(&[
+            PINNED_CONTEXTS[0].1,
+            PINNED_CONTEXTS[2].1,
+            PINNED_CONTEXTS[3].1,
+        ]),
         PinnedTerms::from_documents(&[PINNED_CONTEXTS[1].1, PINNED_CONTEXTS[2].1]),
+        PinnedTerms::from_documents(&[
+            PINNED_CONTEXTS[1].1,
+            PINNED_CONTEXTS[2].1,
+            PINNED_CONTEXTS[3].1,
+        ]),
     ]
 });
 
 impl PinnedTerms {
-    fn for_version(version: VcVersion) -> &'static PinnedTerms {
-        match version {
-            VcVersion::V1_1 => &PINNED_TERMS[0],
-            VcVersion::V2_0 => &PINNED_TERMS[1],
+    fn for_contexts(version: VcVersion, contexts: &[Json]) -> &'static PinnedTerms {
+        let has_status = contexts
+            .iter()
+            .any(|context| context.as_str() == Some(STATUS_CONTEXT_V1));
+        match (version, has_status) {
+            (VcVersion::V1_1, false) => &PINNED_TERMS[0],
+            (VcVersion::V1_1, true) => &PINNED_TERMS[1],
+            (VcVersion::V2_0, false) => &PINNED_TERMS[2],
+            (VcVersion::V2_0, true) => &PINNED_TERMS[3],
         }
     }
 
@@ -296,11 +322,14 @@ struct BodyWalk {
     integrity: Vec<String>,
 }
 
-/// Check the credential body against the supported profile's shape rules.
-pub(super) fn check_body(credential: &Map<String, Json>, version: VcVersion) -> Checked {
+pub(super) fn check_body(
+    credential: &Map<String, Json>,
+    contexts: &[Json],
+    version: VcVersion,
+) -> Checked {
     let mut walk = BodyWalk {
         version,
-        terms: PinnedTerms::for_version(version),
+        terms: PinnedTerms::for_contexts(version, contexts),
         described: HashMap::new(),
         integrity: Vec::new(),
     };
@@ -371,7 +400,7 @@ impl BodyWalk {
         }
         self.identify(node, role)?;
         let json_scoped = self.version == VcVersion::V2_0
-            && type_has_term(node.get("type"), V2_JSON_TYPE_SCOPED.0);
+            && json_type_contains(node.get("type"), V2_JSON_TYPE_SCOPED.0);
         for (key, value) in node {
             if role == Role::Credential && key == "@context" {
                 continue;
@@ -392,14 +421,18 @@ impl BodyWalk {
 
     /// V-36c and V-36d for one node.
     fn identify(&mut self, node: &Map<String, Json>, role: Role) -> Checked {
-        let identifier = match (node.get("id"), node.get("uri")) {
+        let (identifier_key, identifier) = match (node.get("id"), node.get("uri")) {
             (Some(_), Some(_)) => return Err("a node carries both `id` and `uri`".into()),
-            (Some(identifier), None) | (None, Some(identifier)) => identifier,
+            (Some(identifier), None) => ("id", identifier),
+            (None, Some(identifier)) => ("uri", identifier),
             (None, None) => return Ok(()),
         };
-        // The issuer, identity, and provider identifiers keep the codes CAWG
-        // assigns to them (`invalid_issuer`, `verified_identities.invalid`).
-        let checked_by_cawg = matches!(role, Role::Issuer | Role::Identity | Role::Provider);
+        // Preserve CAWG's dedicated codes only for fields its own checks
+        // consume. The issuer is checked below parse; Identity `uri` and
+        // Provider `id` are checked by `verified_identity_defect`.
+        let checked_by_cawg = role == Role::Issuer
+            || (role == Role::Identity && identifier_key == "uri")
+            || (role == Role::Provider && identifier_key == "id");
         let Some(identifier) = identifier.as_str() else {
             if checked_by_cawg {
                 return Ok(());
@@ -436,14 +469,6 @@ impl BodyWalk {
                 "`{identifier}` is described by more than one map"
             )))),
         }
-    }
-}
-
-fn type_has_term(types: Option<&Json>, term: &str) -> bool {
-    match types {
-        Some(Json::String(value)) => value == term,
-        Some(Json::Array(values)) => values.iter().any(|value| value.as_str() == Some(term)),
-        _ => false,
     }
 }
 
@@ -591,24 +616,18 @@ fn natural_language_value(value: &Json) -> bool {
 /// least one well-formed digest. An entry naming a pinned context must match
 /// the pinned bytes, since the verifier makes use of that resource.
 fn related_resources(value: &Json, version: VcVersion) -> Checked {
+    const DIGEST_TOO_LONG: &str = "a relatedResource digest exceeds 140 encoded characters";
     let items = one_or_more_objects(value).ok_or("relatedResource is not one or more objects")?;
-    for (index, item) in items.iter().enumerate() {
+    let mut ids = HashSet::with_capacity(items.len());
+    for item in items {
         let Some(id) = item.get("id").and_then(Json::as_str) else {
             return Err("a relatedResource entry lacks an id".into());
         };
         if !is_identifier(id, version) {
             return Err("a relatedResource id is not a URL".into());
         }
-        if items[..index]
-            .iter()
-            .any(|other| other.get("id").and_then(Json::as_str) == Some(id))
-        {
+        if !ids.insert(id) {
             return Err("relatedResource ids repeat".into());
-        }
-        let sri = strings(item.get("digestSRI"))?;
-        let multibase = strings(item.get("digestMultibase"))?;
-        if sri.is_empty() && multibase.is_empty() {
-            return Err("a relatedResource entry has no digest".into());
         }
         if item
             .get("mediaType")
@@ -620,7 +639,13 @@ fn related_resources(value: &Json, version: VcVersion) -> Checked {
             .iter()
             .find(|(url, _)| *url == id)
             .map(|(_, bytes)| *bytes);
-        for expression in sri {
+        let mut has_digest = false;
+        for expression in strings(item.get("digestSRI"))? {
+            let expression = expression?;
+            has_digest = true;
+            if sri_body(expression).is_some_and(|body| body.len() > MAX_ENCODED_DIGEST_LEN) {
+                return Err(DIGEST_TOO_LONG.into());
+            }
             let (algorithm, digest) =
                 sri_hash(expression).ok_or("a digestSRI value is not an SRI hash-expression")?;
             if let Some(bytes) = pinned {
@@ -629,7 +654,12 @@ fn related_resources(value: &Json, version: VcVersion) -> Checked {
                 }
             }
         }
-        for encoded in multibase {
+        for encoded in strings(item.get("digestMultibase"))? {
+            let encoded = encoded?;
+            has_digest = true;
+            if encoded.len() > MAX_ENCODED_DIGEST_LEN {
+                return Err(DIGEST_TOO_LONG.into());
+            }
             const NOT_MULTIHASH: &str =
                 "a digestMultibase value is not a multibase-encoded multihash";
             let decoded = multibase_decode(encoded).ok_or(NOT_MULTIHASH)?;
@@ -651,22 +681,42 @@ fn related_resources(value: &Json, version: VcVersion) -> Checked {
                 }
             }
         }
+        if !has_digest {
+            return Err("a relatedResource entry has no digest".into());
+        }
     }
     Ok(())
 }
 
-/// "One or more" strings; absent is none.
-fn strings(value: Option<&Json>) -> Result<Vec<&str>, CredentialDefect> {
-    match value {
-        None => Ok(Vec::new()),
-        Some(Json::String(text)) => Ok(vec![text]),
-        Some(Json::Array(texts)) if !texts.is_empty() => texts
-            .iter()
-            .map(|text| {
-                text.as_str()
+/// A borrowed iterator over a digest string or non-empty array of strings.
+enum Strings<'a> {
+    Empty,
+    One(Option<&'a str>),
+    Many(std::slice::Iter<'a, Json>),
+}
+
+impl<'a> Iterator for Strings<'a> {
+    type Item = Result<&'a str, CredentialDefect>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Strings::Empty => None,
+            Strings::One(value) => value.take().map(Ok),
+            Strings::Many(values) => values.next().map(|value| {
+                value
+                    .as_str()
                     .ok_or_else(|| "a relatedResource digest is not a string".into())
-            })
-            .collect(),
+            }),
+        }
+    }
+}
+
+/// "One or more" strings; absent is none.
+fn strings(value: Option<&Json>) -> Result<Strings<'_>, CredentialDefect> {
+    match value {
+        None => Ok(Strings::Empty),
+        Some(Json::String(text)) => Ok(Strings::One(Some(text))),
+        Some(Json::Array(texts)) if !texts.is_empty() => Ok(Strings::Many(texts.iter())),
         Some(_) => Err("a relatedResource digest is not one or more strings".into()),
     }
 }
@@ -686,12 +736,25 @@ fn compute(algorithm: DigestAlgorithm, bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+const MAX_ENCODED_DIGEST_LEN: usize = 140;
+
+/// Return the encoded digest body of an SRI hash-expression.
+fn sri_body(text: &str) -> Option<&str> {
+    let expression = text
+        .split_once('?')
+        .map_or(text, |(expression, _)| expression);
+    expression.split_once('-').map(|(_, digest)| digest)
+}
+
 /// Subresource Integrity `hash-expression`: `hash-algo "-" base64-value`
 /// with an optional `"?" option-expression`. Returns the algorithm and the
 /// decoded digest.
 fn sri_hash(text: &str) -> Option<(DigestAlgorithm, Vec<u8>)> {
     let (expression, options) = text.split_once('?').unwrap_or((text, ""));
     let (algorithm, digest) = expression.split_once('-')?;
+    if digest.len() > MAX_ENCODED_DIGEST_LEN {
+        return None;
+    }
     let algorithm = match algorithm {
         "sha256" => DigestAlgorithm::Sha256,
         "sha384" => DigestAlgorithm::Sha384,
@@ -714,6 +777,9 @@ fn sri_hash(text: &str) -> Option<(DigestAlgorithm, Vec<u8>)> {
 /// (`u` unpadded, `U` padded), base64 (`m`, `M`), base16 (`f`, `F`), and
 /// base32 (`b`, `B`).
 fn multibase_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() > MAX_ENCODED_DIGEST_LEN {
+        return None;
+    }
     let mut chars = text.chars();
     let prefix = chars.next()?;
     let body = chars.as_str();
@@ -982,6 +1048,7 @@ mod tests {
             "ab4ddd9a531758807a79a5b450510d61ae8d147eab966cc9a200c07095b0cdcc",
             "59955ced6697d61e03f2b2556febe5308ab16842846f5b586d7f1f7adec92734",
             "750c94af1c3d7e587dc19f3a06ef1e9bfe8412a1e94ef15037ae83f3baeb82e9",
+            "fda5add353231e6a6884a46b12e6c75464281900cb348284d9c360f62381d9f7",
         ];
         for ((url, bytes), digest) in PINNED_CONTEXTS.iter().zip(expected) {
             assert_eq!(hex::encode(Sha256::digest(bytes)), digest, "{url}");
@@ -1010,6 +1077,7 @@ mod tests {
         };
         assert!(terms(PINNED_CONTEXTS[0].1).is_empty());
         assert!(terms(PINNED_CONTEXTS[2].1).is_empty());
+        assert!(terms(PINNED_CONTEXTS[3].1).is_empty());
         let scoped = |(scope, term): (&str, &str)| (scope.to_string(), term.to_string());
         assert_eq!(
             terms(PINNED_CONTEXTS[1].1),
@@ -1021,13 +1089,13 @@ mod tests {
         );
     }
 
-    /// The only `@id` aliases in the pinned pairs are `id` and CAWG's `uri`,
-    /// which the identifier rules treat as node identifiers.
+    /// The only `@id` aliases in every supported pinned context set are `id`
+    /// and CAWG's `uri`, which the identifier rules treat as node identifiers.
     #[test]
     fn id_and_uri_are_the_only_identifier_aliases() {
-        for pair in [[0, 2], [1, 2]] {
+        for documents in [[0, 2, 3], [1, 2, 3]] {
             let mut aliases = HashSet::new();
-            for index in pair {
+            for index in documents {
                 let document: Json = serde_json::from_slice(PINNED_CONTEXTS[index].1).unwrap();
                 let mut definitions = Vec::new();
                 collect_definitions(&document["@context"], &mut definitions);

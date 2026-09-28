@@ -17,8 +17,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::cawg::is_cawg_label;
 use super::vc_data_model::{
-    self, CredentialDefect, VcVersion, XsdDateTime, XsdInstant, CAWG_ICA_CONTEXT, VC_CONTEXT_V1,
-    VC_CONTEXT_V2,
+    self, CredentialDefect, VcVersion, XsdDateTime, XsdInstant, CAWG_ICA_CONTEXT,
+    STATUS_CONTEXT_V1, VC_CONTEXT_V1, VC_CONTEXT_V2,
 };
 use super::ValidationResults;
 
@@ -119,7 +119,7 @@ pub(super) fn verify_ica_assertion(
             results.push_failure_with_details(
                 CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL,
                 url.into(),
-                "the credential uses a JSON-LD context outside the verifier's pinned VC and CAWG ICA contexts"
+                "the credential uses a JSON-LD context outside the verifier's pinned VC, CAWG ICA, and Bitstring Status List contexts"
                     .into(),
                 json!({"reason": "unsupported_context", "contexts": contexts}),
             );
@@ -269,7 +269,11 @@ pub(super) fn verify_ica_assertion(
         }
     }
 
-    match check_revocation(credential.credential_status.as_ref(), status_lists) {
+    match check_revocation(
+        credential.credential_status.as_ref(),
+        credential.bitstring_status_supported,
+        status_lists,
+    ) {
         Revocation::NotPresent => {}
         Revocation::Unsupported => {
             results.push_failure(
@@ -471,6 +475,7 @@ struct IcaCredential {
     valid_from: ValidityField,
     valid_until: ValidityField,
     credential_status: Option<Json>,
+    bitstring_status_supported: bool,
     c2pa_asset: Json,
     verified_identities: VerifiedIdentities,
 }
@@ -504,7 +509,7 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, CredentialDefec
         return Err("credential lacks the required CAWG Identity 1.1 ICA context".into());
     }
     vc_data_model::check_context_list(contexts, version)?;
-    vc_data_model::check_body(object, version)?;
+    vc_data_model::check_body(object, contexts, version)?;
 
     let types = object
         .get("type")
@@ -576,8 +581,8 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, CredentialDefec
     // that can only reject more: the effective date at its latest instant,
     // the expiration at its earliest.
     const FOURTEEN_HOURS: i128 = 14 * 3600;
-    let parse_validity = |name: &str, zoneless_shift: i128| {
-        match object.get(name) {
+    const ZONELESS_V2: &str = "lacks a time zone: VC 2.0 section 5.8 reads it as UTC, but section 4.9 requires a dateTimeStamp";
+    let parse_validity = |name: &str, zoneless_shift: i128| match object.get(name) {
         None => ValidityField::Missing,
         Some(Json::String(value)) => match vc_data_model::parse_xsd_date_time(value) {
             Ok(XsdDateTime::Zoned(at)) => ValidityField::Parsed(at),
@@ -586,14 +591,11 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, CredentialDefec
             }
             // VC 2.0 section 5.8 reads a zoneless value as UTC, but 4.9
             // requires a dateTimeStamp, so the value is still an error.
-            Ok(XsdDateTime::Local(_)) => ValidityField::Malformed(
-                "lacks a time zone: VC 2.0 section 5.8 reads it as UTC, but section 4.9 requires a dateTimeStamp",
-            ),
+            Ok(XsdDateTime::Local(_)) => ValidityField::Malformed(ZONELESS_V2),
             Err(reason) => ValidityField::Malformed(reason),
         },
         Some(Json::Null) => ValidityField::Malformed("is null"),
         Some(_) => ValidityField::Malformed("is not a string"),
-    }
     };
     let (from_field, until_field) = match version {
         VcVersion::V1_1 => ("issuanceDate", "expirationDate"),
@@ -602,12 +604,17 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, CredentialDefec
     let valid_from = parse_validity(from_field, FOURTEEN_HOURS);
     let valid_until = parse_validity(until_field, -FOURTEEN_HOURS);
     let credential_status = object.get("credentialStatus").cloned();
+    let bitstring_status_supported = version == VcVersion::V2_0
+        || contexts
+            .iter()
+            .any(|context| context.as_str() == Some(STATUS_CONTEXT_V1));
     Ok(IcaCredential {
         raw,
         vc_version: version,
         issuer,
         valid_from,
         valid_until,
+        bitstring_status_supported,
         credential_status,
         c2pa_asset,
         verified_identities,
@@ -1197,6 +1204,7 @@ enum Revocation {
 
 fn check_revocation(
     credential_status: Option<&Json>,
+    bitstring_status_supported: bool,
     status_lists: Option<&HashMap<String, String>>,
 ) -> Revocation {
     let Some(credential_status) = credential_status else {
@@ -1213,6 +1221,7 @@ fn check_revocation(
     for entry in entries {
         if entry.get("statusPurpose").and_then(Json::as_str) != Some("revocation")
             || !json_type_contains(entry.get("type"), "BitstringStatusListEntry")
+            || !bitstring_status_supported
         {
             continue;
         }
@@ -1279,7 +1288,7 @@ fn check_bitstring_status_entry(
     }
 }
 
-fn json_type_contains(value: Option<&Json>, expected: &str) -> bool {
+pub(super) fn json_type_contains(value: Option<&Json>, expected: &str) -> bool {
     match value {
         Some(Json::String(value)) => value == expected,
         Some(Json::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
@@ -1550,10 +1559,85 @@ mod tests {
     }
 
     #[test]
-    fn revoked_bitstring_status_stops_credential_validation() {
+    fn bitstring_status_context_preserves_revoked_credentials_in_both_vc_versions() {
+        for vc_v1 in [true, false] {
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let did = did_jwk(&key);
+            let mut credential = vc_json(json!(&did), vc_v1);
+            credential["@context"] = if vc_v1 {
+                json!([VC_CONTEXT_V1, STATUS_CONTEXT_V1, CAWG_ICA_CONTEXT])
+            } else {
+                json!([VC_CONTEXT_V2, CAWG_ICA_CONTEXT, STATUS_CONTEXT_V1])
+            };
+            credential["credentialStatus"] = json!({
+                "id": "https://status.example/list#3",
+                "type": "BitstringStatusListEntry",
+                "statusPurpose": "revocation",
+                "statusListIndex": "3",
+                "statusListCredential": "https://status.example/list",
+            });
+            let lists = HashMap::from([(
+                "https://status.example/list".into(),
+                base64_encode(&[0b0000_1000], false),
+            )]);
+            let results = run(
+                &eddsa_cose(&key, &credential),
+                std::slice::from_ref(&did),
+                Some(&lists),
+            );
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_CREDENTIAL_REVOKED],
+                "VC {}",
+                if vc_v1 { "1.1" } else { "2.0" }
+            );
+            assert!(!codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID));
+        }
+    }
+
+    #[test]
+    fn bitstring_status_context_preserves_not_revoked_credentials_in_both_vc_versions() {
+        for vc_v1 in [true, false] {
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let did = did_jwk(&key);
+            let mut credential = vc_json(json!(&did), vc_v1);
+            credential["@context"] = if vc_v1 {
+                json!([VC_CONTEXT_V1, STATUS_CONTEXT_V1, CAWG_ICA_CONTEXT])
+            } else {
+                json!([VC_CONTEXT_V2, CAWG_ICA_CONTEXT, STATUS_CONTEXT_V1])
+            };
+            credential["credentialStatus"] = json!({
+                "id": "https://status.example/list#3",
+                "type": "BitstringStatusListEntry",
+                "statusPurpose": "revocation",
+                "statusListIndex": "3",
+                "statusListCredential": "https://status.example/list",
+            });
+            let lists = HashMap::from([(
+                "https://status.example/list".into(),
+                base64_encode(&[0], false),
+            )]);
+            let results = run(
+                &eddsa_cose(&key, &credential),
+                std::slice::from_ref(&did),
+                Some(&lists),
+            );
+            assert!(
+                results.failure.is_empty(),
+                "VC {}: {:?}",
+                if vc_v1 { "1.1" } else { "2.0" },
+                results.failure
+            );
+            assert!(codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_NOT_REVOKED));
+            assert!(codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID));
+        }
+    }
+
+    #[test]
+    fn vc_11_bitstring_term_without_its_context_is_unsupported() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let did = did_jwk(&key);
-        let mut credential = vc_json(json!(&did), false);
+        let mut credential = vc_json(json!(&did), true);
         credential["credentialStatus"] = json!({
             "id": "https://status.example/list#3",
             "type": "BitstringStatusListEntry",
@@ -1570,7 +1654,11 @@ mod tests {
             std::slice::from_ref(&did),
             Some(&lists),
         );
-        assert!(codes(&results.failure).contains(&CAWG_ICA_CREDENTIAL_REVOKED));
+        assert_eq!(
+            codes(&results.failure),
+            vec![CAWG_ICA_REVOCATION_UNSUPPORTED]
+        );
+        assert!(!codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_NOT_REVOKED));
         assert!(!codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID));
     }
 
@@ -2067,6 +2155,10 @@ mod tests {
         for (vc_v1, context) in [
             (false, json!([CAWG_ICA_CONTEXT, VC_CONTEXT_V2])),
             (true, json!([CAWG_ICA_CONTEXT, VC_CONTEXT_V1])),
+            (
+                true,
+                json!([STATUS_CONTEXT_V1, VC_CONTEXT_V1, CAWG_ICA_CONTEXT]),
+            ),
         ] {
             let key = SigningKey::from_bytes(&[7; 32]);
             let did = did_jwk(&key);
@@ -2121,7 +2213,7 @@ mod tests {
     const IDENTITY: &str = "/credentialSubject/verifiedIdentities/0";
     const IDENTITY_URI: &str = "https://social.example/alice";
 
-    fn assert_invalid_vc(case: &str, results: &ValidationResults) {
+    fn assert_invalid_vc(case: &str, expected_explanation: &str, results: &ValidationResults) {
         assert_eq!(
             codes(&results.failure),
             vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
@@ -2131,11 +2223,18 @@ mod tests {
             results.failure[0].details, None,
             "{case}: not a profile limit"
         );
+        assert!(
+            results.failure[0]
+                .explanation
+                .contains(expected_explanation),
+            "{case}: expected explanation containing {expected_explanation:?}, got {:?}",
+            results.failure[0].explanation
+        );
     }
 
-    fn assert_each_invalid_vc(cases: Vec<(&str, Edit)>) {
-        for (case, edit) in cases {
-            assert_invalid_vc(case, &validate_edited(edit));
+    fn assert_each_invalid_vc(cases: Vec<(&str, &str, Edit)>) {
+        for (case, expected_explanation, edit) in cases {
+            assert_invalid_vc(case, expected_explanation, &validate_edited(edit));
         }
     }
 
@@ -2260,6 +2359,23 @@ mod tests {
                 "{case}"
             );
         }
+        let results = validate_edited(put(
+            "",
+            "@context",
+            json!([
+                VC_CONTEXT_V2,
+                CAWG_ICA_CONTEXT,
+                "https://unknown.example/first",
+                "https://unknown.example/second",
+            ]),
+        ));
+        assert_eq!(
+            results.failure[0].details,
+            Some(json!({
+                "reason": "unsupported_context",
+                "contexts": ["https://unknown.example/first"],
+            }))
+        );
     }
 
     /// V-03, V-05, V-06: context items are URLs, never repeat, and name one
@@ -2274,11 +2390,31 @@ mod tests {
             )
         };
         assert_each_invalid_vc(vec![
-            ("string that is not a URL", contexts(json!("not a url"))),
-            ("null", contexts(Json::Null)),
-            ("number", contexts(json!(7))),
-            ("repeated item", contexts(json!(CAWG_ICA_CONTEXT))),
-            ("both base contexts", contexts(json!(VC_CONTEXT_V1))),
+            (
+                "string that is not a URL",
+                "@context item is not a URL",
+                contexts(json!("not a url")),
+            ),
+            (
+                "null",
+                "@context item is neither a URL nor a context object",
+                contexts(Json::Null),
+            ),
+            (
+                "number",
+                "@context item is neither a URL nor a context object",
+                contexts(json!(7)),
+            ),
+            (
+                "repeated item",
+                "@context repeats an item",
+                contexts(json!(CAWG_ICA_CONTEXT)),
+            ),
+            (
+                "both base contexts",
+                "@context lists more than one data-model base context",
+                contexts(json!(VC_CONTEXT_V1)),
+            ),
         ]);
     }
 
@@ -2309,6 +2445,7 @@ mod tests {
         assert_each_invalid_vc(vec![
             (
                 "jsonSchema on a node typed with the full IRI",
+                "JSON-LD keyword key",
                 put(
                     "",
                     "credentialSchema",
@@ -2319,9 +2456,17 @@ mod tests {
                     }),
                 ),
             ),
-            ("jwk outside cnf", put("", "jwk", nest.clone())),
+            (
+                "jwk outside cnf",
+                "JSON-LD keyword key",
+                put("", "jwk", nest.clone()),
+            ),
         ]);
-        assert_invalid_vc("VC 1.1 _sd", &validate_edited_v1(put("", "_sd", nest)));
+        assert_invalid_vc(
+            "VC 1.1 _sd",
+            "JSON-LD keyword key",
+            &validate_edited_v1(put("", "_sd", nest)),
+        );
     }
 
     /// V-36a: compaction under the pinned contexts writes no keyword keys
@@ -2333,10 +2478,12 @@ mod tests {
         assert_each_invalid_vc(vec![
             (
                 "top-level @nest",
+                "JSON-LD keyword key",
                 put("", "@nest", json!({"issuer": "did:example:other"})),
             ),
             (
                 "subject @nest",
+                "JSON-LD keyword key",
                 put(
                     SUBJECT,
                     "@nest",
@@ -2345,43 +2492,72 @@ mod tests {
             ),
             (
                 "nested @type beside type",
+                "JSON-LD keyword key",
                 put(IDENTITY, "@type", json!("cawg.affiliation")),
             ),
-            ("top-level @id", put("", "@id", json!("urn:a:1"))),
+            (
+                "top-level @id",
+                "JSON-LD keyword key",
+                put("", "@id", json!("urn:a:1")),
+            ),
             (
                 "top-level @type",
+                "JSON-LD keyword key",
                 put("", "@type", json!("VerifiableCredential")),
             ),
-            ("@graph", put(SUBJECT, "@graph", json!([]))),
-            ("@reverse", put(SUBJECT, "@reverse", json!({}))),
-            ("@included", put("", "@included", json!([]))),
-            ("keyword-form non-keyword", put("", "@foo", json!(1))),
+            (
+                "@graph",
+                "JSON-LD keyword key",
+                put(SUBJECT, "@graph", json!([])),
+            ),
+            (
+                "@reverse",
+                "JSON-LD keyword key",
+                put(SUBJECT, "@reverse", json!({})),
+            ),
+            (
+                "@included",
+                "JSON-LD keyword key",
+                put("", "@included", json!([])),
+            ),
+            (
+                "keyword-form non-keyword",
+                "JSON-LD keyword key",
+                put("", "@foo", json!(1)),
+            ),
             (
                 "typed value with a language (15.3)",
+                "typed value object also carries",
                 claim(json!({"@value": "x", "type": "https://t.example/T", "@language": "en"})),
             ),
             (
                 "object @value without @json",
+                "non-scalar @value",
                 claim(json!({"@value": {"a": 1}})),
             ),
             (
                 "non-string @language",
+                "language-tagged value object is malformed",
                 claim(json!({"@value": "x", "@language": 7})),
             ),
             (
                 "language-tagged number (15.4)",
+                "language-tagged value object is malformed",
                 claim(json!({"@value": 7, "@language": "en"})),
             ),
             (
                 "blank-node type (15.5)",
+                "typed value object has an invalid type",
                 claim(json!({"@value": "x", "type": "_:b9"})),
             ),
             (
                 "value object with a node key",
+                "value object carries a key besides",
                 claim(json!({"@value": "x", "name": "y"})),
             ),
             (
                 "list object with another key",
+                "list object carries a key besides @list",
                 claim(json!({"@list": [], "name": "y"})),
             ),
         ]);
@@ -2396,6 +2572,7 @@ mod tests {
         assert_each_invalid_vc(vec![
             (
                 "full IRI of issuer",
+                "IRI key for a property",
                 put(
                     "",
                     "https://www.w3.org/2018/credentials#issuer",
@@ -2404,10 +2581,12 @@ mod tests {
             ),
             (
                 "compact CAWG IRI",
+                "IRI key for a property",
                 put(SUBJECT, "cawg:verifiedIdentities", identities.clone()),
             ),
             (
                 "full CAWG IRI",
+                "IRI key for a property",
                 put(
                     SUBJECT,
                     "https://cawg.io/identity/1.1/ica/#verifiedIdentities",
@@ -2416,12 +2595,30 @@ mod tests {
             ),
             (
                 "schema.org name",
+                "IRI key for a property",
                 put(IDENTITY, "https://schema.org/name", json!("Bob")),
             ),
         ]);
         assert_invalid_vc(
             "VC 1.1 cred prefix",
+            "IRI key for a property",
             &validate_edited_v1(put("", "cred:issuer", json!("did:example:other"))),
+        );
+        assert_invalid_vc(
+            "VC 1.1 status-context IRI",
+            "IRI key for a property",
+            &validate_edited_v1(all(vec![
+                put(
+                    "",
+                    "@context",
+                    json!([VC_CONTEXT_V1, STATUS_CONTEXT_V1, CAWG_ICA_CONTEXT]),
+                ),
+                put(
+                    SUBJECT,
+                    "https://www.w3.org/ns/credentials/status#statusListIndex",
+                    json!("3"),
+                ),
+            ])),
         );
         assert_each_valid(vec![(
             "extension IRI",
@@ -2443,14 +2640,17 @@ mod tests {
         assert_each_invalid_vc(vec![
             (
                 "id and uri on one node",
+                "node carries both `id` and `uri`",
                 all(vec![identity_uri(), put(IDENTITY, "id", json!("urn:x:1"))]),
             ),
             (
                 "top-level uri that is not a URL",
+                "node identifier is not a URL",
                 put("", "uri", json!("not a url")),
             ),
             (
                 "subject uri described again by evidence",
+                "described by more than one map",
                 all(vec![
                     put(SUBJECT, "uri", json!("did:example:subject")),
                     evidence(json!({"id": "did:example:subject", "type": "Evidence",
@@ -2459,6 +2659,7 @@ mod tests {
             ),
             (
                 "compact and full spellings of one subject id",
+                "described by more than one map",
                 all(vec![
                     put(SUBJECT, "id", json!("cawg:subject")),
                     evidence(
@@ -2468,6 +2669,7 @@ mod tests {
             ),
             (
                 "identity uri described again by evidence",
+                "described by more than one map",
                 all(vec![
                     identity_uri(),
                     evidence(json!({"id": IDENTITY_URI, "type": "Evidence", "name": "Bob"})),
@@ -2475,10 +2677,12 @@ mod tests {
             ),
             (
                 "provider id reused by evidence",
+                "described by more than one map",
                 evidence(json!({"id": "https://idp.example", "type": "Evidence"})),
             ),
             (
                 "provider under evidence reusing the subject's provider id",
+                "described by more than one map",
                 evidence(json!({"type": "Evidence", "verifiedIdentities": [{
                     "type": "cawg.social_media",
                     "provider": {"id": "https://idp.example", "name": "Evil"},
@@ -2486,6 +2690,7 @@ mod tests {
             ),
             (
                 "full-IRI JsonSchema node re-describing an identity",
+                "described by more than one map",
                 all(vec![
                     identity_uri(),
                     put(
@@ -2501,6 +2706,7 @@ mod tests {
             ),
             (
                 "relatedResource naming the subject",
+                "relatedResource describes",
                 all(vec![
                     put(SUBJECT, "id", json!("did:example:subject")),
                     put(
@@ -2513,6 +2719,7 @@ mod tests {
             ),
             (
                 "evidence repeating the credential id",
+                "described by more than one map",
                 all(vec![
                     put("", "id", json!("urn:uuid:1")),
                     evidence(json!({"id": "urn:uuid:1", "type": "Evidence"})),
@@ -2521,6 +2728,7 @@ mod tests {
         ]);
         assert_invalid_vc(
             "VC 1.1 cred: and full spellings of the credential id",
+            "described by more than one map",
             &validate_edited_v1(all(vec![
                 put("", "id", json!("cred:self")),
                 put(
@@ -2591,21 +2799,90 @@ mod tests {
             put("", "id", json!("https://example.org/café")),
         )]);
         assert_each_invalid_vc(vec![
-            ("URL without a host", put("", "id", json!("http:"))),
+            (
+                "URL without a host",
+                "node identifier is not a URL",
+                put("", "id", json!("http:")),
+            ),
             (
                 "id with two values",
+                "node identifier is not a single URL",
                 put("", "id", json!(["urn:a:1", "urn:a:2"])),
             ),
-            ("subject id not a URL", put(SUBJECT, "id", json!("user 1"))),
-            ("subject id not a string", put(SUBJECT, "id", json!(1))),
-            ("empty type", with_type("")),
-            ("keyword type", with_type("@json")),
-            ("type that is not an absolute URL", with_type("ex:Bad Type")),
+            (
+                "subject id not a URL",
+                "node identifier is not a URL",
+                put(SUBJECT, "id", json!("user 1")),
+            ),
+            (
+                "subject id not a string",
+                "node identifier is not a single URL",
+                put(SUBJECT, "id", json!(1)),
+            ),
+            ("empty type", "type entries must be terms", with_type("")),
+            (
+                "keyword type",
+                "type entries must be terms",
+                with_type("@json"),
+            ),
+            (
+                "type that is not an absolute URL",
+                "type entries must be terms",
+                with_type("ex:Bad Type"),
+            ),
         ]);
         assert_invalid_vc(
             "VC 1.1 non-ASCII id is not a URI",
+            "node identifier is not a URL",
             &validate_edited_v1(put("", "id", json!("https://example.org/café"))),
         );
+    }
+
+    /// CAWG checks `identity.uri` and `provider.id` itself. Their other
+    /// `@id` aliases remain subject to the data-model version's datatype.
+    #[test]
+    fn identity_and_provider_aliases_use_the_version_datatype() {
+        let identity_id = |value: &'static str| put(IDENTITY, "id", json!(value));
+        let provider_uri = |value: &'static str| {
+            Box::new(move |credential: &mut Json| {
+                let provider = credential
+                    .pointer_mut("/credentialSubject/verifiedIdentities/0/provider")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+                provider.remove("id");
+                provider.insert("uri".to_string(), json!(value));
+            }) as Edit
+        };
+
+        assert_each_invalid_vc(vec![
+            (
+                "VC 2.0 identity.id is relative",
+                "node identifier is not a URL",
+                identity_id("relative"),
+            ),
+            (
+                "VC 2.0 provider.uri is relative",
+                "node identifier is not a URL",
+                provider_uri("relative"),
+            ),
+        ]);
+        for (case, edit) in [
+            (
+                "VC 1.1 identity.id is not an ASCII URI",
+                identity_id("https://example.org/café"),
+            ),
+            (
+                "VC 1.1 provider.uri is not an ASCII URI",
+                provider_uri("https://example.org/café"),
+            ),
+        ] {
+            assert_invalid_vc(
+                case,
+                "node identifier is not a URL",
+                &validate_edited_v1(edit),
+            );
+        }
     }
 
     /// V-18: the issuer must be a URL. A DID-shaped string that is not one
@@ -2632,19 +2909,34 @@ mod tests {
     #[test]
     fn name_and_description_must_be_strings_or_language_values() {
         assert_each_invalid_vc(vec![
-            ("number", put("", "name", json!(7))),
-            ("empty array", put("", "name", json!([]))),
+            (
+                "number",
+                "name is not a string or language value",
+                put("", "name", json!(7)),
+            ),
+            (
+                "empty array",
+                "name is not a string or language value",
+                put("", "name", json!([])),
+            ),
             (
                 "array member not a string",
+                "description is not a string or language value",
                 put("", "description", json!([7])),
             ),
             (
                 "missing @value",
+                "JSON-LD keyword key",
                 put("", "name", json!({"@language": "en"})),
             ),
-            ("non-string @value", put("", "name", json!({"@value": 7}))),
+            (
+                "non-string @value",
+                "name is not a string or language value",
+                put("", "name", json!({"@value": 7})),
+            ),
             (
                 "extra key",
+                "value object carries a key besides",
                 put(
                     "",
                     "name",
@@ -2653,6 +2945,7 @@ mod tests {
             ),
             (
                 "bad @direction",
+                "language-tagged value object is malformed",
                 put(
                     "",
                     "description",
@@ -2674,15 +2967,22 @@ mod tests {
         assert_each_invalid_vc(vec![
             (
                 "status as a string",
+                "credentialStatus is not one or more typed objects",
                 put("", "credentialStatus", json!("https://s.example/1")),
             ),
             (
                 "status set with a non-object",
+                "credentialStatus is not one or more typed objects",
                 put("", "credentialStatus", json!([7])),
             ),
-            ("empty status set", put("", "credentialStatus", json!([]))),
+            (
+                "empty status set",
+                "credentialStatus is not one or more typed objects",
+                put("", "credentialStatus", json!([])),
+            ),
             (
                 "status without type",
+                "credentialStatus is not one or more typed objects",
                 put(
                     "",
                     "credentialStatus",
@@ -2691,6 +2991,7 @@ mod tests {
             ),
             (
                 "status id not a URL",
+                "node identifier is not a URL",
                 put(
                     "",
                     "credentialStatus",
@@ -2699,46 +3000,57 @@ mod tests {
             ),
             (
                 "schema without id",
+                "credentialSchema is not one or more typed objects",
                 put("", "credentialSchema", json!({"type": "JsonSchema"})),
             ),
             (
                 "schema without type",
+                "credentialSchema is not one or more typed objects",
                 put("", "credentialSchema", json!({"id": "https://s.example/"})),
             ),
             (
                 "evidence without type",
+                "evidence is not one or more typed objects",
                 put("", "evidence", json!({"id": "https://e.example/1"})),
             ),
             (
                 "terms of use without type",
+                "termsOfUse is not one or more typed objects",
                 put("", "termsOfUse", json!([{"id": "https://t.example/"}])),
             ),
             (
                 "refresh service without type",
+                "refreshService is not one or more typed objects",
                 put("", "refreshService", json!({})),
             ),
             (
                 "proof without type",
+                "proof is not one or more typed objects",
                 put("", "proof", json!({"proofValue": "z58"})),
             ),
             (
                 "confidence method without type",
+                "confidenceMethod is not one or more typed objects",
                 put("", "confidenceMethod", json!({})),
             ),
             (
                 "render method without type",
+                "renderMethod is not one or more typed objects",
                 put("", "renderMethod", json!([{"id": "urn:r:1"}])),
             ),
             (
                 "related resource without digest",
+                "relatedResource entry has no digest",
                 related(json!({"id": "https://r.example/a"})),
             ),
             (
                 "related resource without id",
+                "relatedResource entry lacks an id",
                 related(json!({"digestSRI": sri})),
             ),
             (
                 "related resource ids repeat",
+                "relatedResource ids repeat",
                 related(json!([
                     {"id": "https://r.example/a", "digestSRI": sri},
                     {"id": "https://r.example/a", "digestSRI": sri},
@@ -2746,28 +3058,77 @@ mod tests {
             ),
             (
                 "digestSRI outside the SRI grammar",
+                "digestSRI value is not an SRI hash-expression",
                 related(json!({"id": "https://r.example/a", "digestSRI": [sri, "md5-abc"]})),
             ),
             (
                 "mediaType not a string",
+                "relatedResource mediaType is not a string",
                 related(json!({"id": "https://r.example/a", "digestSRI": sri, "mediaType": 7})),
             ),
-            ("unsupported multibase prefix", multibase("x1220ab")),
+            (
+                "unsupported multibase prefix",
+                "not a multibase-encoded multihash",
+                multibase("x1220ab"),
+            ),
             (
                 "base58 outside its alphabet",
+                "not a multibase-encoded multihash",
                 multibase("zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR10"),
             ),
-            ("truncated multihash", multibase("f122001")),
+            (
+                "truncated multihash",
+                "not a multibase-encoded multihash",
+                multibase("f122001"),
+            ),
             (
                 "sha2-256 multihash of the wrong length",
+                "not a multibase-encoded multihash",
                 multibase(&format!("f1210{}", "ab".repeat(16))),
             ),
-            ("empty digestMultibase", multibase("")),
+            (
+                "empty digestMultibase",
+                "not a multibase-encoded multihash",
+                multibase(""),
+            ),
             (
                 "pinned context with the wrong digest",
+                "digest does not match the pinned context",
                 related(json!({"id": VC_CONTEXT_V2, "digestSRI": sri})),
             ),
         ]);
+    }
+
+    /// Digest parsing happens before issuer trust and signature verification,
+    /// so encoded inputs are bounded before any decoder sees them.
+    #[test]
+    fn oversized_related_resource_digests_have_a_fixed_rejection_reason() {
+        const REASON: &str =
+            "payload is not a valid identity claims aggregation credential: a relatedResource digest exceeds 140 encoded characters";
+        for (case, field, value) in [
+            (
+                "64 KiB multibase",
+                "digestMultibase",
+                format!("z{}", "1".repeat(64 * 1024)),
+            ),
+            (
+                "64 KiB SRI body",
+                "digestSRI",
+                format!("sha512-{}", "A".repeat(64 * 1024)),
+            ),
+        ] {
+            let results = validate_edited(put(
+                "",
+                "relatedResource",
+                json!({"id": "https://r.example/oversized", field: value}),
+            ));
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
+                "{case}"
+            );
+            assert_eq!(results.failure[0].explanation, REASON, "{case}");
+        }
     }
 
     /// V-25, V-27: VC 1.1 also requires an `id` URI on credential status and
@@ -2781,7 +3142,11 @@ mod tests {
                 json!({"type": "ManualRefreshService2018"}),
             ),
         ] {
-            assert_invalid_vc(field, &validate_edited_v1(put("", field, value)));
+            assert_invalid_vc(
+                field,
+                "is not one or more typed objects with URL identifiers",
+                &validate_edited_v1(put("", field, value)),
+            );
         }
         assert_each_valid(vec![(
             "VC 2.0 refresh service without id",
