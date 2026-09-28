@@ -47,6 +47,24 @@ const PINNED_CONTEXTS: [(&str, &[u8]); 4] = [
     ),
 ];
 
+/// Precomputed digests of one pinned context document.
+struct PinnedDigests {
+    sha256: [u8; 32],
+    sha384: [u8; 48],
+    sha512: [u8; 64],
+}
+
+/// Hash each vendored context once. Credential-supplied digest arrays compare
+/// against this cache instead of repeatedly hashing documents before trust and
+/// signature checks.
+static PINNED_DIGESTS: LazyLock<[PinnedDigests; PINNED_CONTEXTS.len()]> = LazyLock::new(|| {
+    PINNED_CONTEXTS.map(|(_, bytes)| PinnedDigests {
+        sha256: Sha256::digest(bytes).into(),
+        sha384: Sha384::digest(bytes).into(),
+        sha512: Sha512::digest(bytes).into(),
+    })
+});
+
 /// The VC data-model version selected by `@context[0]`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum VcVersion {
@@ -616,7 +634,6 @@ fn natural_language_value(value: &Json) -> bool {
 /// least one well-formed digest. An entry naming a pinned context must match
 /// the pinned bytes, since the verifier makes use of that resource.
 fn related_resources(value: &Json, version: VcVersion) -> Checked {
-    const DIGEST_TOO_LONG: &str = "a relatedResource digest exceeds 140 encoded characters";
     let items = one_or_more_objects(value).ok_or("relatedResource is not one or more objects")?;
     let mut ids = HashSet::with_capacity(items.len());
     for item in items {
@@ -637,34 +654,34 @@ fn related_resources(value: &Json, version: VcVersion) -> Checked {
         }
         let pinned = PINNED_CONTEXTS
             .iter()
-            .find(|(url, _)| *url == id)
-            .map(|(_, bytes)| *bytes);
+            .position(|(url, _)| *url == id)
+            .map(|index| &PINNED_DIGESTS[index]);
         let mut has_digest = false;
+        let mut digest_count = 0;
+        let mut seen_digests = HashSet::new();
         for expression in strings(item.get("digestSRI"))? {
             let expression = expression?;
+            check_digest_cardinality(expression, &mut digest_count, &mut seen_digests)?;
             has_digest = true;
-            if sri_body(expression).is_some_and(|body| body.len() > MAX_ENCODED_DIGEST_LEN) {
-                return Err(DIGEST_TOO_LONG.into());
-            }
-            let (algorithm, digest) =
-                sri_hash(expression).ok_or("a digestSRI value is not an SRI hash-expression")?;
-            if let Some(bytes) = pinned {
-                if digest != compute(algorithm, bytes) {
+            let (algorithm, digest) = sri_hash(expression).map_err(digest_defect)?;
+            if let Some(pinned) = pinned {
+                if digest != algorithm.cached(pinned) {
                     return Err("a relatedResource digest does not match the pinned context".into());
                 }
             }
         }
         for encoded in strings(item.get("digestMultibase"))? {
             let encoded = encoded?;
+            check_digest_cardinality(encoded, &mut digest_count, &mut seen_digests)?;
             has_digest = true;
-            if encoded.len() > MAX_ENCODED_DIGEST_LEN {
-                return Err(DIGEST_TOO_LONG.into());
-            }
             const NOT_MULTIHASH: &str =
                 "a digestMultibase value is not a multibase-encoded multihash";
-            let decoded = multibase_decode(encoded).ok_or(NOT_MULTIHASH)?;
+            let decoded = multibase_decode(encoded).map_err(|error| match error {
+                DigestDecodeError::TooLong => digest_defect(error),
+                DigestDecodeError::Invalid => NOT_MULTIHASH.into(),
+            })?;
             let (code, digest) = multihash(&decoded).ok_or(NOT_MULTIHASH)?;
-            if let Some(bytes) = pinned {
+            if let Some(pinned) = pinned {
                 let algorithm = match code {
                     0x12 => DigestAlgorithm::Sha256,
                     0x20 => DigestAlgorithm::Sha384,
@@ -676,7 +693,7 @@ fn related_resources(value: &Json, version: VcVersion) -> Checked {
                         )
                     }
                 };
-                if digest != compute(algorithm, bytes) {
+                if digest != algorithm.cached(pinned) {
                     return Err("a relatedResource digest does not match the pinned context".into());
                 }
             }
@@ -684,6 +701,25 @@ fn related_resources(value: &Json, version: VcVersion) -> Checked {
         if !has_digest {
             return Err("a relatedResource entry has no digest".into());
         }
+    }
+    Ok(())
+}
+
+const MAX_DIGESTS_PER_RESOURCE: usize = 16;
+
+fn check_digest_cardinality<'a>(
+    digest: &'a str,
+    count: &mut usize,
+    seen: &mut HashSet<&'a str>,
+) -> Checked {
+    *count += 1;
+    if *count > MAX_DIGESTS_PER_RESOURCE {
+        return Err(CredentialDefect::Malformed(Cow::Owned(format!(
+            "a relatedResource entry has more than {MAX_DIGESTS_PER_RESOURCE} digests"
+        ))));
+    }
+    if !seen.insert(digest) {
+        return Err("a relatedResource entry repeats a digest".into());
     }
     Ok(())
 }
@@ -728,62 +764,74 @@ enum DigestAlgorithm {
     Sha512,
 }
 
-fn compute(algorithm: DigestAlgorithm, bytes: &[u8]) -> Vec<u8> {
-    match algorithm {
-        DigestAlgorithm::Sha256 => Sha256::digest(bytes).to_vec(),
-        DigestAlgorithm::Sha384 => Sha384::digest(bytes).to_vec(),
-        DigestAlgorithm::Sha512 => Sha512::digest(bytes).to_vec(),
+impl DigestAlgorithm {
+    fn cached(self, digests: &PinnedDigests) -> &[u8] {
+        match self {
+            DigestAlgorithm::Sha256 => &digests.sha256,
+            DigestAlgorithm::Sha384 => &digests.sha384,
+            DigestAlgorithm::Sha512 => &digests.sha512,
+        }
     }
 }
 
 const MAX_ENCODED_DIGEST_LEN: usize = 140;
+const MAX_DECODED_MULTIHASH_LEN: usize = 68;
 
-/// Return the encoded digest body of an SRI hash-expression.
-fn sri_body(text: &str) -> Option<&str> {
-    let expression = text
-        .split_once('?')
-        .map_or(text, |(expression, _)| expression);
-    expression.split_once('-').map(|(_, digest)| digest)
+#[derive(Clone, Copy)]
+enum DigestDecodeError {
+    TooLong,
+    Invalid,
+}
+
+fn digest_defect(error: DigestDecodeError) -> CredentialDefect {
+    match error {
+        DigestDecodeError::TooLong => CredentialDefect::Malformed(Cow::Owned(format!(
+            "a relatedResource digest exceeds {MAX_ENCODED_DIGEST_LEN} encoded characters"
+        ))),
+        DigestDecodeError::Invalid => "a digestSRI value is not an SRI hash-expression".into(),
+    }
 }
 
 /// Subresource Integrity `hash-expression`: `hash-algo "-" base64-value`
 /// with an optional `"?" option-expression`. Returns the algorithm and the
 /// decoded digest.
-fn sri_hash(text: &str) -> Option<(DigestAlgorithm, Vec<u8>)> {
+fn sri_hash(text: &str) -> Result<(DigestAlgorithm, Vec<u8>), DigestDecodeError> {
     let (expression, options) = text.split_once('?').unwrap_or((text, ""));
-    let (algorithm, digest) = expression.split_once('-')?;
+    let (algorithm, digest) = expression
+        .split_once('-')
+        .ok_or(DigestDecodeError::Invalid)?;
     if digest.len() > MAX_ENCODED_DIGEST_LEN {
-        return None;
+        return Err(DigestDecodeError::TooLong);
     }
     let algorithm = match algorithm {
         "sha256" => DigestAlgorithm::Sha256,
         "sha384" => DigestAlgorithm::Sha384,
         "sha512" => DigestAlgorithm::Sha512,
-        _ => return None,
+        _ => return Err(DigestDecodeError::Invalid),
     };
     let body = digest.trim_end_matches('=');
     if body.is_empty()
         || digest.len() - body.len() > 2
         || !options.bytes().all(|b| b.is_ascii_graphic())
     {
-        return None;
+        return Err(DigestDecodeError::Invalid);
     }
     let url_alphabet = body.contains(['-', '_']);
-    let decoded = base64_decode(body, url_alphabet)?;
-    Some((algorithm, decoded))
+    let decoded = base64_decode(body, url_alphabet).ok_or(DigestDecodeError::Invalid)?;
+    Ok((algorithm, decoded))
 }
 
 /// Decode a multibase string. Supported bases: base58btc (`z`), base64url
 /// (`u` unpadded, `U` padded), base64 (`m`, `M`), base16 (`f`, `F`), and
 /// base32 (`b`, `B`).
-fn multibase_decode(text: &str) -> Option<Vec<u8>> {
+fn multibase_decode(text: &str) -> Result<Vec<u8>, DigestDecodeError> {
     if text.len() > MAX_ENCODED_DIGEST_LEN {
-        return None;
+        return Err(DigestDecodeError::TooLong);
     }
     let mut chars = text.chars();
-    let prefix = chars.next()?;
+    let prefix = chars.next().ok_or(DigestDecodeError::Invalid)?;
     let body = chars.as_str();
-    match prefix {
+    let decoded = match prefix {
         'z' => base58btc_decode(body),
         'u' | 'm' if body.contains('=') => None,
         'U' | 'M' if body.len() % 4 != 0 => None,
@@ -794,12 +842,16 @@ fn multibase_decode(text: &str) -> Option<Vec<u8>> {
         'b' => base32_decode(body, false),
         'B' => base32_decode(body, true),
         _ => None,
-    }
+    };
+    decoded.ok_or(DigestDecodeError::Invalid)
 }
 
 fn base58btc_decode(text: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let zeros = text.bytes().take_while(|&byte| byte == b'1').count();
+    if zeros > MAX_DECODED_MULTIHASH_LEN {
+        return None;
+    }
     let mut number: Vec<u8> = Vec::new(); // little-endian base 256
     for byte in text.bytes().skip(zeros) {
         let mut carry = ALPHABET.iter().position(|&symbol| symbol == byte)? as u32;
@@ -809,6 +861,9 @@ fn base58btc_decode(text: &str) -> Option<Vec<u8>> {
             carry >>= 8;
         }
         while carry > 0 {
+            if zeros + number.len() >= MAX_DECODED_MULTIHASH_LEN {
+                return None;
+            }
             number.push(carry as u8);
             carry >>= 8;
         }
@@ -1041,18 +1096,32 @@ fn days_from_civil(year: i128, month: u32, day: u32) -> i128 {
 mod tests {
     use super::*;
 
-    /// The vendored bytes are the pinned documents.
+    /// The one-time digest cache is derived from the exact vendored bytes for
+    /// every supported SRI algorithm.
     #[test]
-    fn vendored_contexts_match_their_pinned_digests() {
-        let expected = [
+    fn pinned_digest_cache_matches_the_vendored_contexts() {
+        let expected_sha256 = [
             "ab4ddd9a531758807a79a5b450510d61ae8d147eab966cc9a200c07095b0cdcc",
             "59955ced6697d61e03f2b2556febe5308ab16842846f5b586d7f1f7adec92734",
             "750c94af1c3d7e587dc19f3a06ef1e9bfe8412a1e94ef15037ae83f3baeb82e9",
             "fda5add353231e6a6884a46b12e6c75464281900cb348284d9c360f62381d9f7",
         ];
-        for ((url, bytes), digest) in PINNED_CONTEXTS.iter().zip(expected) {
-            assert_eq!(hex::encode(Sha256::digest(bytes)), digest, "{url}");
+        for (index, ((url, bytes), digest)) in
+            PINNED_CONTEXTS.iter().zip(expected_sha256).enumerate()
+        {
+            let cached = &PINNED_DIGESTS[index];
+            assert_eq!(hex::encode(cached.sha256), digest, "{url}");
+            assert_eq!(cached.sha384.as_slice(), &Sha384::digest(bytes)[..]);
+            assert_eq!(cached.sha512.as_slice(), &Sha512::digest(bytes)[..]);
         }
+    }
+
+    /// The base58 decoder independently enforces the largest supported
+    /// multihash size, even when its encoded input remains below the text cap.
+    #[test]
+    fn base58_decoder_stops_above_the_supported_multihash_size() {
+        assert!(base58btc_decode(&"z".repeat(94)).is_none());
+        assert!(multibase_decode(&format!("z{}", "z".repeat(94))).is_err());
     }
 
     /// The static `@json` table is exactly what the vendored documents

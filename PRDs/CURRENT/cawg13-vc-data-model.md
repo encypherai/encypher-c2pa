@@ -32,11 +32,11 @@ The four documents are vendored byte-for-byte under `crates/encypher-c2pa/src/c2
 
 ### Profile limits fail closed with `unsupported_context`
 
-Each of the following yields `cawg.ica.invalid_verifiable_credential` with `details: {"reason": "unsupported_context", "contexts": [...]}`, and validation stops:
+Each of the following yields `cawg.ica.invalid_verifiable_credential` with `details: {"reason": "unsupported_context", "contexts": [...]}`, containing only the first offending context, and validation stops:
 
-1. A string `@context` item outside the pinned set. `contexts` lists each such URL.
-2. An object-valued (inline) `@context` item. `contexts` lists `"<inline>"` for each one.
-3. An `@context` member on any JSON object in the credential body, whether node, value, or list object. Expansion processes `@context` wherever it appears. The top-level `@context` value itself and the values of `@json`-typed terms (below) are excluded. `contexts` lists `"<embedded>"`.
+1. A string `@context` item outside the pinned set. `contexts` contains that URL.
+2. An object-valued (inline) `@context` item. `contexts` contains `"<inline>"`.
+3. An `@context` member on any JSON object in the credential body, whether node, value, or list object. Expansion processes `@context` wherever it appears. The top-level `@context` value itself and the values of `@json`-typed terms (below) are excluded. `contexts` contains `"<embedded>"`.
 
 These are profile limitations of type-specific processing (VC 2.0 section 6.3), not claims that the credential breaks VC syntax. VC 2.0 section 4.3 allows object items and VC 1.1 section 4.1 allows "URIs or objects". V-03 is therefore recorded as **partial**, with this rationale.
 
@@ -67,7 +67,7 @@ Interop count: 0 of the 24 real ICA credentials extracted from the vectors (see 
 
 `BitstringStatusListEntry`, the type CAWG recommends, remains supported. A VC 1.1 ICA must list `https://www.w3.org/ns/credentials/status/v1`, normally as `[VC v1, status/v1, CAWG ICA]`; the verifier then returns the same revoked, not-revoked, or unavailable result as before. Without status/v1, the bare term expands through the CAWG `@vocab` to a non-W3C IRI and reports `cawg.ica.revocation.unsupported`. VC 2.0 defines the Bitstring terms in its base context and may list status/v1 redundantly.
 
-The remaining fail-closed case is a VC 2.0 ICA using `StatusList2021Entry`, which needs the unpinned `https://w3id.org/vc/status-list/2021/v1` context. That mechanism was never evaluated by this verifier. It now stops with `unsupported_context` rather than reaching `cawg.ica.revocation.unsupported`. No real credential in the inventory carries a status entry.
+The remaining fail-closed case is a VC 1.1 or 2.0 ICA that lists the unpinned `https://w3id.org/vc/status-list/2021/v1` context and uses `StatusList2021Entry`. That mechanism was never evaluated by this verifier. It now stops with `unsupported_context` rather than reaching `cawg.ica.revocation.unsupported`. No real credential in the inventory carries a status entry.
 
 ### Body shape rules (V-36)
 
@@ -151,8 +151,8 @@ Legend: **Checked** means the rule is enforced after this PRD (**existing**: alr
 | V-27 | `refreshService`: one or more, each with a type (2.0 5.4); 1.1 also requires an `id` URI (1.1 5.5) | Checked (**new**) | |
 | V-28 | `termsOfUse`: one or more policies, each with a type (2.0 5.5; 1.1 5.6) | Checked (**new**) | |
 | V-29 | `evidence`: one object or a set, each with a REQUIRED `type` and an optional `id` (2.0 5.6; 1.1 5.7) | Checked (**new**) | |
-| V-30 | `relatedResource`: one or more objects; `id` REQUIRED, a URL, unique in the list; at least one of `digestSRI` and `digestMultibase` (2.0 5.3) | Checked (**new**) | `digestSRI` is a string or non-empty array of SRI `hash-expression`s using SHA-256/384/512. `digestMultibase` is a string or non-empty array of multibase multihashes. Prefixes `z`, `u`/`U`, `m`/`M`, `f`/`F`, and `b`/`B` are supported. Each encoded digest is capped at 140 characters before any base58, base64, base16, or base32 decoder runs; this covers a SHA-512 multihash in every supported base and bounds pre-authentication work. Duplicate resource ids are tracked in a set. |
-| V-31 | A verifier that "makes use of a resource based on the id of a relatedResource object" MUST compute its digest and error on mismatch (2.0 5.3) | Checked (**new**) for the pinned contexts; N/A otherwise | The verifier makes use of four pinned resources. When a `relatedResource.id` equals a pinned URL, every digest given is computed over the vendored bytes and must match: SHA-256/384/512 for SRI, and multihash codes `0x12`/`0x20`/`0x13`. Other ids are never retrieved. |
+| V-30 | `relatedResource`: one or more objects; `id` REQUIRED, a URL, unique in the list; at least one of `digestSRI` and `digestMultibase` (2.0 5.3) | Checked (**new**) | `digestSRI` is a string or non-empty array of SRI `hash-expression`s using SHA-256/384/512. `digestMultibase` is a string or non-empty array of multibase multihashes. Prefixes `z`, `u`/`U`, `m`/`M`, `f`/`F`, and `b`/`B` are supported. Each encoded digest is capped at 140 characters before any base58, base64, base16, or base32 decoder runs; this covers a SHA-512 multihash in every supported base. Each resource may list at most 16 distinct digest strings. The base58 decoder also stops above the 68-byte maximum supported multihash. Duplicate resource ids are tracked in a set. |
+| V-31 | A verifier that "makes use of a resource based on the id of a relatedResource object" MUST compute its digest and error on mismatch (2.0 5.3) | Checked (**new**) for the pinned contexts; N/A otherwise | The verifier makes use of four pinned resources. Their SHA-256/384/512 digests are computed once from the vendored bytes and cached. When a `relatedResource.id` equals a pinned URL, every digest given must match that cache: SRI uses SHA-256/384/512, and multihash uses codes `0x12`/`0x20`/`0x13`. Other ids are never retrieved. |
 | V-32 | Reserved `confidenceMethod` and `renderMethod` values MUST specify a `type` (2.0 5.10) | Checked (**new**, VC 2.0) | |
 
 ### Securing and syntax

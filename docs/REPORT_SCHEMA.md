@@ -129,7 +129,7 @@ CAWG X.509 identity signatures report the registered `cawg.x509.*` codes from th
 
 `cawg.ica.verified_identities.invalid` carries `details.invalid_entries`, one `{index, field}` object per rejected `verifiedIdentities` entry, because the status code alone cannot say which entry failed. `index` is the entry's zero-based position and `field` is the property that broke a CAWG Identity 1.3 condition, such as `verifiedAt`, `provider.name`, or `uri`; `entry` means the item is not an object.
 
-`cawg.ica.invalid_verifiable_credential` carries `details: {"reason": "unsupported_context", "contexts": [...]}` when the credential uses a JSON-LD context outside the three the verifier pins (VC v1, VC v2, CAWG ICA 1.1). `contexts` lists each unpinned URL, `"<inline>"` for an object item, or `"<embedded>"` for an `@context` inside the body. Other `invalid_verifiable_credential` results carry no `details`.
+`cawg.ica.invalid_verifiable_credential` carries `details: {"reason": "unsupported_context", "contexts": [...]}` when the credential uses a JSON-LD context outside the four the verifier pins (VC v1, VC v2, CAWG ICA 1.1, and W3C Bitstring Status List v1). `contexts` contains only the first offending value: an unpinned URL, `"<inline>"` for an object item, or `"<embedded>"` for an `@context` inside the body. Other `invalid_verifiable_credential` results carry no `details`.
 
 Live-stream reports use the registered `livevideo.*` codes. Supplying fragments that no binding in the active manifest covers is `livevideo.segment.invalid`, with `integrity: invalid` and `hard_binding: mismatch`.
 

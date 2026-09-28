@@ -3131,6 +3131,41 @@ mod tests {
         }
     }
 
+    /// Pinned context digests use a one-time cache, and an entry cannot turn
+    /// a small signed payload into unbounded repeated digest work.
+    #[test]
+    fn related_resource_digest_arrays_are_bounded_and_unique() {
+        let sri = v2_context_sri();
+        for (case, digests, reason) in [
+            (
+                "large repeated valid digest array",
+                vec![sri.clone(); 4096],
+                "a relatedResource entry repeats a digest",
+            ),
+            (
+                "too many distinct valid digest expressions",
+                (0..=16).map(|index| format!("{sri}?v={index}")).collect(),
+                "a relatedResource entry has more than 16 digests",
+            ),
+        ] {
+            let results = validate_edited(put(
+                "",
+                "relatedResource",
+                json!({"id": VC_CONTEXT_V2, "digestSRI": digests}),
+            ));
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
+                "{case}"
+            );
+            assert!(
+                results.failure[0].explanation.contains(reason),
+                "{case}: {:?}",
+                results.failure[0]
+            );
+        }
+    }
+
     /// V-25, V-27: VC 1.1 also requires an `id` URI on credential status and
     /// refresh service objects, which VC 2.0 makes optional.
     #[test]
