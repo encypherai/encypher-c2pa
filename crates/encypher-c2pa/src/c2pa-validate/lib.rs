@@ -68,6 +68,7 @@ mod crjson;
 mod ingredient_graph;
 pub(crate) mod live_video;
 mod network_needs;
+mod vc_data_model;
 pub(crate) use network_needs::{NetworkNeed, OcspPurpose};
 mod observe;
 mod pdf_history;

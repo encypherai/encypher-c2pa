@@ -506,6 +506,7 @@ dependencies = [
  "time",
  "unicode-normalization",
  "ureq",
+ "url",
  "x509-cert",
  "x509-tsp",
 ]

@@ -24,3 +24,15 @@ Apache-2.0, from the Content Authenticity Initiative contributors.
 The repository includes cryptographic and serialization dependencies under
 their respective open-source licenses. Package distributions carry the
 applicable license metadata.
+
+The verifier embeds four JSON-LD context documents byte for byte, under
+crates/encypher-c2pa/src/c2pa-validate/contexts/, to check identity claims
+aggregation credentials offline:
+- credentials-v1.jsonld: https://www.w3.org/2018/credentials/v1
+- credentials-v2.jsonld: https://www.w3.org/ns/credentials/v2
+- credentials-status-v1.jsonld: https://www.w3.org/ns/credentials/status/v1
+  Copyright World Wide Web Consortium. Distributed under the W3C Software and
+  Document License, https://www.w3.org/copyright/software-license-2023/
+- cawg-ica-1.1.jsonld: https://cawg.io/identity/1.1/ica/context/
+  From the Creator Assertions Working Group identity assertion repository,
+  under the Apache License, Version 2.0.
