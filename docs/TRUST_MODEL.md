@@ -53,6 +53,24 @@ Every certificate on the path is checked against the C2PA certificate profile: v
 
 CAWG document-signing credentials require a configured CAWG anchor or allowed-list match; certificate profile alone never establishes trust. Material you pass in `cawg_trust_pem` or `cawg_allowed_certs_pem` is a validator-configured entry, so it is evaluated under the base trust model rather than under the interim S/MIME additions, which belong to the two root stores the specification names. `cawg_did_documents` supplies a pinned DID-to-document map for `did:web` identity resolution without the network; with online checks allowed, a missing document is fetched from the DID's own URL and used the same way.
 
+`cawg_trust_configurations` lets a caller state what each CAWG trust source is. It is a list of entries, appended after `cawg_trust_pem` and `cawg_allowed_certs_pem`:
+
+```json
+[
+  { "profile": "base", "certificates_pem": "-----BEGIN CERTIFICATE-----..." },
+  { "profile": "smime_interim", "certificates_pem": "...", "not_after": "2027-03-31T23:59:59Z" }
+]
+```
+
+- `base` is an entry the validator configured itself. It accepts `id-kp-documentSigning`, and, as local validator policy, `id-kp-emailProtection` with one of the six CA/Browser Forum S/MIME policies, with no time condition. It is reported as `trust_source: caller_supplied`.
+- `smime_interim` is one of the two sources the CAWG Identity 1.3 interim trust model additions name: the Mozilla root store with the email trust bit, or the IPTC Verified News Publishers lists. It accepts only `id-kp-emailProtection` with one of the six policies, and only while the validation time is on or before 31 March 2027 or a trusted time stamp shows the identity assertion was issued by then. Past the cutoff an untimestamped credential reads `cawg.x509.credential.untrusted` with reason `trusted_timestamp_required`. It is reported as `trust_source: smime_interim`. Supply fresh copies of those lists here when you run with `no_default_trust`; `cawg_trust_pem` would treat them as `base`.
+
+Each entry may mix CA and end-entity certificates. A CA certificate, or a self-issued certificate without BasicConstraints (a version 1 root), anchors chains; any other certificate is accepted only when it is the credential itself. `not_before` and `not_after` (RFC 3339) bound that entry alone, measured at the credential's trusted time stamp or, without one, the validation time. The global `trust_anchor_not_before`/`trust_anchor_not_after` do not apply to these entries.
+
+Anchors are kept per accepted EKU. Only entries that are not interim sources (`base`, `cawg_trust_pem`, `cawg_allowed_certs_pem`, and the packaged Encypher Verified Organizations root) can satisfy the document-signing anchor requirement. For `emailProtection`, those entries are tried first and interim entries only if none accepts, so a refused interim path never hides a valid base path. A certificate configured more than once is represented by the first entry that is in force and eligible for the EKU being checked.
+
+An empty `certificates_pem`, undecodable PEM, an unparseable bound, or `not_before` later than `not_after` fails the call with `invalid_trust_material` naming the entry (for example `cawg_trust_configurations[2].not_after`). An unknown `profile` fails option parsing (`invalid_options`).
+
 An identity claims aggregation credential is trusted only when its issuer DID is listed in `cawg_ica_trusted_issuers`, or reaches a DID in `cawg_ica_trust_anchors` through `controller` links in pinned DID documents (at most 16 hops). A credential with a `credentialStatus` revocation entry is checked against `cawg_ica_status_lists`, a map from status-list URI to the decompressed bitstring in standard base64. A missing list is reported as `cawg.ica.revocation.unavailable`; it is never treated as not revoked. Status-list credentials stay caller-supplied even when online checks are allowed: a status list is itself a verifiable credential, and fetching one would mean trusting it before verifying it.
 
 Malformed PEM is a hard input error. The verifier never converts malformed trust material into a silent `not_evaluated` result.

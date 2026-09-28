@@ -357,19 +357,49 @@ impl TrustList {
             .collect()
     }
 
-    /// The anchors that authorize `purpose` and are in force at `at`, each
-    /// with its index in this list so a completed path can name the anchor it
-    /// terminated at.
+    /// The anchors that authorize `purpose`, are in force at `at`, and pass
+    /// `admit`, each with its index in this list so a completed path can name
+    /// the anchor it terminated at.
     fn active_anchors(
         &self,
         purpose: AnchorPurpose,
         at: OffsetDateTime,
+        admit: impl Fn(&TrustAnchor) -> bool,
     ) -> Vec<(usize, &TrustAnchor)> {
         self.anchors
             .iter()
             .enumerate()
-            .filter(|(_, anchor)| anchor.purpose == purpose && anchor.active_at(at))
+            .filter(|(_, anchor)| {
+                anchor.purpose == purpose && anchor.active_at(at) && admit(anchor)
+            })
             .collect()
+    }
+
+    /// Split this list by certificate type: trust anchors first, every other
+    /// certificate second. Each keeps its configuration. A CAWG interim list
+    /// "MAY include both CA and end-entity certificates", so a list is sorted
+    /// by what each certificate is rather than by the list it was published
+    /// in. An anchor is a CA certificate (BasicConstraints `cA = TRUE`) or a
+    /// self-issued certificate with no BasicConstraints extension: version 1
+    /// roots still appear in root stores, and RFC 5280 treats a trust anchor
+    /// as a name and key. A certificate that states `cA = FALSE` is never an
+    /// issuer.
+    pub fn split_certificate_authorities(self) -> (Self, Self) {
+        let (authorities, end_entities) = self.anchors.into_iter().partition(|anchor| {
+            Certificate::from_der(&anchor.certificate).is_ok_and(|cert| {
+                is_ca_certificate(&cert)
+                    || (cert.tbs_certificate.subject == cert.tbs_certificate.issuer
+                        && !has_extension(&cert, OID_EXT_BASIC_CONSTRAINTS))
+            })
+        });
+        (
+            Self {
+                anchors: authorities,
+            },
+            Self {
+                anchors: end_entities,
+            },
+        )
     }
 }
 
@@ -560,6 +590,29 @@ pub fn validate_chain(
     purpose: AnchorPurpose,
     validation_time: Option<OffsetDateTime>,
 ) -> ChainResult {
+    validate_chain_admitting(
+        leaf_der,
+        intermediates_der,
+        trust,
+        purpose,
+        validation_time,
+        |_| true,
+    )
+}
+
+/// [`validate_chain`] restricted to the anchors `admit` accepts.
+///
+/// The CAWG trust configuration keeps anchors per accepted EKU, so one trust
+/// list can hold anchors that may terminate a path for one EKU and not for
+/// another.
+pub fn validate_chain_admitting(
+    leaf_der: &[u8],
+    intermediates_der: &[Vec<u8>],
+    trust: &TrustList,
+    purpose: AnchorPurpose,
+    validation_time: Option<OffsetDateTime>,
+    admit: impl Fn(&TrustAnchor) -> bool,
+) -> ChainResult {
     let at = validation_time.unwrap_or_else(OffsetDateTime::now_utc);
 
     let leaf = match Certificate::from_der(leaf_der) {
@@ -583,7 +636,7 @@ pub fn validate_chain(
             candidates.push(c);
         }
     }
-    for (index, anchor) in trust.active_anchors(purpose, at) {
+    for (index, anchor) in trust.active_anchors(purpose, at, admit) {
         if let Ok(c) = Certificate::from_der(&anchor.certificate) {
             anchor_indices
                 .entry(fingerprint_hex(&anchor.certificate))
@@ -874,6 +927,13 @@ fn is_ca_certificate(cert: &Certificate) -> bool {
     BasicConstraints::from_der(ext.extn_value.as_bytes())
         .map(|bc| bc.ca)
         .unwrap_or(false)
+}
+
+fn has_extension(cert: &Certificate, oid: ObjectIdentifier) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_some_and(|exts| exts.iter().any(|e| e.extn_id == oid))
 }
 
 /// The BasicConstraints `pathLenConstraint` of a CA certificate, if present.

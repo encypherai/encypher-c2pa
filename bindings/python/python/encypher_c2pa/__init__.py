@@ -87,6 +87,7 @@ def verify(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
+    cawg_trust_configurations: Optional[Sequence[Mapping[str, Any]]] = None,
     trust_anchor_not_before: Optional[str] = None,
     trust_anchor_not_after: Optional[str] = None,
     no_default_trust: bool = False,
@@ -108,7 +109,12 @@ def verify(
     caller-supplied PEM bundles extend them. Set ``no_default_trust=True`` to
     evaluate only caller-supplied trust material. CAWG named-actor credentials
     are evaluated against the packaged Mozilla Email, IPTC VNPL, and Encypher
-    identity lists plus ``cawg_trust_pem``/``cawg_allowed_certs_pem``.
+    identity lists plus ``cawg_trust_pem``/``cawg_allowed_certs_pem`` and
+    ``cawg_trust_configurations``: typed CAWG Identity 1.3 trust sources, each
+    ``{"profile": "base" | "smime_interim", "certificates_pem": ...,
+    "not_before": ..., "not_after": ...}``. ``smime_interim`` entries (the
+    Mozilla email roots, the IPTC lists) accept S/MIME identities only until
+    31 March 2027 or with a trusted time stamp from before it.
     ``trust_anchor_not_before``/``trust_anchor_not_after`` are RFC 3339
     instants bounding when the caller-supplied anchors are trusted;
     ``cawg_did_documents`` maps a primary DID (e.g. ``did:web:example.com``)
@@ -168,6 +174,9 @@ def verify(
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
+        "cawg_trust_configurations": [dict(entry) for entry in cawg_trust_configurations]
+        if cawg_trust_configurations
+        else None,
         "trust_anchor_not_before": trust_anchor_not_before,
         "trust_anchor_not_after": trust_anchor_not_after,
         "no_default_trust": bool(no_default_trust),
@@ -235,6 +244,7 @@ def verify_stream(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
+    cawg_trust_configurations: Optional[Sequence[Mapping[str, Any]]] = None,
     no_default_trust: bool = False,
     cawg_did_documents: Optional[Mapping[str, Any]] = None,
     cawg_ica_trusted_issuers: Optional[Sequence[str]] = None,
@@ -303,6 +313,9 @@ def verify_stream(
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
+        "cawg_trust_configurations": [dict(entry) for entry in cawg_trust_configurations]
+        if cawg_trust_configurations
+        else None,
         "no_default_trust": bool(no_default_trust),
         "cawg_did_documents": dict(cawg_did_documents) if cawg_did_documents else None,
         "cawg_ica_trusted_issuers": list(cawg_ica_trusted_issuers)

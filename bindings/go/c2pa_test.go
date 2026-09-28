@@ -162,8 +162,13 @@ func TestVerifyFragmentedFailsClosedOnSegmentsNoBindingCovers(t *testing.T) {
 
 func TestCAWGOptionsAndStatusDetailsRoundTrip(t *testing.T) {
 	optionsJSON, err := json.Marshal(Options{
-		CAWGTrustPEM:          "anchor",
-		CAWGAllowedCertsPEM:   "leaf",
+		CAWGTrustPEM:        "anchor",
+		CAWGAllowedCertsPEM: "leaf",
+		CAWGTrustConfigurations: []CAWGTrustConfiguration{{
+			Profile:         CAWGTrustProfileSMIMEInterim,
+			CertificatesPEM: "roots",
+			NotAfter:        "2027-03-31T23:59:59Z",
+		}},
 		CAWGDIDDocuments:      map[string]json.RawMessage{"did:web:example.test": json.RawMessage(`{"id":"did:web:example.test"}`)},
 		CAWGICATrustedIssuers: []string{"did:web:example.test"},
 		CAWGICATrustAnchors:   []string{"did:web:root.test"},
@@ -182,6 +187,7 @@ func TestCAWGOptionsAndStatusDetailsRoundTrip(t *testing.T) {
 	for _, key := range []string{
 		"cawg_trust_pem",
 		"cawg_allowed_certs_pem",
+		"cawg_trust_configurations",
 		"cawg_did_documents",
 		"cawg_ica_trusted_issuers",
 		"cawg_ica_trust_anchors",
@@ -193,6 +199,17 @@ func TestCAWGOptionsAndStatusDetailsRoundTrip(t *testing.T) {
 		if _, ok := options[key]; !ok {
 			t.Fatalf("missing CAWG option %q in %s", key, optionsJSON)
 		}
+	}
+	var configurations []map[string]string
+	if err := json.Unmarshal(options["cawg_trust_configurations"], &configurations); err != nil {
+		t.Fatal(err)
+	}
+	if len(configurations) != 1 || configurations[0]["profile"] != "smime_interim" ||
+		configurations[0]["certificates_pem"] != "roots" || configurations[0]["not_after"] != "2027-03-31T23:59:59Z" {
+		t.Fatalf("unexpected CAWG trust configurations: %s", options["cawg_trust_configurations"])
+	}
+	if _, ok := configurations[0]["not_before"]; ok {
+		t.Fatalf("unset not_before must be omitted: %s", options["cawg_trust_configurations"])
 	}
 
 	var status Status

@@ -35,22 +35,48 @@ type TelemetryOptions struct {
 	SDKName  string `json:"sdk_name,omitempty"`
 }
 
+// CAWGTrustProfile names the CAWG Identity 1.3 rules a trust configuration
+// is accepted under.
+type CAWGTrustProfile string
+
+const (
+	// CAWGTrustProfileBase is an entry the validator configured itself.
+	CAWGTrustProfileBase CAWGTrustProfile = "base"
+	// CAWGTrustProfileSMIMEInterim is the Mozilla email root store or an IPTC
+	// Verified News Publishers list: S/MIME identities only, and only until
+	// 31 March 2027 or with a trusted time stamp from before it.
+	CAWGTrustProfileSMIMEInterim CAWGTrustProfile = "smime_interim"
+)
+
+// CAWGTrustConfiguration is one typed CAWG trust source. CertificatesPEM may
+// mix CA and end-entity certificates; NotBefore and NotAfter are RFC 3339
+// bounds on this entry alone.
+type CAWGTrustConfiguration struct {
+	Profile         CAWGTrustProfile `json:"profile"`
+	CertificatesPEM string           `json:"certificates_pem"`
+	NotBefore       string           `json:"not_before,omitempty"`
+	NotAfter        string           `json:"not_after,omitempty"`
+}
+
 // Options mirrors the SDK VerifyOptions JSON. TrustAnchorNotBefore and
 // TrustAnchorNotAfter are RFC 3339 instants bounding when the caller-supplied
 // anchors are trusted; the bundled snapshots are unaffected.
 type Options struct {
-	TrustPEM              string                     `json:"trust_pem,omitempty"`
-	TSATrustPEM           string                     `json:"tsa_trust_pem,omitempty"`
-	AllowedCertsPEM       string                     `json:"allowed_list_pem,omitempty"`
-	CAWGTrustPEM          string                     `json:"cawg_trust_pem,omitempty"`
-	CAWGAllowedCertsPEM   string                     `json:"cawg_allowed_certs_pem,omitempty"`
-	TrustAnchorNotBefore  string                     `json:"trust_anchor_not_before,omitempty"`
-	TrustAnchorNotAfter   string                     `json:"trust_anchor_not_after,omitempty"`
-	NoDefaultTrust        bool                       `json:"no_default_trust,omitempty"`
-	CAWGDIDDocuments      map[string]json.RawMessage `json:"cawg_did_documents,omitempty"`
-	CAWGICATrustedIssuers []string                   `json:"cawg_ica_trusted_issuers,omitempty"`
-	CAWGICATrustAnchors   []string                   `json:"cawg_ica_trust_anchors,omitempty"`
-	CAWGICAStatusLists    map[string]string          `json:"cawg_ica_status_lists,omitempty"`
+	TrustPEM            string `json:"trust_pem,omitempty"`
+	TSATrustPEM         string `json:"tsa_trust_pem,omitempty"`
+	AllowedCertsPEM     string `json:"allowed_list_pem,omitempty"`
+	CAWGTrustPEM        string `json:"cawg_trust_pem,omitempty"`
+	CAWGAllowedCertsPEM string `json:"cawg_allowed_certs_pem,omitempty"`
+	// CAWGTrustConfigurations are typed CAWG trust sources, appended after
+	// CAWGTrustPEM and CAWGAllowedCertsPEM.
+	CAWGTrustConfigurations []CAWGTrustConfiguration   `json:"cawg_trust_configurations,omitempty"`
+	TrustAnchorNotBefore    string                     `json:"trust_anchor_not_before,omitempty"`
+	TrustAnchorNotAfter     string                     `json:"trust_anchor_not_after,omitempty"`
+	NoDefaultTrust          bool                       `json:"no_default_trust,omitempty"`
+	CAWGDIDDocuments        map[string]json.RawMessage `json:"cawg_did_documents,omitempty"`
+	CAWGICATrustedIssuers   []string                   `json:"cawg_ica_trusted_issuers,omitempty"`
+	CAWGICATrustAnchors     []string                   `json:"cawg_ica_trust_anchors,omitempty"`
+	CAWGICAStatusLists      map[string]string          `json:"cawg_ica_status_lists,omitempty"`
 	// CAWGStrictEncoding refuses the CAWG field-order signer payload that
 	// c2pa-rs writes; StrictConformance refuses it either way.
 	CAWGStrictEncoding bool `json:"cawg_strict_encoding,omitempty"`

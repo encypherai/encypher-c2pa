@@ -19,8 +19,8 @@ use crate::c2pa_crypto::{
 };
 use crate::c2pa_trust::{
     certificate_eku_oids_der, certificate_policy_oids_der, certificate_valid_at,
-    leaf_profile_acceptable_der, validate_chain, AnchorPurpose, CawgTrustSource, TrustAnchor,
-    TrustList,
+    leaf_profile_acceptable_der, validate_chain_admitting, AnchorPurpose, CawgTrustSource,
+    TrustAnchor, TrustList,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -1240,14 +1240,26 @@ struct IdentityTrustEvidence {
 /// - `id-kp-documentSigning` is the mandatory accepted EKU, and 1.3 requires
 ///   no certificate policy or trust anchor for it. Strict conformance still
 ///   asks for an anchor, which is what `document_signing_require_anchor`
-///   carries.
+///   carries. Only a base-eligible entry (one that is not an interim source)
+///   can supply it: the interim sources are configured for
+///   `id-kp-emailProtection` alone.
 /// - `id-kp-emailProtection` is accepted with one of the six CA/Browser Forum
 ///   S/MIME policies, under the extra conditions of the interim trust model
 ///   additions. Those conditions belong to the two sources that section
 ///   names, the Mozilla email root store and the IPTC lists. An entry the
 ///   validator configured itself, such as the Encypher Verified Organizations
 ///   root or a caller's own anchors, is a plain trust configuration entry and
-///   carries no interim condition.
+///   carries no interim condition; accepting emailProtection there is local
+///   validator policy.
+///
+/// Each EKU is its own entry, so a credential carrying both that the
+/// documentSigning entry cannot anchor is still offered to the
+/// emailProtection entry. Eligible entries are chosen before the chain is
+/// searched: base entries first, interim entries only if no base entry
+/// accepts, so a refused interim path never hides a valid base path.
+///
+/// Every entry is in force only inside its configured window, measured at
+/// `at` (x509/validating: the time stamp, or the current time without one).
 ///
 /// The interim time condition is disjunctive: "the time of validation is on
 /// or before 31 March 2027 *or* a trusted time stamp establishes that the
@@ -1270,10 +1282,15 @@ fn identity_certificate_trust(
     identity_timestamp_trusted: bool,
 ) -> Result<IdentityTrustEvidence, &'static str> {
     let ekus = certificate_eku_oids_der(leaf).unwrap_or_default();
-    let chain_anchor = || chain_trust_anchor(leaf, intermediates, at, trust);
+    let has_eku = |eku: &str| ekus.iter().any(|oid| oid == eku);
+    let base = |entry: &TrustAnchor| !entry.cawg_source.interim();
+    let interim = |entry: &TrustAnchor| entry.cawg_source.interim();
+    let policy = has_eku(OID_KP_EMAIL_PROTECTION)
+        .then(|| approved_smime_policy(leaf))
+        .flatten();
 
-    if ekus.iter().any(|oid| oid == OID_KP_DOCUMENT_SIGNING) {
-        if let Some(entry) = allowed.and_then(|list| list.find_certificate(leaf)) {
+    if has_eku(OID_KP_DOCUMENT_SIGNING) {
+        if let Some(entry) = direct_match(leaf, at, allowed, base) {
             return Ok(IdentityTrustEvidence {
                 source: "allowed_list",
                 accepted_eku: Some(OID_KP_DOCUMENT_SIGNING),
@@ -1281,7 +1298,7 @@ fn identity_certificate_trust(
                 anchor_fingerprint: Some(entry.fingerprint()),
             });
         }
-        let anchor = chain_anchor();
+        let anchor = chain_trust_anchor(leaf, intermediates, at, trust, base);
         if !document_signing_require_anchor || anchor.is_some() {
             return Ok(IdentityTrustEvidence {
                 source: "document_signing",
@@ -1290,67 +1307,91 @@ fn identity_certificate_trust(
                 anchor_fingerprint: anchor.map(TrustAnchor::fingerprint),
             });
         }
-        return Err("document_signing_anchor_required");
+        if policy.is_none() {
+            return Err("document_signing_anchor_required");
+        }
     }
 
-    if !ekus.iter().any(|oid| oid == OID_KP_EMAIL_PROTECTION) {
+    if !has_eku(OID_KP_EMAIL_PROTECTION) {
         return Err("eku_not_accepted");
     }
     // Every entry that accepts emailProtection accepts it only with one of the
     // six approved policies, so this check precedes the entry search.
-    let Some(policy) = approved_smime_policy(leaf) else {
+    let Some(policy) = policy else {
         return Err("smime_policy_not_accepted");
+    };
+    let accepted = move |source, entry: &TrustAnchor| IdentityTrustEvidence {
+        source,
+        accepted_eku: Some(OID_KP_EMAIL_PROTECTION),
+        certificate_policy: Some(policy),
+        anchor_fingerprint: Some(entry.fingerprint()),
+    };
+
+    // A credential can match more than one entry: it may sit in the private
+    // credential store and also chain to an anchor, and a chain may reach
+    // both a base and an interim anchor. Base entries carry no time
+    // condition, so they are offered the credential first.
+    if let Some(entry) = direct_match(leaf, at, allowed, base) {
+        return Ok(accepted("allowed_list", entry));
+    }
+    if let Some(anchor) = chain_trust_anchor(leaf, intermediates, at, trust, base) {
+        return Ok(accepted(anchor.cawg_source.label(), anchor));
+    }
+    let Some((source, entry)) = direct_match(leaf, at, allowed, interim)
+        .map(|entry| ("allowed_list", entry))
+        .or_else(|| {
+            chain_trust_anchor(leaf, intermediates, at, trust, interim)
+                .map(|anchor| (anchor.cawg_source.label(), anchor))
+        })
+    else {
+        return Err("credential_untrusted");
     };
     let before_cutoff =
         |instant: OffsetDateTime| instant.unix_timestamp() < S_MIME_INTERIM_CUTOFF_UNIX;
-    let interim_satisfied =
-        before_cutoff(validation_time) || (identity_timestamp_trusted && before_cutoff(at));
-
-    // A credential can match more than one entry: it may sit in the private
-    // credential store and also chain to an anchor. Each match is offered its
-    // own rules, and only if every match is an interim source that the interim
-    // conditions refuse does the reason become an interim one.
-    let direct = allowed
-        .and_then(|list| list.find_certificate(leaf))
-        .map(|anchor| ("allowed_list", anchor));
-    let chained = chain_anchor().map(|anchor| (anchor.cawg_source.label(), anchor));
-    let mut refused = None;
-    for (label, anchor) in direct.into_iter().chain(chained) {
-        if anchor.cawg_source.interim() && !interim_satisfied {
-            // Past the cutoff, the only surviving disjunct is a trusted time
-            // stamp attesting an earlier signature: absent one, that is what
-            // the credential lacked; present one, it attested too late.
-            refused = Some(if identity_timestamp_trusted {
-                "smime_interim_expired"
-            } else {
-                "trusted_timestamp_required"
-            });
-            continue;
-        }
-        return Ok(IdentityTrustEvidence {
-            source: label,
-            accepted_eku: Some(OID_KP_EMAIL_PROTECTION),
-            certificate_policy: Some(policy),
-            anchor_fingerprint: Some(anchor.fingerprint()),
-        });
+    if before_cutoff(validation_time) || (identity_timestamp_trusted && before_cutoff(at)) {
+        return Ok(accepted(source, entry));
     }
-    Err(refused.unwrap_or("credential_untrusted"))
+    // Past the cutoff, the only surviving disjunct is a trusted time stamp
+    // attesting an earlier signature: absent one, that is what the credential
+    // lacked; present one, it attested too late.
+    Err(if identity_timestamp_trusted {
+        "smime_interim_expired"
+    } else {
+        "trusted_timestamp_required"
+    })
 }
 
-/// The configured anchor a chain from `leaf` terminates at.
+/// The first configured certificate equal to `leaf` that is in force at `at`
+/// and eligible under `admit`: the private credential store's direct match.
+fn direct_match<'a>(
+    leaf: &[u8],
+    at: OffsetDateTime,
+    allowed: Option<&'a TrustList>,
+    admit: impl Fn(&TrustAnchor) -> bool,
+) -> Option<&'a TrustAnchor> {
+    allowed?
+        .anchors
+        .iter()
+        .find(|entry| entry.certificate == leaf && entry.active_at(at) && admit(entry))
+}
+
+/// The configured anchor, among those eligible under `admit`, that a chain
+/// from `leaf` terminates at.
 fn chain_trust_anchor<'a>(
     leaf: &[u8],
     intermediates: &[Vec<u8>],
     at: OffsetDateTime,
     trust: Option<&'a TrustList>,
+    admit: impl Fn(&TrustAnchor) -> bool,
 ) -> Option<&'a TrustAnchor> {
     let anchors = trust?;
-    let result = validate_chain(
+    let result = validate_chain_admitting(
         leaf,
         intermediates,
         anchors,
         AnchorPurpose::CawgIdentity,
         Some(at),
+        admit,
     );
     result
         .trusted
@@ -1381,7 +1422,7 @@ fn approved_smime_policy(cert: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::c2pa_trust::timestamp_fixture::TestTsa;
+    use crate::c2pa_trust::{timestamp_fixture::TestTsa, validate_chain};
     use const_oid::ObjectIdentifier;
     use der::Encode;
     use rcgen::{
@@ -1405,6 +1446,10 @@ mod tests {
     }
 
     fn actor_certificate(eku: &str, policy: Option<&str>, is_ca: bool) -> Vec<u8> {
+        actor_certificate_with_ekus(&[eku], policy, is_ca)
+    }
+
+    fn actor_certificate_with_ekus(ekus: &[&str], policy: Option<&str>, is_ca: bool) -> Vec<u8> {
         let key = KeyPair::generate().expect("actor key");
         let mut params = CertificateParams::new(vec!["actor.example".to_string()]).expect("params");
         let mut name = DistinguishedName::new();
@@ -1418,11 +1463,16 @@ mod tests {
             IsCa::ExplicitNoCa
         };
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::Other(
-            eku.split('.')
-                .map(|part| part.parse::<u64>().expect("oid component"))
-                .collect(),
-        )];
+        params.extended_key_usages = ekus
+            .iter()
+            .map(|eku| {
+                ExtendedKeyUsagePurpose::Other(
+                    eku.split('.')
+                        .map(|part| part.parse::<u64>().expect("oid component"))
+                        .collect(),
+                )
+            })
+            .collect();
         if let Some(policy) = policy {
             params
                 .custom_extensions
@@ -1563,6 +1613,95 @@ mod tests {
             trust(rejected, rejected, true),
             Some("smime_interim_expired")
         );
+    }
+
+    /// CAWG-ID13-X509PROFILE-018: the trust configuration keeps its anchors
+    /// per accepted EKU. The interim sources are configured for
+    /// `id-kp-emailProtection` only, so neither a certificate they list nor an
+    /// anchor they supply can be the anchor `id-kp-documentSigning` requires.
+    /// A validator-configured (base) entry can.
+    #[test]
+    fn an_interim_source_is_not_a_document_signing_anchor() {
+        let leaf = actor_certificate(OID_KP_DOCUMENT_SIGNING, None, false);
+        let at = datetime!(2026-01-01 0:00 UTC);
+        let list = |source| {
+            TrustList::from_certificates(AnchorPurpose::CawgIdentity, [leaf.clone()])
+                .with_cawg_source(source)
+        };
+        let interim = list(CawgTrustSource::SmimeInterim);
+        let base = list(CawgTrustSource::CallerSupplied);
+        let verdict = |trust: Option<&TrustList>, allowed: Option<&TrustList>| {
+            identity_certificate_trust(&leaf, &[], at, at, trust, allowed, true, false)
+                .map(|evidence| evidence.accepted_eku)
+        };
+
+        assert_eq!(
+            verdict(Some(&interim), None).err(),
+            Some("document_signing_anchor_required")
+        );
+        assert_eq!(
+            verdict(None, Some(&interim)).err(),
+            Some("document_signing_anchor_required")
+        );
+        assert_eq!(
+            verdict(Some(&base), None),
+            Ok(Some(OID_KP_DOCUMENT_SIGNING))
+        );
+        assert_eq!(
+            verdict(None, Some(&base)),
+            Ok(Some(OID_KP_DOCUMENT_SIGNING))
+        );
+    }
+
+    /// CAWG-ID13-X509PROFILE-018/026: each accepted EKU is its own entry. A
+    /// credential carrying both EKUs that the documentSigning entry cannot
+    /// anchor is still offered to the emailProtection entry, which an interim
+    /// source accepts before the cutoff.
+    #[test]
+    fn a_credential_refused_as_document_signing_is_offered_to_email_protection() {
+        let leaf = actor_certificate_with_ekus(
+            &[OID_KP_DOCUMENT_SIGNING, OID_KP_EMAIL_PROTECTION],
+            Some(CAWG_SMIME_POLICY_OIDS[0]),
+            false,
+        );
+        let at = OffsetDateTime::from_unix_timestamp(S_MIME_INTERIM_CUTOFF_UNIX - 1).unwrap();
+        let interim = TrustList::from_certificates(AnchorPurpose::CawgIdentity, [leaf.clone()])
+            .with_cawg_source(CawgTrustSource::SmimeInterim);
+        let evidence =
+            identity_certificate_trust(&leaf, &[], at, at, None, Some(&interim), true, false)
+                .expect("interim emailProtection entry");
+        assert_eq!(evidence.accepted_eku, Some(OID_KP_EMAIL_PROTECTION));
+    }
+
+    /// CAWG-ID13-DELTA-009 (x509/validating): a trust configuration carrying
+    /// `notBefore`/`notAfter` MUST NOT validate a signature whose time stamp
+    /// (or the current time) lies outside them. That holds for a certificate
+    /// the configuration lists directly, not only for a chain anchor.
+    #[test]
+    fn a_configuration_window_bounds_a_directly_listed_certificate() {
+        let leaf = actor_certificate(
+            OID_KP_EMAIL_PROTECTION,
+            Some(CAWG_SMIME_POLICY_OIDS[0]),
+            false,
+        );
+        let at = datetime!(2026-06-01 0:00 UTC);
+        let second = time::Duration::seconds(1);
+        let verdict = |not_before, not_after| {
+            let allowed = TrustList::from_certificates(AnchorPurpose::CawgIdentity, [leaf.clone()])
+                .with_cawg_source(CawgTrustSource::CallerSupplied)
+                .with_bounds(not_before, not_after);
+            identity_certificate_trust(&leaf, &[], at, at, None, Some(&allowed), false, false).err()
+        };
+
+        assert_eq!(
+            verdict(None, Some(at - second)),
+            Some("credential_untrusted")
+        );
+        assert_eq!(
+            verdict(Some(at + second), None),
+            Some("credential_untrusted")
+        );
+        assert_eq!(verdict(Some(at), Some(at)), None);
     }
 
     fn identity_payload(role: &str, expected: Option<Vec<Value>>) -> Value {
@@ -2994,6 +3133,7 @@ mod tests {
         root_pem: String,
         issuing_der: Vec<u8>,
         leaf_der: Vec<u8>,
+        leaf_pem: String,
         leaf_key_pem: String,
     }
 
@@ -3071,6 +3211,7 @@ mod tests {
             root_pem: root.pem(),
             issuing_der: issuing.der().to_vec(),
             leaf_der: leaf.der().to_vec(),
+            leaf_pem: leaf.pem(),
             leaf_key_pem: leaf_key.serialize_pem(),
         }
     }
@@ -3390,6 +3531,362 @@ mod tests {
         assert_eq!(details["trust_source"], "smime_interim");
         assert_eq!(details["timestamp_trusted"], true);
         assert_eq!(details["trusted_at"], BEFORE_INTERIM_CUTOFF.to_string());
+    }
+
+    /// One entry of `VerifyOptions::cawg_trust_configurations`, in the JSON
+    /// form the bindings send.
+    fn trust_configuration(
+        profile: &str,
+        pem: &str,
+        not_before: Option<&str>,
+        not_after: Option<&str>,
+    ) -> serde_json::Value {
+        json!({
+            "profile": profile,
+            "certificates_pem": pem,
+            "not_before": not_before,
+            "not_after": not_after,
+        })
+    }
+
+    /// Resolve caller options exactly as the public entry points do and run
+    /// the identity lane against the CAWG trust they produce.
+    fn configured_verdict(
+        bytes: &[u8],
+        configurations: Vec<serde_json::Value>,
+        validation_time: OffsetDateTime,
+        claim_timestamp: Option<OffsetDateTime>,
+    ) -> ValidationResults {
+        let options: crate::VerifyOptions = serde_json::from_value(json!({
+            "no_default_trust": true,
+            "cawg_trust_configurations": configurations,
+        }))
+        .expect("options JSON");
+        let resolved = crate::ResolvedOptions::resolve(&options).expect("resolve options");
+        identity_verdict_full(
+            bytes,
+            &binding_claim_refs(0x22),
+            false,
+            "c2pa.hash.data",
+            resolved.cawg_trust(),
+            resolved.cawg_allowed_certs(),
+            true,
+            None,
+            &TimestampAssertionIndex::default(),
+            validation_time,
+            claim_timestamp,
+            Default::default(),
+        )
+    }
+
+    /// CAWG-ID13-X509PROFILE-023/025/027 and the consumer side of 024: a
+    /// caller that supplies the Mozilla or IPTC lists itself (no bundled
+    /// trust) can declare them as interim S/MIME sources, and then the 31
+    /// March 2027 condition applies to them: an untimestamped identity is
+    /// trusted before the cutoff, refused after it, and rescued after it only
+    /// by a trusted time stamp from before it. The same root configured as a
+    /// base entry keeps the base model.
+    #[test]
+    fn a_caller_supplied_interim_source_is_held_to_the_cutoff() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let bytes = encypher_identity_assertion(&chain, None);
+        let interim = || {
+            vec![trust_configuration(
+                "smime_interim",
+                &chain.root_pem,
+                None,
+                None,
+            )]
+        };
+
+        let in_window = configured_verdict(&bytes, interim(), BEFORE_INTERIM_CUTOFF, None);
+        assert_eq!(failure_codes(&in_window), Vec::<&str>::new());
+        assert_eq!(trusted_details(&in_window)["trust_source"], "smime_interim");
+
+        let expired = configured_verdict(&bytes, interim(), AFTER_INTERIM_CUTOFF, None);
+        assert!(!expired.has_success(CAWG_IDENTITY_TRUSTED));
+        assert_eq!(untrusted_reason(&expired), "trusted_timestamp_required");
+
+        let attested = configured_verdict(
+            &bytes,
+            interim(),
+            AFTER_INTERIM_CUTOFF,
+            Some(BEFORE_INTERIM_CUTOFF),
+        );
+        assert_eq!(failure_codes(&attested), Vec::<&str>::new());
+        assert_eq!(trusted_details(&attested)["timestamp_trusted"], true);
+
+        let base = configured_verdict(
+            &bytes,
+            vec![trust_configuration("base", &chain.root_pem, None, None)],
+            AFTER_INTERIM_CUTOFF,
+            None,
+        );
+        assert_eq!(failure_codes(&base), Vec::<&str>::new());
+        assert_eq!(trusted_details(&base)["trust_source"], "caller_supplied");
+    }
+
+    /// CAWG-ID13-X509PROFILE-031: "The lists below MAY include both CA and
+    /// end-entity certificates. The certificate under validation MUST either
+    /// be directly included in one of these lists, or have a valid chain of
+    /// trust to a certificate present in one of these lists." A configuration
+    /// places each certificate by what it is, and a directly listed
+    /// certificate keeps its source's interim conditions.
+    #[test]
+    fn a_configuration_places_each_certificate_by_what_it_is() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let bytes = encypher_identity_assertion(&chain, None);
+        let only = |pem: &str| vec![trust_configuration("smime_interim", pem, None, None)];
+
+        let anchored =
+            configured_verdict(&bytes, only(&chain.root_pem), BEFORE_INTERIM_CUTOFF, None);
+        assert_eq!(trusted_details(&anchored)["trust_source"], "smime_interim");
+
+        let listed = configured_verdict(&bytes, only(&chain.leaf_pem), BEFORE_INTERIM_CUTOFF, None);
+        assert_eq!(trusted_details(&listed)["trust_source"], "allowed_list");
+
+        let mixed = format!("{}{}", chain.leaf_pem, chain.root_pem);
+        let both = configured_verdict(&bytes, only(&mixed), BEFORE_INTERIM_CUTOFF, None);
+        assert_eq!(failure_codes(&both), Vec::<&str>::new());
+
+        let listed_expired =
+            configured_verdict(&bytes, only(&chain.leaf_pem), AFTER_INTERIM_CUTOFF, None);
+        assert_eq!(
+            untrusted_reason(&listed_expired),
+            "trusted_timestamp_required"
+        );
+    }
+
+    /// CAWG-ID13-DELTA-009 (x509/validating): a configuration's `notBefore`
+    /// and `notAfter` bound the signatures it validates, measured at the
+    /// signature's trusted time stamp or, without one, at the current time.
+    /// Each configuration carries its own window.
+    #[test]
+    fn each_configuration_window_bounds_what_it_validates() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let bytes = encypher_identity_assertion(&chain, None);
+        let verdict = |pem: &str, not_before, not_after, at, stamped| {
+            configured_verdict(
+                &bytes,
+                vec![trust_configuration("base", pem, not_before, not_after)],
+                at,
+                stamped,
+            )
+        };
+
+        for pem in [&chain.root_pem, &chain.leaf_pem] {
+            let ended = verdict(
+                pem,
+                None,
+                Some("2027-02-01T00:00:00Z"),
+                BEFORE_INTERIM_CUTOFF,
+                None,
+            );
+            assert_eq!(untrusted_reason(&ended), "credential_untrusted");
+            let not_started = verdict(
+                pem,
+                Some("2027-03-02T00:00:00Z"),
+                None,
+                BEFORE_INTERIM_CUTOFF,
+                None,
+            );
+            assert_eq!(untrusted_reason(&not_started), "credential_untrusted");
+            // Validated after the window closed, but time-stamped inside it.
+            let stamped = verdict(
+                pem,
+                Some("2027-02-01T00:00:00Z"),
+                Some("2027-03-15T00:00:00Z"),
+                AFTER_INTERIM_CUTOFF,
+                Some(BEFORE_INTERIM_CUTOFF),
+            );
+            assert_eq!(failure_codes(&stamped), Vec::<&str>::new());
+        }
+
+        // A second configuration without a window still validates on its own.
+        let unbounded = configured_verdict(
+            &bytes,
+            vec![
+                trust_configuration("base", &chain.root_pem, None, Some("2027-02-01T00:00:00Z")),
+                trust_configuration("smime_interim", &chain.root_pem, None, None),
+            ],
+            BEFORE_INTERIM_CUTOFF,
+            None,
+        );
+        assert_eq!(trusted_details(&unbounded)["trust_source"], "smime_interim");
+    }
+
+    /// CAWG-ID13-X509PROFILE-018: a certificate the validator configured
+    /// itself keeps the base rules even when an interim source lists it too,
+    /// whichever configuration comes first.
+    #[test]
+    fn a_root_listed_as_both_base_and_interim_keeps_the_base_rules() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let bytes = encypher_identity_assertion(&chain, None);
+        let results = configured_verdict(
+            &bytes,
+            vec![
+                trust_configuration("smime_interim", &chain.root_pem, None, None),
+                trust_configuration("base", &chain.root_pem, None, None),
+            ],
+            AFTER_INTERIM_CUTOFF,
+            None,
+        );
+        assert_eq!(failure_codes(&results), Vec::<&str>::new());
+        assert_eq!(trusted_details(&results)["trust_source"], "caller_supplied");
+    }
+
+    /// CAWG-ID13-X509PROFILE-031: placement by certificate content must not
+    /// drop a version 1 root, which carries no BasicConstraints extension. A
+    /// self-issued certificate without BasicConstraints is a trust anchor.
+    #[test]
+    fn a_self_issued_root_without_basic_constraints_anchors_a_chain() {
+        let policy = || {
+            CustomExtension::from_oid_content(
+                &[2, 5, 29, 32],
+                certificate_policies_value(ORGANIZATION_VALIDATED_STRICT_POLICY),
+            )
+        };
+        let root_key = KeyPair::generate().expect("root key");
+        let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        let mut root_name = DistinguishedName::new();
+        root_name.push(DnType::CommonName, "Legacy Email Root");
+        root_params.distinguished_name = root_name;
+        root_params.not_before = datetime!(2025-01-01 0:00 UTC);
+        root_params.not_after = datetime!(2030-01-01 0:00 UTC);
+        root_params.is_ca = IsCa::NoCa;
+        root_params.custom_extensions.push(policy());
+        let root = root_params.self_signed(&root_key).expect("legacy root");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf_params =
+            CertificateParams::new(vec!["actor.example".to_string()]).expect("leaf params");
+        let mut leaf_name = DistinguishedName::new();
+        leaf_name.push(DnType::CommonName, "Legacy Root Actor");
+        leaf_params.distinguished_name = leaf_name;
+        leaf_params.not_before = datetime!(2025-01-01 0:00 UTC);
+        leaf_params.not_after = datetime!(2030-01-01 0:00 UTC);
+        leaf_params.is_ca = IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.use_authority_key_identifier_extension = true;
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+        leaf_params.custom_extensions.push(policy());
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &root, &root_key)
+            .expect("leaf under the legacy root");
+
+        let options: crate::VerifyOptions = serde_json::from_value(json!({
+            "no_default_trust": true,
+            "cawg_trust_configurations": [trust_configuration("smime_interim", &root.pem(), None, None)],
+        }))
+        .expect("options JSON");
+        let resolved = crate::ResolvedOptions::resolve(&options).expect("resolve options");
+        let at = datetime!(2026-06-01 0:00 UTC);
+        let evidence = identity_certificate_trust(
+            leaf.der(),
+            &[],
+            at,
+            at,
+            resolved.cawg_trust(),
+            resolved.cawg_allowed_certs(),
+            true,
+            false,
+        )
+        .expect("the legacy root anchors the chain");
+        assert_eq!(evidence.source, "smime_interim");
+    }
+
+    /// CAWG-ID13-X509PROFILE-018/025: each entry is offered its own rules, so
+    /// the anchors an entry may use are chosen before the chain is searched.
+    /// Here the issuing CA is cross-certified: one certificate chains to an
+    /// interim root, another to a base root. Past the cutoff, with no time
+    /// stamp, the interim path is refused, and it must not hide the base path
+    /// the same credential also has.
+    #[test]
+    fn a_refused_interim_path_does_not_mask_a_base_path() {
+        fn ca(name: &str) -> CertificateParams {
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+            let mut dn = DistinguishedName::new();
+            dn.push(DnType::CommonName, name);
+            params.distinguished_name = dn;
+            params.not_before = datetime!(2026-01-01 0:00 UTC);
+            params.not_after = datetime!(2030-01-01 0:00 UTC);
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params.use_authority_key_identifier_extension = true;
+            params
+                .custom_extensions
+                .push(CustomExtension::from_oid_content(
+                    &[2, 5, 29, 32],
+                    certificate_policies_value(ORGANIZATION_VALIDATED_STRICT_POLICY),
+                ));
+            params
+        }
+        let interim_key = KeyPair::generate().expect("interim root key");
+        let interim_root = ca("Interim Root")
+            .self_signed(&interim_key)
+            .expect("interim root");
+        let base_key = KeyPair::generate().expect("base root key");
+        let base_root = ca("Base Root").self_signed(&base_key).expect("base root");
+        let issuing_key = KeyPair::generate().expect("issuing key");
+        let via_interim = ca("Issuing CA")
+            .signed_by(&issuing_key, &interim_root, &interim_key)
+            .expect("issuing CA under the interim root");
+        let via_base = ca("Issuing CA")
+            .signed_by(&issuing_key, &base_root, &base_key)
+            .expect("issuing CA under the base root");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf_params =
+            CertificateParams::new(vec!["actor.example".to_string()]).expect("leaf params");
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Cross-certified Actor");
+        leaf_params.distinguished_name = dn;
+        leaf_params.not_before = datetime!(2026-01-01 0:00 UTC);
+        leaf_params.not_after = datetime!(2030-01-01 0:00 UTC);
+        leaf_params.is_ca = IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.use_authority_key_identifier_extension = true;
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[2, 5, 29, 32],
+                certificate_policies_value(ORGANIZATION_VALIDATED_STRICT_POLICY),
+            ));
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &via_interim, &issuing_key)
+            .expect("leaf");
+
+        let mut trust = TrustList::from_certificates(
+            AnchorPurpose::CawgIdentity,
+            [interim_root.der().to_vec()],
+        )
+        .with_cawg_source(CawgTrustSource::SmimeInterim);
+        trust.anchors.extend(
+            TrustList::from_certificates(AnchorPurpose::CawgIdentity, [base_root.der().to_vec()])
+                .with_cawg_source(CawgTrustSource::CallerSupplied)
+                .anchors,
+        );
+        let intermediates = [via_interim.der().to_vec(), via_base.der().to_vec()];
+
+        let evidence = identity_certificate_trust(
+            leaf.der(),
+            &intermediates,
+            AFTER_INTERIM_CUTOFF,
+            AFTER_INTERIM_CUTOFF,
+            Some(&trust),
+            None,
+            true,
+            false,
+        )
+        .expect("the base path accepts the credential");
+        assert_eq!(evidence.source, "caller_supplied");
+        assert_eq!(
+            evidence.anchor_fingerprint,
+            Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                base_root.der()
+            )))
+        );
     }
 
     /// The Encypher chain is offered to the C2PA certificate profile and the

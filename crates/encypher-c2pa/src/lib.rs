@@ -146,6 +146,10 @@ pub struct VerifyOptions {
     pub cawg_trust_pem: Option<String>,
     /// PEM bundle of directly allowed CAWG end-entity certificates.
     pub cawg_allowed_certs_pem: Option<String>,
+    /// Typed CAWG trust configurations, one per source. Each carries its
+    /// profile and its own trust window; see [`CawgTrustConfiguration`].
+    /// Appended after `cawg_trust_pem`/`cawg_allowed_certs_pem`, in order.
+    pub cawg_trust_configurations: Option<Vec<CawgTrustConfiguration>>,
     /// RFC 3339 start of trust for every caller-supplied trust anchor. Before
     /// this instant the caller's anchors do not validate a signature, whatever
     /// the anchor certificate's own `notBefore` says. Bundled snapshots are
@@ -237,6 +241,48 @@ pub struct VerifyOptions {
     /// declares that this machine's own network is trusted; do not set it on a
     /// host that verifies files sent in by strangers.
     pub online_allow_private_networks: bool,
+}
+
+/// One entry of the CAWG Identity 1.3 trust configuration a caller supplies.
+///
+/// Certificates are placed by what they are, not by the list they came from:
+/// a CA certificate, or a self-issued certificate without BasicConstraints,
+/// anchors chains; any other certificate is accepted only by direct match.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CawgTrustConfiguration {
+    /// Which trust-model rules this entry is accepted under.
+    pub profile: CawgTrustProfile,
+    /// PEM bundle of the entry's certificates. CA and end-entity certificates
+    /// may be mixed. Must hold at least one certificate.
+    pub certificates_pem: String,
+    /// RFC 3339 start of this entry's trust. A signature whose time stamp, or
+    /// without one the validation time, precedes it is not validated by it.
+    #[serde(default)]
+    pub not_before: Option<String>,
+    /// RFC 3339 end of this entry's trust. A signature whose time stamp, or
+    /// without one the validation time, follows it is not validated by it.
+    #[serde(default)]
+    pub not_after: Option<String>,
+}
+
+/// The CAWG Identity 1.3 rules a [`CawgTrustConfiguration`] is accepted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CawgTrustProfile {
+    /// An entry the validator configured itself. Accepts
+    /// `id-kp-documentSigning`, and, as local validator policy,
+    /// `id-kp-emailProtection` with one of the six CA/Browser Forum S/MIME
+    /// policies, without the interim time conditions. Reported as
+    /// `trust_source: caller_supplied`.
+    Base,
+    /// One of the two sources the interim trust model additions name: the
+    /// Mozilla root store with the email trust bit, or the IPTC Verified News
+    /// Publishers lists. Accepts only `id-kp-emailProtection` with one of the
+    /// six policies, and only while the validation time, or a trusted time
+    /// stamp, is on or before 31 March 2027. Reported as
+    /// `trust_source: smime_interim`.
+    SmimeInterim,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -621,6 +667,8 @@ impl ResolvedOptions {
                 "trust_anchor_not_after",
             )?,
         );
+        let (cawg_anchors, cawg_direct) =
+            resolve_cawg_configurations(options.cawg_trust_configurations.as_deref())?;
         Ok(Self {
             claim_trust: resolve_trust(
                 options.trust_pem.as_deref(),
@@ -640,18 +688,24 @@ impl ResolvedOptions {
                 AnchorPurpose::ClaimSigning,
                 bounds,
             )?,
-            cawg_trust: resolve_trust(
-                options.cawg_trust_pem.as_deref(),
-                use_defaults.then(default_trust::cawg_identity),
-                AnchorPurpose::CawgIdentity,
-                bounds,
-            )?,
-            cawg_allowed_certs: resolve_trust(
-                options.cawg_allowed_certs_pem.as_deref(),
-                use_defaults.then(default_trust::cawg_allowed_identities),
-                AnchorPurpose::CawgIdentity,
-                bounds,
-            )?,
+            cawg_trust: extend_trust(
+                resolve_trust(
+                    options.cawg_trust_pem.as_deref(),
+                    use_defaults.then(default_trust::cawg_identity),
+                    AnchorPurpose::CawgIdentity,
+                    bounds,
+                )?,
+                cawg_anchors,
+            ),
+            cawg_allowed_certs: extend_trust(
+                resolve_trust(
+                    options.cawg_allowed_certs_pem.as_deref(),
+                    use_defaults.then(default_trust::cawg_allowed_identities),
+                    AnchorPurpose::CawgIdentity,
+                    bounds,
+                )?,
+                cawg_direct,
+            ),
             validation_time,
             validation_time_text: validation_time
                 .format(&Rfc3339)
@@ -1145,6 +1199,68 @@ fn resolve_trust(
     }
 }
 
+/// Build the CAWG anchors and direct matches the caller's typed trust
+/// configurations contribute, each certificate tagged with its entry's
+/// profile and window and placed by what it is.
+///
+/// A malformed entry fails the call and names itself: silently dropping a
+/// source or a bound would change which signatures the configuration
+/// validates.
+fn resolve_cawg_configurations(
+    configurations: Option<&[CawgTrustConfiguration]>,
+) -> Result<(TrustList, TrustList), Error> {
+    let mut anchors = TrustList::default();
+    let mut direct = TrustList::default();
+    for (index, configuration) in configurations.unwrap_or_default().iter().enumerate() {
+        let invalid = |field: &str, detail: &dyn std::fmt::Display| {
+            Error::InvalidTrust(format!(
+                "cawg_trust_configurations[{index}]{field}: {detail}"
+            ))
+        };
+        let instant = |value: Option<&str>, field| {
+            value
+                .map(|raw| {
+                    OffsetDateTime::parse(raw, &Rfc3339).map_err(|error| invalid(field, &error))
+                })
+                .transpose()
+        };
+        let not_before = instant(configuration.not_before.as_deref(), ".not_before")?;
+        let not_after = instant(configuration.not_after.as_deref(), ".not_after")?;
+        if let (Some(start), Some(end)) = (not_before, not_after) {
+            if start > end {
+                return Err(invalid("", &"not_before is later than not_after"));
+            }
+        }
+        let source = match configuration.profile {
+            CawgTrustProfile::Base => CawgTrustSource::CallerSupplied,
+            CawgTrustProfile::SmimeInterim => CawgTrustSource::SmimeInterim,
+        };
+        let (entry_anchors, entry_direct) =
+            TrustList::from_pem_for(AnchorPurpose::CawgIdentity, &configuration.certificates_pem)
+                .map_err(|error| invalid(".certificates_pem", &error))?
+                .with_bounds(not_before, not_after)
+                .with_cawg_source(source)
+                .split_certificate_authorities();
+        anchors.anchors.extend(entry_anchors.anchors);
+        direct.anchors.extend(entry_direct.anchors);
+    }
+    Ok((anchors, direct))
+}
+
+/// Append `extra` to one resolved trust store.
+fn extend_trust(resolved: Option<ResolvedTrust>, extra: TrustList) -> Option<ResolvedTrust> {
+    if extra.anchors.is_empty() {
+        return resolved;
+    }
+    let mut merged = match resolved {
+        None => return Some(ResolvedTrust::Owned(extra)),
+        Some(ResolvedTrust::Bundled(bundled)) => bundled.clone(),
+        Some(ResolvedTrust::Owned(owned)) => owned,
+    };
+    merged.anchors.extend(extra.anchors);
+    Some(ResolvedTrust::Owned(merged))
+}
+
 fn parse_validation_time(value: Option<&str>) -> Result<OffsetDateTime, Error> {
     match value {
         Some(raw) => OffsetDateTime::parse(raw, &Rfc3339)
@@ -1459,5 +1575,60 @@ mod tests {
         let error = verify(b"not an asset", "application/x-unknown").unwrap_err();
         assert!(matches!(error, Error::UnsupportedMime(_)));
         assert_eq!(error.code(), "unsupported_mime");
+    }
+
+    /// CAWG-ID13-DELTA-009: a trust configuration's certificates and window
+    /// are what the validator enforces, so a malformed one fails the call
+    /// before any asset is read, naming the entry, rather than silently
+    /// dropping a source or a bound. An unknown profile is a malformed option.
+    #[test]
+    fn a_malformed_cawg_trust_configuration_fails_the_call_naming_its_entry() {
+        let root = include_str!("default_trust/encypher-identity-root.pem");
+        let resolve = |entry: serde_json::Value| {
+            let options: VerifyOptions = serde_json::from_value(serde_json::json!({
+                "no_default_trust": true,
+                "cawg_trust_configurations": [
+                    { "profile": "base", "certificates_pem": root },
+                    entry,
+                ],
+            }))
+            .map_err(|error| error.to_string())?;
+            super::ResolvedOptions::resolve(&options)
+                .map(|_| ())
+                .map_err(|error| format!("{}: {error}", error.code()))
+        };
+
+        for (entry, field) in [
+            (
+                serde_json::json!({ "profile": "smime_interim", "certificates_pem": "" }),
+                "cawg_trust_configurations[1].certificates_pem",
+            ),
+            (
+                serde_json::json!({ "profile": "smime_interim", "certificates_pem": root, "not_after": "next spring" }),
+                "cawg_trust_configurations[1].not_after",
+            ),
+            (
+                serde_json::json!({
+                    "profile": "smime_interim",
+                    "certificates_pem": root,
+                    "not_before": "2027-01-02T00:00:00Z",
+                    "not_after": "2027-01-01T00:00:00Z",
+                }),
+                "cawg_trust_configurations[1]",
+            ),
+        ] {
+            let error = resolve(entry).expect_err("malformed configuration");
+            assert!(error.starts_with("invalid_trust_material: "), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
+
+        let unknown =
+            resolve(serde_json::json!({ "profile": "trusted", "certificates_pem": root }))
+                .expect_err("unknown profile");
+        assert!(unknown.contains("unknown variant `trusted`"), "{unknown}");
+        assert_eq!(
+            resolve(serde_json::json!({ "profile": "smime_interim", "certificates_pem": root })),
+            Ok(())
+        );
     }
 }

@@ -14,8 +14,8 @@ use encypher_c2pa::{
     allow_interactive_online_consent, detached_manifest_evidence, mime_from_path,
     online_preference, set_online_preference, set_telemetry_enabled, supported_mime_types,
     telemetry_preference, verify_file, verify_fragmented_with_options, verify_stream_with_options,
-    verify_with_manifest_store, verify_with_options, Error, OnlinePreference, StreamEncapsulation,
-    StreamMethod, TelemetryOptions, VerifyOptions,
+    verify_with_manifest_store, verify_with_options, CawgTrustConfiguration, Error,
+    OnlinePreference, StreamEncapsulation, StreamMethod, TelemetryOptions, VerifyOptions,
 };
 
 mod encypher_api;
@@ -115,6 +115,11 @@ enum Command {
         /// Directly allowed CAWG end-entity certificates (PEM). Repeatable.
         #[arg(long, value_name = "PEM")]
         cawg_allowed: Vec<PathBuf>,
+        /// Typed CAWG trust configurations: a JSON array of
+        /// `{profile: base|smime_interim, certificates_pem, not_before?,
+        /// not_after?}`. Repeatable; arrays concatenate in flag order.
+        #[arg(long, value_name = "JSON")]
+        cawg_trust_configurations: Vec<PathBuf>,
         /// RFC 3339 start of trust for the caller-supplied trust anchors above.
         #[arg(long, value_name = "RFC3339")]
         trust_anchor_not_before: Option<String>,
@@ -253,6 +258,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             allowed,
             cawg_trust,
             cawg_allowed,
+            cawg_trust_configurations,
             trust_anchor_not_before,
             trust_anchor_not_after,
             no_default_trust,
@@ -302,6 +308,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 allowed_list_pem: read_merged_pem(&allowed)?,
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
+                cawg_trust_configurations: read_trust_configurations(&cawg_trust_configurations)?,
                 trust_anchor_not_before,
                 trust_anchor_not_after,
                 no_default_trust,
@@ -775,6 +782,28 @@ fn read_did_documents(
 
 fn nonempty<T>(values: Vec<T>) -> Option<Vec<T>> {
     (!values.is_empty()).then_some(values)
+}
+
+/// Read repeatable `--cawg-trust-configurations PATH` files, each a JSON array
+/// of configurations, concatenated in flag order.
+fn read_trust_configurations(
+    paths: &[PathBuf],
+) -> Result<Option<Vec<CawgTrustConfiguration>>, Error> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut configurations = Vec::new();
+    for path in paths {
+        let entries: Vec<CawgTrustConfiguration> = serde_json::from_str(&fs::read_to_string(path)?)
+            .map_err(|error| {
+                Error::Verification(format!(
+                    "cawg trust configurations: {}: {error}",
+                    path.display()
+                ))
+            })?;
+        configurations.extend(entries);
+    }
+    Ok(Some(configurations))
 }
 
 fn read_string_map(
