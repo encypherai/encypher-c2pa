@@ -15,6 +15,7 @@ use sha2::Digest as _;
 use signature::{hazmat::PrehashVerifier as _, Verifier as _};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use super::cawg::is_cawg_label;
 use super::ValidationResults;
 
 pub const CAWG_ICA_INVALID_COSE_SIGN1: &str = "cawg.ica.invalid_cose_sign1";
@@ -283,6 +284,18 @@ pub(super) fn verify_ica_assertion(
         }
     }
 
+    // 1.3 orders "Verify binding to C2PA asset" before "Verify verified
+    // identities", and the validator SHALL follow its steps in that order.
+    if super::report::cbor_to_json(signer_payload) != credential.c2pa_asset {
+        results.push_failure(
+            CAWG_ICA_SIGNER_PAYLOAD_MISMATCH,
+            url.into(),
+            "credentialSubject.c2paAsset is not the exact JSON serialization of signer_payload"
+                .into(),
+        );
+        ok = false;
+    }
+
     match &credential.verified_identities {
         VerifiedIdentities::Missing => {
             results.push_failure(
@@ -292,25 +305,24 @@ pub(super) fn verify_ica_assertion(
             );
             ok = false;
         }
-        VerifiedIdentities::Invalid(_) => {
-            results.push_failure(
+        // The status mechanism cannot say which entry failed, so 1.3
+        // recommends an out-of-band signal: each rejected entry's index and
+        // the property that broke a condition.
+        VerifiedIdentities::Invalid(defects) => {
+            results.push_failure_with_details(
                 CAWG_ICA_VERIFIED_IDENTITIES_INVALID,
                 url.into(),
                 "one or more verifiedIdentities entries violate the CAWG ICA data model".into(),
+                json!({
+                    "invalid_entries": defects
+                        .iter()
+                        .map(|(index, field)| json!({"index": index, "field": field}))
+                        .collect::<Vec<_>>(),
+                }),
             );
             ok = false;
         }
         VerifiedIdentities::Valid(_) => {}
-    }
-
-    if super::report::cbor_to_json(signer_payload) != credential.c2pa_asset {
-        results.push_failure(
-            CAWG_ICA_SIGNER_PAYLOAD_MISMATCH,
-            url.into(),
-            "credentialSubject.c2paAsset is not the exact JSON serialization of signer_payload"
-                .into(),
-        );
-        ok = false;
     }
 
     if ok {
@@ -429,7 +441,8 @@ enum ValidityField {
 
 enum VerifiedIdentities {
     Missing,
-    Invalid(Vec<Json>),
+    /// Each rejected entry's index and the property that broke a condition.
+    Invalid(Vec<(usize, &'static str)>),
     Valid(Vec<Json>),
 }
 
@@ -444,6 +457,14 @@ struct IcaCredential {
     verified_identities: VerifiedIdentities,
 }
 
+/// Parse and check the ICA credential against the CAWG Identity 1.3 prose.
+///
+/// `credentialSchema` is deliberately not evaluated. 1.3 only RECOMMENDS it,
+/// and the published v1.3 schemas cannot serve as a gate: they reference
+/// `#/definitions/...` while declaring `$defs`, they require `uri` for
+/// `cawg.social_media` where the prose only recommends it, and production
+/// credentials cite a schema URL that is neither listed one. These checks
+/// implement the prose rules instead.
 fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
     let raw: Json = serde_json::from_slice(payload).map_err(|_| "payload is not JSON")?;
     let object = raw.as_object().ok_or("credential is not a JSON object")?;
@@ -456,12 +477,12 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
             .iter()
             .any(|entry| entry.as_str() == Some(expected))
     };
-    let vc_version = if contains(VC_CONTEXT_V2) {
-        "2.0"
-    } else if contains(VC_CONTEXT_V1) {
-        "1.1"
-    } else {
-        return Err("credential lacks a W3C Verifiable Credentials context");
+    // VC 2.0 section 4.3 and VC 1.1 section 4.1: the first item is the data
+    // model's own context URL, which also selects the model version.
+    let vc_version = match contexts.first().and_then(Json::as_str) {
+        Some(VC_CONTEXT_V2) => "2.0",
+        Some(VC_CONTEXT_V1) => "1.1",
+        _ => return Err("first @context item is not a W3C Verifiable Credentials context"),
     };
     if !contains(CAWG_ICA_CONTEXT) {
         return Err("credential lacks the required CAWG Identity 1.1 ICA context");
@@ -474,6 +495,9 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
         .get("type")
         .and_then(Json::as_array)
         .ok_or("type is missing or not an array")?;
+    if types.iter().any(|entry| !entry.is_string()) {
+        return Err("type entries must be strings");
+    }
     if ![
         "VerifiableCredential",
         "IdentityClaimsAggregationCredential",
@@ -504,10 +528,17 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
     let c2pa_asset = subject.get("c2paAsset").cloned().unwrap_or(Json::Null);
     let verified_identities = match subject.get("verifiedIdentities") {
         Some(Json::Array(values)) if !values.is_empty() => {
-            if values.iter().all(valid_verified_identity) {
+            let defects: Vec<(usize, &'static str)> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    verified_identity_defect(value).map(|field| (index, field))
+                })
+                .collect();
+            if defects.is_empty() {
                 VerifiedIdentities::Valid(values.clone())
             } else {
-                VerifiedIdentities::Invalid(values.clone())
+                VerifiedIdentities::Invalid(defects)
             }
         }
         _ => VerifiedIdentities::Missing,
@@ -542,16 +573,19 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
     })
 }
 
-fn valid_verified_identity(value: &Json) -> bool {
+/// Name the property of a `verifiedIdentities` entry that breaks a condition
+/// of CAWG Identity 1.3 "Verified identities" (`entry` when the entry is not
+/// an object), or `None` when the entry meets every condition.
+fn verified_identity_defect(value: &Json) -> Option<&'static str> {
     let Some(identity) = value.as_object() else {
-        return false;
+        return Some("entry");
     };
     let Some(identity_type) = identity
         .get("type")
         .and_then(Json::as_str)
-        .filter(|v| !v.is_empty())
+        .filter(|v| is_cawg_label(v))
     else {
-        return false;
+        return Some("type");
     };
     if identity
         .get("verifiedAt")
@@ -559,41 +593,56 @@ fn valid_verified_identity(value: &Json) -> bool {
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
         .is_none()
     {
-        return false;
+        return Some("verifiedAt");
     }
     let Some(provider) = identity.get("provider").and_then(Json::as_object) else {
-        return false;
+        return Some("provider");
     };
     if !natural_language_string(provider.get("name")) {
-        return false;
+        return Some("provider.name");
     }
     if provider
         .get("id")
-        .is_some_and(|id| id.as_str().is_none_or(|id| !has_uri_scheme(id)))
+        .is_some_and(|id| id.as_str().is_none_or(|id| !is_uri(id)))
     {
-        return false;
+        return Some("provider.id");
     }
-    for field in ["name", "username", "address", "method"] {
+    for field in ["name", "username", "address"] {
         if identity
             .get(field)
             .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
         {
-            return false;
+            return Some(field);
         }
     }
     if identity
-        .get("uri")
-        .is_some_and(|value| value.as_str().is_none_or(|uri| !has_uri_scheme(uri)))
+        .get("method")
+        .is_some_and(|value| value.as_str().is_none_or(|method| !is_cawg_label(method)))
     {
-        return false;
+        return Some("method");
     }
-    match identity_type {
-        "cawg.document_verification" => identity.get("name").and_then(Json::as_str).is_some(),
-        "cawg.web_site" => identity.get("uri").and_then(Json::as_str).is_some(),
-        "cawg.social_media" => identity.get("username").and_then(Json::as_str).is_some(),
-        "cawg.crypto_wallet" => identity.get("address").and_then(Json::as_str).is_some(),
-        _ => true,
+    if identity
+        .get("uri")
+        .is_some_and(|value| value.as_str().is_none_or(|uri| !is_uri(uri)))
+    {
+        return Some("uri");
     }
+    let required = match identity_type {
+        "cawg.document_verification" => "name",
+        "cawg.web_site" => "uri",
+        "cawg.social_media" => "username",
+        "cawg.crypto_wallet" => "address",
+        _ => return None,
+    };
+    let Some(value) = identity.get(required).and_then(Json::as_str) else {
+        return Some(required);
+    };
+    // A wallet address "MUST be the unique alphanumeric string" for the
+    // service. The social-media username carries the same words, but
+    // production aggregators put display names such as "Eric Scouten" there,
+    // so it keeps only the non-empty-string rule as an interop decision.
+    (identity_type == "cawg.crypto_wallet" && !value.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some("address")
 }
 
 fn natural_language_string(value: Option<&Json>) -> bool {
@@ -609,17 +658,96 @@ fn natural_language_string(value: Option<&Json>) -> bool {
     }
 }
 
-fn has_uri_scheme(text: &str) -> bool {
-    let Some((scheme, _)) = text.split_once(':') else {
+/// RFC 3986 section 3 `URI`: `scheme ":" hier-part [ "?" query ] [ "#"
+/// fragment ]`, ASCII only.
+fn is_uri(text: &str) -> bool {
+    let Some((scheme, rest)) = text.split_once(':') else {
         return false;
     };
-    let mut chars = scheme.chars();
-    chars
+    let mut scheme = scheme.bytes();
+    if !scheme
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic())
-        && chars.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-        })
+        || !scheme.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (hier_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let pchar = |byte: u8| matches!(byte, b':' | b'@');
+    let query_char = |byte: u8| matches!(byte, b':' | b'@' | b'/' | b'?');
+    if !uri_component(query, query_char) || !uri_component(fragment, query_char) {
+        return false;
+    }
+    let path_char = |byte: u8| pchar(byte) || byte == b'/';
+    match hier_part.strip_prefix("//") {
+        Some(after) => {
+            let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
+            is_uri_authority(authority) && uri_component(path, path_char)
+        }
+        None => uri_component(hier_part, path_char),
+    }
+}
+
+/// RFC 3986 `authority`: `[ userinfo "@" ] host [ ":" port ]`.
+fn is_uri_authority(authority: &str) -> bool {
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    if userinfo.is_some_and(|userinfo| !uri_component(userinfo, |byte| byte == b':')) {
+        return false;
+    }
+    let (host_ok, port) = match host_port.strip_prefix('[') {
+        Some(literal) => {
+            let Some((address, port)) = literal.split_once(']') else {
+                return false;
+            };
+            (is_ip_literal(address), port)
+        }
+        None => {
+            let (host, port) = host_port.split_at(host_port.find(':').unwrap_or(host_port.len()));
+            (uri_component(host, |_| false), port)
+        }
+    };
+    host_ok
+        && (port.is_empty()
+            || port
+                .strip_prefix(':')
+                .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_digit())))
+}
+
+/// RFC 3986 `IP-literal` contents: an IPv6 address or `IPvFuture`.
+fn is_ip_literal(address: &str) -> bool {
+    match address.strip_prefix(['v', 'V']) {
+        Some(future) => future.split_once('.').is_some_and(|(version, rest)| {
+            !version.is_empty()
+                && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&byte))
+        }),
+        None => address.parse::<std::net::Ipv6Addr>().is_ok(),
+    }
+}
+
+/// Every byte of `text` is unreserved, a sub-delimiter, a valid
+/// percent-encoding, or accepted by `extra`.
+fn uri_component(text: &str, extra: impl Fn(u8) -> bool) -> bool {
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        let valid = if byte == b'%' {
+            bytes.next().is_some_and(|hex| hex.is_ascii_hexdigit())
+                && bytes.next().is_some_and(|hex| hex.is_ascii_hexdigit())
+        } else {
+            byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte) || extra(byte)
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 
 struct IssuerFailure {
@@ -1153,6 +1281,7 @@ fn base64_decode(input: &str, url_alphabet: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::c2pa_trust::timestamp_fixture::TestTsa;
     use ed25519_dalek::{Signer as _, SigningKey};
     use p256::elliptic_curve::sec1::ToEncodedPoint as _;
     use serde_json::json;
@@ -1234,10 +1363,21 @@ mod tests {
     }
 
     fn cose(algorithm: CoseAlg, payload: &[u8], sign: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
-        let protected = Value::Map(vec![
-            (Value::Integer(1), Value::Integer(algorithm.cose_id())),
-            (Value::Integer(3), Value::Text(VC_CONTENT_TYPE.into())),
-        ]);
+        cose_with_protected(
+            Value::Map(vec![
+                (Value::Integer(1), Value::Integer(algorithm.cose_id())),
+                (Value::Integer(3), Value::Text(VC_CONTENT_TYPE.into())),
+            ]),
+            payload,
+            sign,
+        )
+    }
+
+    fn cose_with_protected(
+        protected: Value,
+        payload: &[u8],
+        sign: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) -> Vec<u8> {
         let protected_bytes = encode(&protected, Profile::LegacyPipelineBDefinite).unwrap();
         let input = encode(
             &Value::Array(vec![
@@ -1276,21 +1416,15 @@ mod tests {
         trusted: &[String],
         status_lists: Option<&HashMap<String, String>>,
     ) -> ValidationResults {
-        let mut results = ValidationResults::default();
-        verify_ica_assertion(
+        run_full(
             &signer_payload(),
             cose,
-            URL,
+            trusted,
             datetime!(2025-06-01 0:00 UTC),
             Some(datetime!(2025-05-01 0:00 UTC)),
             None,
-            None,
-            Some(trusted),
-            None,
             status_lists,
-            &mut results,
-        );
-        results
+        )
     }
 
     fn codes(items: &[super::super::StatusCode]) -> Vec<&str> {
@@ -1767,5 +1901,1029 @@ mod tests {
             "{:?}",
             unresolved.network_needs
         );
+    }
+
+    // CAWG Identity 1.3 ICA conformance. Each test names the requirement ids
+    // of the TEAM_457 coverage matrix it defends.
+
+    /// Validate `cose` with every caller input explicit.
+    fn run_full(
+        signer_payload: &Value,
+        cose: &[u8],
+        trusted: &[String],
+        validation_time: OffsetDateTime,
+        manifest_time: Option<OffsetDateTime>,
+        tsa_trust: Option<&TrustList>,
+        status_lists: Option<&HashMap<String, String>>,
+    ) -> ValidationResults {
+        let mut results = ValidationResults::default();
+        verify_ica_assertion(
+            signer_payload,
+            cose,
+            URL,
+            validation_time,
+            manifest_time,
+            tsa_trust,
+            None,
+            Some(trusted),
+            None,
+            status_lists,
+            &mut results,
+        );
+        results
+    }
+
+    /// Sign a VC 2.0 credential from the trusted `did:jwk` issuer after `edit`
+    /// alters it, and validate it with the default inputs.
+    fn validate_edited(edit: impl FnOnce(&mut Json)) -> ValidationResults {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let did = did_jwk(&key);
+        let mut credential = vc_json(json!(&did), false);
+        edit(&mut credential);
+        run(
+            &eddsa_cose(&key, &credential),
+            std::slice::from_ref(&did),
+            None,
+        )
+    }
+
+    fn validate_identities(identities: Json) -> ValidationResults {
+        validate_edited(|credential| {
+            credential["credentialSubject"]["verifiedIdentities"] = identities;
+        })
+    }
+
+    /// A verified identity with the always-required fields plus `fields`.
+    fn identity(fields: Json) -> Json {
+        let mut identity = json!({
+            "verifiedAt": "2024-05-27T08:40:39Z",
+            "provider": {"id": "https://idp.example", "name": "Example IdP"},
+        });
+        for (name, value) in fields.as_object().unwrap() {
+            identity[name] = value.clone();
+        }
+        identity
+    }
+
+    fn edited(base: &Json, edit: impl FnOnce(&mut serde_json::Map<String, Json>)) -> Json {
+        let mut value = base.clone();
+        edit(value.as_object_mut().unwrap());
+        value
+    }
+
+    fn assert_credential_valid(results: &ValidationResults, case: &str) {
+        assert!(results.failure.is_empty(), "{case}: {:?}", results.failure);
+        assert!(
+            codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID),
+            "{case}"
+        );
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-006: `type` MUST be present and MUST contain both
+    /// `VerifiableCredential` and `IdentityClaimsAggregationCredential`.
+    /// TECH-A-004 (VC data model): every `type` member is a string.
+    #[test]
+    fn credential_type_must_contain_both_ica_types() {
+        let cases: [(&str, Option<Json>); 4] = [
+            ("type missing", None),
+            (
+                "only VerifiableCredential",
+                Some(json!(["VerifiableCredential"])),
+            ),
+            (
+                "only IdentityClaimsAggregationCredential",
+                Some(json!(["IdentityClaimsAggregationCredential"])),
+            ),
+            (
+                "non-string member",
+                Some(json!([
+                    "VerifiableCredential",
+                    "IdentityClaimsAggregationCredential",
+                    7
+                ])),
+            ),
+        ];
+        for (case, types) in cases {
+            let results = validate_edited(|credential| match types {
+                Some(types) => credential["type"] = types,
+                None => {
+                    credential.as_object_mut().unwrap().remove("type");
+                }
+            });
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
+                "{case}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-004 and TECH-A-005: the VC data model requires
+    /// its own context URL as the first `@context` item (VC 2.0 section
+    /// 4.3, VC 1.1 section 4.1), and that URL selects the model version.
+    #[test]
+    fn the_vc_context_must_be_the_first_context_item() {
+        for (vc_v1, context) in [
+            (false, json!([CAWG_ICA_CONTEXT, VC_CONTEXT_V2])),
+            (true, json!([CAWG_ICA_CONTEXT, VC_CONTEXT_V1])),
+        ] {
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let did = did_jwk(&key);
+            let mut credential = vc_json(json!(&did), vc_v1);
+            credential["@context"] = context.clone();
+            let results = run(
+                &eddsa_cose(&key, &credential),
+                std::slice::from_ref(&did),
+                None,
+            );
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
+                "{context}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-013 (consumers SHOULD accept the five defined
+    /// types), TECH-A-014 (other label values MAY be used), and the optional
+    /// fields of TECH-A-015/018/021/024: each type validates with only the
+    /// fields its own row requires, so `name`, `username`, `address`, and
+    /// `uri` are each absent from some accepted entry.
+    #[test]
+    fn every_defined_identity_type_validates_with_only_its_required_fields() {
+        let identities = [
+            identity(json!({"type": "cawg.document_verification", "name": "First Last"})),
+            identity(json!({"type": "cawg.web_site", "uri": "https://named-actor.example/"})),
+            identity(json!({"type": "cawg.affiliation"})),
+            identity(json!({"type": "cawg.social_media", "username": "user"})),
+            identity(json!({
+                "type": "cawg.crypto_wallet",
+                "address": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            })),
+            identity(json!({"type": "com.example.passport_check"})),
+        ];
+        for identity in identities {
+            let results = validate_identities(json!([identity.clone()]));
+            assert_credential_valid(&results, &identity["type"].to_string());
+            let details = results
+                .success
+                .iter()
+                .find(|status| status.code == CAWG_ICA_CREDENTIAL_VALID)
+                .and_then(|status| status.details.as_ref())
+                .unwrap();
+            assert_eq!(details["verified_identities"], json!([identity]));
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECHNICAL-B-004: consumers SHOULD be prepared to accept
+    /// the five defined `method` values.
+    #[test]
+    fn every_defined_verification_method_validates() {
+        for method in [
+            "cawg.dns_record",
+            "cawg.uri_file_verification",
+            "cawg.email",
+            "cawg.uri_meta_tag_verification",
+            "cawg.federated_login",
+        ] {
+            let results = validate_identities(json!([identity(json!({
+                "type": "cawg.web_site",
+                "uri": "https://named-actor.example/",
+                "method": method,
+            }))]));
+            assert_credential_valid(&results, method);
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECHNICAL-B-015: `provider.name` is a natural language
+    /// string, which may be a language map as well as a plain string.
+    #[test]
+    fn provider_name_may_be_a_language_map() {
+        let results = validate_identities(json!([identity(json!({
+            "type": "cawg.social_media",
+            "username": "user",
+            "provider": {
+                "id": "https://idp.example",
+                "name": {"en": "Example IdP", "fr": "IdP exemple"},
+            },
+        }))]));
+        assert_credential_valid(&results, "language map");
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-B-010: every condition in "Verified
+    /// identities" is checked for each entry, and any unmet condition is
+    /// `cawg.ica.verified_identities.invalid`. Rows: TECH-A-012, 016, 017,
+    /// 019, 020, 022, 023, 025, 026; TECHNICAL-B-003, 007, 009, 012, 015.
+    #[test]
+    fn each_verified_identity_condition_is_enforced() {
+        let base = identity(json!({"type": "cawg.social_media", "username": "user"}));
+        let set = |field: &'static str, value: Json| {
+            edited(&base, |identity| {
+                identity.insert(field.into(), value);
+            })
+        };
+        let remove = |field: &'static str| {
+            edited(&base, |identity| {
+                identity.remove(field);
+            })
+        };
+        let provider = |edit: fn(&mut serde_json::Map<String, Json>)| {
+            edited(&base, |identity| {
+                edit(identity["provider"].as_object_mut().unwrap());
+            })
+        };
+        let cases = [
+            ("TECH-A-012 type missing", remove("type")),
+            ("TECH-A-012 type not a string", set("type", json!(7))),
+            ("TECH-A-012 type empty", set("type", json!(""))),
+            ("TECH-A-016 name empty", set("name", json!(""))),
+            ("TECH-A-016 name not a string", set("name", json!(7))),
+            (
+                "TECH-A-017 document_verification without name",
+                set("type", json!("cawg.document_verification")),
+            ),
+            ("TECH-A-019 username empty", set("username", json!(""))),
+            (
+                "TECH-A-019 username not a string",
+                set("username", json!(7)),
+            ),
+            (
+                "TECH-A-020 social_media without username",
+                remove("username"),
+            ),
+            ("TECH-A-022 address empty", set("address", json!(""))),
+            ("TECH-A-022 address not a string", set("address", json!(7))),
+            (
+                "TECH-A-023 crypto_wallet without address",
+                set("type", json!("cawg.crypto_wallet")),
+            ),
+            (
+                "TECH-A-025 uri without a scheme",
+                set("uri", json!("named-actor-site.example")),
+            ),
+            ("TECH-A-025 uri not a string", set("uri", json!(7))),
+            (
+                "TECH-A-026 web_site without uri",
+                set("type", json!("cawg.web_site")),
+            ),
+            ("TECHNICAL-B-003 method empty", set("method", json!(""))),
+            (
+                "TECHNICAL-B-003 method not a string",
+                set("method", json!(7)),
+            ),
+            ("TECHNICAL-B-007 verifiedAt missing", remove("verifiedAt")),
+            (
+                "TECHNICAL-B-007 verifiedAt not RFC 3339",
+                set("verifiedAt", json!("2024-05-27")),
+            ),
+            ("TECHNICAL-B-009 provider missing", remove("provider")),
+            (
+                "TECHNICAL-B-009 provider not an object",
+                set("provider", json!("Example IdP")),
+            ),
+            (
+                "TECHNICAL-B-012 provider.id not a string",
+                provider(|provider| {
+                    provider.insert("id".into(), json!(7));
+                }),
+            ),
+            (
+                "TECHNICAL-B-012 provider.id without a scheme",
+                provider(|provider| {
+                    provider.insert("id".into(), json!("idp.example"));
+                }),
+            ),
+            (
+                "TECHNICAL-B-015 provider.name missing",
+                provider(|provider| {
+                    provider.remove("name");
+                }),
+            ),
+            (
+                "TECHNICAL-B-015 provider.name empty",
+                provider(|provider| {
+                    provider.insert("name".into(), json!(""));
+                }),
+            ),
+            (
+                "TECHNICAL-B-015 provider.name language map with an empty value",
+                provider(|provider| {
+                    provider.insert("name".into(), json!({"en": ""}));
+                }),
+            ),
+            (
+                "VALIDATING-B-010 entry not an object",
+                json!("cawg.social_media"),
+            ),
+        ];
+        for (case, entry) in cases {
+            let results = validate_identities(json!([entry]));
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_VERIFIED_IDENTITIES_INVALID],
+                "{case}"
+            );
+            assert!(
+                !codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID),
+                "{case}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-B-008: a missing, non-array, or empty
+    /// `verifiedIdentities` is `cawg.ica.verified_identities.missing`.
+    #[test]
+    fn absent_non_array_or_empty_verified_identities_are_missing() {
+        for (case, value) in [
+            ("absent", None),
+            ("object", Some(json!({}))),
+            ("string", Some(json!("cawg.social_media"))),
+            ("empty array", Some(json!([]))),
+        ] {
+            let results = validate_edited(|credential| {
+                let subject = credential["credentialSubject"].as_object_mut().unwrap();
+                match value {
+                    Some(value) => subject.insert("verifiedIdentities".into(), value),
+                    None => subject.remove("verifiedIdentities"),
+                };
+            });
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_VERIFIED_IDENTITIES_MISSING],
+                "{case}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-B-012: the validator SHOULD identify which
+    /// `verifiedIdentities` entries are not accepted.
+    #[test]
+    fn invalid_verified_identities_name_each_rejected_entry() {
+        let accepted = identity(json!({"type": "cawg.social_media", "username": "user"}));
+        let results = validate_identities(json!([
+            edited(&accepted, |identity| {
+                identity.remove("verifiedAt");
+            }),
+            accepted.clone(),
+            identity(json!({"type": "cawg.web_site"})),
+        ]));
+        let status = results
+            .failure
+            .iter()
+            .find(|status| status.code == CAWG_ICA_VERIFIED_IDENTITIES_INVALID)
+            .unwrap();
+        assert_eq!(
+            status.details.as_ref().unwrap()["invalid_entries"],
+            json!([
+                {"index": 0, "field": "verifiedAt"},
+                {"index": 2, "field": "uri"},
+            ])
+        );
+    }
+
+    /// Bytes whose base64 uses alphabet indices 62 and 63 in every position,
+    /// so the standard (`+/`) and URL-safe (`-_`) encodings always differ.
+    fn index_62_63_hash() -> Vec<u8> {
+        [0xFB, 0xFF, 0xBF].into_iter().cycle().take(32).collect()
+    }
+
+    fn payload_with_hash(hash: &[u8]) -> Value {
+        Value::Map(vec![
+            (
+                "referenced_assertions".into(),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        "url".into(),
+                        Value::Text("self#jumbf=c2pa.assertions/c2pa.hash.data".into()),
+                    ),
+                    ("hash".into(), Value::Bytes(hash.to_vec())),
+                ])]),
+            ),
+            (
+                "sig_type".into(),
+                Value::Text("cawg.identity_claims_aggregation".into()),
+            ),
+        ])
+    }
+
+    /// Validate a credential whose `c2paAsset` is `asset`, written by hand
+    /// rather than by the serializer under test, against a signer payload
+    /// carrying `index_62_63_hash`.
+    fn validate_c2pa_asset(asset: Json) -> ValidationResults {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let did = did_jwk(&key);
+        let mut credential = vc_json(json!(&did), false);
+        credential["credentialSubject"]["c2paAsset"] = asset;
+        run_full(
+            &payload_with_hash(&index_62_63_hash()),
+            &eddsa_cose(&key, &credential),
+            std::slice::from_ref(&did),
+            datetime!(2025-06-01 0:00 UTC),
+            Some(datetime!(2025-05-01 0:00 UTC)),
+            None,
+            None,
+        )
+    }
+
+    const STANDARD_HASH: &str = "+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/8=";
+
+    fn c2pa_asset(hash: &str, assertions_key: &str, sig_type_key: &str) -> Json {
+        json!({
+            assertions_key: [{
+                "url": "self#jumbf=c2pa.assertions/c2pa.hash.data",
+                "hash": hash,
+            }],
+            sig_type_key: "cawg.identity_claims_aggregation",
+        })
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-B-004 and TECHNICAL-B-018: byte strings are
+    /// standard RFC 4648 section 4 base64 and MUST NOT use the URL-safe
+    /// alphabet.
+    #[test]
+    fn c2pa_asset_hashes_use_the_standard_base64_alphabet() {
+        let standard = validate_c2pa_asset(c2pa_asset(
+            STANDARD_HASH,
+            "referenced_assertions",
+            "sig_type",
+        ));
+        assert_credential_valid(&standard, "standard alphabet");
+
+        let url_safe = STANDARD_HASH.replace('+', "-").replace('/', "_");
+        let results =
+            validate_c2pa_asset(c2pa_asset(&url_safe, "referenced_assertions", "sig_type"));
+        assert_eq!(
+            codes(&results.failure),
+            vec![CAWG_ICA_SIGNER_PAYLOAD_MISMATCH]
+        );
+    }
+
+    /// CAWG-ID13-ICA-TECHNICAL-B-019: the encoding MUST NOT include line
+    /// feeds.
+    #[test]
+    fn c2pa_asset_hashes_with_line_breaks_are_a_mismatch() {
+        for broken in [
+            format!("{}\n{}", &STANDARD_HASH[..20], &STANDARD_HASH[20..]),
+            format!("{STANDARD_HASH}\r\n"),
+        ] {
+            let results =
+                validate_c2pa_asset(c2pa_asset(&broken, "referenced_assertions", "sig_type"));
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_SIGNER_PAYLOAD_MISMATCH],
+                "{broken:?}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECHNICAL-B-020 and B-021: field names are used exactly
+    /// as in `signer_payload`; a snake_case to camelCase translation MUST NOT
+    /// be performed.
+    #[test]
+    fn c2pa_asset_field_names_are_not_translated_to_camel_case() {
+        for (assertions_key, sig_type_key) in [
+            ("referencedAssertions", "sig_type"),
+            ("referenced_assertions", "sigType"),
+        ] {
+            let results =
+                validate_c2pa_asset(c2pa_asset(STANDARD_HASH, assertions_key, sig_type_key));
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_SIGNER_PAYLOAD_MISMATCH],
+                "{assertions_key}/{sig_type_key}"
+            );
+        }
+    }
+
+    /// Validate a credential signed with `algorithm` by the issuer whose
+    /// public JWK is `jwk`.
+    fn assert_algorithm_validates(
+        algorithm: CoseAlg,
+        jwk: Json,
+        sign: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) {
+        let did = format!(
+            "did:jwk:{}",
+            base64_encode(jwk.to_string().as_bytes(), true)
+        );
+        let credential = vc_json(json!(&did), false);
+        let signature = cose(algorithm, &serde_json::to_vec(&credential).unwrap(), sign);
+        let results = run(&signature, std::slice::from_ref(&did), None);
+        assert_credential_valid(&results, &format!("{algorithm:?}"));
+    }
+
+    fn ec_jwk(crv: &str, x: &[u8], y: &[u8]) -> Json {
+        json!({
+            "kty": "EC",
+            "crv": crv,
+            "x": base64_encode(x, true),
+            "y": base64_encode(y, true),
+        })
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-036: the COSE signature may use any C2PA 2.4
+    /// signature algorithm. ES384 and ES512.
+    #[test]
+    fn ecdsa_p384_and_p521_credentials_validate() {
+        use p384::ecdsa::signature::Signer as _;
+
+        let p384_key = p384::ecdsa::SigningKey::from_bytes((&[9_u8; 48]).into()).unwrap();
+        let point = p384_key.verifying_key().to_encoded_point(false);
+        assert_algorithm_validates(
+            CoseAlg::Es384,
+            ec_jwk("P-384", point.x().unwrap(), point.y().unwrap()),
+            |input| {
+                let signature: p384::ecdsa::Signature = p384_key.sign(input);
+                signature.to_bytes().to_vec()
+            },
+        );
+
+        let mut scalar = [9_u8; 66];
+        scalar[0] = 1;
+        let p521_key = p521::ecdsa::SigningKey::from_slice(&scalar).unwrap();
+        let point = p521::ecdsa::VerifyingKey::from(&p521_key).to_encoded_point(false);
+        assert_algorithm_validates(
+            CoseAlg::Es512,
+            ec_jwk("P-521", point.x().unwrap(), point.y().unwrap()),
+            |input| {
+                let signature: p521::ecdsa::Signature = p521_key.sign(input);
+                signature.to_bytes().to_vec()
+            },
+        );
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-036: PS256, PS384, and PS512.
+    #[test]
+    fn rsa_pss_credentials_validate() {
+        use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _};
+        use rsa::traits::PublicKeyParts as _;
+
+        let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+        let jwk = json!({
+            "kty": "RSA",
+            "n": base64_encode(&key.n().to_bytes_be(), true),
+            "e": base64_encode(&key.e().to_bytes_be(), true),
+        });
+        assert_algorithm_validates(CoseAlg::Ps256, jwk.clone(), |input| {
+            rsa::pss::SigningKey::<sha2::Sha256>::new(key.clone())
+                .sign_with_rng(&mut rand_core::OsRng, input)
+                .to_vec()
+        });
+        assert_algorithm_validates(CoseAlg::Ps384, jwk.clone(), |input| {
+            rsa::pss::SigningKey::<sha2::Sha384>::new(key.clone())
+                .sign_with_rng(&mut rand_core::OsRng, input)
+                .to_vec()
+        });
+        assert_algorithm_validates(CoseAlg::Ps512, jwk, |input| {
+            rsa::pss::SigningKey::<sha2::Sha512>::new(key.clone())
+                .sign_with_rng(&mut rand_core::OsRng, input)
+                .to_vec()
+        });
+    }
+
+    /// Attach a `sigTst2` header whose token the fixture TSA minted over the
+    /// C2PA v2 time-stamp input of `cose`, attesting `gen_time`. The input
+    /// covers the protected header and signature, not the unprotected
+    /// bucket, so the header can be added after signing.
+    fn with_sig_tst2(cose: &[u8], tsa: &TestTsa, gen_time: OffsetDateTime) -> Vec<u8> {
+        let token = tsa.token(&timestamp_input(cose).unwrap(), gen_time);
+        let Ok(Value::Tag(18, boxed)) = crate::c2pa_cbor::decode(cose) else {
+            panic!("fixture is a tagged COSE_Sign1");
+        };
+        let Value::Array(mut parts) = *boxed else {
+            panic!("COSE_Sign1 is an array");
+        };
+        parts[1] = Value::Map(vec![(
+            Value::Text("sigTst2".into()),
+            Value::Map(vec![(
+                Value::Text("tstTokens".into()),
+                Value::Array(vec![Value::Map(vec![(
+                    Value::Text("val".into()),
+                    Value::Bytes(token),
+                )])]),
+            )]),
+        )]);
+        encode(
+            &Value::Tag(18, Box::new(Value::Array(parts))),
+            Profile::LegacyPipelineBDefinite,
+        )
+        .unwrap()
+    }
+
+    fn fixture_tsa() -> TestTsa {
+        TestTsa::new(
+            datetime!(2025-01-01 0:00 UTC),
+            datetime!(2030-01-01 0:00 UTC),
+        )
+    }
+
+    /// A signed credential with `validFrom` set, time-stamped by `tsa` at
+    /// 2025-03-01.
+    fn time_stamped_credential(tsa: &TestTsa, valid_from: &str) -> (Vec<u8>, String) {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let did = did_jwk(&key);
+        let mut credential = vc_json(json!(&did), false);
+        credential["validFrom"] = json!(valid_from);
+        let cose = with_sig_tst2(
+            &eddsa_cose(&key, &credential),
+            tsa,
+            datetime!(2025-03-01 0:00 UTC),
+        );
+        (cose, did)
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-031/032, VALIDATING-A-036, VALIDATING-B-025: a
+    /// C2PA v2 `sigTst2` time stamp from a configured TSA is validated and
+    /// reported as `cawg.ica.time_stamp.validated`, and its time is the
+    /// credential's trusted time.
+    #[test]
+    fn a_trusted_sig_tst2_is_reported_validated() {
+        let tsa = fixture_tsa();
+        let (cose, did) = time_stamped_credential(&tsa, "2025-01-01T00:00:00Z");
+        let results = run_full(
+            &signer_payload(),
+            &cose,
+            std::slice::from_ref(&did),
+            datetime!(2025-06-01 0:00 UTC),
+            Some(datetime!(2025-05-01 0:00 UTC)),
+            Some(&tsa.trust_list()),
+            None,
+        );
+        assert_credential_valid(&results, "trusted sigTst2");
+        assert!(codes(&results.success).contains(&CAWG_ICA_TIME_STAMP_VALIDATED));
+        let details = results
+            .success
+            .iter()
+            .find(|status| status.code == CAWG_ICA_CREDENTIAL_VALID)
+            .and_then(|status| status.details.as_ref())
+            .unwrap();
+        assert_eq!(details["timestamp_trusted"], json!(true));
+        assert_eq!(details["trusted_at"], json!("2025-03-01T00:00:00Z"));
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-A-044: the effective date is compared with
+    /// the COSE time stamp. The time stamp alone predates `validFrom` here,
+    /// so it alone produces `cawg.ica.valid_from.invalid`; when the same
+    /// token cannot be validated it MUST NOT be used, and the credential's
+    /// dates are then judged without it.
+    #[test]
+    fn a_validated_time_stamp_before_valid_from_invalidates_the_credential() {
+        let tsa = fixture_tsa();
+        let (cose, did) = time_stamped_credential(&tsa, "2025-04-01T00:00:00Z");
+        let validate = |tsa_trust: Option<&TrustList>| {
+            run_full(
+                &signer_payload(),
+                &cose,
+                std::slice::from_ref(&did),
+                datetime!(2025-06-01 0:00 UTC),
+                Some(datetime!(2025-05-01 0:00 UTC)),
+                tsa_trust,
+                None,
+            )
+        };
+
+        let trusted = validate(Some(&tsa.trust_list()));
+        assert!(codes(&trusted.success).contains(&CAWG_ICA_TIME_STAMP_VALIDATED));
+        assert_eq!(codes(&trusted.failure), vec![CAWG_ICA_VALID_FROM_INVALID]);
+
+        let untrusted = validate(None);
+        assert_eq!(codes(&untrusted.failure), vec![CAWG_ICA_TIME_STAMP_INVALID]);
+    }
+
+    fn validate_dates(
+        vc_v1: bool,
+        dates: Json,
+        validation_time: OffsetDateTime,
+        manifest_time: Option<OffsetDateTime>,
+    ) -> ValidationResults {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let did = did_jwk(&key);
+        let mut credential = vc_json(json!(&did), vc_v1);
+        let object = credential.as_object_mut().unwrap();
+        object.remove("issuanceDate");
+        object.remove("validFrom");
+        for (name, value) in dates.as_object().unwrap() {
+            object.insert(name.clone(), value.clone());
+        }
+        run_full(
+            &signer_payload(),
+            &eddsa_cose(&key, &credential),
+            std::slice::from_ref(&did),
+            validation_time,
+            manifest_time,
+            None,
+            None,
+        )
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-A-044 and A-049: the effective and expiration
+    /// dates are compared with the C2PA Manifest time stamp. Each case is
+    /// valid at the current time and fails only because of the manifest
+    /// time.
+    #[test]
+    fn manifest_time_bounds_the_effective_and_expiration_dates() {
+        let manifest = Some(datetime!(2025-05-01 0:00 UTC));
+        let cases = [
+            (
+                json!({"validFrom": "2025-05-15T00:00:00Z"}),
+                datetime!(2025-06-01 0:00 UTC),
+                CAWG_ICA_VALID_FROM_INVALID,
+            ),
+            (
+                json!({
+                    "validFrom": "2025-01-01T00:00:00Z",
+                    "validUntil": "2025-03-01T00:00:00Z",
+                }),
+                datetime!(2025-02-01 0:00 UTC),
+                CAWG_ICA_VALID_UNTIL_INVALID,
+            ),
+        ];
+        for (dates, now, expected) in cases {
+            let without_manifest = validate_dates(false, dates.clone(), now, None);
+            assert_credential_valid(&without_manifest, &dates.to_string());
+            let with_manifest = validate_dates(false, dates.clone(), now, manifest);
+            assert_eq!(codes(&with_manifest.failure), vec![expected], "{dates}");
+        }
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-A-047 and A-049: a VC 1.1 credential keeps
+    /// its dates in `issuanceDate` and `expirationDate`, and the expiration
+    /// date is compared with the validation time.
+    #[test]
+    fn vc_11_issuance_and_expiration_dates_bound_the_credential() {
+        let now = datetime!(2025-06-01 0:00 UTC);
+        let manifest = Some(datetime!(2025-05-01 0:00 UTC));
+        let in_range = validate_dates(
+            true,
+            json!({
+                "issuanceDate": "2025-01-01T00:00:00Z",
+                "expirationDate": "2026-01-01T00:00:00Z",
+            }),
+            now,
+            manifest,
+        );
+        assert_credential_valid(&in_range, "expirationDate in range");
+
+        let expired = validate_dates(
+            true,
+            json!({
+                "issuanceDate": "2025-01-01T00:00:00Z",
+                "expirationDate": "2025-05-15T00:00:00Z",
+            }),
+            now,
+            manifest,
+        );
+        assert_eq!(codes(&expired.failure), vec![CAWG_ICA_VALID_UNTIL_INVALID]);
+
+        let malformed = validate_dates(
+            true,
+            json!({
+                "issuanceDate": "2025-01-01T00:00:00Z",
+                "expirationDate": "2026-01-01",
+            }),
+            now,
+            manifest,
+        );
+        assert_eq!(
+            codes(&malformed.failure),
+            vec![CAWG_ICA_VALID_UNTIL_INVALID]
+        );
+
+        // A VC 2.0 field does not stand in for the VC 1.1 effective date.
+        let wrong_version_field = validate_dates(
+            true,
+            json!({"validFrom": "2025-01-01T00:00:00Z"}),
+            now,
+            manifest,
+        );
+        assert_eq!(
+            codes(&wrong_version_field.failure),
+            vec![CAWG_ICA_VALID_FROM_MISSING]
+        );
+    }
+
+    /// CAWG-ID13-ICA-VALIDATING-A-004: the validator SHALL follow the steps in
+    /// the order presented. Credentials that fail every continuing step
+    /// report the failures in that order: COSE headers, issuer (DID, then
+    /// trust), signature, time stamp, validity range, revocation, then
+    /// binding to the C2PA asset before verified identities.
+    #[test]
+    fn continuing_failures_are_reported_in_specification_order() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let other_key = SigningKey::from_bytes(&[8; 32]);
+        let valid_protected = || {
+            Value::Map(vec![
+                (Value::Integer(1), Value::Integer(CoseAlg::EdDsa.cose_id())),
+                (Value::Integer(3), Value::Text(VC_CONTENT_TYPE.into())),
+            ])
+        };
+        let cases = [
+            (
+                "invalid headers",
+                json!(did_jwk(&key)),
+                Value::Map(vec![
+                    (Value::Integer(1), Value::Integer(-65_535)),
+                    (Value::Integer(3), Value::Text("application/json".into())),
+                ]),
+                vec![
+                    CAWG_ICA_INVALID_ALG,
+                    CAWG_ICA_INVALID_CONTENT_TYPE,
+                    CAWG_ICA_UNTRUSTED_ISSUER,
+                ],
+            ),
+            (
+                "wrong issuer key",
+                json!(did_jwk(&other_key)),
+                valid_protected(),
+                vec![CAWG_ICA_UNTRUSTED_ISSUER, CAWG_ICA_SIGNATURE_MISMATCH],
+            ),
+            (
+                "unsupported DID method",
+                json!("did:example:issuer"),
+                valid_protected(),
+                vec![CAWG_ICA_DID_UNSUPPORTED_METHOD, CAWG_ICA_UNTRUSTED_ISSUER],
+            ),
+            (
+                "issuer without a DID",
+                json!({"name": "no DID"}),
+                valid_protected(),
+                vec![CAWG_ICA_INVALID_ISSUER, CAWG_ICA_UNTRUSTED_ISSUER],
+            ),
+        ];
+        let tsa = fixture_tsa();
+        for (case, issuer, protected, head) in cases {
+            let mut credential = vc_json(issuer, false);
+            credential["validFrom"] = json!("2026-01-01T00:00:00Z");
+            credential["validUntil"] = json!("2025-01-15T00:00:00Z");
+            credential["credentialStatus"] = json!({"type": "VendorStatus"});
+            credential["credentialSubject"]["c2paAsset"]["sig_type"] = json!("other");
+            credential["credentialSubject"]["verifiedIdentities"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("verifiedAt");
+            let signature = cose_with_protected(
+                protected,
+                &serde_json::to_vec(&credential).unwrap(),
+                |input| key.sign(input).to_bytes().to_vec(),
+            );
+            let signature = with_sig_tst2(&signature, &tsa, datetime!(2025-03-01 0:00 UTC));
+            let results = run(&signature, &[], None);
+            let mut expected = head;
+            expected.extend([
+                CAWG_ICA_TIME_STAMP_INVALID,
+                CAWG_ICA_VALID_FROM_INVALID,
+                CAWG_ICA_VALID_UNTIL_INVALID,
+                CAWG_ICA_REVOCATION_UNSUPPORTED,
+                CAWG_ICA_SIGNER_PAYLOAD_MISMATCH,
+                CAWG_ICA_VERIFIED_IDENTITIES_INVALID,
+            ]);
+            assert_eq!(codes(&results.failure), expected, "{case}");
+        }
+    }
+
+    /// Validate one social-media identity carrying `field: value`, and
+    /// return the `details.invalid_entries` fields it was rejected for.
+    fn rejected_fields(field: &str, value: &str) -> Vec<String> {
+        let mut entry = identity(json!({"type": "cawg.social_media", "username": "user"}));
+        entry[field] = json!(value);
+        let results = validate_identities(json!([entry]));
+        results
+            .failure
+            .iter()
+            .filter(|status| status.code == CAWG_ICA_VERIFIED_IDENTITIES_INVALID)
+            .flat_map(|status| {
+                status.details.as_ref().unwrap()["invalid_entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["field"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-014 and TECHNICAL-B-006: values other than the
+    /// defined `type` and `method` values MAY be used "subject to
+    /// restrictions described in Labels". The labels ABNF requires two or
+    /// more period-separated components, each `1(DIGIT / ALPHA) *(DIGIT /
+    /// ALPHA / "-" / "_")`.
+    #[test]
+    fn identity_type_and_method_must_be_namespaced_labels() {
+        for field in ["type", "method"] {
+            for label in [
+                "cawg.social_media",
+                "cawg.idv",
+                "com.example.passport_check",
+                "net.fine-art-school.v2",
+                "com.example.2fa",
+            ] {
+                assert!(rejected_fields(field, label).is_empty(), "{field} {label}");
+            }
+            for label in [
+                "passport",
+                "cawg.",
+                ".cawg",
+                "cawg..idv",
+                "com.example.-x",
+                "com.example._x",
+                "com example.x",
+                "com.exämple.x",
+                "com.example.x!",
+                // labels.adoc reserves `__` for multiple-assertion suffixes.
+                "com.example.a__b",
+                "com.example.foo__bar",
+                "cawg.social_media__1",
+            ] {
+                assert_eq!(
+                    rejected_fields(field, label),
+                    vec![field],
+                    "{field} {label}"
+                );
+            }
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-025 and TECHNICAL-B-012: `uri` and `provider.id`
+    /// MUST be valid URIs, which is the RFC 3986 `URI` production, not
+    /// merely a scheme followed by a colon.
+    #[test]
+    fn uri_and_provider_id_must_be_rfc_3986_uris() {
+        let valid = [
+            "https://www.linkedin.com/profile-thirdparty-redirect/AgEvmWjOfQ_D-2mp",
+            "https://user:pw@host.example:8443/a/b;c?q=1&r=%2F#frag/ment?",
+            "https://[2001:db8::1]:443/",
+            "https://192.0.2.1/",
+            "did:web:idp.example",
+            "mailto:actor@named.example",
+            "urn:uuid:F9168C5E-CEB2-4faa-B6BF-329BF39FA1E4",
+        ];
+        let invalid = [
+            "https://named actor.example/",
+            "https://named.example/a b",
+            "https://named.example/%zz",
+            "https://named.example/%4",
+            "https://named.example/#a#b",
+            "https://named.example:80a/",
+            "https://[2001:db8::zz]/",
+            "https://named.example/<script>",
+            "https://exämple.example/",
+            "1https://named.example/",
+        ];
+        for uri in valid {
+            assert!(rejected_fields("uri", uri).is_empty(), "uri {uri}");
+            let provider = validate_identities(json!([identity(json!({
+                "type": "cawg.social_media",
+                "username": "user",
+                "provider": {"id": uri, "name": "Example IdP"},
+            }))]));
+            assert_credential_valid(&provider, uri);
+        }
+        for uri in invalid {
+            assert_eq!(rejected_fields("uri", uri), vec!["uri"], "uri {uri}");
+            let provider = validate_identities(json!([identity(json!({
+                "type": "cawg.social_media",
+                "username": "user",
+                "provider": {"id": uri, "name": "Example IdP"},
+            }))]));
+            assert_eq!(
+                codes(&provider.failure),
+                vec![CAWG_ICA_VERIFIED_IDENTITIES_INVALID],
+                "provider.id {uri}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-023: a `cawg.crypto_wallet` `address` MUST be an
+    /// alphanumeric string. CAWG-ID13-ICA-TECH-A-020 uses the same words for
+    /// a `cawg.social_media` `username`, but production aggregators emit
+    /// display names there (Adobe: `"Eric Scouten"`), so the username keeps
+    /// only its non-empty-string rule as a deliberate interop decision.
+    #[test]
+    fn crypto_wallet_address_must_be_alphanumeric_but_username_need_not_be() {
+        let wallet = |address: &str| {
+            validate_identities(json!([identity(json!({
+                "type": "cawg.crypto_wallet",
+                "address": address,
+            }))]))
+        };
+        for address in [
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        ] {
+            assert_credential_valid(&wallet(address), address);
+        }
+        for address in [
+            "0x5aAeb6053F 3E94",
+            "eip155:1:0xab16a96D",
+            "wallet.eth",
+            "ädress",
+        ] {
+            assert_eq!(
+                codes(&wallet(address).failure),
+                vec![CAWG_ICA_VERIFIED_IDENTITIES_INVALID],
+                "{address}"
+            );
+        }
+        assert!(rejected_fields("username", "Eric Scouten").is_empty());
     }
 }

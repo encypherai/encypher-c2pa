@@ -93,6 +93,15 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
+    /// CAWG-ID13-ICA-TECHNICAL-B-018: CAWG ICA `c2paAsset` byte strings use
+    /// the standard alphabet, so indices 62 and 63 are `+` and `/`, never the
+    /// URL-safe `-` and `_`.
+    #[test]
+    fn base64_uses_the_standard_alphabet_for_indices_62_and_63() {
+        assert_eq!(base64_encode(&[0xFB, 0xFF]), "+/8=");
+        assert_eq!(base64_encode(&[0xFB, 0xFF, 0xBF]), "+/+/");
+    }
+
     #[test]
     fn bytes_become_base64_in_json() {
         let v = Value::Map(vec![(

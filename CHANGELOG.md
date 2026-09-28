@@ -8,6 +8,7 @@ All notable changes to this project are recorded here.
 
 - `cawg_trust_configurations` (CLI `--cawg-trust-configurations`): typed CAWG Identity 1.3 trust sources. A caller that supplies the Mozilla email root store or the IPTC Verified News Publishers lists itself can declare them `smime_interim`, so the 31 March 2027 cutoff and the trusted-time-stamp condition apply to them. Before this, caller-supplied copies were accepted under the base model with no time limit. Each entry carries its own `not_before`/`not_after`, and may mix CA and end-entity certificates: certificates with BasicConstraints `cA = TRUE` and self-issued X.509 v1 certificates without BasicConstraints anchor chains; other certificates, including self-issued v3 end entities without BasicConstraints, match directly. Python (`cawg_trust_configurations=`) and Go (`Options.CAWGTrustConfigurations`) expose it; the C and WASM bindings accept it in their options JSON.
 - Public option preflight APIs: Rust `VerifyOptions::validate` and C `encypher_c2pa_validate_options` resolve canonical validation settings without asset I/O, so path-based bindings can reject malformed trust material before opening an asset.
+- `cawg.ica.verified_identities.invalid` names each rejected entry in `details.invalid_entries` as `{index, field}`, the out-of-band signal CAWG Identity 1.3 recommends because the status code cannot say which entry failed.
 
 ### Security
 
@@ -21,6 +22,9 @@ All notable changes to this project are recorded here.
 - A caller-bounded `cawg_allowed_certs_pem` entry now honours `trust_anchor_not_before`/`trust_anchor_not_after`, measured at the credential's trusted time stamp or the validation time, as chain anchors already did.
 - Rust `verify_file`, Go `VerifyFile`, every CLI asset-loading branch, and Python `verify`/`verify_stream` now resolve options before opening an asset, detached manifest, or stream segment. Malformed trust material therefore returns `invalid_trust_material` even when an asset path is missing.
 - Configured CA certificates that are in force for the requested purpose may bridge a path as ordinary intermediates regardless of profile; only an entry eligible for that trust decision may terminate the path.
+- CAWG Identity 1.3 identity claims aggregation credentials are held to three `verifiedIdentities` rules that were not checked before. A custom `type` or `method` must be a namespaced label (`com.example.passport_check`, not `passport`) and may not contain `__`, which CAWG reserves for multiple-assertion labels. A `uri` or `provider.id` must be a complete RFC 3986 URI, not merely start with a scheme. A `cawg.crypto_wallet` `address` must be alphanumeric. An entry that breaks one of them reports `cawg.ica.verified_identities.invalid`. No credential in the Adobe, c2pa-rs, or c2pa-cpp interoperability corpus is affected. The same alphanumeric wording for a `cawg.social_media` `username` is not enforced, because production credentials carry display names there.
+- An ICA credential must list the W3C Verifiable Credentials context as its first `@context` item and use only strings in `type`, as both data-model versions require. Otherwise it reports `cawg.ica.invalid_verifiable_credential`. Previously the context could appear in any position and non-string `type` members were ignored.
+- `cawg.ica.signer_payload.mismatch` is reported before the `verifiedIdentities` codes, in the order CAWG Identity 1.3 lists the validation steps.
 
 ## 1.3.0 - 2026-09-27
 

@@ -118,7 +118,7 @@ pub(super) fn validate_training_mining(
                 "cawg.training-mining entry '{key}' uses the reserved cawg namespace"
             ));
         }
-        if !valid_custom_label(key) {
+        if !super::cawg::is_cawg_label(key) {
             return Err(format!(
                 "cawg.training-mining custom entry '{key}' is not a valid namespaced label"
             ));
@@ -194,30 +194,6 @@ fn effective_standard_use(label: &str, value: &Value) -> Result<Json, String> {
         details.insert("constraintInfo".into(), Json::String(constraint.into()));
     }
     Ok(Json::Object(details))
-}
-
-fn valid_custom_label(label: &str) -> bool {
-    if label.contains("__") {
-        return false;
-    }
-    let mut components = label.split('.');
-    let Some(namespace) = components.next() else {
-        return false;
-    };
-    let Some(first_label_component) = components.next() else {
-        return false;
-    };
-    valid_label_component(namespace)
-        && valid_label_component(first_label_component)
-        && components.all(valid_label_component)
-}
-
-fn valid_label_component(component: &str) -> bool {
-    let mut bytes = component.bytes();
-    bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[cfg(test)]

@@ -1423,6 +1423,22 @@ fn approved_smime_policy(cert: &[u8]) -> Option<String> {
         .find(|oid| CAWG_SMIME_POLICY_OIDS.contains(&oid.as_str()))
 }
 
+/// CAWG Identity 1.3 labels ABNF (labels.adoc): two or more period-separated
+/// components, each `1( DIGIT / ALPHA ) *( DIGIT / ALPHA / "-" / "_" )`,
+/// without the repeated underscore (`__`) reserved for multiple-assertion
+/// suffixes. The labels prose says a component starts with a letter; the
+/// ABNF, followed here, also allows a digit (`com.3m`).
+pub(super) fn is_cawg_label(label: &str) -> bool {
+    let valid_component = |component: &str| {
+        let mut bytes = component.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    label.contains('.') && !label.contains("__") && label.split('.').all(valid_component)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
