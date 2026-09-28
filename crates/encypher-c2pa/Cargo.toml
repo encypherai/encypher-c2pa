@@ -53,6 +53,7 @@ unicode-normalization = "0.1"
 miniz_oxide = "0.8"
 brotli = { version = "8", default-features = false, features = ["std"] }
 ureq = { workspace = true, optional = true }
+url = "2.5"
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }

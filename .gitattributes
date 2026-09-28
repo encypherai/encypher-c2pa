@@ -1,0 +1,2 @@
+# Pinned JSON-LD contexts are compared by SHA-256; keep their bytes exact.
+crates/encypher-c2pa/src/c2pa-validate/contexts/*.jsonld -text
