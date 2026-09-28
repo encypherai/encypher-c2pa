@@ -2286,6 +2286,30 @@ pub(super) fn evaluate_online_ocsp(
     outcome
 }
 
+/// Check only CA positions when a terminal embedded leaf verdict makes online
+/// leaf work irrelevant. CA responses retain the C2PA window policy.
+pub(super) fn any_online_ca_revoked(
+    targets: &[OcspTarget<'_>],
+    evidence: OnlineEvidence<'_>,
+    attested: Option<OffsetDateTime>,
+    verification_time: OffsetDateTime,
+) -> bool {
+    targets.iter().skip(1).any(|target| {
+        evidence
+            .ocsp_response(&target.certificate_sha256_hex)
+            .is_some_and(|der| {
+                crate::c2pa_trust::evaluate_ocsp_online(
+                    der,
+                    target.issuer,
+                    target.subject,
+                    attested,
+                    verification_time,
+                    crate::c2pa_trust::OnlineOcspPolicy::C2paClaim,
+                ) == OnlineOcspVerdict::Revoked
+            })
+    })
+}
+
 /// Report the claim signer's revocation outcome from embedded and online
 /// evidence, and record the queries that would settle what neither did.
 ///

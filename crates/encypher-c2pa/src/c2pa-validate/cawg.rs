@@ -5388,21 +5388,30 @@ pub(crate) mod tests {
         }
 
         fn identity_assertion_for_payload(chain: &OcspChain, payload: Value) -> Vec<u8> {
+            identity_assertion_for_payload_with_root(chain, payload, false)
+        }
+
+        fn identity_assertion_for_payload_with_root(
+            chain: &OcspChain,
+            payload: Value,
+            include_root: bool,
+        ) -> Vec<u8> {
             use p256::ecdsa::signature::Signer as _;
             use p256::pkcs8::DecodePrivateKey as _;
 
             let canonical = encode(&payload, Profile::CanonicalForHashedSubstructures)
                 .expect("encode signer_payload");
+            let mut x5chain = vec![
+                Value::Bytes(chain.leaf_der.clone()),
+                Value::Bytes(chain.issuing_der.clone()),
+            ];
+            if include_root {
+                x5chain.push(Value::Bytes(chain.root_der.clone()));
+            }
             let protected = encode(
                 &Value::Map(vec![
                     (Value::Integer(1), Value::Integer(-7)),
-                    (
-                        Value::Integer(33),
-                        Value::Array(vec![
-                            Value::Bytes(chain.leaf_der.clone()),
-                            Value::Bytes(chain.issuing_der.clone()),
-                        ]),
-                    ),
+                    (Value::Integer(33), Value::Array(x5chain)),
                 ]),
                 Profile::LegacyPipelineBDefinite,
             )
@@ -5471,8 +5480,31 @@ pub(crate) mod tests {
             staples: Vec<Vec<u8>>,
         ) -> Vec<u8> {
             let base = identity_assertion(chain);
+            identity_assertion_with_staples_from_base(&base, tsa, signed_at, staples)
+        }
+
+        fn identity_assertion_with_root_and_staples(
+            chain: &OcspChain,
+            tsa: &TestTsa,
+            signed_at: OffsetDateTime,
+            staples: Vec<Vec<u8>>,
+        ) -> Vec<u8> {
+            let base = identity_assertion_for_payload_with_root(
+                chain,
+                identity_payload("cawg.publisher:primary", None),
+                true,
+            );
+            identity_assertion_with_staples_from_base(&base, tsa, signed_at, staples)
+        }
+
+        fn identity_assertion_with_staples_from_base(
+            base: &[u8],
+            tsa: &TestTsa,
+            signed_at: OffsetDateTime,
+            staples: Vec<Vec<u8>>,
+        ) -> Vec<u8> {
             let input =
-                timestamp_input(&fixture_identity_cose(&base)).expect("identity timestamp input");
+                timestamp_input(&fixture_identity_cose(base)).expect("identity timestamp input");
             let token = tsa.token(&input, signed_at);
             let mut headers = sig_tst_header("sigTst2", vec![timestamp_token_entry(token)]);
             headers.push((
@@ -5482,7 +5514,7 @@ pub(crate) mod tests {
                     Value::Array(staples.into_iter().map(Value::Bytes).collect()),
                 )]),
             ));
-            with_unprotected_headers(&base, headers)
+            with_unprotected_headers(base, headers)
         }
 
         fn alter_signed_role(assertion: &[u8]) -> Vec<u8> {
@@ -5564,6 +5596,20 @@ pub(crate) mod tests {
             subject_der: &[u8],
             status: FixtureStatus,
         ) -> Vec<u8> {
+            answer_with_spec(
+                issuer_der,
+                issuer_key,
+                subject_der,
+                ResponseSpec { status, ..WINDOW },
+            )
+        }
+
+        fn answer_with_spec(
+            issuer_der: &[u8],
+            issuer_key: &KeyPair,
+            subject_der: &[u8],
+            spec: ResponseSpec,
+        ) -> Vec<u8> {
             response(
                 issuer_der,
                 subject_der,
@@ -5572,7 +5618,7 @@ pub(crate) mod tests {
                     key: issuer_key,
                     embed_certificate: false,
                 },
-                ResponseSpec { status, ..WINDOW },
+                spec,
             )
         }
 
@@ -5765,11 +5811,61 @@ pub(crate) mod tests {
         }
 
         /// CAWG Identity 1.3 trust-model/scenarios.adoc applies revoked actor
-        /// status only where a trust relationship exists. A self-issued chain
-        /// outside every configured root remains well formed, even if it
-        /// staples a revoked response for its own leaf.
+        /// status only where a trust relationship exists. A chain outside
+        /// every configured root remains untrusted, but its authenticated
+        /// offline revocation evidence remains visible in report details.
         #[test]
-        fn untrusted_chain_cannot_assign_stapled_leaf_revocation() {
+        fn untrusted_chain_reports_stapled_leaf_revocation_without_assigning_actor_status() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let unrelated = ocsp_chain();
+            let unrelated_trust =
+                encypher_root_trust(&unrelated.root_pem, CawgTrustSource::CallerSupplied);
+            let revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
+
+            reset_identity_work_counts();
+            let results = identity_verdict_full(
+                &assertion,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                Some(&unrelated_trust),
+                None,
+                true,
+                Some(&tsa.trust_list()),
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                None,
+                OnlineEvidence::default(),
+            );
+
+            assert!(results.has_failure(CAWG_X509_CREDENTIAL_UNTRUSTED));
+            assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            let untrusted = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                .expect("configured-untrusted status");
+            let details = untrusted.details.as_ref().expect("untrusted details");
+            assert_eq!(details["chain_trusted"], false);
+            assert_eq!(details["revocation_status"], "leaf_revoked");
+            assert!(results.network_needs.is_empty());
+            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
+        }
+
+        #[test]
+        fn no_root_leaf_revocation_remains_well_formed_with_offline_evidence() {
             let tsa = TestTsa::new(
                 datetime!(2026-01-01 0:00 UTC),
                 datetime!(2030-01-01 0:00 UTC),
@@ -5783,8 +5879,6 @@ pub(crate) mod tests {
             );
             let assertion =
                 identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
-
-            reset_identity_work_counts();
             let results = identity_verdict_full(
                 &assertion,
                 &binding_claim_refs(0x22),
@@ -5801,10 +5895,65 @@ pub(crate) mod tests {
             );
 
             assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
-            assert!(results.has_success(CAWG_IDENTITY_WELL_FORMED));
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
-            assert!(!results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
-            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
+            let well_formed = results
+                .success
+                .iter()
+                .find(|status| status.code == CAWG_IDENTITY_WELL_FORMED)
+                .expect("well-formed status");
+            let details = well_formed.details.as_ref().expect("well-formed details");
+            assert_eq!(details["chain_trusted"], false);
+            assert_eq!(details["revocation_status"], "leaf_revoked");
+            assert!(results.network_needs.is_empty());
+        }
+
+        #[test]
+        fn no_root_ca_revocation_rejects_the_credential() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let ca_revoked = answer(
+                &chain.root_der,
+                &chain.root_key,
+                &chain.issuing_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion = identity_assertion_with_root_and_staples(
+                &chain,
+                &tsa,
+                AFTER_INTERIM_CUTOFF,
+                vec![ca_revoked],
+            );
+            let results = identity_verdict_full(
+                &assertion,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                None,
+                None,
+                true,
+                Some(&tsa.trust_list()),
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                None,
+                OnlineEvidence::default(),
+            );
+
+            assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            assert!(!results.has_success(CAWG_IDENTITY_WELL_FORMED));
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            let untrusted = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                .expect("CA revocation rejects the credential");
+            let details = untrusted.details.as_ref().expect("untrusted details");
+            assert_eq!(details["reason"], "ca_revoked");
+            assert_eq!(details["chain_trusted"], false);
+            assert_eq!(details["revocation_status"], "ca_revoked");
+            assert!(results.network_needs.is_empty());
         }
 
         #[test]
@@ -5849,9 +5998,102 @@ pub(crate) mod tests {
                 .find(|status| status.code == CAWG_IDENTITY_CREDENTIAL_REVOKED)
                 .expect("document-signing leaf is revoked");
             let details = revoked.details.as_ref().expect("revocation details");
-            assert_eq!(details["chain_trusted"], true);
+            assert_eq!(details["chain_trusted"], false);
             assert_eq!(details["trust_source"], "document_signing");
             assert!(details["anchor_fingerprint"].is_null());
+        }
+
+        /// Chain validity precedes revocation even when direct allow-list or
+        /// anchorless document-signing acceptance bypasses path validation.
+        #[test]
+        fn validity_precedes_revocation_for_direct_and_anchorless_acceptance() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let signed_at = datetime!(2028-02-01 0:00 UTC);
+            let revoked_spec = ResponseSpec {
+                status: FixtureStatus::RevokedAt(REVOKED_AT),
+                produced_at: b"20280201000000Z",
+                this_update: b"20280101000000Z",
+                next_update: Some(b"20290101000000Z"),
+            };
+
+            let allowed_chain = ocsp_chain();
+            let allowed = TrustList::from_certificates(
+                AnchorPurpose::CawgIdentity,
+                [allowed_chain.leaf_der.clone()],
+            )
+            .with_cawg_source(CawgTrustSource::CallerSupplied);
+            let allowed_revoked = answer_with_spec(
+                &allowed_chain.issuing_der,
+                &allowed_chain.issuing_key,
+                &allowed_chain.leaf_der,
+                revoked_spec,
+            );
+            let allowed_assertion = identity_assertion_with_staples(
+                &allowed_chain,
+                &tsa,
+                signed_at,
+                vec![allowed_revoked],
+            );
+            let allowed_results = identity_verdict_full(
+                &allowed_assertion,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                None,
+                Some(&allowed),
+                true,
+                Some(&tsa.trust_list()),
+                &TimestampAssertionIndex::default(),
+                datetime!(2029-01-01 0:00 UTC),
+                None,
+                OnlineEvidence::default(),
+            );
+            assert_eq!(
+                failure_codes(&allowed_results),
+                [CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY]
+            );
+            assert!(!allowed_results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+
+            let document_chain = ocsp_chain_with_leaf_eku(ExtendedKeyUsagePurpose::Other(
+                OID_KP_DOCUMENT_SIGNING
+                    .split('.')
+                    .map(|part| part.parse::<u64>().expect("OID component"))
+                    .collect(),
+            ));
+            let document_revoked = answer_with_spec(
+                &document_chain.issuing_der,
+                &document_chain.issuing_key,
+                &document_chain.leaf_der,
+                revoked_spec,
+            );
+            let document_assertion = identity_assertion_with_staples(
+                &document_chain,
+                &tsa,
+                signed_at,
+                vec![document_revoked],
+            );
+            let document_results = identity_verdict_full(
+                &document_assertion,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                None,
+                None,
+                false,
+                Some(&tsa.trust_list()),
+                &TimestampAssertionIndex::default(),
+                datetime!(2029-01-01 0:00 UTC),
+                None,
+                OnlineEvidence::default(),
+            );
+            assert_eq!(
+                failure_codes(&document_results),
+                [CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY]
+            );
+            assert!(!document_results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
         }
 
         /// Embedded CA revocation keeps the established trust-path behavior:
