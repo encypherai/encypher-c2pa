@@ -220,6 +220,56 @@ fn corpus_integrity_is_offline() {
     }
 }
 
+/// CAWG-ID13-ASSERTION-CREATION-011; C2PA 2.4 section 6.4 requires a
+/// double-underscore followed by a monotonically increasing instance number.
+/// Exercise every extracted external and generated asset so malformed legacy
+/// suffixes cannot silently enter the pinned real-asset corpus.
+#[test]
+fn real_corpus_identity_labels_use_valid_instance_numbers() {
+    let mut base_labels = 0usize;
+    let mut valid_instances = 0usize;
+    let mut zero_suffixes = 0usize;
+    let mut leading_zero_suffixes = 0usize;
+    let mut nonnumeric_suffixes = 0usize;
+
+    for index in [external_index(), generated_index()] {
+        for vector in vectors(&index) {
+            let report = verify(vector, CawgTrustMode::Allowed);
+            let manifests = report["manifests"].as_object().expect("manifest map");
+            for manifest in manifests.values() {
+                for assertion in manifest["assertions"].as_array().expect("assertion array") {
+                    let Some(label) = assertion["label"].as_str() else {
+                        continue;
+                    };
+                    if label == "cawg.identity" {
+                        base_labels += 1;
+                        continue;
+                    }
+                    let Some(suffix) = label.strip_prefix("cawg.identity__") else {
+                        continue;
+                    };
+                    if suffix == "0" {
+                        zero_suffixes += 1;
+                    } else if suffix.len() > 1 && suffix.starts_with('0') {
+                        leading_zero_suffixes += 1;
+                    } else if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                        nonnumeric_suffixes += 1;
+                    } else {
+                        valid_instances += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "CAWG identity labels: base={base_labels}, valid_instances={valid_instances}, __0={zero_suffixes}, leading_zero={leading_zero_suffixes}, nonnumeric={nonnumeric_suffixes}"
+    );
+    assert_eq!(zero_suffixes, 0);
+    assert_eq!(leading_zero_suffixes, 0);
+    assert_eq!(nonnumeric_suffixes, 0);
+}
+
 /// Pinned external vectors (c2pa-rs / c2pa-cpp fixtures) produce exactly the
 /// recorded CAWG contract codes.
 #[test]
@@ -440,6 +490,8 @@ fn generated_bestpractice_vector_covers_editorial_metadata() {
     assert_eq!(urls, expected);
 }
 
+/// CAWG-ID13-TRUST-MODEL-056: a C2PA manifest failure suppresses all CAWG
+/// identity interpretation, including well-formed and trusted success codes.
 /// The corpus certificates are valid 2026-08-01..2036-08-01. Outside that
 /// window the claim credential is outside validity and the CAWG identity lane
 /// is not evaluated at all: no `cawg.*` code of any polarity is emitted.

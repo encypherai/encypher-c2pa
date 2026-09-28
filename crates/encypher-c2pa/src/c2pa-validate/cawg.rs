@@ -95,10 +95,7 @@ const OID_KP_EMAIL_PROTECTION: &str = "1.3.6.1.5.5.7.3.4";
 const MAX_IDENTITY_ASSERTIONS: usize = 64;
 
 fn is_identity_assertion_label(label: &str) -> bool {
-    label == "cawg.identity"
-        || label
-            .strip_prefix("cawg.identity__")
-            .is_some_and(|instance| !instance.is_empty())
+    super::is_cawg_assertion_instance(label, "cawg.identity")
 }
 
 #[cfg(test)]
@@ -1762,6 +1759,26 @@ pub(crate) mod tests {
         ])
     }
 
+    /// CAWG-ID13-ASSERTION-CREATION-011; C2PA 2.4 section 6.4: uniqueness is
+    /// "accomplished by adding a double-underscore and a monotonically
+    /// increasing index to the label" (`cawg.identity`, `__1`, `__2`, ...).
+    #[test]
+    fn identity_labels_follow_c2pa_instance_numbers() {
+        for label in ["cawg.identity", "cawg.identity__1", "cawg.identity__24"] {
+            assert!(is_identity_assertion_label(label), "{label}");
+        }
+        for label in [
+            "cawg.identity__",
+            "cawg.identity__0",
+            "cawg.identity__01",
+            "cawg.identity__secondary",
+            "cawg.identity__-1",
+            "cawg.identity_1",
+        ] {
+            assert!(!is_identity_assertion_label(label), "{label}");
+        }
+    }
+
     #[test]
     fn hashed_uri_match_requires_the_exact_url() {
         let full = hashed_uri(
@@ -2761,6 +2778,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             IDENTITY_VALIDATION_TIME,
             None,
+            &[],
             Default::default(),
         )
     }
@@ -2783,6 +2801,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             IDENTITY_VALIDATION_TIME,
             None,
+            &[],
             Default::default(),
         )
     }
@@ -2806,6 +2825,7 @@ pub(crate) mod tests {
             timestamp_index,
             IDENTITY_VALIDATION_TIME,
             None,
+            &[],
             Default::default(),
         )
     }
@@ -2826,6 +2846,7 @@ pub(crate) mod tests {
         timestamp_index: &TimestampAssertionIndex,
         validation_time: OffsetDateTime,
         claim_timestamp: Option<OffsetDateTime>,
+        certificate_status_assertions: &[&[u8]],
         evidence: super::super::OnlineEvidence<'_>,
     ) -> ValidationResults {
         let manifest = ParsedManifest {
@@ -2876,7 +2897,7 @@ pub(crate) mod tests {
             &assertion,
             &indexed_refs,
             Some(primary_binding),
-            &[],
+            certificate_status_assertions,
             "cawg.identity",
             reference_cycle,
         );
@@ -2982,7 +3003,7 @@ pub(crate) mod tests {
     #[test]
     fn referenced_identity_assertion_is_allowed_when_acyclic() {
         let reference = hashed_uri(
-            "self#jumbf=/c2pa/test/c2pa.assertions/cawg.identity__secondary",
+            "self#jumbf=/c2pa/test/c2pa.assertions/cawg.identity__1",
             0x44,
         );
         let assertion = identity_assertion_map(vec![reference.clone()]);
@@ -3172,12 +3193,16 @@ pub(crate) mod tests {
         );
     }
 
+    /// CAWG-ID13-TRUST-MODEL-009: a signature mismatch stops identity
+    /// interpretation before either trusted or well-formed can be issued.
     #[test]
     fn legacy_field_order_signature_fails_by_default() {
         let bytes = signed_identity_assertion_bytes(Profile::LegacyPipelineBDefinite);
         let results = identity_verdict_bytes(&bytes, &binding_claim_refs(0x22), false);
         assert_eq!(failure_codes(&results), [CAWG_X509_SIGNATURE_MISMATCH]);
         assert!(!results.has_informational(CAWG_LEGACY_PROFILE));
+        assert!(!results.has_success(CAWG_IDENTITY_TRUSTED));
+        assert!(!results.has_success(CAWG_IDENTITY_WELL_FORMED));
     }
 
     #[test]
@@ -3275,10 +3300,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// CAWG Identity 1.3 status-codes: "The `url` field for a status code
-    /// MUST always be the label of the identity assertion." Two identities in
-    /// one manifest each report their own label, suffix included, rather than
-    /// a JUMBF URI.
+    /// CAWG-ID13-ASSERTION-CREATION-010: multiple identity assertions in one
+    /// manifest are each interpreted. CAWG Identity 1.3 status-codes also says
+    /// "The `url` field for a status code MUST always be the label of the
+    /// identity assertion", so each result retains its instance suffix.
     #[test]
     fn every_identity_status_reports_the_assertion_label_as_its_url() {
         let primary_bytes =
@@ -3349,35 +3374,46 @@ pub(crate) mod tests {
         );
     }
 
-    /// 1.3 validation-method: a validator SHALL NOT consider fields the
-    /// `identity` rule does not document. A leftover `expected_partial_claim`
-    /// is therefore neither schema-checked nor compared; validation proceeds to
-    /// the signature, which no longer covers these bytes.
+    /// CAWG-ID13-TRUST-MODEL-061 and CAWG-ID13-DELTA-020: Identity 1.3
+    /// removes all three `expected_*` fields and requires consumers to ignore
+    /// them. Even a value that violates the deleted 1.2 shape reaches signature
+    /// validation instead of being rejected as malformed identity CBOR.
     #[test]
-    fn undocumented_expected_fields_are_not_schema_checked() {
-        let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
-        let Ok(Value::Map(mut assertion)) = crate::c2pa_cbor::decode(&bytes) else {
-            panic!("fixture must decode as a map");
-        };
-        for (key, value) in &mut assertion {
-            if key.as_text() != Some("signer_payload") {
-                continue;
-            }
-            let Value::Map(payload) = value else {
-                panic!("signer_payload must be a map");
+    fn removed_expected_fields_are_not_schema_checked() {
+        for field in [
+            "expected_partial_claim",
+            "expected_claim_generator",
+            "expected_countersigners",
+        ] {
+            let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
+            let Ok(Value::Map(mut assertion)) = crate::c2pa_cbor::decode(&bytes) else {
+                panic!("fixture must decode as a map");
             };
-            payload.push((
-                Value::Text("expected_partial_claim".into()),
-                Value::Text("not a hash map".into()),
-            ));
+            for (key, value) in &mut assertion {
+                if key.as_text() != Some("signer_payload") {
+                    continue;
+                }
+                let Value::Map(payload) = value else {
+                    panic!("signer_payload must be a map");
+                };
+                payload.push((
+                    Value::Text(field.into()),
+                    Value::Text("not the deleted 1.2 field shape".into()),
+                ));
+            }
+            let mutated = encode(
+                &Value::Map(assertion),
+                Profile::CanonicalForHashedSubstructures,
+            )
+            .expect("re-encode mutated assertion");
+            let results = identity_verdict_bytes(&mutated, &binding_claim_refs(0x22), false);
+            assert_eq!(
+                failure_codes(&results),
+                [CAWG_X509_SIGNATURE_MISMATCH],
+                "{field}"
+            );
+            assert!(!results.has_failure(CAWG_IDENTITY_CBOR_INVALID), "{field}");
         }
-        let mutated = encode(
-            &Value::Map(assertion),
-            Profile::CanonicalForHashedSubstructures,
-        )
-        .expect("re-encode mutated assertion");
-        let results = identity_verdict_bytes(&mutated, &binding_claim_refs(0x22), false);
-        assert_eq!(failure_codes(&results), ["cawg.x509.signature.mismatch"]);
     }
 
     /// The X.509 lane reports the registered `cawg.x509.*` set from the 1.3
@@ -3460,6 +3496,98 @@ pub(crate) mod tests {
             .to_vec()
     }
 
+    /// Replace the identity COSE's unprotected timestamp header. COSE
+    /// `Sig_structure` excludes this bucket, so the identity signature remains
+    /// valid while the test controls only timestamp evidence.
+    fn with_timestamp_tokens(bytes: &[u8], label: &str, tokens: Vec<Vec<u8>>) -> Vec<u8> {
+        let Ok(Value::Map(mut identity)) = crate::c2pa_cbor::decode(bytes) else {
+            panic!("identity fixture must decode as a map");
+        };
+        let signature = identity
+            .iter_mut()
+            .find(|(key, _)| key.as_text() == Some("signature"))
+            .and_then(|(_, value)| match value {
+                Value::Bytes(bytes) => Some(bytes),
+                _ => None,
+            })
+            .expect("identity fixture carries signature bytes");
+        let Value::Tag(18, mut cose) =
+            crate::c2pa_cbor::decode(signature.as_slice()).expect("identity COSE decodes")
+        else {
+            panic!("identity signature must be a tagged COSE_Sign1");
+        };
+        let Value::Array(parts) = cose.as_mut() else {
+            panic!("identity COSE tag must wrap an array");
+        };
+        parts[1] = Value::Map(vec![(
+            Value::Text(label.into()),
+            Value::Map(vec![(
+                Value::Text("tstTokens".into()),
+                Value::Array(
+                    tokens
+                        .into_iter()
+                        .map(|token| {
+                            Value::Map(vec![(
+                                Value::Text("val".into()),
+                                Value::Bytes(token),
+                            )])
+                        })
+                        .collect(),
+                ),
+            )]),
+        )]);
+        *signature = encode(
+            &Value::Tag(18, cose),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("re-encode identity COSE");
+        encode(
+            &Value::Map(identity),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("re-encode identity assertion")
+    }
+
+    fn timestamp_token_without_certificates(token: &[u8]) -> Vec<u8> {
+        let mut content =
+            cms::content_info::ContentInfo::from_der(token).expect("timestamp ContentInfo");
+        let mut signed = content
+            .content
+            .decode_as::<cms::signed_data::SignedData>()
+            .expect("timestamp SignedData");
+        signed.certificates = None;
+        content.content = der::Any::encode_from(&signed).expect("re-encode SignedData");
+        content.to_der().expect("re-encode TimeStampToken")
+    }
+
+    fn timestamp_token_without_message_imprint(token: &[u8]) -> Vec<u8> {
+        let mut content =
+            cms::content_info::ContentInfo::from_der(token).expect("timestamp ContentInfo");
+        let mut signed = content
+            .content
+            .decode_as::<cms::signed_data::SignedData>()
+            .expect("timestamp SignedData");
+        let mut tst_info = vec![0x02, 0x01, 0x01];
+        tst_info.extend(
+            ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.1")
+                .to_der()
+                .expect("policy OID"),
+        );
+        // RFC 3161 requires messageImprint between policy and serialNumber.
+        // The surrounding CMS remains well formed, but this TSTInfo omits it.
+        tst_info.extend([0x02, 0x01, 0x01]);
+        tst_info.extend([0x18, 0x0f]);
+        tst_info.extend(b"20250401000000Z");
+        let malformed = der_sequence(tst_info);
+        let octets = der::asn1::OctetString::new(malformed).expect("TSTInfo octets");
+        signed.encap_content_info.econtent = Some(
+            der::Any::new(der::Tag::OctetString, octets.as_bytes().to_vec())
+                .expect("TSTInfo eContent"),
+        );
+        content.content = der::Any::encode_from(&signed).expect("re-encode SignedData");
+        content.to_der().expect("re-encode TimeStampToken")
+    }
+
     /// Add one `c2pa.time-stamp` assertion entry to the store-wide index.
     fn add_timestamp_assertion(
         index: &mut TimestampAssertionIndex,
@@ -3538,6 +3666,120 @@ pub(crate) mod tests {
         );
         assert!(results.has_success("cawg.x509.signature.inside_validity"));
         assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
+    }
+
+    /// CAWG-ID13-DELTA-010 and CAWG-ID13-X509-VALIDATING-A-016:
+    /// Identity 1.3 says a v1 timestamp "SHALL" be considered invalid and only
+    /// `sigTst2` is acceptable. The legacy header cannot establish signing time.
+    #[test]
+    fn a_legacy_identity_sig_tst_is_invalid_and_ignored() {
+        let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
+        let with_v1 = with_timestamp_tokens(&bytes, "sigTst", vec![vec![0x30, 0x00]]);
+        let results =
+            identity_verdict_with_timestamp(&with_v1, None, &TimestampAssertionIndex::default());
+
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_MALFORMED));
+        assert!(!results.has_success(CAWG_X509_TIME_STAMP_VALIDATED));
+        assert!(!results.has_success(CAWG_X509_TIME_STAMP_TRUSTED));
+        assert!(results.has_success(CAWG_X509_SIGNATURE_INSIDE_VALIDITY));
+    }
+
+    /// CAWG-ID13-X509-VALIDATING-A-030: an invalid CMS signature reports the
+    /// CAWG mismatch code and cannot establish an attested signing time.
+    #[test]
+    fn an_invalid_identity_timestamp_signature_is_mismatch_and_ignored() {
+        let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
+        let tsa = TestTsa::new(
+            datetime!(2025-01-01 0:00 UTC),
+            datetime!(2029-01-01 0:00 UTC),
+        );
+        let input = timestamp_input(&fixture_identity_cose(&bytes)).expect("timestamp input");
+        let mut token = tsa.token(&input, datetime!(2025-04-01 0:00 UTC));
+        *token.last_mut().expect("non-empty token") ^= 1;
+        let with_bad_signature = with_timestamp_tokens(&bytes, "sigTst2", vec![token]);
+        let results = identity_verdict_with_timestamp(
+            &with_bad_signature,
+            Some(&tsa.trust_list()),
+            &TimestampAssertionIndex::default(),
+        );
+
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_MISMATCH));
+        assert!(!results.has_success(CAWG_X509_TIME_STAMP_VALIDATED));
+        assert!(results.has_success(CAWG_X509_SIGNATURE_INSIDE_VALIDITY));
+    }
+
+    /// CAWG-ID13-X509-VALIDATING-A-031: a structurally valid CMS token whose
+    /// TSTInfo omits the required messageImprint is malformed and ignored.
+    #[test]
+    fn an_identity_timestamp_without_message_imprint_is_malformed() {
+        let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
+        let tsa = TestTsa::new(
+            datetime!(2025-01-01 0:00 UTC),
+            datetime!(2029-01-01 0:00 UTC),
+        );
+        let input = timestamp_input(&fixture_identity_cose(&bytes)).expect("timestamp input");
+        let token = tsa.token(&input, datetime!(2025-04-01 0:00 UTC));
+        let without_imprint = timestamp_token_without_message_imprint(&token);
+        let assertion = with_timestamp_tokens(&bytes, "sigTst2", vec![without_imprint]);
+        let results = identity_verdict_with_timestamp(
+            &assertion,
+            Some(&tsa.trust_list()),
+            &TimestampAssertionIndex::default(),
+        );
+
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_MALFORMED));
+        assert!(!results.has_success(CAWG_X509_TIME_STAMP_VALIDATED));
+        assert!(results.has_success(CAWG_X509_SIGNATURE_INSIDE_VALIDITY));
+    }
+
+    /// CAWG-ID13-X509-VALIDATING-A-036: a sound token without a chain to
+    /// configured TSA trust reports untrusted and is ignored.
+    #[test]
+    fn an_identity_timestamp_without_tsa_trust_is_untrusted() {
+        let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
+        let tsa = TestTsa::new(
+            datetime!(2025-01-01 0:00 UTC),
+            datetime!(2029-01-01 0:00 UTC),
+        );
+        let input = timestamp_input(&fixture_identity_cose(&bytes)).expect("timestamp input");
+        let token = tsa.token(&input, datetime!(2025-04-01 0:00 UTC));
+        let assertion = with_timestamp_tokens(&bytes, "sigTst2", vec![token]);
+        let results = identity_verdict_with_timestamp(
+            &assertion,
+            None,
+            &TimestampAssertionIndex::default(),
+        );
+
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_UNTRUSTED));
+        assert!(!results.has_informational(CAWG_X509_TIME_STAMP_CREDENTIAL_INVALID));
+        assert!(!results.has_success(CAWG_X509_TIME_STAMP_VALIDATED));
+        assert!(results.has_success(CAWG_X509_SIGNATURE_INSIDE_VALIDITY));
+    }
+
+    /// CAWG-ID13-X509-VALIDATING-A-037: Encypher consistently elects to emit
+    /// the optional credential_invalid code when a token omits its signer
+    /// certificate, alongside the required untrusted result.
+    #[test]
+    fn an_identity_timestamp_without_its_signer_certificate_is_invalid() {
+        let bytes = signed_identity_assertion_bytes(Profile::CanonicalForHashedSubstructures);
+        let tsa = TestTsa::new(
+            datetime!(2025-01-01 0:00 UTC),
+            datetime!(2029-01-01 0:00 UTC),
+        );
+        let input = timestamp_input(&fixture_identity_cose(&bytes)).expect("timestamp input");
+        let token = tsa.token(&input, datetime!(2025-04-01 0:00 UTC));
+        let without_certificate = timestamp_token_without_certificates(&token);
+        let assertion = with_timestamp_tokens(&bytes, "sigTst2", vec![without_certificate]);
+        let results = identity_verdict_with_timestamp(
+            &assertion,
+            Some(&tsa.trust_list()),
+            &TimestampAssertionIndex::default(),
+        );
+
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_CREDENTIAL_INVALID));
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_UNTRUSTED));
+        assert!(!results.has_success(CAWG_X509_TIME_STAMP_VALIDATED));
+        assert!(results.has_success(CAWG_X509_SIGNATURE_INSIDE_VALIDITY));
     }
 
     // -----------------------------------------------------------------
@@ -4360,6 +4602,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             AFTER_INTERIM_CUTOFF,
             None,
+            &[],
             Default::default(),
         );
 
@@ -4698,6 +4941,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             at,
             claim_timestamp,
+            &[],
             Default::default(),
         )
     }
@@ -4802,10 +5046,11 @@ pub(crate) mod tests {
         assert_eq!(details["timestamp_trusted"], false);
     }
 
-    /// 1.3 source order, first source: the identity assertion's own `sigTst2`
-    /// token. Its attested time is what the interim cutoff is measured
-    /// against, so a credential validated in June 2027 is still accepted by
-    /// the interim entry when the token proves a March 2027 signature.
+    /// CAWG-ID13-X509-VALIDATING-A-017, source-order first branch: the
+    /// identity assertion's own `sigTst2` token. Its attested time is what the
+    /// interim cutoff is measured against, so a credential validated in June
+    /// 2027 is still accepted by the interim entry when the token proves a
+    /// March 2027 signature.
     #[test]
     fn an_identity_sig_tst2_establishes_the_interim_signing_time() {
         let tsa = TestTsa::new(
@@ -5297,10 +5542,21 @@ pub(crate) mod tests {
         }
 
         fn ocsp_chain() -> OcspChain {
-            ocsp_chain_with_leaf_eku(ExtendedKeyUsagePurpose::EmailProtection)
+            ocsp_chain_with_options(ExtendedKeyUsagePurpose::EmailProtection, false)
         }
 
         fn ocsp_chain_with_leaf_eku(leaf_eku: ExtendedKeyUsagePurpose) -> OcspChain {
+            ocsp_chain_with_options(leaf_eku, false)
+        }
+
+        fn ocsp_chain_with_issuing_aia(issuing_aia: bool) -> OcspChain {
+            ocsp_chain_with_options(ExtendedKeyUsagePurpose::EmailProtection, issuing_aia)
+        }
+
+        fn ocsp_chain_with_options(
+            leaf_eku: ExtendedKeyUsagePurpose,
+            issuing_aia: bool,
+        ) -> OcspChain {
             fn name(common_name: &str) -> DistinguishedName {
                 let mut name = DistinguishedName::new();
                 name.push(DnType::CountryName, "US");
@@ -5342,6 +5598,11 @@ pub(crate) mod tests {
             issuing_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
             issuing_params.use_authority_key_identifier_extension = true;
             add_policy(&mut issuing_params);
+            if issuing_aia {
+                issuing_params
+                    .custom_extensions
+                    .push(aia_extension(RESPONDER_URL));
+            }
             let issuing = issuing_params
                 .signed_by(&issuing_key, &root, &root_key)
                 .expect("runtime issuing CA");
@@ -5565,6 +5826,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 evidence,
             )
         }
@@ -5587,6 +5849,49 @@ pub(crate) mod tests {
                     ocsp_responses: Some(&responses),
                     ..OnlineEvidence::default()
                 },
+            )
+        }
+
+        /// Model the verifier's store-wide certificate-status assertion input.
+        fn verdict_with_status_assertion(
+            chain: &OcspChain,
+            responses: Vec<Vec<u8>>,
+        ) -> ValidationResults {
+            let status = encode(
+                &Value::Map(vec![(
+                    Value::Text("ocspVals".into()),
+                    Value::Array(responses.into_iter().map(Value::Bytes).collect()),
+                )]),
+                Profile::LegacyPipelineBDefinite,
+            )
+            .expect("encode certificate-status assertion");
+            let assertions = [status.as_slice()];
+            let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+            let identity = identity_assertion(chain);
+            let cose = fixture_identity_cose(&identity);
+            let mut visited = 0;
+            let scan = crate::c2pa_validate::scan_embedded_ocsp_evidence(
+                &cose,
+                &assertions,
+                |_| visited += 1,
+            );
+            assert!(!scan.rejected, "status assertion exceeded evidence limits");
+            assert_eq!(visited, scan.responses, "each response is visited once");
+            assert!(visited > 0, "status assertion must expose OCSP evidence");
+            identity_verdict_full(
+                &identity,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                Some(&trust),
+                None,
+                true,
+                None,
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                Some(AFTER_INTERIM_CUTOFF),
+                &assertions,
+                OnlineEvidence::default(),
             )
         }
 
@@ -6485,6 +6790,50 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+
+        /// CAWG-ID13-X509-VALIDATING-A-051 and
+        /// CAWG-ID13-X509-VALIDATING-A-056: the store-wide status-assertion
+        /// aggregate includes assertions from subsequent manifests. A CA
+        /// response is applied only to its matching AIA-enabled certificate,
+        /// and CA revocation rejects trust without misreporting the leaf.
+        #[test]
+        fn a_subsequent_manifest_status_assertion_applies_to_its_matching_ca() {
+            let chain = ocsp_chain_with_issuing_aia(true);
+            let results = verdict_with_status_assertion(
+                &chain,
+                vec![
+                    leaf_response(&chain, FixtureStatus::Good).1,
+                    issuing_response(&chain, FixtureStatus::RevokedAt(REVOKED_AT)).1,
+                ],
+            );
+
+            assert_eq!(
+                failure_codes(&results),
+                [CAWG_X509_CREDENTIAL_UNTRUSTED],
+                "{results:?}"
+            );
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            assert!(!results.has_success(CAWG_IDENTITY_TRUSTED));
+        }
+
+        /// CAWG-ID13-X509-VALIDATING-B-030: an OCSP response embedded in a
+        /// certificate-status assertion participates in the CAWG identity
+        /// verdict and can establish that the matching leaf is not revoked.
+        #[test]
+        fn a_certificate_status_assertion_can_clear_the_identity_leaf() {
+            let chain = ocsp_chain();
+            let results = verdict_with_status_assertion(
+                &chain,
+                vec![leaf_response(&chain, FixtureStatus::Good).1],
+            );
+
+            assert!(
+                results.has_success(CAWG_X509_OCSP_NOT_REVOKED),
+                "{results:?}"
+            );
+            assert_eq!(failure_codes(&results), Vec::<&str>::new());
+            assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
         }
 
         #[test]
