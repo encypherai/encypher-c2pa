@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash, X509Certificate } from "node:crypto";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -152,8 +153,9 @@ const assertNoIdentitySubject = (status) => {
   assert.equal("certificate_trusted" in details, false);
 };
 
-// The packed npm artifact must preserve trusted, unevaluated, and rejected
-// X.509 subject evidence on the exact assertion label being evaluated.
+// The packed npm artifact must preserve the selected leaf fingerprint and the
+// trusted, unevaluated, and rejected X.509 subject boundary on the exact
+// assertion label being evaluated.
 const subjectAsset = await readFile(
   resolve(root, "tests/vectors/cawg/generated/identity-1.2/assets/x509-es256-jpeg.jpg"),
 );
@@ -165,6 +167,9 @@ const subjectIdentityTrust = await readFile(
   resolve(root, "tests/vectors/cawg/generated/identity-1.2/certs/es256.cert.pem"),
   "utf8",
 );
+const subjectCredentialSha256 = createHash("sha256")
+  .update(new X509Certificate(subjectIdentityTrust).raw)
+  .digest("hex");
 const subjectOptions = {
   no_default_trust: true,
   trust_pem: subjectClaimTrust,
@@ -185,6 +190,10 @@ assert.equal(
   trustedSubject.details.subject_common_name,
   "CAWG Identity 1.2 ES256 Test Actor",
 );
+assert.equal(
+  trustedSubject.details.credential_sha256,
+  subjectCredentialSha256,
+);
 
 const unevaluatedSubjectReport = verify(subjectAsset, "image/jpeg", {
   no_default_trust: true,
@@ -203,6 +212,10 @@ assert.equal(unevaluatedSubject.details.certificate_trusted, false);
 assert.equal(
   unevaluatedSubject.details.subject_organization,
   "Encypher Test Vectors",
+);
+assert.equal(
+  unevaluatedSubject.details.credential_sha256,
+  subjectCredentialSha256,
 );
 
 const unrelatedIdentityTrust = await readFile(
@@ -226,6 +239,10 @@ const rejectedSubject = statusAt(
 );
 assert.ok(rejectedSubject);
 assertNoIdentitySubject(rejectedSubject);
+assert.equal(
+  rejectedSubject.details.credential_sha256,
+  subjectCredentialSha256,
+);
 
 const icaAsset = await readFile(
   resolve(
@@ -242,6 +259,7 @@ const icaStatuses = allStatuses(
 assert.ok(icaStatuses.length > 0);
 for (const status of icaStatuses) {
   assertNoIdentitySubject(status);
+  assert.equal("credential_sha256" in (status.details ?? {}), false);
 }
 assert.throws(
   () => verifyFragmented(asset, [new Uint8Array([1])], "image/jpeg"),
