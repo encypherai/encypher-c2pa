@@ -32,7 +32,7 @@ __all__ = [
     "verify",
     "verify_stream",
 ]
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 Asset = Union[bytes, bytearray, memoryview, str, Path]
 _MAX_PATH_ASSET_BYTES = 128 * 1024 * 1024

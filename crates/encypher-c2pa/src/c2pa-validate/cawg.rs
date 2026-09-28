@@ -674,17 +674,21 @@ fn verify_identity_assertion(
                 url.into(),
                 "CAWG identity signature validated but no configured trust root accepted the credential"
                     .into(),
-                json!({
-                    "trust_source": "none",
-                    "accepted_eku": accepted_eku,
-                    "certificate_policy": certificate_policy,
-                    "trusted_at": null,
-                    "timestamp_trusted": timestamp_trusted,
-                    "chain_trusted": false,
-                    "revocation_status": revocation_status.as_str(),
-                    "trust_failure": trust_failure,
-                    "payload_encoding": payload_encoding,
-                }),
+                terminal_identity_details(
+                    leaf,
+                    false,
+                    json!({
+                        "trust_source": "none",
+                        "accepted_eku": accepted_eku,
+                        "certificate_policy": certificate_policy,
+                        "trusted_at": null,
+                        "timestamp_trusted": timestamp_trusted,
+                        "chain_trusted": false,
+                        "revocation_status": revocation_status.as_str(),
+                        "trust_failure": trust_failure,
+                        "payload_encoding": payload_encoding,
+                    }),
+                ),
             );
             return;
         }
@@ -863,17 +867,64 @@ fn verify_identity_assertion(
         CAWG_IDENTITY_TRUSTED,
         url.into(),
         "CAWG identity signature and X.509 trust policy validated".into(),
-        json!({
-            "trust_source": trust.source,
-            "accepted_eku": trust.accepted_eku,
-            "certificate_policy": trust.certificate_policy,
-            "anchor_fingerprint": trust.anchor_fingerprint,
-            "trusted_at": at.to_string(),
-            "timestamp_trusted": timestamp_trusted,
-            "revocation_status": revocation_status.as_str(),
-            "payload_encoding": payload_encoding,
-        }),
+        terminal_identity_details(
+            leaf,
+            true,
+            json!({
+                "trust_source": trust.source,
+                "accepted_eku": trust.accepted_eku,
+                "certificate_policy": trust.certificate_policy,
+                "anchor_fingerprint": trust.anchor_fingerprint,
+                "trusted_at": at.to_string(),
+                "timestamp_trusted": timestamp_trusted,
+                "revocation_status": revocation_status.as_str(),
+                "payload_encoding": payload_encoding,
+            }),
+        ),
     );
+}
+
+/// Attach bounded display names to an X.509 identity's terminal status.
+///
+/// The explicit boolean keeps the trust outcome beside the subject even when a
+/// consumer retains only `details`. This helper is never called for configured
+/// untrusted chains or ICA credentials.
+fn terminal_identity_details(
+    leaf: &[u8],
+    certificate_trusted: bool,
+    mut details: serde_json::Value,
+) -> serde_json::Value {
+    use der::Decode as _;
+
+    let Some(object) = details.as_object_mut() else {
+        return details;
+    };
+    object.insert(
+        "certificate_trusted".into(),
+        serde_json::Value::Bool(certificate_trusted),
+    );
+    let Ok(certificate) = x509_cert::Certificate::from_der(leaf) else {
+        return details;
+    };
+    if let Some(organization) = super::cert::name_attribute(
+        &certificate.tbs_certificate.subject,
+        super::cert::OID_AT_ORGANIZATION,
+    ) {
+        object.insert(
+            "subject_organization".into(),
+            serde_json::Value::String(organization),
+        );
+    }
+    if let Some(common_name) = super::cert::name_attribute(
+        &certificate.tbs_certificate.subject,
+        super::cert::OID_AT_COMMON_NAME,
+    ) {
+        object.insert(
+            "subject_common_name".into(),
+            serde_json::Value::String(common_name),
+        );
+    }
+    details
 }
 
 fn reference_targets_identity(reference_url: &str, identity_url: &str) -> bool {
@@ -3523,6 +3574,15 @@ pub(crate) mod tests {
         );
         assert!(!results.has_success(CAWG_IDENTITY_WELL_FORMED));
         assert!(!results.has_success(CAWG_IDENTITY_TRUSTED));
+        let rejection = results
+            .failure
+            .iter()
+            .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+            .and_then(|status| status.details.as_ref())
+            .expect("untrusted details");
+        assert!(rejection.get("subject_organization").is_none());
+        assert!(rejection.get("subject_common_name").is_none());
+        assert!(rejection.get("certificate_trusted").is_none());
     }
 
     /// With no CAWG trust material at all there is no root of trust to reach,
@@ -5077,6 +5137,49 @@ pub(crate) mod tests {
         assert_eq!(details["accepted_eku"], OID_KP_EMAIL_PROTECTION);
         assert_eq!(details["certificate_policy"], "2.23.140.1.5.2.3");
         assert_eq!(details["timestamp_trusted"], false);
+    }
+
+    #[test]
+    fn terminal_identity_details_bind_subject_to_the_trust_outcome() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let bytes = encypher_identity_assertion(&chain, None);
+        let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+
+        let trusted = encypher_verdict(&bytes, &trust, AFTER_INTERIM_CUTOFF, None, None);
+        let trusted = trusted_details(&trusted);
+        assert_eq!(trusted["subject_organization"], "Encypher Corporation");
+        assert_eq!(
+            trusted["subject_common_name"],
+            "Encypher CAWG Runtime Publisher"
+        );
+        assert_eq!(trusted["certificate_trusted"], true);
+
+        let well_formed = identity_verdict_full(
+            &bytes,
+            &binding_claim_refs(0x22),
+            false,
+            "c2pa.hash.data",
+            None,
+            None,
+            true,
+            None,
+            &TimestampAssertionIndex::default(),
+            AFTER_INTERIM_CUTOFF,
+            None,
+            Default::default(),
+        );
+        let well_formed = well_formed
+            .success
+            .iter()
+            .find(|status| status.code == CAWG_IDENTITY_WELL_FORMED)
+            .and_then(|status| status.details.as_ref())
+            .expect("well-formed details");
+        assert_eq!(well_formed["subject_organization"], "Encypher Corporation");
+        assert_eq!(
+            well_formed["subject_common_name"],
+            "Encypher CAWG Runtime Publisher"
+        );
+        assert_eq!(well_formed["certificate_trusted"], false);
     }
 
     /// The same leaf, the same chain, the same instant: configured as an

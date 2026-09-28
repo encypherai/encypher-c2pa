@@ -29,7 +29,7 @@ The SDK implements the open standards: [C2PA 2.4](https://spec.c2pa.org/specific
 ### Command line
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.3.0
+cargo install encypher-c2pa-cli --version 1.3.1
 encypher-c2pa verify photo.jpg
 encypher-c2pa verify photo.jpg --json
 encypher-c2pa formats
@@ -41,7 +41,7 @@ The MIME type comes from the file extension; pass `--mime` for a file whose name
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.3.0"
+encypher-c2pa = "1.3.1"
 ```
 
 ```rust
@@ -295,7 +295,7 @@ Build without the fetcher entirely with `--no-default-features --features teleme
 Each release carries verification fixes and a refreshed trust snapshot, so an old copy judges files against old trust lists. The command line checks for a newer release once a day, when a person is at the terminal, and offers to install it:
 
 ```text
-encypher-c2pa 1.3.1 is available. You have 1.3.0, with trust lists dated 2026-09-24.
+encypher-c2pa 1.3.2 is available. You have 1.3.1, with trust lists dated 2026-09-24.
 Releases carry verification fixes and refreshed trust lists.
 Update now? [y] yes  [N] not now  [s] skip this version  [o] stop checking
 ```

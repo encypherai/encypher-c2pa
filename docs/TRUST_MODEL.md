@@ -21,6 +21,8 @@ The CAWG trust configuration is a list of entries, as CAWG Identity 1.3 defines 
 
 The IPTC CAWG anchor list was empty at snapshot time; its end-entity list was not. Under CAWG Identity 1.3, an identity credential that reaches none of the configured CAWG anchors is rejected with the failure code `cawg.x509.credential.untrusted`. With no CAWG trust material configured at all there is no root of trust to reach, and a signature-valid assertion keeps the `cawg.identity.well-formed` success code unless authenticated offline evidence reports a CA certificate revoked. Configured-untrusted and no-root identities retain verified offline OCSP in `details.revocation_status` with `chain_trusted: false`, but never assign `credential_revoked` to the named actor. Either way the C2PA integrity verdict is unchanged.
 
+The terminal X.509 identity status makes that distinction explicit in `details.certificate_trusted`. A trusted outcome may also carry the validated leaf's sanitized `subject_organization` and `subject_common_name`. A `well-formed` outcome carries the same display evidence with `certificate_trusted: false` only when no CAWG trust material was available, so a reader can describe the asserted subject without presenting it as verified. Once trust material is configured, a chain failure exposes no subject fields as trusted evidence.
+
 No trust-list fetch occurs at install time or verification time. The exact source URLs and SHA-256 digests are recorded in `crates/encypher-c2pa/src/default_trust/sources.json`; Rust callers can read `DEFAULT_TRUST_SNAPSHOT_DATE`.
 
 Integrity and trust remain separate. A credential can have valid integrity while failing to chain to a packaged anchor:
