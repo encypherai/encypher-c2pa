@@ -293,7 +293,7 @@ fn stream_pass(
         method.kernel(),
         resolved.cawg_trust(),
         resolved.cawg_allowed_certs(),
-        true,
+        resolved.cawg_document_signing_require_anchor,
         options.cawg_did_documents.as_ref(),
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),

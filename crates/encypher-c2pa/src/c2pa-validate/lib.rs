@@ -633,6 +633,30 @@ pub(crate) struct CawgTrustInputs<'a> {
     /// the credentialStatus statusListCredential URI.
     ica_status_lists: Option<&'a std::collections::HashMap<String, String>>,
 }
+
+impl<'a> CawgTrustInputs<'a> {
+    /// The full CAWG trust input set, for callers outside this module.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        trust: Option<&'a TrustList>,
+        allowed_certs: Option<&'a TrustList>,
+        document_signing_require_anchor: bool,
+        did_documents: Option<&'a std::collections::HashMap<String, Json>>,
+        ica_trusted_issuers: Option<&'a [String]>,
+        ica_trust_anchors: Option<&'a [String]>,
+        ica_status_lists: Option<&'a std::collections::HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            trust,
+            allowed_certs,
+            document_signing_require_anchor,
+            did_documents,
+            ica_trusted_issuers,
+            ica_trust_anchors,
+            ica_status_lists,
+        }
+    }
+}
 /// The store-wide facts one manifest's verification needs: its sibling
 /// manifests and the per-manifest hashed-URI digests. Both are derived from the
 /// same parsed store, so they travel together rather than as separate parameters.
@@ -1677,6 +1701,80 @@ pub fn verify_prehashed_manifest<'a>(
     Ok(out)
 }
 
+/// Outcome of one deferred-binding identity evaluation.
+pub(crate) struct DeferredIdentityOutput {
+    /// Label of the store's active manifest, if it has one.
+    pub(crate) manifest_label: Option<String>,
+    /// Expanded-domain SHA-256 of every manifest in the store, in store order.
+    pub(crate) store_manifest_sha256: Vec<(String, [u8; 32])>,
+    /// The status that kept the identity step from running.
+    pub(crate) gate_code: Option<String>,
+    /// Exactly the statuses the identity step appended, when it ran.
+    pub(crate) identity: Option<ValidationResults>,
+}
+
+/// Evaluate the CAWG identity assertions of a store's active manifest for a
+/// caller that has already verified the asset's content binding.
+///
+/// Runs the ordinary per-manifest pass with the content binding deferred: no
+/// host bytes are hashed, claim structure and the claim signature still gate
+/// the identity step, and failures outside claim structure (the version
+/// ladder, external data, hashed-URI and ingredient links) are left to the
+/// caller's engine. Only the identity step's own statuses are returned.
+pub(crate) fn verify_identity_with_caller_verified_binding(
+    manifest_store: &[u8],
+    host_less: bool,
+    input: &VerifyInput<'_>,
+    cawg_inputs: CawgTrustInputs<'_>,
+) -> Result<DeferredIdentityOutput, ValidateError> {
+    let expanded = expand_store(manifest_store)?;
+    let store = parse_manifest_store(expanded.bytes())?;
+    let manifest_hashes = manifest_hashes(&expanded, &store.manifests)?;
+    let store_manifest_sha256 = store
+        .manifests
+        .iter()
+        .filter_map(|manifest| {
+            let digests = manifest_hashes.get(&manifest.label)?;
+            let sha256 = <[u8; 32]>::try_from(digests.expanded_sha256.as_slice()).ok()?;
+            Some((manifest.label.clone(), sha256))
+        })
+        .collect();
+    let Some(manifest) = store.manifests.last() else {
+        return Ok(DeferredIdentityOutput {
+            manifest_label: None,
+            store_manifest_sha256,
+            gate_code: Some(CLAIM_MISSING.to_string()),
+            identity: None,
+        });
+    };
+    let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
+    let mut capture = DeferredCapture::default();
+    let deferred_input = VerifyInput {
+        data: &[],
+        mime: "",
+        ..*input
+    };
+    let _ = verify_manifest_bound(
+        manifest,
+        StoreContext {
+            manifests: &store.manifests,
+            manifest_hashes: &manifest_hashes,
+        },
+        &deferred_input,
+        ContentBinding::Deferred { host_less },
+        &[],
+        cawg_inputs,
+        &mut report_decode_nodes,
+        Some(&mut capture),
+    );
+    Ok(DeferredIdentityOutput {
+        manifest_label: Some(manifest.label.clone()),
+        store_manifest_sha256,
+        gate_code: capture.gate_code,
+        identity: capture.identity,
+    })
+}
+
 const MAX_EMBEDDED_OCSP_RESPONSES: usize = 32;
 const MAX_EMBEDDED_OCSP_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_EMBEDDED_OCSP_COLLECTION_DEPTH: usize = 4;
@@ -2423,6 +2521,97 @@ fn verify_manifest<'a>(
     cawg_inputs: CawgTrustInputs<'_>,
     report_decode_nodes: &mut usize,
 ) -> VerifyOutput {
+    verify_manifest_bound(
+        manifest,
+        store,
+        input,
+        ContentBinding::Asset {
+            format,
+            prehashed_digest,
+        },
+        fragments,
+        cawg_inputs,
+        report_decode_nodes,
+        None,
+    )
+}
+
+/// What stands for the asset's content binding in one manifest pass.
+#[derive(Clone, Copy)]
+enum ContentBinding<'d> {
+    /// The pipeline verifies the binding: over the asset's bytes, or over a
+    /// digest the caller computed from them.
+    Asset {
+        format: AssetFormat,
+        prehashed_digest: Option<&'d [u8]>,
+    },
+    /// The caller has verified the binding with its own engine. No host
+    /// format exists here; `host_less` says whether the store is a
+    /// host-less `application/c2pa` store, which decides whether
+    /// `c2pa.compound.content` counts as a primary binding.
+    Deferred { host_less: bool },
+}
+
+impl<'d> ContentBinding<'d> {
+    fn format(self) -> Option<AssetFormat> {
+        match self {
+            Self::Asset { format, .. } => Some(format),
+            Self::Deferred { .. } => None,
+        }
+    }
+
+    fn prehashed_digest(self) -> Option<&'d [u8]> {
+        match self {
+            Self::Asset {
+                prehashed_digest, ..
+            } => prehashed_digest,
+            Self::Deferred { .. } => None,
+        }
+    }
+
+    fn compound_ok(self) -> bool {
+        match self {
+            Self::Asset { format, .. } => format == AssetFormat::C2paStore,
+            Self::Deferred { host_less } => host_less,
+        }
+    }
+}
+
+/// What a deferred-binding pass records for its caller.
+#[derive(Default)]
+pub(crate) struct DeferredCapture {
+    /// The status that kept the identity step from running.
+    pub(crate) gate_code: Option<String>,
+    /// Exactly the statuses the identity step appended, when it ran.
+    pub(crate) identity: Option<ValidationResults>,
+}
+
+/// Record an early-return status. It wins over any fatal status recorded
+/// before it.
+fn capture_early_return(capture: &mut Option<&mut DeferredCapture>, code: &str) {
+    if let Some(capture) = capture.as_deref_mut() {
+        capture.gate_code = Some(code.to_string());
+    }
+}
+
+/// Remember the most recently pushed failure as the first fatal status.
+fn mark_fatal(first_fatal: &mut Option<String>, results: &ValidationResults) {
+    if first_fatal.is_none() {
+        *first_fatal = results.failure.last().map(|status| status.code.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // one internal pass threads shared store/report budgets
+fn verify_manifest_bound<'a>(
+    manifest: &'a ParsedManifest<'a>,
+    store: StoreContext<'a>,
+    input: &VerifyInput,
+    binding: ContentBinding<'_>,
+    fragments: &[&[u8]],
+    cawg_inputs: CawgTrustInputs<'_>,
+    report_decode_nodes: &mut usize,
+    mut capture: Option<&mut DeferredCapture>,
+) -> VerifyOutput {
     let label = manifest.label.clone();
     let sig_url = format!("self#jumbf=/c2pa/{label}/c2pa.signature");
     let mut results = ValidationResults::default();
@@ -2430,6 +2619,7 @@ fn verify_manifest<'a>(
     // --- Claim + signature presence ---
     let Some(claim_cbor) = manifest.claim_cbor else {
         results.push_failure(CLAIM_MISSING, sig_url, "no claim found in manifest".into());
+        capture_early_return(&mut capture, CLAIM_MISSING);
         return finish(
             label,
             manifest,
@@ -2451,6 +2641,7 @@ fn verify_manifest<'a>(
                 sig_url,
                 "claim CBOR could not be decoded".into(),
             );
+            capture_early_return(&mut capture, CLAIM_CBOR_INVALID);
             return finish(
                 label,
                 manifest,
@@ -2471,7 +2662,7 @@ fn verify_manifest<'a>(
     // the output and is finalized in `finish` (cleared when Invalid).
     let generation = versions::claim_generation(manifest, &claim);
     let mut claim_refs = ClaimAssertionRefs::build(manifest, &claim, generation);
-    let verdict = versions::evaluate(manifest, &claim, format);
+    let verdict = versions::evaluate_for(manifest, &claim, binding.format());
 
     // Strict target-version control (internal conformance analysis): in
     // Conformance mode the manifest is additionally held to the profile's
@@ -2508,17 +2699,18 @@ fn verify_manifest<'a>(
 
     // --- Structural claim/assertion validation (detection of malformed input) ---
     let certificate_statuses = certificate_status_payloads(store.manifests);
-    let mut structure_ok = !verify_claim_structure(
+    let mut first_fatal = claim_structure_first_fatal(
         manifest,
         store,
         &claim,
         generation,
         &claim_refs,
-        format,
+        binding.compound_ok(),
         &sig_url,
         input.profile,
         &mut results,
     );
+    let mut structure_ok = first_fatal.is_none();
     // Runs alongside the structural gate rather than inside it: the external
     // data checks are the only ones that consult caller-supplied network
     // evidence, which the structural gate has no business knowing about.
@@ -2549,6 +2741,7 @@ fn verify_manifest<'a>(
     redaction::verify_claim_redactions(&manifest.label, &claim, store.manifests, &mut results);
     if verify_spec_version_metadata(&claim, input.profile, &sig_url, &mut results) {
         structure_ok = false;
+        mark_fatal(&mut first_fatal, &results);
     }
     if certificate_statuses.rejected {
         results.push_failure(
@@ -2557,6 +2750,7 @@ fn verify_manifest<'a>(
             "store-wide certificate-status evidence exceeds verifier bounds".into(),
         );
         structure_ok = false;
+        mark_fatal(&mut first_fatal, &results);
     }
 
     let Some(cose) = manifest.signature_cose else {
@@ -2565,6 +2759,7 @@ fn verify_manifest<'a>(
             sig_url,
             "no claim signature present".into(),
         );
+        capture_early_return(&mut capture, CLAIM_SIGNATURE_MISSING);
         return finish(
             label,
             manifest,
@@ -2592,6 +2787,7 @@ fn verify_manifest<'a>(
             sig_url.clone(),
             "claim signature reference does not resolve to c2pa.signature".into(),
         );
+        capture_early_return(&mut capture, CLAIM_SIGNATURE_MISSING);
         return finish(
             label,
             manifest,
@@ -2695,6 +2891,7 @@ fn verify_manifest<'a>(
     // cert-time as a non-invalidating caveat.
     let sig_constructed = sig_ok && structure_ok;
 
+    let signature_block_start = results.failure.len();
     match leaf {
         Some(_leaf_der) => {
             // An unacceptable claim signer (CA cert, keyCertSign, wrong/any
@@ -2758,6 +2955,7 @@ fn verify_manifest<'a>(
             );
         }
     }
+    let signature_block_end = results.failure.len();
 
     if leaf.is_some() {
         if in_validity {
@@ -2791,6 +2989,18 @@ fn verify_manifest<'a>(
     } else {
         sig_constructed && in_validity
     };
+    if !sig_usable {
+        if let Some(capture) = capture.as_deref_mut() {
+            capture.gate_code = first_fatal
+                .clone()
+                .or_else(|| {
+                    results.failure[signature_block_start..signature_block_end]
+                        .first()
+                        .map(|status| status.code.clone())
+                })
+                .or_else(|| (!in_validity).then(|| CLAIM_SIGNATURE_OUTSIDE_VALIDITY.to_string()));
+        }
+    }
     if sig_usable {
         // Step 5: assertion hashed-URI bindings.
         verify_assertion_bindings(
@@ -2837,16 +3047,16 @@ fn verify_manifest<'a>(
                 manifest,
                 store,
                 input.data,
-                format,
+                binding.format(),
                 fragments,
-                prehashed_digest,
+                binding.prehashed_digest(),
                 input.profile,
                 &mut results,
             );
-        } else if let Some(digest) = prehashed_digest {
+        } else if let Some(digest) = binding.prehashed_digest() {
             let _ =
                 verify_prehashed_hard_binding(&claim, &claim_refs, digest, &label, &mut results);
-        } else {
+        } else if let Some(format) = binding.format() {
             let _ = verify_data_hash(
                 &claim,
                 &claim_refs,
@@ -2863,7 +3073,9 @@ fn verify_manifest<'a>(
         // application/c2pa (C2paStore). Ordinary host-bearing formats require a
         // real c2pa.hash.* binding (verify_data_hash) and never treat
         // c2pa.compound.content as a hard binding.
-        if format == AssetFormat::C2paStore {
+        // Skipped under a deferred binding: the caller's engine runs its own
+        // compound check, and nothing here would read the result.
+        if binding.format() == Some(AssetFormat::C2paStore) {
             verify_compound_content(&claim_refs, &label, store.manifest_hashes, &mut results);
         }
         // An update manifest carries no hard binding of its own, so an identity
@@ -2876,11 +3088,20 @@ fn verify_manifest<'a>(
         // matches its stored bytes. CAWG assertion failures are consumer-layer
         // results and do not invalidate the manifest or suppress identity
         // validation.
-        if results
-            .failure
-            .iter()
-            .all(|status| is_identity_assertion_scoped(&status.code))
+        // Under a deferred binding the caller's engine has already passed its
+        // own route gate on byte-identical manifests, so failures recorded
+        // outside `structure_ok` are not re-litigated here.
+        if capture.is_some()
+            || results
+                .failure
+                .iter()
+                .all(|status| is_identity_assertion_scoped(&status.code))
         {
+            let identity_start = (
+                results.success.len(),
+                results.informational.len(),
+                results.failure.len(),
+            );
             cawg::verify_identity_assertions(
                 &mut cawg::IdentityContext {
                     manifest,
@@ -2916,11 +3137,17 @@ fn verify_manifest<'a>(
                     results: &mut results,
                 },
                 &claim_refs,
-                claim_refs
-                    .binding_plan(format == AssetFormat::C2paStore)
-                    .primary(),
+                claim_refs.binding_plan(binding.compound_ok()).primary(),
                 &certificate_statuses.payloads,
             );
+            if let Some(capture) = capture.as_deref_mut() {
+                capture.identity = Some(ValidationResults {
+                    success: results.success[identity_start.0..].to_vec(),
+                    informational: results.informational[identity_start.1..].to_vec(),
+                    failure: results.failure[identity_start.2..].to_vec(),
+                    ..ValidationResults::default()
+                });
+            }
         }
     }
 
@@ -3502,6 +3729,7 @@ fn verify_spec_version_metadata(
 }
 
 #[allow(clippy::too_many_arguments)] // internal structural gate; grouping obscures inputs
+#[allow(clippy::too_many_arguments)]
 fn verify_claim_structure(
     manifest: &ParsedManifest,
     store: StoreContext<'_>,
@@ -3513,9 +3741,38 @@ fn verify_claim_structure(
     profile: EngineProfile,
     results: &mut ValidationResults,
 ) -> bool {
+    claim_structure_first_fatal(
+        manifest,
+        store,
+        claim,
+        generation,
+        claim_refs,
+        format == AssetFormat::C2paStore,
+        sig_url,
+        profile,
+        results,
+    )
+    .is_some()
+}
+
+/// [`verify_claim_structure`] reporting the first fatal status it recorded,
+/// in record order, or `None` when the structure is sound. `compound_ok`
+/// says whether `c2pa.compound.content` counts as a primary binding.
+#[allow(clippy::too_many_arguments)]
+fn claim_structure_first_fatal(
+    manifest: &ParsedManifest,
+    store: StoreContext<'_>,
+    claim: &Value,
+    generation: ClaimGeneration,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    compound_ok: bool,
+    sig_url: &str,
+    profile: EngineProfile,
+    results: &mut ValidationResults,
+) -> Option<String> {
     // Returns false when a fatal structural defect (multiple claims / malformed
     // claim) means the signature must not be reported as validated/trusted.
-    let mut fatal = false;
+    let mut fatal: Option<String> = None;
     // claim.multiple: more than one claim box in the manifest.
     if manifest.claim_count > 1 {
         results.push_failure(
@@ -3526,7 +3783,7 @@ fn verify_claim_structure(
                 manifest.claim_count
             ),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
 
     // Defense in depth for in-crate direct callers; the production JUMBF parser rejects both duplicate forms before this function.
@@ -3542,7 +3799,7 @@ fn verify_claim_structure(
             "manifest store contains duplicate labels; internal JUMBF references are ambiguous"
                 .into(),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
     let mut assertion_labels = std::collections::BTreeSet::new();
     if manifest
@@ -3556,7 +3813,7 @@ fn verify_claim_structure(
             "manifest contains duplicate assertion labels; internal JUMBF references are ambiguous"
                 .into(),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
 
     // claim.malformed: fields required by the detected claim generation must
@@ -3595,7 +3852,7 @@ fn verify_claim_structure(
             sig_url.to_string(),
             format!("claim missing required field(s): {}", missing.join(", ")),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
 
     // claim.malformed: v2 manifest labels must follow the C2PA 2.x grammar
@@ -3619,7 +3876,8 @@ fn verify_claim_structure(
                 "claim assertion-reference count exceeds verifier bound ({MAX_CLAIM_ASSERTION_REFERENCES})"
             ),
         );
-        return true;
+        mark_fatal(&mut fatal, results);
+        return fatal;
     }
     for reference in &claim_refs.references {
         let malformed = !matches!(reference.value, Value::Map(_))
@@ -3639,7 +3897,7 @@ fn verify_claim_structure(
                 sig_url.to_string(),
                 "claim assertion reference is not a complete HashedUriMap".into(),
             );
-            fatal = true;
+            mark_fatal(&mut fatal, results);
         }
         if reference.field == GENERATOR_ICON_REFERENCE_FIELD
             && !reference.label.is_some_and(is_generator_icon_label)
@@ -3649,7 +3907,7 @@ fn verify_claim_structure(
                 sig_url.to_string(),
                 "claim generator icon must reference a c2pa.icon assertion".into(),
             );
-            fatal = true;
+            mark_fatal(&mut fatal, results);
         }
     }
     if let Some(label) = claim_refs.duplicate_label {
@@ -3658,7 +3916,7 @@ fn verify_claim_structure(
             sig_url.to_string(),
             format!("claim declares assertion '{label}' more than once"),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
     let is_update = manifest.kind() == ManifestKind::Update;
     if is_update {
@@ -3670,7 +3928,7 @@ fn verify_claim_structure(
                 format!("self#jumbf=/c2pa/{}", manifest.label),
                 "update manifest must declare exactly one parentOf ingredient".into(),
             );
-            fatal = true;
+            mark_fatal(&mut fatal, results);
         }
         if inspection.invalid {
             results.push_failure(
@@ -3678,7 +3936,7 @@ fn verify_claim_structure(
                 format!("self#jumbf=/c2pa/{}", manifest.label),
                 "update manifest contains forbidden content or an incomplete parent link".into(),
             );
-            fatal = true;
+            mark_fatal(&mut fatal, results);
         }
         if !inspection.wrong_parents && !inspection.invalid {
             match update_manifest::resolve_standard(manifest, store.manifests) {
@@ -3705,7 +3963,7 @@ fn verify_claim_structure(
                                     "parent standard manifest declares more than one supported primary hard binding"
                                         .into(),
                                 );
-                                fatal = true;
+                                mark_fatal(&mut fatal, results);
                             }
                         }
                     }
@@ -3715,7 +3973,7 @@ fn verify_claim_structure(
                             sig_url.to_string(),
                             "update chain parent claim could not be decoded".into(),
                         );
-                        fatal = true;
+                        mark_fatal(&mut fatal, results);
                     }
                 },
                 Err(update_manifest::ResolveError::WrongParents(label)) => {
@@ -3725,7 +3983,7 @@ fn verify_claim_structure(
                         "update manifest in parent chain must declare exactly one parentOf ingredient"
                             .into(),
                     );
-                    fatal = true;
+                    mark_fatal(&mut fatal, results);
                 }
                 Err(update_manifest::ResolveError::Invalid(label)) => {
                     results.push_failure(
@@ -3734,7 +3992,7 @@ fn verify_claim_structure(
                         "update manifest in parent chain contains forbidden content or an incomplete parent link"
                             .into(),
                     );
-                    fatal = true;
+                    mark_fatal(&mut fatal, results);
                 }
                 Err(update_manifest::ResolveError::MissingParent(label)) => {
                     results.push_failure(
@@ -3742,7 +4000,7 @@ fn verify_claim_structure(
                         sig_url.to_string(),
                         format!("update chain parent manifest '{label}' is absent"),
                     );
-                    fatal = true;
+                    mark_fatal(&mut fatal, results);
                 }
                 Err(update_manifest::ResolveError::Cycle(label)) => {
                     results.push_failure(
@@ -3750,7 +4008,7 @@ fn verify_claim_structure(
                         sig_url.to_string(),
                         format!("update manifest parent chain cycles at '{label}'"),
                     );
-                    fatal = true;
+                    mark_fatal(&mut fatal, results);
                 }
                 Err(update_manifest::ResolveError::TooDeep) => {
                     results.push_failure(
@@ -3758,7 +4016,7 @@ fn verify_claim_structure(
                         sig_url.to_string(),
                         "update manifest parent chain exceeds the verifier bound".into(),
                     );
-                    fatal = true;
+                    mark_fatal(&mut fatal, results);
                 }
             }
         }
@@ -3783,7 +4041,7 @@ fn verify_claim_structure(
                 format!("self#jumbf=/c2pa/{}", manifest.label),
                 "manifest declares more than one parent ingredient".into(),
             );
-            fatal = true;
+            mark_fatal(&mut fatal, results);
         }
     }
 
@@ -3801,7 +4059,7 @@ fn verify_claim_structure(
                 "assertion '{label}' is present in the assertion store but absent from the claim"
             ),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
 
     if claim_refs.hash_work_bytes(generation).is_none() {
@@ -3812,7 +4070,7 @@ fn verify_claim_structure(
                 "aggregate assertion digest work exceeds verifier bound ({MAX_ASSERTION_HASH_WORK_BYTES} bytes)"
             ),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
     if claim_refs.decode_budget_exhausted {
         results.push_failure(
@@ -3823,14 +4081,14 @@ fn verify_claim_structure(
                 claim_refs.decoded_value_nodes
             ),
         );
-        fatal = true;
+        mark_fatal(&mut fatal, results);
     }
 
     // Update manifests inherit their sole operative binding from the first
     // standard manifest in their parent chain. Their own assertion set was
     // checked above for forbidden bindings and multi-asset assertions.
     if !is_update {
-        let binding_plan = claim_refs.binding_plan(format == AssetFormat::C2paStore);
+        let binding_plan = claim_refs.binding_plan(compound_ok);
         match binding_plan.primary_count {
             0 => results.push_failure(
                 CLAIM_HARD_BINDINGS_MISSING,
@@ -3844,7 +4102,7 @@ fn verify_claim_structure(
                     format!("self#jumbf=/c2pa/{}/c2pa.assertions", manifest.label),
                     "claim declares more than one supported primary hard binding".into(),
                 );
-                fatal = true;
+                mark_fatal(&mut fatal, results);
             }
         }
         if binding_plan.multi_asset_count > 1 {
@@ -3856,7 +4114,7 @@ fn verify_claim_structure(
                 ),
                 "claim declares more than one c2pa.hash.multi-asset fallback".into(),
             );
-            fatal = true;
+            mark_fatal(&mut fatal, results);
         }
     }
 
@@ -5702,7 +5960,7 @@ fn verify_update_hard_binding(
     active: &ParsedManifest<'_>,
     store: StoreContext<'_>,
     data: &[u8],
-    format: AssetFormat,
+    format: Option<AssetFormat>,
     fragments: &[&[u8]],
     prehashed_digest: Option<&[u8]>,
     profile: EngineProfile,
@@ -5773,7 +6031,7 @@ fn verify_update_hard_binding(
     if let Some(digest) = prehashed_digest {
         let _ =
             verify_prehashed_hard_binding(&claim, &claim_refs, digest, &standard.label, results);
-    } else {
+    } else if let Some(format) = format {
         // The active manifest is an update, so the store the standard claim
         // signed its exclusions against has since grown (C2PA 2.4, Validating
         // a data hash).
@@ -11721,6 +11979,81 @@ mod tests {
         let (fatal, results) = run_structure(&claim);
         assert!(fatal);
         assert!(results.has_failure(CLAIM_MALFORMED));
+    }
+
+    fn first_fatal(claim: &Value, compound_ok: bool) -> Option<String> {
+        let manifests = [structural_manifest_for(ClaimGeneration::V2)];
+        let hashes = std::collections::HashMap::new();
+        let mut results = ValidationResults::default();
+        let claim_refs = ClaimAssertionRefs::build(&manifests[0], claim, ClaimGeneration::V2);
+        claim_structure_first_fatal(
+            &manifests[0],
+            StoreContext {
+                manifests: &manifests,
+                manifest_hashes: &hashes,
+            },
+            claim,
+            ClaimGeneration::V2,
+            &claim_refs,
+            compound_ok,
+            "self#jumbf=/c2pa/test/c2pa.signature",
+            EngineProfile::GENEROUS,
+            &mut results,
+        )
+    }
+
+    /// A claim-v2 map carrying every required field, so the only structural
+    /// defects are the ones a test adds.
+    fn complete_claim(created_assertions: Vec<Value>) -> Value {
+        vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("test".into()))]),
+            ),
+            ("created_assertions", Value::Array(created_assertions)),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+        ])
+    }
+
+    /// The deferred-binding gate reports the status that closed it. The
+    /// reference bound exits early without a `fatal` assignment, so it must
+    /// still name its own code.
+    #[test]
+    fn first_fatal_names_the_gating_status_including_the_reference_bound_exit() {
+        let over_bound = vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:test".into())),
+            (
+                "created_assertions",
+                Value::Array(vec![valid_hashed_uri(); MAX_CLAIM_ASSERTION_REFERENCES + 1]),
+            ),
+        ]);
+        assert_eq!(first_fatal(&over_bound, false).as_deref(), Some(CLAIM_MALFORMED));
+
+        let two_primaries = complete_claim(vec![
+            hashed_uri_for_assertion("c2pa.hash.data"),
+            hashed_uri_for_assertion("c2pa.hash.boxes"),
+        ]);
+        assert_eq!(
+            first_fatal(&two_primaries, false).as_deref(),
+            Some(ASSERTION_MULTIPLE_HARD_BINDINGS)
+        );
+
+        // Zero primary bindings is recorded but is not fatal.
+        let multi_asset_only =
+            complete_claim(vec![hashed_uri_for_assertion("c2pa.hash.multi-asset")]);
+        assert_eq!(first_fatal(&multi_asset_only, false), None);
+
+        // The host context, not a format, decides whether compound counts.
+        let data_and_compound = complete_claim(vec![
+            hashed_uri_for_assertion("c2pa.hash.data"),
+            hashed_uri_for_assertion("c2pa.compound.content"),
+        ]);
+        assert_eq!(first_fatal(&data_and_compound, false), None);
+        assert_eq!(
+            first_fatal(&data_and_compound, true).as_deref(),
+            Some(ASSERTION_MULTIPLE_HARD_BINDINGS)
+        );
     }
 
     #[test]

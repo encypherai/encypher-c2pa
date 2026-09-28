@@ -75,6 +75,10 @@ pub use stream::{
 };
 mod telemetry;
 mod telemetry_consent;
+#[cfg(feature = "caller-verified-binding")]
+mod caller_verified_binding;
+#[cfg(feature = "caller-verified-binding")]
+pub use caller_verified_binding::{CawgEvaluation, CawgEvaluator, CawgProfile, CawgStoreHost};
 pub use config_dir::config_directory;
 pub use default_trust::SNAPSHOT_DATE as DEFAULT_TRUST_SNAPSHOT_DATE;
 
@@ -146,6 +150,10 @@ pub struct VerifyOptions {
     pub cawg_trust_pem: Option<String>,
     /// PEM bundle of directly allowed CAWG end-entity certificates.
     pub cawg_allowed_certs_pem: Option<String>,
+    /// Require an `id-kp-documentSigning` CAWG credential to chain to a
+    /// configured anchor or appear on the allowed list. `None` keeps the
+    /// default, `true`.
+    pub cawg_document_signing_require_anchor: Option<bool>,
     /// Typed CAWG trust configurations, one per source. Each carries its
     /// profile and its own trust window; see [`CawgTrustConfiguration`].
     /// Appended after `cawg_trust_pem`/`cawg_allowed_certs_pem`, in order.
@@ -578,7 +586,7 @@ fn detached_pass(
         &input,
         resolved.cawg_trust(),
         resolved.cawg_allowed_certs(),
-        true,
+        resolved.cawg_document_signing_require_anchor,
         options.cawg_did_documents.as_ref(),
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),
@@ -675,6 +683,7 @@ pub(crate) struct ResolvedOptions {
     trust_basis: &'static str,
     profile: EngineProfile,
     cawg_strict_encoding: bool,
+    cawg_document_signing_require_anchor: bool,
     /// Caller-supplied online evidence, base64-decoded once.
     ocsp_responses: HashMap<String, Vec<u8>>,
     ocsp_unreachable: Vec<String>,
@@ -751,6 +760,9 @@ impl ResolvedOptions {
                 EngineProfile::GENEROUS
             },
             cawg_strict_encoding: options.cawg_strict_encoding,
+            cawg_document_signing_require_anchor: options
+                .cawg_document_signing_require_anchor
+                .unwrap_or(true),
             ocsp_responses: decode_base64_map(
                 options.ocsp_responses.as_ref(),
                 "ocsp_responses",
@@ -947,7 +959,7 @@ fn embedded_pass_resolved(
             &options.expected_seek_positions,
             resolved.cawg_trust(),
             resolved.cawg_allowed_certs(),
-            true,
+            resolved.cawg_document_signing_require_anchor,
             options.cawg_did_documents.as_ref(),
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),
@@ -957,7 +969,7 @@ fn embedded_pass_resolved(
             &input,
             resolved.cawg_trust(),
             resolved.cawg_allowed_certs(),
-            true,
+            resolved.cawg_document_signing_require_anchor,
             options.cawg_did_documents.as_ref(),
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),

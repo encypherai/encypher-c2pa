@@ -81,7 +81,11 @@ const SURFACE_MATRIX = [
   ["", "telemetry only", ["--no-default-features", "--features", "telemetry"]],
   ["", "online only", ["--no-default-features", "--features", "online"]],
   ["", "default", []],
+  // Store-level identity evaluation for a caller that verifies the content
+  // binding itself. It pulls in no dependency, so it also builds for wasm32.
+  ["", "caller-verified-binding", ["--no-default-features", "--features", "caller-verified-binding"]],
   ["wasm32-unknown-unknown", "no features", ["--no-default-features"]],
+  ["wasm32-unknown-unknown", "caller-verified-binding", ["--no-default-features", "--features", "caller-verified-binding"]],
 ];
 
 // Canonical feature map, as Cargo resolves it - not as a TOML file spells it.
@@ -90,6 +94,7 @@ const SURFACE_MATRIX = [
 // past a hand-written manifest parser. `dep:` syntax suppresses the implicit
 // feature, which is why `telemetry` is spelled the way it is.
 const APPROVED_FEATURES = {
+  "caller-verified-binding": [],
   default: ["online", "telemetry"],
   online: ["dep:ureq"],
   telemetry: ["dep:ureq"],
