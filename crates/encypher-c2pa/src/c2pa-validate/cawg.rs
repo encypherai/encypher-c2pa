@@ -7032,6 +7032,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 OnlineEvidence {
                     ocsp_responses: Some(&responses),
                     ..OnlineEvidence::default()
