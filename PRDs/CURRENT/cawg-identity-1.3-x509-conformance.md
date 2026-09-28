@@ -26,10 +26,10 @@ The full leaf decision table is:
 
 | Embedded leaf | Online absent | unreachable | invalid response | good | revoked | unknown | outside window |
 |---|---|---|---|---|---|---|---|
-| none | `ocsp.skipped` | `ocsp.inaccessible` | Encypher unusable-response info | `ocsp.not_revoked` | `identity.credential_revoked` | `ocsp.unknown` | Encypher outside-window info |
-| qualifying good | `ocsp.not_revoked` | not-revoked + inaccessible | not-revoked + Encypher unusable-response info | `ocsp.not_revoked` | `identity.credential_revoked` | not-revoked + unknown | not-revoked + Encypher outside-window info |
+| none | `ocsp.skipped` | `ocsp.inaccessible` | Encypher `unusableResponse` info | `ocsp.not_revoked` | `identity.credential_revoked` | `ocsp.unknown` | Encypher `outsideWindow` info |
+| qualifying good | `ocsp.not_revoked` | not-revoked + inaccessible | not-revoked + Encypher `unusableResponse` info | `ocsp.not_revoked` | `identity.credential_revoked` | not-revoked + unknown | not-revoked + Encypher `outsideWindow` info |
 | qualifying revoked | terminal `identity.credential_revoked` | same | same | same | same | same | same |
-| unusable staple | `ocsp.skipped` | `ocsp.inaccessible` | Encypher unusable-response info | `ocsp.not_revoked` | `identity.credential_revoked` | `ocsp.unknown` | Encypher outside-window info |
+| unusable staple | `ocsp.skipped` | `ocsp.inaccessible` | Encypher `unusableResponse` info | `ocsp.not_revoked` | `identity.credential_revoked` | `ocsp.unknown` | Encypher `outsideWindow` info |
 
 Each online column gets an identity-level regression against a revoked staple.
 The good-staple rows also prove failed extra assurance does not erase embedded
@@ -47,10 +47,10 @@ The CAWG identity lane applies this decision table to a received response:
 
 | RFC 6960 / response state | Effective time | CAWG identity result |
 |---|---|---|
-| Requirements 1-4 fail (malformed, unauthorized, wrong certificate) | any | non-evidence plus `com.encypher.cawg.x509.ocsp.unusable_response`; no `ocsp.inaccessible`; retain the unresolved network need |
+| Requirements 1-4 fail (malformed, unauthorized, wrong certificate) | any | non-evidence plus `com.encypher.cawg.x509.ocsp.unusableResponse`; no `ocsp.inaccessible`; retain the unresolved network need |
 | `unknown` | any | `cawg.x509.ocsp.unknown` |
 | `good` or `revoked/removeFromCRL`, with `nextUpdate` present | trusted timestamp if present, otherwise current time | not revoked only when `thisUpdate < effective < nextUpdate` |
-| same status at either equality boundary or outside the open interval | trusted timestamp if present, otherwise current time | non-evidence plus `com.encypher.cawg.x509.ocsp.outside_window`; never inaccessible or revoked |
+| same status at either equality boundary or outside the open interval | trusted timestamp if present, otherwise current time | non-evidence plus `com.encypher.cawg.x509.ocsp.outsideWindow`; never inaccessible or revoked |
 | same status with `nextUpdate` absent | any | outside-window non-evidence; the online procedure does not borrow the embedded procedure's `producedAt + 24h` rule |
 | revoked for another reason | trusted timestamp present | not revoked only when `thisUpdate < attested < nextUpdate` and `revocationTime > attested`; otherwise revoked |
 | revoked for another reason | no trusted timestamp | current time is not substituted for the historical exception; revoked |
@@ -92,13 +92,23 @@ evaluation. CA-chain handling remains unchanged except that provenance cannot
 manufacture revocation.
 
 SDK fetches refused before I/O (endpoint policy/SSRF) are not marked
-unreachable; the second verification pass reports `ocsp.skipped` and retains
-the unresolved network need. An oversized body means bytes were received but
-could not be accepted: record `Unusable`, emit the same namespaced
-`unusable_response` code as invalid caller-supplied bytes, and retain the
-network need. `OutsideWindow` likewise retains the need so a later fresh query
-can settle status. A true transport/server failure is `Unreachable`, emits
+unreachable. On both the CAWG and C2PA claim-signer lanes, the second
+verification pass changes from `ocsp.inaccessible` to `ocsp.skipped` and
+retains the unresolved need; a claim-lane regression pins that intentional
+observable change. A true transport/server failure is `Unreachable`, emits
 `ocsp.inaccessible`, and records no duplicate need.
+
+An oversized body means bytes were received but could not be accepted.
+`FetchErr` records that fact internally; `fetch_all` carries it to the existing
+`VerifyOptions.ocsp_responses` map as an empty DER entry for the certificate,
+without a new public field. Evaluation returns `Unusable`, emits
+`com.encypher.cawg.x509.ocsp.unusableResponse`, and retains the need.
+
+For `OutsideWindow`, retain the need only when `effective >= nextUpdate`, or
+when `nextUpdate` is absent and `effective > thisUpdate`, because a later
+response could cover that instant. Drop the need when
+`effective <= thisUpdate`; no later live response can move `thisUpdate`
+backward to cover an archived signing time.
 
 ### 3. Acyclic identity references
 
@@ -141,7 +151,7 @@ inside/outside validity code. The optional chronology check against trusted
 | usable | inside every chain certificate | absent, `iat <= genTime`, or `iat > genTime` | `inside_validity` |
 
 When `iat > genTime`, emit `inside_validity` plus the namespaced informational
-code `com.encypher.cawg.x509.time_of_signing.after_timestamp`; the optional
+code `com.encypher.cawg.x509.time_of_signing.afterTimestamp`; the optional
 chronology result cannot replace the mandated certificate-validity code.
 Certificate `notBefore` and `notAfter` boundaries, equality with `genTime`,
 malformed `iat`, and `iat > genTime` get direct tests. This is a production
@@ -166,20 +176,25 @@ Keep behavior in the existing private verifier modules:
 - `crates/encypher-c2pa/src/online.rs`
 
 No public API or report schema shape changes. Add the namespaced informational
-codes `com.encypher.cawg.x509.ocsp.outside_window`,
-`com.encypher.cawg.x509.ocsp.unusable_response`, and
-`com.encypher.cawg.x509.time_of_signing.after_timestamp`. Preserve the 64-entry
+codes `com.encypher.cawg.x509.ocsp.outsideWindow`,
+`com.encypher.cawg.x509.ocsp.unusableResponse`, and
+`com.encypher.cawg.x509.time_of_signing.afterTimestamp`. These follow the
+existing Encypher extension convention of camelCase leaves. Preserve the
+64-entry
 OCSP bound and fail closed only on contradictory actual certificate statuses,
 not on freshness misses.
 
 ## Documentation
 
-- Correct `CHANGELOG.md` where it says all nested identity references are
-  rejected, and record all three additive namespaced informational codes.
-- Narrow `docs/TRUST_MODEL.md` definitions of CAWG `ocsp.inaccessible` to an
-  attempted query that received no response.
-- Update the `cawg.rs` status comment and the `online.rs` module/verdict docs so
-  they distinguish unreachable, invalid received evidence, and outside-window.
+- Add separate `CHANGELOG.md` entries for: acyclic identity references;
+  terminal stapled revocation over every online outcome; all three additive
+  namespaced informational codes; SDK-refused fetches changing from
+  inaccessible to skipped with a retained need on both lanes; malformed `iat`
+  producing no validity code; and `iat > genTime` producing inside-validity
+  plus chronology information.
+- Update both `CHANGELOG.md:70` and `docs/TRUST_MODEL.md:82`: inaccessible means
+  an attempted query received no response, while SDK policy refusal is skipped
+  with a retained need on both CAWG and claim-signer lanes.
 - Include the staple-precedence rationale and the upstream issue draft below in
   the pull request body.
 
@@ -193,18 +208,21 @@ signing time is earlier than `thisUpdate`, but the online procedure only names
 the open `(thisUpdate,nextUpdate)` interval. A normal live OCSP response
 therefore cannot establish status for most archived, time-stamped identities.
 The final "otherwise revoked" branch could also make a stale authentic `good`
-response force a revoked verdict. A second ambiguity arises when a signed
-staple says revoked, but an online `revoked` response has a
-`revocationTime` after the trusted signing time and therefore establishes
-historical non-revocation. Please clarify whether outside-window good responses
-are non-evidence, and whether a qualifying signed revoked staple remains
-terminal when optional online evidence would establish historical
-non-revocation.
+response force a revoked verdict. A narrow replay remains for a real past
+`certificateHold`: an on-path actor could replay the stale authentic hold
+response after a later `removeFromCRL`, and the fail-closed revoked branch
+would win. A second ambiguity arises when a signed staple says revoked, but an
+online `revoked` response has a `revocationTime` after the trusted signing time
+and therefore establishes historical non-revocation. Please clarify whether
+outside-window good responses are non-evidence, and whether a qualifying
+signed revoked staple remains terminal when optional online evidence would
+establish historical non-revocation.
 
 ## Acceptance
 
-- Red-to-green behavior tests cite CAWG-ID13-X509VALB-003, -006, -011, -032,
-  and CAWG-ID13-ASSERTION-CREATION-017.
+- Red-to-green behavior tests cite CAWG-ID13-X509VALB-003, -006, -011, -029,
+  -032, CAWG-ID13-X509-VALIDATING-A-049, and
+  CAWG-ID13-ASSERTION-CREATION-017.
 - Test-only rows cite their exact X509-VALIDATING-A or X509VALB ids.
 - Invert `referenced_identity_assertion_is_rejected`; retain self-cycle and add
   multi-node/SCC/DAG cases.
