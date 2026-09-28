@@ -36,7 +36,7 @@
 
 mod assertion_semantics;
 mod cache;
-mod cawg;
+pub(crate) mod cawg;
 mod cawg_metadata;
 mod cawg_training_mining;
 mod exclusions;
@@ -80,7 +80,7 @@ mod refs;
 mod report;
 mod revocation;
 #[cfg(test)]
-mod signature_conformance_tests;
+pub(crate) mod signature_conformance_tests;
 pub(crate) mod stream;
 mod timestamp_assertion;
 mod update_manifest;

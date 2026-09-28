@@ -8,12 +8,7 @@
 
 ### 1. Embedded revocation is terminal
 
-A qualifying embedded OCSP response that says the identity leaf is revoked
-rejects the identity with `cawg.identity.credential_revoked`. Online evidence
-cannot erase that result. This holds for every online outcome: absent,
-unreachable, received-but-invalid, good, revoked, unknown, or outside-window.
-Online evidence is considered only when the embedded leaf result is not
-revoked. CA revocation remains `cawg.x509.credential.untrusted`.
+A qualifying embedded OCSP response that says the identity leaf is revoked rejects the identity with `cawg.identity.credential_revoked` only after the COSE signature over `signer_payload` validates and the certificate chain reaches accepted CAWG trust. The failure carries `details.chain_trusted: true`, `trust_source`, and `anchor_fingerprint`; the fingerprint is null for anchorless document-signing acceptance. A signature mismatch takes precedence and suppresses every revocation outcome. A self-issued or otherwise untrusted chain reports `cawg.x509.credential.untrusted`, or `cawg.identity.well-formed` when no CAWG roots are configured, and never assigns revoked status to a named actor. For a trusted and signed identity, online evidence cannot erase a qualifying embedded revocation. This holds for every online outcome: absent, unreachable, received-but-invalid, good, revoked, unknown, or outside-window. CA revocation remains `cawg.x509.credential.untrusted`.
 
 This is a fail-closed reading of an ambiguity in X509VALB-003. The stapled
 procedure says a qualifying revoked response MUST reject, while the online
@@ -105,11 +100,13 @@ An oversized body means bytes were received but could not be accepted.
 without a new public field. Evaluation returns `Unusable`, emits
 `com.encypher.cawg.x509.ocsp.unusableResponse`, and retains the need.
 
-For `OutsideWindow`, retain the need only when `effective >= nextUpdate`, or
-when `nextUpdate` is absent and `effective > thisUpdate`, because a later
-response could cover that instant. Drop the need when
-`effective <= thisUpdate`; no later live response can move `thisUpdate`
-backward to cover an archived signing time.
+For `OutsideWindow` at a trusted attested time, retain the need only when
+`effective >= nextUpdate`, or when `nextUpdate` is absent and
+`effective > thisUpdate`, because a later response could cover that instant.
+Drop the need when the attested `effective <= thisUpdate`; no later live
+response can move `thisUpdate` backward to cover an archived signing time.
+Without a trusted attested time, retain the need at either boundary: the
+effective current time advances, so a later live response may cover the check.
 
 ### 3. Acyclic identity references
 
@@ -235,5 +232,6 @@ establish historical non-revocation.
 - Keep CAWG-ID13-X509VALB-011 `partial` for the documented outside-window
   deviation until CAWG resolves the upstream ambiguity.
 - Add a regression for every column of the stapled-revoked decision table.
+- Prove that signature mismatch suppresses revoked status, an untrusted chain cannot assign revoked status, and a trusted signed revoked leaf carries `details.chain_trusted: true`.
 - The affected crate tests pass.
 - The branch is committed and opened as a public pull request.

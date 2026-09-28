@@ -598,6 +598,20 @@ mod tests {
             }
         );
 
+        let current_time_boundary = pair.issuer_signed(ResponseSpec {
+            status: FixtureStatus::Good,
+            produced_at: b"20260601000000Z",
+            this_update: b"20260601000000Z",
+            next_update: Some(b"20260701000000Z"),
+        });
+        assert_eq!(
+            pair.evaluate_with(&current_time_boundary, None, OnlinePolicy::CawgIdentity),
+            OnlineVerdict::OutsideWindow {
+                refresh_may_cover: true,
+            },
+            "without an attested historical instant, a later live response may cover the check"
+        );
+
         let unbounded = pair.issuer_signed(ResponseSpec {
             status: FixtureStatus::Good,
             produced_at: b"20251231120000Z",

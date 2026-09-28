@@ -251,6 +251,79 @@ pub(super) fn verify_identity_assertions(
     }
 }
 
+#[derive(Clone, Copy)]
+enum IdentityShapeDefect {
+    DuplicateKey,
+    SignerPayloadMissing,
+    SignerPayloadInvalid,
+    SignatureMissing,
+    SignatureEmpty,
+    Padding,
+}
+
+struct IdentityShape<'a> {
+    signer_payload: &'a Value,
+    referenced: &'a Vec<Value>,
+    signature: &'a [u8],
+}
+
+fn identity_shape(assertion: &Value) -> Result<IdentityShape<'_>, IdentityShapeDefect> {
+    if !map_keys_are_unique(assertion) {
+        return Err(IdentityShapeDefect::DuplicateKey);
+    }
+    let signer_payload = assertion
+        .get("signer_payload")
+        .ok_or(IdentityShapeDefect::SignerPayloadMissing)?;
+    let referenced =
+        valid_signer_payload(signer_payload).ok_or(IdentityShapeDefect::SignerPayloadInvalid)?;
+    let signature = assertion
+        .get("signature")
+        .and_then(Value::as_bytes)
+        .ok_or(IdentityShapeDefect::SignatureMissing)?;
+    if signature.is_empty() {
+        return Err(IdentityShapeDefect::SignatureEmpty);
+    }
+    if !valid_padding(assertion.get("pad1"), true) || !valid_padding(assertion.get("pad2"), false) {
+        return Err(IdentityShapeDefect::Padding);
+    }
+    Ok(IdentityShape {
+        signer_payload,
+        referenced,
+        signature,
+    })
+}
+
+fn report_identity_shape_defect(
+    results: &mut ValidationResults,
+    url: &str,
+    defect: IdentityShapeDefect,
+) {
+    match defect {
+        IdentityShapeDefect::DuplicateKey => invalid_cbor(
+            results,
+            url,
+            "identity assertion contains a duplicate CBOR map key",
+        ),
+        IdentityShapeDefect::SignerPayloadMissing => {
+            invalid_cbor(results, url, "signer_payload is missing");
+        }
+        IdentityShapeDefect::SignerPayloadInvalid => invalid_cbor(
+            results,
+            url,
+            "signer_payload violates the CAWG Identity 1.3 CDDL",
+        ),
+        IdentityShapeDefect::SignatureMissing => {
+            invalid_cbor(results, url, "signature is missing or is not a byte string")
+        }
+        IdentityShapeDefect::SignatureEmpty => invalid_cbor(results, url, "signature is empty"),
+        IdentityShapeDefect::Padding => results.push_failure(
+            CAWG_IDENTITY_PAD_INVALID,
+            url.into(),
+            "pad1 or pad2 is missing, not a byte string, or contains non-zero bytes".into(),
+        ),
+    }
+}
+
 /// Validate one CAWG identity assertion.
 ///
 /// `url` is the `url` field every status this function reports carries. CAWG
@@ -270,12 +343,9 @@ fn verify_identity_assertion(
 ) {
     #[cfg(test)]
     record_identity_work(|counts| counts.identity_evaluations += 1);
-    if !map_keys_are_unique(assertion) {
-        invalid_cbor(
-            ctx.results,
-            url,
-            "identity assertion contains a duplicate CBOR map key",
-        );
+    let shape = identity_shape(assertion);
+    if matches!(&shape, Err(IdentityShapeDefect::DuplicateKey)) {
+        report_identity_shape_defect(ctx.results, url, IdentityShapeDefect::DuplicateKey);
         return;
     }
     let identity_uri = format!(
@@ -297,38 +367,17 @@ fn verify_identity_assertion(
         );
         return;
     }
-    let Some(signer_payload) = assertion.get("signer_payload") else {
-        invalid_cbor(ctx.results, url, "signer_payload is missing");
-        return;
+    let IdentityShape {
+        signer_payload,
+        referenced,
+        signature,
+    } = match shape {
+        Ok(shape) => shape,
+        Err(defect) => {
+            report_identity_shape_defect(ctx.results, url, defect);
+            return;
+        }
     };
-    let Some(referenced) = valid_signer_payload(signer_payload) else {
-        invalid_cbor(
-            ctx.results,
-            url,
-            "signer_payload violates the CAWG Identity 1.3 CDDL",
-        );
-        return;
-    };
-    let Some(signature) = assertion.get("signature").and_then(Value::as_bytes) else {
-        invalid_cbor(
-            ctx.results,
-            url,
-            "signature is missing or is not a byte string",
-        );
-        return;
-    };
-    if signature.is_empty() {
-        invalid_cbor(ctx.results, url, "signature is empty");
-        return;
-    }
-    if !valid_padding(assertion.get("pad1"), true) || !valid_padding(assertion.get("pad2"), false) {
-        ctx.results.push_failure(
-            CAWG_IDENTITY_PAD_INVALID,
-            url.into(),
-            "pad1 or pad2 is missing, not a byte string, or contains non-zero bytes".into(),
-        );
-        return;
-    }
     let sig_type = signer_payload
         .get("sig_type")
         .and_then(Value::as_text)
@@ -513,6 +562,33 @@ fn verify_identity_assertion(
         return;
     }
 
+    // CAWG Identity 1.3 x509/validating.adoc, "Validate the signature",
+    // requires signature validation before the later "Validate the credential
+    // revocation information" procedure. A revoked response is evidence about
+    // this named actor only after the COSE signature binds the signer_payload
+    // to the leaf certificate.
+    if verified.is_err() {
+        ctx.results.push_failure(
+            CAWG_X509_SIGNATURE_MISMATCH,
+            url.into(),
+            "CAWG identity COSE signature does not match signer_payload".into(),
+        );
+        return;
+    }
+    ctx.results.push_success(
+        CAWG_X509_SIGNATURE_VALIDATED,
+        url.into(),
+        "the identity COSE signature validated against the signing certificate".into(),
+    );
+    if payload_encoding == "legacy-field-order" {
+        ctx.results.push_informational(
+            CAWG_LEGACY_PROFILE,
+            url.into(),
+            "identity signature verifies over the CAWG 1.1 field-order encoding, not the CAWG 1.3 canonical encoding"
+                .into(),
+        );
+    }
+
     let attested = identity_timestamp(
         signature,
         &ctx.manifest.label,
@@ -525,6 +601,74 @@ fn verify_identity_assertion(
     );
     let at = attested.unwrap_or(ctx.validation_time);
     let timestamp_trusted = attested.is_some();
+
+    // CAWG Identity 1.3 x509/validating.adoc establishes the trust
+    // relationship before its revocation procedure. Never let evidence signed
+    // by an untrusted chain assign a revoked status to a named actor.
+    let trust = match identity_trust_outcome(
+        leaf,
+        &chain,
+        at,
+        ctx.validation_time,
+        ctx.cawg_trust,
+        ctx.cawg_allowed_certs,
+        ctx.document_signing_require_anchor,
+        timestamp_trusted,
+        IdentityRevocationStatus::NotChecked,
+    ) {
+        IdentityTrust::Untrusted(reason) => {
+            ctx.results.push_failure_with_details(
+                CAWG_X509_CREDENTIAL_UNTRUSTED,
+                url.into(),
+                "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
+                    .into(),
+                json!({"reason": reason}),
+            );
+            return;
+        }
+        IdentityTrust::Trusted(evidence) => evidence,
+        IdentityTrust::NoRootOfTrust(trust_failure) => {
+            if !chain
+                .iter()
+                .all(|certificate| certificate_valid_at(certificate, at))
+            {
+                ctx.results.push_failure(
+                    CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY,
+                    url.into(),
+                    "the time of signing falls outside the validity window of the identity certificate chain"
+                        .into(),
+                );
+                return;
+            }
+            if !timestamp_trusted {
+                ctx.results.push_success(
+                    CAWG_X509_SIGNATURE_INSIDE_VALIDITY,
+                    url.into(),
+                    "no trusted time stamp was available, and the current time falls inside the identity certificate chain's validity window"
+                        .into(),
+                );
+            }
+            report_time_of_signing(signature, &chain, attested, ctx.results, url);
+            let (accepted_eku, certificate_policy) = identity_trust_rejection(leaf);
+            ctx.results.push_success_with_details(
+                CAWG_IDENTITY_WELL_FORMED,
+                url.into(),
+                "CAWG identity signature validated but no configured trust root accepted the credential"
+                    .into(),
+                json!({
+                    "trust_source": "none",
+                    "accepted_eku": accepted_eku,
+                    "certificate_policy": certificate_policy,
+                    "trusted_at": null,
+                    "timestamp_trusted": timestamp_trusted,
+                    "revocation_status": IdentityRevocationStatus::NotChecked.as_str(),
+                    "trust_failure": trust_failure,
+                    "payload_encoding": payload_encoding,
+                }),
+            );
+            return;
+        }
+    };
 
     #[cfg(test)]
     record_identity_work(|counts| counts.ocsp_evaluations += 1);
@@ -546,15 +690,6 @@ fn verify_identity_assertion(
         revocation_status,
         IdentityRevocationStatus::LeafRevoked | IdentityRevocationStatus::LeafAndCaRevoked
     );
-    if embedded_leaf_revoked {
-        ctx.results.push_failure(
-            CAWG_IDENTITY_CREDENTIAL_REVOKED,
-            url.into(),
-            "verified stapled OCSP evidence reports the identity signing certificate revoked"
-                .into(),
-        );
-        return;
-    }
     // CAWG 1.3 "Determining revocation from online OCSP response" is the same
     // procedure the C2PA claim signer follows, with CAWG's own status codes.
     let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
@@ -571,6 +706,38 @@ fn verify_identity_assertion(
             CAWG_X509_CREDENTIAL_UNTRUSTED,
             url.into(),
             "online OCSP response reports a CA certificate in the identity chain revoked".into(),
+        );
+        return;
+    }
+
+    if matches!(
+        revocation_status,
+        IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
+    ) {
+        ctx.results.push_failure_with_details(
+            CAWG_X509_CREDENTIAL_UNTRUSTED,
+            url.into(),
+            "stapled OCSP evidence reports a CA certificate in the identity chain revoked".into(),
+            json!({"reason": "ca_revoked"}),
+        );
+        return;
+    }
+    ctx.results.push_success(
+        CAWG_X509_CREDENTIAL_TRUSTED,
+        url.into(),
+        "the identity signing certificate satisfies the CAWG X.509 trust model".into(),
+    );
+    if embedded_leaf_revoked {
+        ctx.results.push_failure_with_details(
+            CAWG_IDENTITY_CREDENTIAL_REVOKED,
+            url.into(),
+            "verified stapled OCSP evidence reports the identity signing certificate revoked"
+                .into(),
+            json!({
+                "chain_trusted": true,
+                "trust_source": trust.source,
+                "anchor_fingerprint": trust.anchor_fingerprint,
+            }),
         );
         return;
     }
@@ -651,72 +818,18 @@ fn verify_identity_assertion(
         );
     }
     if leaf_revoked {
-        ctx.results.push_failure(
+        ctx.results.push_failure_with_details(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
             url.into(),
             "verified OCSP evidence reports the identity signing certificate revoked".into(),
+            json!({
+                "chain_trusted": true,
+                "trust_source": trust.source,
+                "anchor_fingerprint": trust.anchor_fingerprint,
+            }),
         );
         return;
     }
-
-    // 1.3 orders the chain-of-trust rejection ahead of signature validation.
-    // The cryptographic result is reported first anyway, so a consumer can
-    // tell an untrusted credential that did sign these bytes from one that did
-    // not. The rejection itself is unchanged: an untrusted credential still
-    // stops validation and issues no identity-level success code.
-    if verified.is_err() {
-        ctx.results.push_failure(
-            CAWG_X509_SIGNATURE_MISMATCH,
-            url.into(),
-            "CAWG identity COSE signature does not match signer_payload".into(),
-        );
-        return;
-    }
-    ctx.results.push_success(
-        CAWG_X509_SIGNATURE_VALIDATED,
-        url.into(),
-        "the identity COSE signature validated against the signing certificate".into(),
-    );
-    if payload_encoding == "legacy-field-order" {
-        ctx.results.push_informational(
-            CAWG_LEGACY_PROFILE,
-            url.into(),
-            "identity signature verifies over the CAWG 1.1 field-order encoding, not the CAWG 1.3 canonical encoding"
-                .into(),
-        );
-    }
-
-    let evidence = match identity_trust_outcome(
-        leaf,
-        &chain,
-        at,
-        ctx.validation_time,
-        ctx.cawg_trust,
-        ctx.cawg_allowed_certs,
-        ctx.document_signing_require_anchor,
-        timestamp_trusted,
-        revocation_status,
-    ) {
-        IdentityTrust::Untrusted(reason) => {
-            ctx.results.push_failure_with_details(
-                CAWG_X509_CREDENTIAL_UNTRUSTED,
-                url.into(),
-                "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
-                    .into(),
-                json!({"reason": reason}),
-            );
-            return;
-        }
-        IdentityTrust::Trusted(evidence) => {
-            ctx.results.push_success(
-                CAWG_X509_CREDENTIAL_TRUSTED,
-                url.into(),
-                "the identity signing certificate satisfies the CAWG X.509 trust model".into(),
-            );
-            Ok(evidence)
-        }
-        IdentityTrust::NoRootOfTrust(reason) => Err(reason),
-    };
 
     if !chain
         .iter()
@@ -740,42 +853,21 @@ fn verify_identity_assertion(
     }
     report_time_of_signing(signature, &chain, attested, ctx.results, url);
 
-    match evidence {
-        Ok(trust) => ctx.results.push_success_with_details(
-            CAWG_IDENTITY_TRUSTED,
-            url.into(),
-            "CAWG identity signature and X.509 trust policy validated".into(),
-            json!({
-                "trust_source": trust.source,
-                "accepted_eku": trust.accepted_eku,
-                "certificate_policy": trust.certificate_policy,
-                "anchor_fingerprint": trust.anchor_fingerprint,
-                "trusted_at": at.to_string(),
-                "timestamp_trusted": timestamp_trusted,
-                "revocation_status": revocation_status.as_str(),
-                "payload_encoding": payload_encoding,
-            }),
-        ),
-        Err(trust_failure) => {
-            let (accepted_eku, certificate_policy) = identity_trust_rejection(leaf);
-            ctx.results.push_success_with_details(
-                CAWG_IDENTITY_WELL_FORMED,
-                url.into(),
-                "CAWG identity signature validated but no configured trust root accepted the credential"
-                    .into(),
-                json!({
-                    "trust_source": "none",
-                    "accepted_eku": accepted_eku,
-                    "certificate_policy": certificate_policy,
-                    "trusted_at": null,
-                    "timestamp_trusted": timestamp_trusted,
-                    "revocation_status": revocation_status.as_str(),
-                    "trust_failure": trust_failure,
-                    "payload_encoding": payload_encoding,
-                }),
-            );
-        }
-    }
+    ctx.results.push_success_with_details(
+        CAWG_IDENTITY_TRUSTED,
+        url.into(),
+        "CAWG identity signature and X.509 trust policy validated".into(),
+        json!({
+            "trust_source": trust.source,
+            "accepted_eku": trust.accepted_eku,
+            "certificate_policy": trust.certificate_policy,
+            "anchor_fingerprint": trust.anchor_fingerprint,
+            "trusted_at": at.to_string(),
+            "timestamp_trusted": timestamp_trusted,
+            "revocation_status": revocation_status.as_str(),
+            "payload_encoding": payload_encoding,
+        }),
+    );
 }
 
 fn reference_targets_identity(reference_url: &str, identity_url: &str) -> bool {
@@ -887,22 +979,10 @@ fn identity_reference_cycles<'a>(
         else {
             continue;
         };
-        if !map_keys_are_unique(assertion)
-            || assertion
-                .get("signature")
-                .and_then(Value::as_bytes)
-                .is_none_or(|signature| signature.is_empty())
-            || !valid_padding(assertion.get("pad1"), true)
-            || !valid_padding(assertion.get("pad2"), false)
-        {
-            continue;
-        }
-        let Some(references) = assertion
-            .get("signer_payload")
-            .and_then(valid_signer_payload)
-        else {
+        let Ok(shape) = identity_shape(assertion) else {
             continue;
         };
+        let references = shape.referenced;
         for reference in references {
             let Some(target) = reference
                 .get("url")
@@ -1529,7 +1609,7 @@ pub(super) fn is_cawg_label(label: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::c2pa_trust::{timestamp_fixture::TestTsa, validate_chain};
     use const_oid::ObjectIdentifier;
@@ -2445,9 +2525,17 @@ mod tests {
             (Value::Text("pad1".into()), Value::Bytes(Vec::new())),
         ])
     }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GraphIdentityMalformation {
+        DuplicateKey,
+        Signature,
+        Padding,
+        SignerPayload,
+    }
+
     fn reference_graph_members(
         edges: &[Vec<usize>],
-        malformed_identity: Option<usize>,
+        malformed_identity: Option<(usize, GraphIdentityMalformation)>,
     ) -> Vec<bool> {
         assert!(edges.len() <= MAX_IDENTITY_ASSERTIONS);
         let labels: Vec<String> = (0..edges.len())
@@ -2463,7 +2551,10 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, targets)| {
-                identity_assertion_map_with_sig_type(
+                let malformation = malformed_identity
+                    .filter(|(malformed, _)| *malformed == index)
+                    .map(|(_, malformation)| malformation);
+                let mut assertion = identity_assertion_map_with_sig_type(
                     targets
                         .iter()
                         .map(|target| {
@@ -2476,19 +2567,42 @@ mod tests {
                             )
                         })
                         .collect(),
-                    if malformed_identity == Some(index) {
+                    if malformation == Some(GraphIdentityMalformation::SignerPayload) {
                         ""
                     } else {
                         CAWG_X509_COSE
                     },
-                )
+                );
+                let Value::Map(fields) = &mut assertion else {
+                    unreachable!("identity fixture is a map");
+                };
+                match malformation {
+                    Some(GraphIdentityMalformation::DuplicateKey) => {
+                        fields.push((Value::Text("signature".into()), Value::Bytes(vec![2])))
+                    }
+                    Some(GraphIdentityMalformation::Signature) => {
+                        fields
+                            .iter_mut()
+                            .find(|(key, _)| key.as_text() == Some("signature"))
+                            .expect("signature field")
+                            .1 = Value::Bytes(Vec::new());
+                    }
+                    Some(GraphIdentityMalformation::Padding) => {
+                        fields
+                            .iter_mut()
+                            .find(|(key, _)| key.as_text() == Some("pad1"))
+                            .expect("pad1 field")
+                            .1 = Value::Bytes(vec![1]);
+                    }
+                    Some(GraphIdentityMalformation::SignerPayload) | None => {}
+                }
+                assertion
             })
             .collect();
         let assertion_bytes: Vec<Vec<u8>> = assertion_values
             .iter()
             .map(|assertion| {
-                encode(assertion, Profile::CanonicalForHashedSubstructures)
-                    .expect("encode graph identity")
+                encode(assertion, Profile::LegacyPipelineBDefinite).expect("encode graph identity")
             })
             .collect();
         let assertions = labels
@@ -2833,11 +2947,18 @@ mod tests {
             vec![false, false, false, false],
             "a shared-descendant diamond is a DAG"
         );
-        assert_eq!(
-            reference_graph_members(&[vec![1], vec![0]], Some(1)),
-            vec![false, false],
-            "malformed B cannot make valid A a cycle member"
-        );
+        for malformation in [
+            GraphIdentityMalformation::DuplicateKey,
+            GraphIdentityMalformation::Signature,
+            GraphIdentityMalformation::Padding,
+            GraphIdentityMalformation::SignerPayload,
+        ] {
+            assert_eq!(
+                reference_graph_members(&[vec![1], vec![0]], Some((1, malformation))),
+                vec![false, false],
+                "{malformation:?} B cannot make valid A a cycle member"
+            );
+        }
     }
 
     /// CAWG-ID13-ASSERTION-CREATION-017: the maximum permitted acyclic chain
@@ -4172,6 +4293,137 @@ mod tests {
         assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
     }
 
+    pub(crate) struct SdkOnlineManifestFixture {
+        pub(crate) asset: Vec<u8>,
+        pub(crate) store: Vec<u8>,
+        pub(crate) options: crate::VerifyOptions,
+        pub(crate) claim_leaf_sha256: String,
+        pub(crate) identity_leaf_sha256: String,
+    }
+
+    pub(crate) fn sdk_online_manifest_fixture() -> SdkOnlineManifestFixture {
+        const MANIFEST_LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-000000000462";
+        let asset = vec![
+            0xff, 0xd8, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x00, 0xff,
+            0xd9,
+        ];
+        let hard_label = "c2pa.hash.data";
+        let hard_payload = encode(
+            &Value::Map(vec![
+                (Value::Text("alg".into()), Value::Text("sha256".into())),
+                (
+                    Value::Text("hash".into()),
+                    Value::Bytes(sha2::Sha256::digest(&asset).to_vec()),
+                ),
+                (Value::Text("exclusions".into()), Value::Array(Vec::new())),
+            ]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("hard binding");
+        let actions_label = "c2pa.actions.v2";
+        let actions_payload = encode(
+            &Value::Map(vec![(
+                Value::Text("actions".into()),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        Value::Text("action".into()),
+                        Value::Text("c2pa.created".into()),
+                    ),
+                    (
+                        Value::Text("digitalSourceType".into()),
+                        Value::Text(
+                            "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                        ),
+                    ),
+                ])]),
+            )]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("actions");
+        let hard_box = crate::c2pa_core::jumbf::assertion_box(hard_label, &hard_payload, None);
+        let actions_box =
+            crate::c2pa_core::jumbf::assertion_box(actions_label, &actions_payload, None);
+        let assertion_reference = |label: &str, assertion_box: &[u8]| {
+            let content = crate::c2pa_core::jumbf::superbox_content(assertion_box)
+                .expect("assertion-box content");
+            Value::Map(vec![
+                (
+                    Value::Text("url".into()),
+                    Value::Text(format!(
+                        "self#jumbf=/c2pa/{MANIFEST_LABEL}/c2pa.assertions/{label}"
+                    )),
+                ),
+                (Value::Text("alg".into()), Value::Text("sha256".into())),
+                (
+                    Value::Text("hash".into()),
+                    Value::Bytes(sha2::Sha256::digest(content).to_vec()),
+                ),
+            ])
+        };
+        let hard_reference = assertion_reference(hard_label, &hard_box);
+        let identity = online_ocsp::sdk_online_identity(hard_reference.clone());
+        let identity_label = "cawg.identity";
+        let identity_box =
+            crate::c2pa_core::jumbf::assertion_box(identity_label, &identity.assertion, None);
+        let references = vec![
+            assertion_reference(identity_label, &identity_box),
+            hard_reference,
+            assertion_reference(actions_label, &actions_box),
+        ];
+        let claim = Value::Map(vec![
+            (
+                Value::Text("instanceID".into()),
+                Value::Text("xmp:iid:team-461-online-second-pass".into()),
+            ),
+            (
+                Value::Text("claim_generator_info".into()),
+                Value::Map(vec![(
+                    Value::Text("name".into()),
+                    Value::Text("Encypher TEAM_461 online fixture".into()),
+                )]),
+            ),
+            (Value::Text("alg".into()), Value::Text("sha256".into())),
+            (
+                Value::Text("created_assertions".into()),
+                Value::Array(references),
+            ),
+            (
+                Value::Text("signature".into()),
+                Value::Text(format!("self#jumbf=/c2pa/{MANIFEST_LABEL}/c2pa.signature")),
+            ),
+        ]);
+        let claim_cbor = encode(&claim, Profile::LegacyPipelineBDefinite).expect("claim");
+        let claim_signer = super::super::signature_conformance_tests::Signer::online();
+        let claim_leaf_sha256 = claim_signer.leaf_sha256();
+        let claim_signature = claim_signer.sign(&claim_cbor);
+        let manifest = crate::c2pa_core::jumbf::build_manifest(
+            MANIFEST_LABEL,
+            &[hard_box, actions_box, identity_box],
+            &claim_cbor,
+            &claim_signature,
+        );
+        let store = crate::c2pa_core::jumbf::build_manifest_store(&[manifest]);
+        let options = crate::VerifyOptions {
+            trust_pem: Some(claim_signer.root_pem()),
+            cawg_trust_pem: Some(identity.root_pem),
+            no_default_trust: true,
+            validation_time: Some("2027-06-01T00:00:00Z".into()),
+            telemetry: crate::TelemetryOptions {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            online: Some(false),
+            ..Default::default()
+        };
+        SdkOnlineManifestFixture {
+            asset,
+            store,
+            options,
+            claim_leaf_sha256,
+            identity_leaf_sha256: identity.leaf_sha256,
+        }
+    }
+
     /// CAWG-ID13-ASSERTION-CREATION-017: a fully signed manifest store binds
     /// both signed identities through their real assertion-box hashes. The
     /// public detached-store verifier accepts A -> B, while a changed B fails
@@ -4929,7 +5181,7 @@ mod tests {
     /// reports it with the `cawg.x509.*` codes, scoped to the assertion that
     /// carried the credential. Every response is minted in process: no test
     /// here opens a socket.
-    mod online_ocsp {
+    pub(crate) mod online_ocsp {
         use std::collections::HashMap;
 
         use sha2::Digest as _;
@@ -4971,6 +5223,10 @@ mod tests {
         }
 
         fn ocsp_chain() -> OcspChain {
+            ocsp_chain_with_leaf_eku(ExtendedKeyUsagePurpose::EmailProtection)
+        }
+
+        fn ocsp_chain_with_leaf_eku(leaf_eku: ExtendedKeyUsagePurpose) -> OcspChain {
             fn name(common_name: &str) -> DistinguishedName {
                 let mut name = DistinguishedName::new();
                 name.push(DnType::CountryName, "US");
@@ -5028,7 +5284,7 @@ mod tests {
                 KeyUsagePurpose::DigitalSignature,
                 KeyUsagePurpose::ContentCommitment,
             ];
-            leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+            leaf_params.extended_key_usages = vec![leaf_eku];
             leaf_params.use_authority_key_identifier_extension = true;
             add_policy(&mut leaf_params);
             leaf_params
@@ -5056,10 +5312,13 @@ mod tests {
 
         /// Sign a CAWG identity assertion with the chain's ES256 leaf.
         fn identity_assertion(chain: &OcspChain) -> Vec<u8> {
+            identity_assertion_for_payload(chain, identity_payload("cawg.publisher:primary", None))
+        }
+
+        fn identity_assertion_for_payload(chain: &OcspChain, payload: Value) -> Vec<u8> {
             use p256::ecdsa::signature::Signer as _;
             use p256::pkcs8::DecodePrivateKey as _;
 
-            let payload = identity_payload("cawg.publisher:primary", None);
             let canonical = encode(&payload, Profile::CanonicalForHashedSubstructures)
                 .expect("encode signer_payload");
             let protected = encode(
@@ -5113,6 +5372,26 @@ mod tests {
             .expect("encode identity assertion")
         }
 
+        pub(crate) struct SdkOnlineIdentity {
+            pub(crate) assertion: Vec<u8>,
+            pub(crate) root_pem: String,
+            pub(crate) leaf_sha256: String,
+        }
+
+        pub(crate) fn sdk_online_identity(hard_reference: Value) -> SdkOnlineIdentity {
+            let chain = ocsp_chain();
+            let leaf_sha256 = evidence_key(&chain.leaf_der);
+            let assertion = identity_assertion_for_payload(
+                &chain,
+                identity_payload_with_binding("cawg.publisher:primary", hard_reference, None),
+            );
+            SdkOnlineIdentity {
+                assertion,
+                root_pem: chain.root_pem,
+                leaf_sha256,
+            }
+        }
+
         fn identity_assertion_with_staples(
             chain: &OcspChain,
             tsa: &TestTsa,
@@ -5132,6 +5411,33 @@ mod tests {
                 )]),
             ));
             with_unprotected_headers(&base, headers)
+        }
+
+        fn alter_signed_role(assertion: &[u8]) -> Vec<u8> {
+            let mut assertion =
+                crate::c2pa_cbor::decode(assertion).expect("identity assertion decodes");
+            let Value::Map(assertion_fields) = &mut assertion else {
+                panic!("identity assertion is a map");
+            };
+            let payload_value = &mut assertion_fields
+                .iter_mut()
+                .find(|(key, _)| key.as_text() == Some("signer_payload"))
+                .expect("signer_payload")
+                .1;
+            let Value::Map(payload) = payload_value else {
+                panic!("signer_payload map");
+            };
+            let role_value = &mut payload
+                .iter_mut()
+                .find(|(key, _)| key.as_text() == Some("role"))
+                .expect("role")
+                .1;
+            let Value::Array(role) = role_value else {
+                panic!("role array");
+            };
+            role[0] = Value::Text("cawg.publisher:tampered".into());
+            encode(&assertion, Profile::CanonicalForHashedSubstructures)
+                .expect("encode altered identity assertion")
         }
 
         fn verdict_for_assertion(
@@ -5298,6 +5604,151 @@ mod tests {
                 failure_codes(&revoked_results),
                 [CAWG_IDENTITY_CREDENTIAL_REVOKED]
             );
+            assert!(
+                revoked_results.has_success(CAWG_X509_SIGNATURE_VALIDATED),
+                "{revoked_results:?}"
+            );
+            let revoked_status = revoked_results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_IDENTITY_CREDENTIAL_REVOKED)
+                .expect("trusted revoked status");
+            assert_eq!(
+                revoked_status
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("chain_trusted"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            let details = revoked_status.details.as_ref().expect("revocation details");
+            assert_eq!(details["trust_source"], "caller_supplied");
+            assert!(details["anchor_fingerprint"].as_str().is_some());
+            assert!(revoked_results.network_needs.is_empty());
+        }
+
+        /// CAWG Identity 1.3 x509/validating.adoc validates the signature
+        /// before revocation. A revoked staple cannot assign status to a
+        /// signer_payload that the credential did not sign.
+        #[test]
+        fn signature_mismatch_suppresses_stapled_leaf_revocation() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let signed =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
+            let altered = alter_signed_role(&signed);
+
+            reset_identity_work_counts();
+            let results = verdict_for_assertion(
+                &chain,
+                &altered,
+                Some(&tsa.trust_list()),
+                OnlineEvidence::default(),
+            );
+
+            assert_eq!(failure_codes(&results), [CAWG_X509_SIGNATURE_MISMATCH]);
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
+        }
+
+        /// CAWG Identity 1.3 trust-model/scenarios.adoc applies revoked actor
+        /// status only where a trust relationship exists. A self-issued chain
+        /// outside every configured root remains well formed, even if it
+        /// staples a revoked response for its own leaf.
+        #[test]
+        fn untrusted_chain_cannot_assign_stapled_leaf_revocation() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
+
+            reset_identity_work_counts();
+            let results = identity_verdict_full(
+                &assertion,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                None,
+                None,
+                true,
+                Some(&tsa.trust_list()),
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                None,
+                OnlineEvidence::default(),
+            );
+
+            assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            assert!(results.has_success(CAWG_IDENTITY_WELL_FORMED));
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            assert!(!results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
+            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
+        }
+
+        #[test]
+        fn anchorless_document_signing_revocation_names_its_trust_source() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain_with_leaf_eku(ExtendedKeyUsagePurpose::Other(
+                OID_KP_DOCUMENT_SIGNING
+                    .split('.')
+                    .map(|part| part.parse::<u64>().expect("OID component"))
+                    .collect(),
+            ));
+            let revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
+            let results = identity_verdict_full(
+                &assertion,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                None,
+                None,
+                false,
+                Some(&tsa.trust_list()),
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                None,
+                OnlineEvidence::default(),
+            );
+
+            assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            let revoked = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_IDENTITY_CREDENTIAL_REVOKED)
+                .expect("document-signing leaf is revoked");
+            let details = revoked.details.as_ref().expect("revocation details");
+            assert_eq!(details["chain_trusted"], true);
+            assert_eq!(details["trust_source"], "document_signing");
+            assert!(details["anchor_fingerprint"].is_null());
         }
 
         /// Embedded CA revocation keeps the established trust-path behavior:
@@ -5725,11 +6176,19 @@ mod tests {
         }
 
         /// CA-chain handling predates the CAWG leaf's open freshness window.
-        /// At `thisUpdate` with no `nextUpdate`, the established inclusive
-        /// 24-hour policy still accepts a verified CA revocation.
+        /// At a trusted signing time equal to `thisUpdate`, the established
+        /// inclusive 24-hour policy can establish that a later CA revocation
+        /// did not apply at signing. The CAWG leaf policy would reject this
+        /// boundary and incorrectly treat the CA as revoked.
         #[test]
         fn a_ca_response_keeps_the_established_claim_window_policy() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
             let chain = ocsp_chain();
+            let assertion =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, Vec::new());
             let ca_response = response(
                 &chain.root_der,
                 &chain.issuing_der,
@@ -5739,19 +6198,57 @@ mod tests {
                     embed_certificate: false,
                 },
                 ResponseSpec {
-                    status: FixtureStatus::RevokedAt(REVOKED_AT),
-                    produced_at: b"20270601000000Z",
+                    status: FixtureStatus::RevokedAt(b"20270701000000Z"),
+                    produced_at: b"20270601120000Z",
                     this_update: b"20270601000000Z",
                     next_update: None,
                 },
             );
-            let results = verdict_with_responses(
+            let responses = HashMap::from([(evidence_key(&chain.issuing_der), ca_response)]);
+            let results = verdict_for_assertion(
                 &chain,
-                HashMap::from([(evidence_key(&chain.issuing_der), ca_response)]),
+                &assertion,
+                Some(&tsa.trust_list()),
+                OnlineEvidence {
+                    ocsp_responses: Some(&responses),
+                    ..OnlineEvidence::default()
+                },
             );
 
-            assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
+            assert!(results.has_success(CAWG_IDENTITY_TRUSTED), "{results:?}");
+            assert!(!results.has_failure(CAWG_X509_CREDENTIAL_UNTRUSTED));
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+        }
+
+        /// With no attested historical instant, equality at `thisUpdate` is
+        /// outside CAWG's open window but remains refreshable because current
+        /// time will advance.
+        #[test]
+        fn an_untimestamped_leaf_boundary_retains_the_ocsp_need() {
+            let chain = ocsp_chain();
+            let response = response(
+                &chain.issuing_der,
+                &chain.leaf_der,
+                &Responder {
+                    certificate_der: &chain.issuing_der,
+                    key: &chain.issuing_key,
+                    embed_certificate: false,
+                },
+                ResponseSpec {
+                    status: FixtureStatus::Good,
+                    produced_at: b"20270601000000Z",
+                    this_update: b"20270601000000Z",
+                    next_update: Some(b"20270701000000Z"),
+                },
+            );
+            let results = verdict_with_responses(
+                &chain,
+                HashMap::from([(evidence_key(&chain.leaf_der), response)]),
+            );
+
+            assert!(results.has_informational(CAWG_X509_OCSP_OUTSIDE_WINDOW));
+            assert!(!results.has_informational(CAWG_X509_OCSP_INACCESSIBLE));
+            assert_eq!(results.network_needs.len(), 1, "{results:?}");
         }
 
         #[test]

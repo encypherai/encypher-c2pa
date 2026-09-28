@@ -75,7 +75,6 @@
         "required_codes": [
           "cawg.x509.signature.validated",
           "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
           "com.encypher.cawg.legacyProfile",
           "com.encypher.cawg.trainingMining.effectiveUse"
         ]
@@ -88,7 +87,6 @@
         "required_codes": [
           "cawg.x509.signature.validated",
           "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
           "com.encypher.cawg.legacyProfile",
           "com.encypher.cawg.trainingMining.effectiveUse"
         ]
@@ -107,7 +105,6 @@
       "strict_expected": {
         "required_codes": [
           "cawg.x509.signature.mismatch",
-          "cawg.x509.ocsp.skipped",
           "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
@@ -1221,7 +1218,6 @@
         "required_codes": [
           "cawg.x509.signature.validated",
           "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
           "com.encypher.cawg.legacyProfile"
         ]
       },
@@ -1233,7 +1229,6 @@
         "required_codes": [
           "cawg.x509.signature.validated",
           "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
           "com.encypher.cawg.legacyProfile"
         ]
       },

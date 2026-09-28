@@ -38,6 +38,7 @@ fn enc(value: &Value) -> Vec<u8> {
 /// A claim-signing credential: a self-signed CA plus the leaf it issues.
 pub struct Signer {
     root_der: Vec<u8>,
+    root_pem: String,
     root_key: KeyPair,
     leaf_der: Vec<u8>,
     leaf_key: KeyPair,
@@ -147,6 +148,7 @@ impl Signer {
 
         Self {
             root_der: root.der().as_ref().to_vec(),
+            root_pem: root.pem(),
             root_key,
             leaf_der,
             leaf_key,
@@ -155,6 +157,19 @@ impl Signer {
 
     pub fn conformant() -> Self {
         Self::new(LeafShape::Conformant, NOT_BEFORE, NOT_AFTER)
+    }
+
+    pub(crate) fn online() -> Self {
+        Self::new(LeafShape::OcspResponder, NOT_BEFORE, NOT_AFTER)
+    }
+
+    pub(crate) fn leaf_sha256(&self) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(&self.leaf_der))
+    }
+
+    pub(crate) fn root_pem(&self) -> String {
+        self.root_pem.clone()
     }
 
     fn trust_list(&self) -> TrustList {
