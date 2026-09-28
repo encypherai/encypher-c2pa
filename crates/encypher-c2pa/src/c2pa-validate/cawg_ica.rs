@@ -1578,7 +1578,7 @@ mod tests {
             });
             let lists = HashMap::from([(
                 "https://status.example/list".into(),
-                base64_encode(&[0b0000_1000], false),
+                base64_encode(&[0b0001_0000], false),
             )]);
             let results = run(
                 &eddsa_cose(&key, &credential),
@@ -1732,7 +1732,7 @@ mod tests {
             Revocation::Unsupported
         ));
         assert!(matches!(
-            check_revocation(Some(&size_two), Some(&lists)),
+            check_revocation(Some(&size_two), true, Some(&lists)),
             Revocation::Unsupported
         ));
 
