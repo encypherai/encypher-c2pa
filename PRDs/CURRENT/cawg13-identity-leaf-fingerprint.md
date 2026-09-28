@@ -1,7 +1,7 @@
 # CAWG Identity Leaf Fingerprint
 
 **Date:** 2026-09-28
-**Status:** PLAN GATE PENDING - CYCLE 1 FINDINGS APPLIED
+**Status:** PLAN GATE CLEARED - CYCLE 2 (`0c52b73`; astra6 9.5/10/10, opus55 9.5/9.5/9.5)
 **Owner:** PublicLeafFingerprint
 **Base:** `feat/cawg13-x509-conformance` at `3596a547f`
 **Dependency:** TEAM_466 / PR #30 (`feat/cawg-identity-subject-details` at `d5dd24e`)
@@ -27,16 +27,16 @@ For every `cawg.identity.credential_revoked` status whose `details.chain_trusted
 
 A `cawg.identity.credential_revoked` status with `chain_trusted: false`, including anchorless document-signing acceptance, gets the fingerprint but no subject fields and no `certificate_trusted`. Every CA-revoked `cawg.x509.credential.untrusted` status gets only the fingerprint when the leaf parsed, regardless of whether its `chain_trusted` detail is true. Configured-untrusted terminals likewise get the fingerprint only. `cawg.x509.algorithm.unsupported`, `cawg.x509.signature.mismatch`, `cawg.x509.signature.outside_validity`, and every other status outside the four-code list get no fingerprint even if leaf extraction occurred.
 
-The fingerprint is descriptive evidence, not a trust verdict or standalone proof that the certificate bytes were COSE-protected. The existing selector can accept an unprotected-bucket certificate; a same-key certificate substitution can therefore change this identifier without changing signature verification. Consumers must correlate the exact assertion label and terminal verdict and must not infer trust from the digest alone. Tightening X.509 selection to a protected bucket is outside this additive reporting change.
+The fingerprint is descriptive evidence, not a trust verdict or standalone proof that the certificate bytes were COSE-protected. The existing selector can accept an unprotected-bucket certificate; a same-key certificate substitution can therefore change this identifier without changing signature verification. An untrusted terminal can also be emitted before signature validation, so its digest does not attribute the assertion to the certificate holder. Consumers must correlate the exact assertion label and `cawg.x509.signature.validated` before using the digest for actor attribution or a known-actor key. Protected-only `x5chain` selection or protected `x5t` binding is tracked in public issue #5 and is outside this additive reporting change.
 
 The change adds JSON fields only. It adds no Rust public item and does not change header selection, terminal selection, trust, signature, revocation, endpoint, or network behavior.
 
 ## Implementation
 
 1. Immediately after existing leaf selection, perform one explicit `x509_cert::Certificate::from_der(leaf)` decode. Retain that result for both fingerprint eligibility and TEAM_466 subject extraction, removing the helper's later decode. Compute the SHA-256 once over the original selected DER only when the decode succeeds.
-2. Keep one small digest insertion step for digest-only terminals. Keep the terminal-details helper for subject plus `certificate_trusted`; extend it to reuse the retained parsed certificate and digest, and update its comment to name trusted, well-formed, and chain-trusted revoked callers.
-3. Pass the optional digest into `report_identity_ca_revoked` so all four call sites attach the digest when eligible but never attach subject fields or `certificate_trusted`.
-4. Update `docs/REPORT_SCHEMA.md` with selector provenance, status presence, the unprotected-bucket limitation, and the revoked chain-trust meaning. Update `CHANGELOG.md` under Unreleased.
+2. Put the `credential_sha256` key name and value insertion in one private helper used by all four terminal-status kinds. Keep the terminal-details helper for subject plus `certificate_trusted`; extend it to reuse the retained parsed certificate, delegate digest insertion to that single helper, and update its comment to name trusted, well-formed, and chain-trusted revoked callers.
+3. Pass the optional digest into `report_identity_ca_revoked` so all five call sites attach the digest when eligible but never attach subject fields or `certificate_trusted`.
+4. Update `docs/REPORT_SCHEMA.md` with selector provenance, status presence, the unprotected-bucket limitation, the revoked chain-trust meaning, and the fact that untrusted digests may precede signature validation and require a correlated `cawg.x509.signature.validated` for attribution. Update `CHANGELOG.md` under Unreleased.
 5. Extend the packed npm smoke in `scripts/test-wasm.mjs` so the installed `@encypherai/c2pa` artifact proves the fields survive the WASM binding.
 
 ## Tests and Proof
@@ -50,7 +50,7 @@ TDD coverage in the CAWG validator and COSE modules will assert:
 - trusted and well-formed retain their TEAM_466 subject fields and respective `certificate_trusted` values;
 - stapled and online chain-trusted leaf revocation carry sanitized O/CN and `certificate_trusted: true`;
 - chain-untrusted and anchorless revoked terminals carry no subject fields or `certificate_trusted`;
-- each of the four `report_identity_ca_revoked` sites carries the digest only, including a `chain_trusted: true` case, with no subject fields or `certificate_trusted`;
+- each of the five `report_identity_ca_revoked` sites carries the digest only, including all three `chain_trusted: true` sites and both `chain_trusted: false` sites, with no subject fields or `certificate_trusted`;
 - ICA terminals and excluded X.509 failures carry none of the new fields, with `cawg.x509.signature.mismatch` as the parsed-leaf exclusion regression;
 - the existing sanitizer tests continue to prove first-match behavior and the 256-byte omission bound for names also used by revoked terminals.
 
