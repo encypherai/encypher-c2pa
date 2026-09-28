@@ -562,11 +562,74 @@ fn verify_identity_assertion(
         return;
     }
 
-    // CAWG Identity 1.3 x509/validating.adoc, "Validate the signature",
-    // requires signature validation before the later "Validate the credential
-    // revocation information" procedure. A revoked response is evidence about
-    // this named actor only after the COSE signature binds the signer_payload
-    // to the leaf certificate.
+
+    let attested = identity_timestamp(
+        signature,
+        &ctx.manifest.label,
+        ctx.timestamp_index,
+        ctx.tsa_trust,
+        ctx.claim_timestamp,
+        ctx.validation_time,
+        ctx.results,
+        url,
+    );
+    let at = attested.unwrap_or(ctx.validation_time);
+    let timestamp_trusted = attested.is_some();
+
+    // CAWG Identity 1.3 x509/validating.adoc establishes the credential trust
+    // outcome before signature validation, then evaluates revocation only for
+    // an assertion that survived both stages.
+    let trust = match identity_trust_outcome(
+        leaf,
+        &chain,
+        at,
+        ctx.validation_time,
+        ctx.cawg_trust,
+        ctx.cawg_allowed_certs,
+        ctx.document_signing_require_anchor,
+        timestamp_trusted,
+    ) {
+        IdentityTrust::Untrusted(reason) => {
+            let revocation_status = identity_embedded_revocation_status(
+                signature,
+                certificate_status_assertions,
+                &chain,
+                timestamp_trusted.then_some(at),
+                ctx.ocsp_verification_time,
+                ctx.cawg_trust,
+            );
+            let reason = if matches!(
+                revocation_status,
+                IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
+            ) {
+                "ca_revoked"
+            } else {
+                reason
+            };
+            ctx.results.push_failure_with_details(
+                CAWG_X509_CREDENTIAL_UNTRUSTED,
+                url.into(),
+                "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
+                    .into(),
+                json!({
+                    "reason": reason,
+                    "chain_trusted": false,
+                    "revocation_status": revocation_status.as_str(),
+                }),
+            );
+            return;
+        }
+        IdentityTrust::Trusted(evidence) => {
+            ctx.results.push_success(
+                CAWG_X509_CREDENTIAL_TRUSTED,
+                url.into(),
+                "the identity signing certificate satisfies the CAWG X.509 trust model".into(),
+            );
+            Ok(evidence)
+        }
+        IdentityTrust::NoRootOfTrust(trust_failure) => Err(trust_failure),
+    };
+
     if verified.is_err() {
         ctx.results.push_failure(
             CAWG_X509_SIGNATURE_MISMATCH,
@@ -589,66 +652,44 @@ fn verify_identity_assertion(
         );
     }
 
-    let attested = identity_timestamp(
-        signature,
-        &ctx.manifest.label,
-        ctx.timestamp_index,
-        ctx.tsa_trust,
-        ctx.claim_timestamp,
-        ctx.validation_time,
-        ctx.results,
-        url,
-    );
-    let at = attested.unwrap_or(ctx.validation_time);
-    let timestamp_trusted = attested.is_some();
-
-    // CAWG Identity 1.3 x509/validating.adoc establishes the trust
-    // relationship before its revocation procedure. Never let evidence signed
-    // by an untrusted chain assign a revoked status to a named actor.
-    let trust = match identity_trust_outcome(
-        leaf,
-        &chain,
-        at,
-        ctx.validation_time,
-        ctx.cawg_trust,
-        ctx.cawg_allowed_certs,
-        ctx.document_signing_require_anchor,
-        timestamp_trusted,
-        IdentityRevocationStatus::NotChecked,
-    ) {
-        IdentityTrust::Untrusted(reason) => {
-            ctx.results.push_failure_with_details(
-                CAWG_X509_CREDENTIAL_UNTRUSTED,
-                url.into(),
-                "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
-                    .into(),
-                json!({"reason": reason}),
+    let trust = match trust {
+        Ok(evidence) => evidence,
+        Err(trust_failure) => {
+            if !report_identity_signing_validity(
+                signature,
+                &chain,
+                at,
+                attested,
+                ctx.results,
+                url,
+            ) {
+                return;
+            }
+            let revocation_status = identity_embedded_revocation_status(
+                signature,
+                certificate_status_assertions,
+                &chain,
+                timestamp_trusted.then_some(at),
+                ctx.ocsp_verification_time,
+                ctx.cawg_trust,
             );
-            return;
-        }
-        IdentityTrust::Trusted(evidence) => evidence,
-        IdentityTrust::NoRootOfTrust(trust_failure) => {
-            if !chain
-                .iter()
-                .all(|certificate| certificate_valid_at(certificate, at))
-            {
-                ctx.results.push_failure(
-                    CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY,
+            if matches!(
+                revocation_status,
+                IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
+            ) {
+                ctx.results.push_failure_with_details(
+                    CAWG_X509_CREDENTIAL_UNTRUSTED,
                     url.into(),
-                    "the time of signing falls outside the validity window of the identity certificate chain"
+                    "stapled OCSP evidence reports a CA certificate in the identity chain revoked"
                         .into(),
+                    json!({
+                        "reason": "ca_revoked",
+                        "chain_trusted": false,
+                        "revocation_status": revocation_status.as_str(),
+                    }),
                 );
                 return;
             }
-            if !timestamp_trusted {
-                ctx.results.push_success(
-                    CAWG_X509_SIGNATURE_INSIDE_VALIDITY,
-                    url.into(),
-                    "no trusted time stamp was available, and the current time falls inside the identity certificate chain's validity window"
-                        .into(),
-                );
-            }
-            report_time_of_signing(signature, &chain, attested, ctx.results, url);
             let (accepted_eku, certificate_policy) = identity_trust_rejection(leaf);
             ctx.results.push_success_with_details(
                 CAWG_IDENTITY_WELL_FORMED,
@@ -661,7 +702,8 @@ fn verify_identity_assertion(
                     "certificate_policy": certificate_policy,
                     "trusted_at": null,
                     "timestamp_trusted": timestamp_trusted,
-                    "revocation_status": IdentityRevocationStatus::NotChecked.as_str(),
+                    "chain_trusted": false,
+                    "revocation_status": revocation_status.as_str(),
                     "trust_failure": trust_failure,
                     "payload_encoding": payload_encoding,
                 }),
@@ -670,22 +712,21 @@ fn verify_identity_assertion(
         }
     };
 
-    #[cfg(test)]
-    record_identity_work(|counts| counts.ocsp_evaluations += 1);
+    if !report_identity_signing_validity(signature, &chain, at, attested, ctx.results, url) {
+        return;
+    }
 
     // CAWG identity revocation stays fail-closed in both postures: the
     // conformance reading of VAL-STRU-0027 is a C2PA claim-signer rule, and
     // CAWG registers no code for an outranked revoked response.
-    let revocation_status = evaluate_embedded_ocsp(
+    let revocation_status = identity_embedded_revocation_status(
         signature,
         certificate_status_assertions,
         &chain,
         timestamp_trusted.then_some(at),
         ctx.ocsp_verification_time,
         ctx.cawg_trust,
-        false,
-    )
-    .status;
+    );
     let embedded_leaf_revoked = matches!(
         revocation_status,
         IdentityRevocationStatus::LeafRevoked | IdentityRevocationStatus::LeafAndCaRevoked
@@ -693,23 +734,6 @@ fn verify_identity_assertion(
     // CAWG 1.3 "Determining revocation from online OCSP response" is the same
     // procedure the C2PA claim signer follows, with CAWG's own status codes.
     let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
-    let online = super::evaluate_online_ocsp(
-        &targets,
-        ctx.evidence,
-        timestamp_trusted.then_some(at),
-        ctx.ocsp_verification_time,
-        crate::c2pa_trust::OnlineOcspPolicy::CawgIdentity,
-    );
-
-    if online.ca_revoked {
-        ctx.results.push_failure(
-            CAWG_X509_CREDENTIAL_UNTRUSTED,
-            url.into(),
-            "online OCSP response reports a CA certificate in the identity chain revoked".into(),
-        );
-        return;
-    }
-
     if matches!(
         revocation_status,
         IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
@@ -722,22 +746,46 @@ fn verify_identity_assertion(
         );
         return;
     }
-    ctx.results.push_success(
-        CAWG_X509_CREDENTIAL_TRUSTED,
-        url.into(),
-        "the identity signing certificate satisfies the CAWG X.509 trust model".into(),
-    );
     if embedded_leaf_revoked {
+        if super::any_online_ca_revoked(
+            &targets,
+            ctx.evidence,
+            timestamp_trusted.then_some(at),
+            ctx.ocsp_verification_time,
+        ) {
+            ctx.results.push_failure(
+                CAWG_X509_CREDENTIAL_UNTRUSTED,
+                url.into(),
+                "online OCSP response reports a CA certificate in the identity chain revoked"
+                    .into(),
+            );
+            return;
+        }
         ctx.results.push_failure_with_details(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
             url.into(),
             "verified stapled OCSP evidence reports the identity signing certificate revoked"
                 .into(),
             json!({
-                "chain_trusted": true,
+                "chain_trusted": trust.anchor_fingerprint.is_some(),
                 "trust_source": trust.source,
                 "anchor_fingerprint": trust.anchor_fingerprint,
             }),
+        );
+        return;
+    }
+    let online = super::evaluate_online_ocsp(
+        &targets,
+        ctx.evidence,
+        timestamp_trusted.then_some(at),
+        ctx.ocsp_verification_time,
+        crate::c2pa_trust::OnlineOcspPolicy::CawgIdentity,
+    );
+    if online.ca_revoked {
+        ctx.results.push_failure(
+            CAWG_X509_CREDENTIAL_UNTRUSTED,
+            url.into(),
+            "online OCSP response reports a CA certificate in the identity chain revoked".into(),
         );
         return;
     }
@@ -823,7 +871,7 @@ fn verify_identity_assertion(
             url.into(),
             "verified OCSP evidence reports the identity signing certificate revoked".into(),
             json!({
-                "chain_trusted": true,
+                "chain_trusted": trust.anchor_fingerprint.is_some(),
                 "trust_source": trust.source,
                 "anchor_fingerprint": trust.anchor_fingerprint,
             }),
@@ -831,27 +879,6 @@ fn verify_identity_assertion(
         return;
     }
 
-    if !chain
-        .iter()
-        .all(|certificate| certificate_valid_at(certificate, at))
-    {
-        ctx.results.push_failure(
-            CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY,
-            url.into(),
-            "the time of signing falls outside the validity window of the identity certificate chain"
-                .into(),
-        );
-        return;
-    }
-    if !timestamp_trusted {
-        ctx.results.push_success(
-            CAWG_X509_SIGNATURE_INSIDE_VALIDITY,
-            url.into(),
-            "no trusted time stamp was available, and the current time falls inside the identity certificate chain's validity window"
-                .into(),
-        );
-    }
-    report_time_of_signing(signature, &chain, attested, ctx.results, url);
 
     ctx.results.push_success_with_details(
         CAWG_IDENTITY_TRUSTED,
@@ -1329,6 +1356,58 @@ fn report_time_of_signing(
     }
 }
 
+fn identity_embedded_revocation_status(
+    signature: &[u8],
+    certificate_status_assertions: &[&[u8]],
+    chain: &[Vec<u8>],
+    signed_at: Option<OffsetDateTime>,
+    verification_time: OffsetDateTime,
+    trust: Option<&TrustList>,
+) -> IdentityRevocationStatus {
+    evaluate_embedded_ocsp(
+        signature,
+        certificate_status_assertions,
+        chain,
+        signed_at,
+        verification_time,
+        trust,
+        false,
+    )
+    .status
+}
+
+fn report_identity_signing_validity(
+    signature: &[u8],
+    chain: &[Vec<u8>],
+    at: OffsetDateTime,
+    attested: Option<OffsetDateTime>,
+    results: &mut ValidationResults,
+    url: &str,
+) -> bool {
+    if !chain
+        .iter()
+        .all(|certificate| certificate_valid_at(certificate, at))
+    {
+        results.push_failure(
+            CAWG_X509_SIGNATURE_OUTSIDE_VALIDITY,
+            url.into(),
+            "the time of signing falls outside the validity window of the identity certificate chain"
+                .into(),
+        );
+        return false;
+    }
+    if attested.is_none() {
+        results.push_success(
+            CAWG_X509_SIGNATURE_INSIDE_VALIDITY,
+            url.into(),
+            "no trusted time stamp was available, and the current time falls inside the identity certificate chain's validity window"
+                .into(),
+        );
+    }
+    report_time_of_signing(signature, chain, attested, results, url);
+    true
+}
+
 /// How the CAWG X.509 trust model resolved for one identity credential.
 enum IdentityTrust {
     Trusted(IdentityTrustEvidence),
@@ -1355,7 +1434,6 @@ fn identity_trust_outcome(
     allowed: Option<&TrustList>,
     document_signing_require_anchor: bool,
     timestamp_trusted: bool,
-    revocation_status: IdentityRevocationStatus,
 ) -> IdentityTrust {
     // A C2PA leaf-credential profile violation has no 1.3 status code of its
     // own. The 1.3 trust model requires the generator to sign with a compliant
@@ -1365,12 +1443,6 @@ fn identity_trust_outcome(
     // extension code.
     if !leaf_profile_acceptable_der(leaf) {
         return IdentityTrust::Untrusted("leaf_profile_unacceptable");
-    }
-    // 1.3: a revoked CA certificate in the chain is an untrusted credential,
-    // not a revoked named actor. A revoked leaf has already been rejected with
-    // `cawg.identity.credential_revoked`.
-    if matches!(revocation_status, IdentityRevocationStatus::CaRevoked) {
-        return IdentityTrust::Untrusted("ca_revoked");
     }
     match identity_certificate_trust(
         leaf,
@@ -5656,7 +5728,38 @@ pub(crate) mod tests {
             );
 
             assert_eq!(failure_codes(&results), [CAWG_X509_SIGNATURE_MISMATCH]);
+            assert!(results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
+        }
+
+        #[test]
+        fn configured_untrusted_credential_precedes_signature_mismatch() {
+            let chain = ocsp_chain();
+            let wrong_anchor = ocsp_chain();
+            let wrong_trust =
+                encypher_root_trust(&wrong_anchor.root_pem, CawgTrustSource::CallerSupplied);
+            let altered = alter_signed_role(&identity_assertion(&chain));
+
+            reset_identity_work_counts();
+            let results = identity_verdict_full(
+                &altered,
+                &binding_claim_refs(0x22),
+                false,
+                "c2pa.hash.data",
+                Some(&wrong_trust),
+                None,
+                true,
+                None,
+                &TimestampAssertionIndex::default(),
+                AFTER_INTERIM_CUTOFF,
+                None,
+                OnlineEvidence::default(),
+            );
+
+            assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
+            assert!(!results.has_failure(CAWG_X509_SIGNATURE_MISMATCH));
             assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
             assert_eq!(identity_work_counts().ocsp_evaluations, 0);
         }
