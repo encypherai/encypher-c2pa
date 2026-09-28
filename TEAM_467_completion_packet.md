@@ -1,6 +1,6 @@
 # TEAM_467 completion packet: CAWG ICA W3C VC data model (TECH-A-004)
 
-**Frozen implementation SHA:** `d9cf7a3467d322e387dd50c119446fa65a8f367a` on `feat/cawg13-vc-data-model` (public after push), stacked on `feat/cawg13-ica-conformance` (`34619e9`, PR #28)
+**Frozen implementation SHA:** `0489436ce56c0ec8fcb7774f3f70e21830a89f8e` on `feat/cawg13-vc-data-model` (public after push), stacked on `feat/cawg13-ica-conformance` (`34619e9`, PR #28)
 **PR:** https://github.com/encypherai/encypher-c2pa/pull/31 (base `feat/cawg13-ica-conformance`; not merged)
 **PRD:** `PRDs/CURRENT/cawg13-vc-data-model.md` (plan gate cleared at cycle 5, `788b7051d`; cycle 5 lows folded in at `c3ca873`)
 
@@ -13,6 +13,7 @@
 | `5b01101` | New `c2pa-validate/vc_data_model.rs`; `cawg_ica.rs` parser and validity rewrite; tests; CHANGELOG; REPORT_SCHEMA |
 | `9fd93fb` | NOTICE mirrored into the crate and binding directories (the CI `cmp NOTICE` gate) |
 | `d9cf7a3` | Completion cycle 1: pre-decode digest bounds; exact CAWG alias exemptions; pinned Bitstring Status List v1 context and status compatibility; allocation and pre-authentication list-work reductions; signed regressions; PRD, CHANGELOG, and NOTICE updates |
+| `0489436` | Completion cycle 2: cached pinned-context digests; 16-distinct-digest aggregate bound; repeated-digest rejection; 68-byte base58 decoded-output bound; consolidated decode guards; signed and unit regressions; REPORT_SCHEMA, PRD, CHANGELOG, and PR-body corrections |
 
 Behavior, per PRD row:
 
@@ -31,12 +32,13 @@ Behavior, per PRD row:
 
 | Gate | Result |
 |---|---|
-| `cargo fmt --all` | applied before commit `d9cf7a3` |
+| `cargo fmt --all` | applied before commit `0489436` |
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, no warnings |
-| `cargo test --workspace` | 914 tests passed across 22 suites; no failures |
+| `cargo test --workspace` | 916 tests passed across 22 suites; no failures |
+| `cargo test -p encypher-c2pa-cli --test cawg_corpus` | 12 passed; no failures |
 | `cargo build -p encypher-c2pa --no-default-features` (host) | ok |
 | `cargo build -p encypher-c2pa --no-default-features --target wasm32-unknown-unknown` | ok |
-| WASM package (`wasm-pack build --target web --release`, `bindings/wasm`) | pre-feature 3,078,171 B raw / 1,202,257 B gzip -9; cycle-1 frozen build 3,311,997 B / 1,293,494 B (+233,826 raw, +91,237 gzip, +7.6%). The cycle-1 fixes reduce the first completion build by 14,730 raw / 9,106 gzip bytes despite adding status/v1. |
+| WASM package (`wasm-pack build --target web --release`, `bindings/wasm`) | pre-feature 3,078,171 B raw / 1,202,257 B gzip -9; cycle-2 frozen build 3,329,886 B / 1,303,000 B (+251,715 raw, +100,743 gzip, +8.4%). |
 | Private Adobe smoke (`adobe-cai-prod-ica-es-266-1236.jpg`, `--time 2026-08-05T00:00:00Z`, pinned Adobe DID doc) | JSON report byte-identical to the base-code report (`cmp` equal). CAWG codes before and after are the same pre-existing trio: `invalid_did_document`, `signer_payload.mismatch`, and `untrusted_issuer` |
 | Mutation check (`/tmp/vc467/mutate.sh`) | 7 of 7 mutations caught: no body walk, no unsupported-context rule, no provider exception, no V-22, no leap rule, untrimmed validation fraction, zoneless read as UTC |
 | Real-credential inventory (`/tmp/vc467/ica_inventory.json`, script `/tmp/vc467/extract_ica_inventory.py`) | 24 credentials: 0 unpinned/inline contexts, 0 keyword or IRI keys, 1 repeated description (the Adobe provider pair, admitted by the exception) |
@@ -59,6 +61,15 @@ The Astra and Opus completion reviews held correctness and security below 9.5. T
 3. `https://www.w3.org/ns/credentials/status/v1` is vendored byte for byte at SHA-256 `fda5add353231e6a6884a46b12e6c75464281900cb348284d9c360f62381d9f7`. Its terms join the active protected-term set only when listed. Signed revoked and not-revoked checks pass for VC 1.1 `[v1, status/v1, CAWG]` and VC 2.0 with status/v1 listed redundantly. VC 1.1 without status/v1 reports `revocation.unsupported`.
 4. Digest string iteration no longer allocates a `Vec`. Related-resource duplicate ids use a `HashSet`. Context duplicate checking is linear, and an unknown context stops at the first entry, bounding report growth.
 5. Every table-driven invalid-VC case asserts an explanation fragment. The duplicated type-membership helper was removed, and the validity closure now formats normally.
+
+## Completion cycle-2 delta
+
+The second Opus review measured linear pre-authentication amplification from repeatedly hashing public pinned-context bytes. The second Astra review confirmed that blocker and found two stale context-report descriptions. This delta resolves all three findings:
+
+1. A `LazyLock` computes SHA-256, SHA-384, and SHA-512 once for each of the four vendored context documents. Every pinned `relatedResource` comparison uses that fixed cache.
+2. Each resource may carry at most 16 distinct digest strings. A repeated digest fails on its second appearance. The signed regression supplies 4,096 repeated correct pinned-context digests and asserts the fixed repeated-digest reason; a separate signed case asserts the 17th distinct expression fails at the aggregate bound.
+3. The base58 decoder stops if decoded output would exceed 68 bytes, the largest supported SHA-512 multihash. The 140-character checks live only at the multibase decoder and SRI base64-body boundary, and their rejection text is derived from the constant.
+4. `REPORT_SCHEMA.md`, the PRD, CHANGELOG, and PR #31 body now name all four pinned contexts, first-offender context reporting, the VC 1.1 status/v1 requirement, the unsupported StatusList2021 context for both VC versions, and the digest work bounds.
 
 ## Risks
 
