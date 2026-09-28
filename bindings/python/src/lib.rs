@@ -11,6 +11,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 #[pyfunction]
+fn validate_options(options_json: String) -> PyResult<()> {
+    let options: VerifyOptions = serde_json::from_str(&options_json)
+        .map_err(|error| PyValueError::new_err(format!("invalid_options: {error}")))?;
+    options
+        .validate()
+        .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
+}
+
+#[pyfunction]
 fn verify_bytes(
     py: Python<'_>,
     asset: Vec<u8>,
@@ -123,6 +132,7 @@ fn extensions_json() -> PyResult<String> {
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(validate_options, module)?)?;
     module.add_function(wrap_pyfunction!(verify_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(verify_detached_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(verify_fragmented_bytes, module)?)?;

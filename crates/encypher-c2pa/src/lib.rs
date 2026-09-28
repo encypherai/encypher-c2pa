@@ -146,14 +146,18 @@ pub struct VerifyOptions {
     pub cawg_trust_pem: Option<String>,
     /// PEM bundle of directly allowed CAWG end-entity certificates.
     pub cawg_allowed_certs_pem: Option<String>,
-    /// RFC 3339 start of trust for every caller-supplied trust anchor. Before
-    /// this instant the caller's anchors do not validate a signature, whatever
-    /// the anchor certificate's own `notBefore` says. Bundled snapshots are
-    /// unaffected.
+    /// Typed CAWG trust configurations, one per source. Each carries its
+    /// profile and its own trust window; see [`CawgTrustConfiguration`].
+    /// Appended after `cawg_trust_pem`/`cawg_allowed_certs_pem`, in order.
+    pub cawg_trust_configurations: Option<Vec<CawgTrustConfiguration>>,
+    /// RFC 3339 start of trust for caller-supplied PEM anchors. Before this
+    /// instant those anchors do not validate a signature, whatever the anchor
+    /// certificate's own `notBefore` says. Bundled snapshots and typed
+    /// `cawg_trust_configurations` are unaffected.
     pub trust_anchor_not_before: Option<String>,
-    /// RFC 3339 end of trust for every caller-supplied trust anchor. After this
-    /// instant the caller's anchors no longer validate a signature. Bundled
-    /// snapshots are unaffected.
+    /// RFC 3339 end of trust for caller-supplied PEM anchors. After this
+    /// instant those anchors no longer validate a signature. Bundled snapshots
+    /// and typed `cawg_trust_configurations` are unaffected.
     pub trust_anchor_not_after: Option<String>,
     /// Disable the bundled C2PA, IPTC, and Encypher trust snapshots. By
     /// default, caller-supplied PEM bundles extend those snapshots; setting
@@ -237,6 +241,62 @@ pub struct VerifyOptions {
     /// declares that this machine's own network is trusted; do not set it on a
     /// host that verifies files sent in by strangers.
     pub online_allow_private_networks: bool,
+}
+
+impl VerifyOptions {
+    /// Resolve and validate every option without reading or parsing an asset.
+    ///
+    /// Path-based adapters call this before opening asset files so malformed
+    /// trust material and invalid validation instants fail deterministically.
+    pub fn validate(&self) -> Result<(), Error> {
+        ResolvedOptions::resolve(self).map(|_| ())
+    }
+}
+
+/// One entry of the CAWG Identity 1.3 trust configuration a caller supplies.
+///
+/// Certificates are placed by what they are, not by the list they came from:
+/// a CA certificate, or a self-issued X.509 v1 certificate without
+/// BasicConstraints, anchors chains; any other certificate is accepted only
+/// by direct match.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CawgTrustConfiguration {
+    /// Which trust-model rules this entry is accepted under.
+    pub profile: CawgTrustProfile,
+    /// PEM bundle of the entry's certificates. CA and end-entity certificates
+    /// may be mixed. Must hold at least one certificate.
+    pub certificates_pem: String,
+    /// RFC 3339 start of this entry's trust. A signature whose time stamp, or
+    /// without one the validation time, precedes it is not validated by it.
+    #[serde(default)]
+    pub not_before: Option<String>,
+    /// RFC 3339 end of this entry's trust. A signature whose time stamp, or
+    /// without one the validation time, follows it is not validated by it.
+    #[serde(default)]
+    pub not_after: Option<String>,
+}
+
+/// The CAWG Identity 1.3 rules a [`CawgTrustConfiguration`] is accepted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CawgTrustProfile {
+    /// An entry the validator configured itself. Accepts
+    /// `id-kp-documentSigning`, and, as local validator policy,
+    /// `id-kp-emailProtection` with one of the six CA/Browser Forum S/MIME
+    /// policies, without the interim time conditions. A direct certificate
+    /// match reports `trust_source: allowed_list`; an anchored
+    /// `id-kp-documentSigning` match reports `document_signing`; an anchored
+    /// `id-kp-emailProtection` match reports `caller_supplied`.
+    Base,
+    /// One of the two sources the interim trust model additions name: the
+    /// Mozilla root store with the email trust bit, or the IPTC Verified News
+    /// Publishers lists. Accepts only `id-kp-emailProtection` with one of the
+    /// six policies, and only while the validation time, or a trusted time
+    /// stamp, is on or before 31 March 2027. A direct certificate match reports
+    /// `trust_source: allowed_list`; an anchored match reports
+    /// `smime_interim`.
+    SmimeInterim,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -537,8 +597,19 @@ pub fn verify_with_options(
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
+    verify_with_resolved_options(data, None, mime_type, options, &resolved)
+}
+
+fn verify_with_resolved_options(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime_type: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
-    let result = verify_with_options_inner(data, None, mime_type, options);
+    let result = verify_with_options_inner(data, fragments, mime_type, options, resolved);
     if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
         mime_type,
         &result,
@@ -563,12 +634,13 @@ pub fn verify_fragmented_with_options(
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let mime = canonicalize_mime(mime_type);
     let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
         == Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
-        verify_with_options_inner(init_segment, Some(fragments), &mime, options)
+        verify_with_options_inner(init_segment, Some(fragments), &mime, options, &resolved)
     } else {
         Err(Error::UnsupportedMime(mime))
     };
@@ -621,6 +693,8 @@ impl ResolvedOptions {
                 "trust_anchor_not_after",
             )?,
         );
+        let (cawg_anchors, cawg_direct) =
+            resolve_cawg_configurations(options.cawg_trust_configurations.as_deref())?;
         Ok(Self {
             claim_trust: resolve_trust(
                 options.trust_pem.as_deref(),
@@ -640,18 +714,24 @@ impl ResolvedOptions {
                 AnchorPurpose::ClaimSigning,
                 bounds,
             )?,
-            cawg_trust: resolve_trust(
-                options.cawg_trust_pem.as_deref(),
-                use_defaults.then(default_trust::cawg_identity),
-                AnchorPurpose::CawgIdentity,
-                bounds,
-            )?,
-            cawg_allowed_certs: resolve_trust(
-                options.cawg_allowed_certs_pem.as_deref(),
-                use_defaults.then(default_trust::cawg_allowed_identities),
-                AnchorPurpose::CawgIdentity,
-                bounds,
-            )?,
+            cawg_trust: extend_trust(
+                resolve_trust(
+                    options.cawg_trust_pem.as_deref(),
+                    use_defaults.then(default_trust::cawg_identity),
+                    AnchorPurpose::CawgIdentity,
+                    bounds,
+                )?,
+                cawg_anchors,
+            ),
+            cawg_allowed_certs: extend_trust(
+                resolve_trust(
+                    options.cawg_allowed_certs_pem.as_deref(),
+                    use_defaults.then(default_trust::cawg_allowed_identities),
+                    AnchorPurpose::CawgIdentity,
+                    bounds,
+                )?,
+                cawg_direct,
+            ),
             validation_time,
             validation_time_text: validation_time
                 .format(&Rfc3339)
@@ -804,9 +884,10 @@ fn verify_with_options_inner(
     fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
+    resolved: &ResolvedOptions,
 ) -> Result<VerificationReport, Error> {
     let mime = resolve_mime(mime_type)?;
-    let (mut report, needs) = embedded_pass(data, fragments, &mime, options)?;
+    let (mut report, needs) = embedded_pass_resolved(data, fragments, &mime, options, resolved)?;
     let (mut network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
@@ -845,6 +926,16 @@ fn embedded_pass(
     options: &VerifyOptions,
 ) -> Result<(VerificationReport, Vec<online::NetworkNeed>), Error> {
     let resolved = ResolvedOptions::resolve(options)?;
+    embedded_pass_resolved(data, fragments, mime, options, &resolved)
+}
+
+fn embedded_pass_resolved(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>), Error> {
     let input = resolved.input(data, mime);
     let output = match fragments {
         Some(fragments) => verify_fragmented_safe(
@@ -873,7 +964,7 @@ fn embedded_pass(
     .map_err(map_validate_error)?;
     let needs = online::network_needs(&output);
     Ok((
-        report_from_output(output, mime.to_string(), &resolved),
+        report_from_output(output, mime.to_string(), resolved),
         needs,
     ))
 }
@@ -887,6 +978,7 @@ pub fn verify_file(
     mime_type: Option<&str>,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
     let path = path.as_ref();
     let mime = match mime_type {
         Some(value) => value.to_string(),
@@ -895,7 +987,7 @@ pub fn verify_file(
             .to_string(),
     };
     let data = read_path_asset(path, MAX_PATH_ASSET_BYTES)?;
-    verify_with_options(&data, &mime, options)
+    verify_with_resolved_options(&data, None, &mime, options, &resolved)
 }
 
 fn read_path_asset(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
@@ -1145,6 +1237,68 @@ fn resolve_trust(
     }
 }
 
+/// Build the CAWG anchors and direct matches the caller's typed trust
+/// configurations contribute, each certificate tagged with its entry's
+/// profile and window and placed by what it is.
+///
+/// A malformed entry fails the call and names itself: silently dropping a
+/// source or a bound would change which signatures the configuration
+/// validates.
+fn resolve_cawg_configurations(
+    configurations: Option<&[CawgTrustConfiguration]>,
+) -> Result<(TrustList, TrustList), Error> {
+    let mut anchors = TrustList::default();
+    let mut direct = TrustList::default();
+    for (index, configuration) in configurations.unwrap_or_default().iter().enumerate() {
+        let invalid = |field: &str, detail: &dyn std::fmt::Display| {
+            Error::InvalidTrust(format!(
+                "cawg_trust_configurations[{index}]{field}: {detail}"
+            ))
+        };
+        let instant = |value: Option<&str>, field| {
+            value
+                .map(|raw| {
+                    OffsetDateTime::parse(raw, &Rfc3339).map_err(|error| invalid(field, &error))
+                })
+                .transpose()
+        };
+        let not_before = instant(configuration.not_before.as_deref(), ".not_before")?;
+        let not_after = instant(configuration.not_after.as_deref(), ".not_after")?;
+        if let (Some(start), Some(end)) = (not_before, not_after) {
+            if start > end {
+                return Err(invalid("", &"not_before is later than not_after"));
+            }
+        }
+        let source = match configuration.profile {
+            CawgTrustProfile::Base => CawgTrustSource::CallerSupplied,
+            CawgTrustProfile::SmimeInterim => CawgTrustSource::SmimeInterim,
+        };
+        let (entry_anchors, entry_direct) =
+            TrustList::from_pem_for(AnchorPurpose::CawgIdentity, &configuration.certificates_pem)
+                .map_err(|error| invalid(".certificates_pem", &error))?
+                .with_bounds(not_before, not_after)
+                .with_cawg_source(source)
+                .split_certificate_authorities();
+        anchors.anchors.extend(entry_anchors.anchors);
+        direct.anchors.extend(entry_direct.anchors);
+    }
+    Ok((anchors, direct))
+}
+
+/// Append `extra` to one resolved trust store.
+fn extend_trust(resolved: Option<ResolvedTrust>, extra: TrustList) -> Option<ResolvedTrust> {
+    if extra.anchors.is_empty() {
+        return resolved;
+    }
+    let mut merged = match resolved {
+        None => return Some(ResolvedTrust::Owned(extra)),
+        Some(ResolvedTrust::Bundled(bundled)) => bundled.clone(),
+        Some(ResolvedTrust::Owned(owned)) => owned,
+    };
+    merged.anchors.extend(extra.anchors);
+    Some(ResolvedTrust::Owned(merged))
+}
+
 fn parse_validation_time(value: Option<&str>) -> Result<OffsetDateTime, Error> {
     match value {
         Some(raw) => OffsetDateTime::parse(raw, &Rfc3339)
@@ -1309,8 +1463,9 @@ fn trust_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_fragmented,
-        verify_with_options, Error, VerifyOptions,
+        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_file,
+        verify_fragmented, verify_with_options, CawgTrustConfiguration, CawgTrustProfile, Error,
+        VerifyOptions,
     };
     use std::{io::Cursor, path::Path};
 
@@ -1459,5 +1614,88 @@ mod tests {
         let error = verify(b"not an asset", "application/x-unknown").unwrap_err();
         assert!(matches!(error, Error::UnsupportedMime(_)));
         assert_eq!(error.code(), "unsupported_mime");
+    }
+
+    #[test]
+    fn verify_file_resolves_options_before_opening_the_asset() {
+        let path = std::env::temp_dir().join(format!(
+            "encypher-c2pa-invalid-options-missing-{}.jpg",
+            std::process::id()
+        ));
+        let options = VerifyOptions {
+            no_default_trust: true,
+            cawg_trust_configurations: Some(vec![CawgTrustConfiguration {
+                profile: CawgTrustProfile::Base,
+                certificates_pem: String::new(),
+                not_before: None,
+                not_after: None,
+            }]),
+            ..VerifyOptions::default()
+        };
+
+        let error = verify_file(path, Some("image/jpeg"), &options)
+            .expect_err("invalid trust material must win over a missing asset");
+        assert_eq!(error.code(), "invalid_trust_material");
+        assert!(
+            error
+                .to_string()
+                .contains("cawg_trust_configurations[0].certificates_pem"),
+            "{error}"
+        );
+    }
+
+    /// CAWG-ID13-DELTA-009: a trust configuration's certificates and window
+    /// are what the validator enforces, so a malformed one fails the call
+    /// before any asset is read, naming the entry, rather than silently
+    /// dropping a source or a bound. An unknown profile is a malformed option.
+    #[test]
+    fn a_malformed_cawg_trust_configuration_fails_the_call_naming_its_entry() {
+        let root = include_str!("default_trust/encypher-identity-root.pem");
+        let resolve = |entry: serde_json::Value| {
+            let options: VerifyOptions = serde_json::from_value(serde_json::json!({
+                "no_default_trust": true,
+                "cawg_trust_configurations": [
+                    { "profile": "base", "certificates_pem": root },
+                    entry,
+                ],
+            }))
+            .map_err(|error| error.to_string())?;
+            super::ResolvedOptions::resolve(&options)
+                .map(|_| ())
+                .map_err(|error| format!("{}: {error}", error.code()))
+        };
+
+        for (entry, field) in [
+            (
+                serde_json::json!({ "profile": "smime_interim", "certificates_pem": "" }),
+                "cawg_trust_configurations[1].certificates_pem",
+            ),
+            (
+                serde_json::json!({ "profile": "smime_interim", "certificates_pem": root, "not_after": "next spring" }),
+                "cawg_trust_configurations[1].not_after",
+            ),
+            (
+                serde_json::json!({
+                    "profile": "smime_interim",
+                    "certificates_pem": root,
+                    "not_before": "2027-01-02T00:00:00Z",
+                    "not_after": "2027-01-01T00:00:00Z",
+                }),
+                "cawg_trust_configurations[1]",
+            ),
+        ] {
+            let error = resolve(entry).expect_err("malformed configuration");
+            assert!(error.starts_with("invalid_trust_material: "), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
+
+        let unknown =
+            resolve(serde_json::json!({ "profile": "trusted", "certificates_pem": root }))
+                .expect_err("unknown profile");
+        assert!(unknown.contains("unknown variant `trusted`"), "{unknown}");
+        assert_eq!(
+            resolve(serde_json::json!({ "profile": "smime_interim", "certificates_pem": root })),
+            Ok(())
+        );
     }
 }

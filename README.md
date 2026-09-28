@@ -203,6 +203,7 @@ Your own PEM bundles extend the snapshot. To evaluate only your own material, se
 | `--allowed` | `allowed_list_pem` | Directly allowed claim-signing certificates |
 | `--cawg-trust` | `cawg_trust_pem` | CAWG X.509 identity anchors |
 | `--cawg-allowed` | `cawg_allowed_certs_pem` | Directly allowed CAWG identity certificates |
+| `--cawg-trust-configurations` | `cawg_trust_configurations` | Typed CAWG trust sources (`base` or `smime_interim`), each with its own validity window, as a JSON array |
 | `--trust-anchor-not-before`, `--trust-anchor-not-after` | `trust_anchor_not_before`, `trust_anchor_not_after` | Validity window for your own anchors (RFC 3339) |
 | `--cawg-did-documents` | `cawg_did_documents` | Pinned DID documents for `did:web` issuers |
 | `--cawg-ica-trusted-issuer` | `cawg_ica_trusted_issuers` | Identity-aggregation issuer DIDs you trust directly |

@@ -18,6 +18,7 @@ from ._native import (
     formats_json,
     get_telemetry_preference,
     set_telemetry_preference,
+    validate_options as _validate_options,
     verify_bytes,
     verify_detached_bytes,
     verify_fragmented_bytes,
@@ -87,6 +88,7 @@ def verify(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
+    cawg_trust_configurations: Optional[Sequence[Mapping[str, Any]]] = None,
     trust_anchor_not_before: Optional[str] = None,
     trust_anchor_not_after: Optional[str] = None,
     no_default_trust: bool = False,
@@ -108,7 +110,12 @@ def verify(
     caller-supplied PEM bundles extend them. Set ``no_default_trust=True`` to
     evaluate only caller-supplied trust material. CAWG named-actor credentials
     are evaluated against the packaged Mozilla Email, IPTC VNPL, and Encypher
-    identity lists plus ``cawg_trust_pem``/``cawg_allowed_certs_pem``.
+    identity lists plus ``cawg_trust_pem``/``cawg_allowed_certs_pem`` and
+    ``cawg_trust_configurations``: typed CAWG Identity 1.3 trust sources, each
+    ``{"profile": "base" | "smime_interim", "certificates_pem": ...,
+    "not_before": ..., "not_after": ...}``. ``smime_interim`` entries (the
+    Mozilla email roots, the IPTC lists) accept S/MIME identities only until
+    31 March 2027 or with a trusted time stamp from before it.
     ``trust_anchor_not_before``/``trust_anchor_not_after`` are RFC 3339
     instants bounding when the caller-supplied anchors are trusted;
     ``cawg_did_documents`` maps a primary DID (e.g. ``did:web:example.com``)
@@ -143,31 +150,15 @@ def verify(
     ``online_allow_private_networks=True`` is intranet mode: it lets those
     fetches reach loopback and private addresses and accept plaintext http.
     """
-    if isinstance(asset, (str, Path)):
-        path = Path(asset)
-        data = _read_path(path)
-        if mime_type is None:
-            mime_type = _infer_mime_type(path)
-    elif isinstance(asset, (bytes, bytearray, memoryview)):
-        data = asset
-    else:
-        raise TypeError("asset must be bytes or a filesystem path")
-
-    if not mime_type:
-        raise ValueError("mime_type is required when it cannot be inferred from a path")
-
-    if telemetry is not None:
-        try:
-            set_telemetry_preference(bool(telemetry))
-        except Exception:
-            pass
-
     options = {
         "trust_pem": trust_pem,
         "tsa_trust_pem": tsa_trust_pem,
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
+        "cawg_trust_configurations": [dict(entry) for entry in cawg_trust_configurations]
+        if cawg_trust_configurations
+        else None,
         "trust_anchor_not_before": trust_anchor_not_before,
         "trust_anchor_not_after": trust_anchor_not_after,
         "no_default_trust": bool(no_default_trust),
@@ -195,6 +186,27 @@ def verify(
             "sdk_name": "python",
         },
     }
+    options_json = json.dumps(options)
+    _validate_options(options_json)
+
+    if isinstance(asset, (str, Path)):
+        path = Path(asset)
+        data = _read_path(path)
+        if mime_type is None:
+            mime_type = _infer_mime_type(path)
+    elif isinstance(asset, (bytes, bytearray, memoryview)):
+        data = asset
+    else:
+        raise TypeError("asset must be bytes or a filesystem path")
+
+    if not mime_type:
+        raise ValueError("mime_type is required when it cannot be inferred from a path")
+
+    if telemetry is not None:
+        try:
+            set_telemetry_preference(bool(telemetry))
+        except Exception:
+            pass
     if manifest_store is not None:
         if fragments is not None:
             raise ValueError("manifest_store cannot be combined with fragments")
@@ -204,9 +216,9 @@ def verify(
             store = manifest_store
         else:
             raise TypeError("manifest_store must be bytes or a filesystem path")
-        report = verify_detached_bytes(data, store, mime_type, json.dumps(options))
+        report = verify_detached_bytes(data, store, mime_type, options_json)
     elif fragments is None:
-        report = verify_bytes(data, mime_type, json.dumps(options))
+        report = verify_bytes(data, mime_type, options_json)
     else:
         fragment_data = []
         for fragment in fragments:
@@ -216,9 +228,7 @@ def verify(
                 fragment_data.append(fragment)
             else:
                 raise TypeError("each fragment must be bytes or a filesystem path")
-        report = verify_fragmented_bytes(
-            data, fragment_data, mime_type, json.dumps(options)
-        )
+        report = verify_fragmented_bytes(data, fragment_data, mime_type, options_json)
     return json.loads(report)
 
 
@@ -235,6 +245,7 @@ def verify_stream(
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
+    cawg_trust_configurations: Optional[Sequence[Mapping[str, Any]]] = None,
     no_default_trust: bool = False,
     cawg_did_documents: Optional[Mapping[str, Any]] = None,
     cawg_ica_trusted_issuers: Optional[Sequence[str]] = None,
@@ -269,6 +280,43 @@ def verify_stream(
     recomputed ``chain_valid`` for per-segment streams. Trust and telemetry
     options behave exactly as in :func:`verify`.
     """
+    options = {
+        "trust_pem": trust_pem,
+        "tsa_trust_pem": tsa_trust_pem,
+        "allowed_list_pem": allowed_list_pem,
+        "cawg_trust_pem": cawg_trust_pem,
+        "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
+        "cawg_trust_configurations": [dict(entry) for entry in cawg_trust_configurations]
+        if cawg_trust_configurations
+        else None,
+        "no_default_trust": bool(no_default_trust),
+        "cawg_did_documents": dict(cawg_did_documents) if cawg_did_documents else None,
+        "cawg_ica_trusted_issuers": list(cawg_ica_trusted_issuers)
+        if cawg_ica_trusted_issuers
+        else None,
+        "cawg_ica_trust_anchors": list(cawg_ica_trust_anchors)
+        if cawg_ica_trust_anchors
+        else None,
+        "cawg_ica_status_lists": dict(cawg_ica_status_lists)
+        if cawg_ica_status_lists
+        else None,
+        "expected_seek_positions": list(expected_seek_positions)
+        if expected_seek_positions
+        else [],
+        "cawg_strict_encoding": bool(cawg_strict_encoding),
+        "strict_conformance": bool(strict_conformance),
+        "validation_time": validation_time,
+        "online": online,
+        "online_allow_private_networks": bool(online_allow_private_networks),
+        "telemetry": {
+            "enabled": telemetry,
+            "endpoint": telemetry_endpoint,
+            "sdk_name": "python",
+        },
+    }
+    options_json = json.dumps(options)
+    _validate_options(options_json)
+
     if isinstance(init_segment, (str, Path)):
         path = Path(init_segment)
         init_data: Any = _read_path(path)
@@ -296,38 +344,6 @@ def verify_stream(
             set_telemetry_preference(bool(telemetry))
         except Exception:
             pass
-
-    options = {
-        "trust_pem": trust_pem,
-        "tsa_trust_pem": tsa_trust_pem,
-        "allowed_list_pem": allowed_list_pem,
-        "cawg_trust_pem": cawg_trust_pem,
-        "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
-        "no_default_trust": bool(no_default_trust),
-        "cawg_did_documents": dict(cawg_did_documents) if cawg_did_documents else None,
-        "cawg_ica_trusted_issuers": list(cawg_ica_trusted_issuers)
-        if cawg_ica_trusted_issuers
-        else None,
-        "cawg_ica_trust_anchors": list(cawg_ica_trust_anchors)
-        if cawg_ica_trust_anchors
-        else None,
-        "cawg_ica_status_lists": dict(cawg_ica_status_lists)
-        if cawg_ica_status_lists
-        else None,
-        "expected_seek_positions": list(expected_seek_positions)
-        if expected_seek_positions
-        else [],
-        "cawg_strict_encoding": bool(cawg_strict_encoding),
-        "strict_conformance": bool(strict_conformance),
-        "validation_time": validation_time,
-        "online": online,
-        "online_allow_private_networks": bool(online_allow_private_networks),
-        "telemetry": {
-            "enabled": telemetry,
-            "endpoint": telemetry_endpoint,
-            "sdk_name": "python",
-        },
-    }
     return json.loads(
         verify_stream_bytes(
             init_data,
@@ -335,7 +351,7 @@ def verify_stream(
             mime_type,
             encapsulation,
             method,
-            json.dumps(options),
+            options_json,
         )
     )
 
