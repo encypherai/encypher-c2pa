@@ -476,12 +476,12 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
             .iter()
             .any(|entry| entry.as_str() == Some(expected))
     };
-    let vc_version = if contains(VC_CONTEXT_V2) {
-        "2.0"
-    } else if contains(VC_CONTEXT_V1) {
-        "1.1"
-    } else {
-        return Err("credential lacks a W3C Verifiable Credentials context");
+    // VC 2.0 section 4.3 and VC 1.1 section 4.1: the first item is the data
+    // model's own context URL, which also selects the model version.
+    let vc_version = match contexts.first().and_then(Json::as_str) {
+        Some(VC_CONTEXT_V2) => "2.0",
+        Some(VC_CONTEXT_V1) => "1.1",
+        _ => return Err("first @context item is not a W3C Verifiable Credentials context"),
     };
     if !contains(CAWG_ICA_CONTEXT) {
         return Err("credential lacks the required CAWG Identity 1.1 ICA context");
@@ -494,6 +494,9 @@ fn parse_ica_credential(payload: &[u8]) -> Result<IcaCredential, &'static str> {
         .get("type")
         .and_then(Json::as_array)
         .ok_or("type is missing or not an array")?;
+    if types.iter().any(|entry| !entry.is_string()) {
+        return Err("type entries must be strings");
+    }
     if ![
         "VerifiableCredential",
         "IdentityClaimsAggregationCredential",
@@ -643,9 +646,13 @@ fn verified_identity_defect(value: &Json) -> Option<&'static str> {
 }
 
 /// CAWG Identity 1.3 labels ABNF: two or more period-separated components,
-/// each `1( DIGIT / ALPHA ) *( DIGIT / ALPHA / "-" / "_" )`.
+/// each `1( DIGIT / ALPHA ) *( DIGIT / ALPHA / "-" / "_" )`, without the
+/// repeated underscore (`__`) reserved for multiple-assertion suffixes. The
+/// labels prose says a component starts with a letter; the ABNF, followed
+/// here, also allows a digit (`com.3m`).
 fn is_label(text: &str) -> bool {
     text.contains('.')
+        && !text.contains("__")
         && text.split('.').all(|component| {
             component
                 .bytes()
@@ -1998,9 +2005,10 @@ mod tests {
 
     /// CAWG-ID13-ICA-TECH-A-006: `type` MUST be present and MUST contain both
     /// `VerifiableCredential` and `IdentityClaimsAggregationCredential`.
+    /// TECH-A-004 (VC data model): every `type` member is a string.
     #[test]
     fn credential_type_must_contain_both_ica_types() {
-        let cases: [(&str, Option<Json>); 3] = [
+        let cases: [(&str, Option<Json>); 4] = [
             ("type missing", None),
             (
                 "only VerifiableCredential",
@@ -2009,6 +2017,14 @@ mod tests {
             (
                 "only IdentityClaimsAggregationCredential",
                 Some(json!(["IdentityClaimsAggregationCredential"])),
+            ),
+            (
+                "non-string member",
+                Some(json!([
+                    "VerifiableCredential",
+                    "IdentityClaimsAggregationCredential",
+                    7
+                ])),
             ),
         ];
         for (case, types) in cases {
@@ -2022,6 +2038,32 @@ mod tests {
                 codes(&results.failure),
                 vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
                 "{case}"
+            );
+        }
+    }
+
+    /// CAWG-ID13-ICA-TECH-A-004 and TECH-A-005: the VC data model requires
+    /// its own context URL as the first `@context` item (VC 2.0 section
+    /// 4.3, VC 1.1 section 4.1), and that URL selects the model version.
+    #[test]
+    fn the_vc_context_must_be_the_first_context_item() {
+        for (vc_v1, context) in [
+            (false, json!([CAWG_ICA_CONTEXT, VC_CONTEXT_V2])),
+            (true, json!([CAWG_ICA_CONTEXT, VC_CONTEXT_V1])),
+        ] {
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let did = did_jwk(&key);
+            let mut credential = vc_json(json!(&did), vc_v1);
+            credential["@context"] = context.clone();
+            let results = run(
+                &eddsa_cose(&key, &credential),
+                std::slice::from_ref(&did),
+                None,
+            );
+            assert_eq!(
+                codes(&results.failure),
+                vec![CAWG_ICA_INVALID_VERIFIABLE_CREDENTIAL],
+                "{context}"
             );
         }
     }
@@ -2774,6 +2816,9 @@ mod tests {
                 "com example.x",
                 "com.exämple.x",
                 "com.example.x!",
+                // labels.adoc reserves `__` for multiple-assertion suffixes.
+                "com.example.foo__bar",
+                "cawg.social_media__1",
             ] {
                 assert_eq!(
                     rejected_fields(field, label),
