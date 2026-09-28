@@ -1,6 +1,7 @@
 # Typed CAWG Trust Configurations
 
 **Status:** implemented; completion fixes verified (885 Rust tests, Go, Python, CLI, formatting, Clippy, and public-surface gate)
+**Completion Gate:** cleared at cycle 3 on `fd98287bc5a7a929a8687efa51c89283eed6575d` - Astra 10/9.5/10; Opus 9.6/9.5/9.8.
 **Current Goal:** a caller can hand the verifier the Mozilla email root store and the IPTC lists as interim S/MIME sources, so the 31 March 2027 cutoff and the trusted-time-stamp condition apply to them, and each source can carry its own trust window.
 
 ## Overview
