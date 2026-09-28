@@ -1,9 +1,10 @@
 # CAWG Identity Certificate Subject Details
 
 **Date:** 2026-09-28
-**Status:** IMPLEMENTED - COMPLETION REVIEW
+**Status:** COMPLETE - COMPLETION GATE CLEARED
 **Owner:** PublicIdentitySubject
 **Release:** 1.3.1
+**Completion gate:** Cycle 2 cleared on commit `53ceec2`: astra6 10/9.5/9.5; opus55 9.6/9.6/pass.
 
 ## Problem
 
