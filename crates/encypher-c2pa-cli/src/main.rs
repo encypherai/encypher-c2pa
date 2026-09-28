@@ -309,6 +309,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
                 cawg_trust_configurations: read_trust_configurations(&cawg_trust_configurations)?,
+                // The public CLI keeps the default: a documentSigning identity
+                // must chain to a configured anchor or be allowed directly.
+                cawg_document_signing_require_anchor: None,
                 trust_anchor_not_before,
                 trust_anchor_not_after,
                 no_default_trust,

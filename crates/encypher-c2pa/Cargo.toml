@@ -25,6 +25,10 @@ telemetry = ["dep:ureq"]
 # fetching on. Without it a build cannot reach the network for verification at
 # all, which is what an air-gapped deployment wants to be able to prove.
 online = ["dep:ureq"]
+# Store-level CAWG identity evaluation for callers that verify the asset's
+# content binding themselves. Off by default: the API it exposes reports
+# identity without checking content, so only such a caller should enable it.
+caller-verified-binding = []
 
 [dependencies]
 serde = { workspace = true }

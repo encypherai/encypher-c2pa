@@ -2,6 +2,18 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Added
+
+- `caller-verified-binding` feature, off by default: `CawgEvaluator::evaluate_with_caller_verified_binding` evaluates the CAWG identity assertions of a manifest store's active manifest for a caller that has already verified the asset's content binding with its own engine. It hashes no asset content, so it can report `cawg.identity.trusted` for content nobody checked; the function name, the feature gate, and its documented precondition carry that contract. It returns exactly the identity step's statuses, the expanded SHA-256 of every manifest in the store for the caller's own comparison, or `StoreGateClosed` with the status that kept the identity step from running. `CawgProfile` carries the caller's spec version, mode, and compliance bar; `CawgStoreHost` says whether the store is host-less `application/c2pa`. `CawgEvaluator::new` requires `validation_time`, so a long-lived evaluator never judges later evaluations at its construction instant.
+- `VerifyOptions::cawg_document_signing_require_anchor`. `None` keeps the existing behavior: a `documentSigning` identity must chain to a configured anchor or be allowed directly.
+
+### Changed
+
+- An ICA issuer whose DID breaks DID Core 1.0 syntax (a `method-specific-id` character outside `ALPHA / DIGIT / "." / "-" / "_"`, a malformed `%` escape, or a trailing `:`) now reports `cawg.ica.invalid_issuer`, the code for an issuer that is not a DID. It previously reached method resolution. A malformed `did:jwk` reported `cawg.ica.invalid_did_document`. A malformed `did:web`, such as `did:web:a b` or `did:web:%zz`, reported `cawg.identity.network_traffic_blocked` with no pinned DID-document store and `cawg.ica.did_unavailable` with one. A malformed DID of any other method reported `cawg.ica.did_unsupported_method`.
+- A compressed manifest whose `brob` payload carries the JPEG XL type prefix (`jumb` followed by the Brotli stream) now expands. The type-prefixed reading wins when the payload starts with `jumb` and the remainder inflates to a manifest carrying the compressed manifest's label; otherwise the whole payload is inflated as before. An inflate over the bound still fails closed and is never retried. C2PA 2.4 11.2.4 and 11.1.3.2 leave the layout open; both are now read.
+
 ## 1.4.0 - 2026-09-28
 
 ### Added

@@ -1087,6 +1087,11 @@ fn jwk_component(
         })
 }
 
+/// Split a DID or DID URL into its method and the text after `did:method:`.
+///
+/// The DID itself, up to the first `/`, `?`, or `#`, must follow DID Core
+/// 1.0 section 3.1: `method-specific-id = *( *idchar ":" ) 1*idchar`, with
+/// `idchar = ALPHA / DIGIT / "." / "-" / "_" / pct-encoded`.
 fn parse_did(text: &str) -> Option<(&str, &str)> {
     let rest = text.strip_prefix("did:")?;
     let (method, id) = rest.split_once(':')?;
@@ -1094,11 +1099,35 @@ fn parse_did(text: &str) -> Option<(&str, &str)> {
         || !method
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        || id.is_empty()
+        || !is_method_specific_id(id.split(['/', '?', '#']).next().unwrap_or_default())
     {
         return None;
     }
     Some((method, id))
+}
+
+fn is_method_specific_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.last().is_none_or(|&last| last == b':') {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hex = bytes.get(index + 1..index + 3);
+                if !hex.is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit)) {
+                    return false;
+                }
+                index += 3;
+            }
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':') => {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn primary_did(did: &str) -> &str {
@@ -2033,6 +2062,127 @@ mod tests {
             unresolved.network_needs.is_empty(),
             "{:?}",
             unresolved.network_needs
+        );
+    }
+
+    // Ported from the retained commercial kernel (TEAM_465): behaviors it
+    // defended that no public test covered.
+
+    /// An issuer whose method-specific id breaks DID syntax is not a DID; a
+    /// well-formed `did:jwk` whose id is not a JWK, and a pinned `did:web`
+    /// document with no usable method, are DID-document failures.
+    #[test]
+    fn issuer_classification_separates_did_syntax_from_did_documents() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let store: HashMap<String, Json> = [
+            (
+                "did:web:pinned.example".to_string(),
+                json!({
+                    "id": "did:web:pinned.example",
+                    "verificationMethod": [{
+                        "id": "did:web:pinned.example#key-0",
+                        "type": "JsonWebKey2020",
+                        "controller": "did:web:pinned.example",
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": base64_encode(key.verifying_key().as_bytes(), true),
+                        },
+                    }],
+                    "assertionMethod": ["did:web:pinned.example#key-0"],
+                }),
+            ),
+            (
+                "did:web:no-method.example".to_string(),
+                json!({"id": "did:web:no-method.example"}),
+            ),
+        ]
+        .into();
+        let case = |issuer: &str, store: Option<&HashMap<String, Json>>| {
+            resolve_issuer_key(issuer, store)
+                .err()
+                .map(|failure| failure.code)
+        };
+        for not_a_did in [
+            "did:jwk:!!!",
+            "did:web:a b",
+            "did:web:example:",
+            "did:web:%zz",
+        ] {
+            assert_eq!(
+                case(not_a_did, None),
+                Some(CAWG_ICA_INVALID_ISSUER),
+                "{not_a_did}"
+            );
+        }
+        assert_eq!(
+            case("did:jwk:AAAA", None),
+            Some(CAWG_ICA_INVALID_DID_DOCUMENT)
+        );
+        assert_eq!(
+            case("did:web:no-method.example", Some(&store)),
+            Some(CAWG_ICA_INVALID_DID_DOCUMENT)
+        );
+        assert_eq!(case("did:web:pinned.example", Some(&store)), None);
+        assert_eq!(case("did:web:pinned.example#key-0", Some(&store)), None);
+        assert_eq!(case(&did_jwk(&key), None), None);
+    }
+
+    /// A `c2paAsset` hash written as a JSON array of byte values is not the
+    /// base64 string the data model requires, so it never matches.
+    #[test]
+    fn a_byte_array_c2pa_asset_hash_is_a_signer_payload_mismatch() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let did = did_jwk(&key);
+        let mut credential = vc_json(json!(&did), false);
+        credential["credentialSubject"]["c2paAsset"]["referenced_assertions"][0]["hash"] =
+            json!(HASH.to_vec());
+        let results = run(
+            &eddsa_cose(&key, &credential),
+            std::slice::from_ref(&did),
+            None,
+        );
+        assert_eq!(
+            codes(&results.failure),
+            vec![CAWG_ICA_SIGNER_PAYLOAD_MISMATCH]
+        );
+        assert!(!codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID));
+    }
+
+    /// A valid credential under the required contexts carries no
+    /// informational status: the contexts are not a compatibility signal.
+    #[test]
+    fn a_valid_credential_reports_no_informational_status() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let did = did_jwk(&key);
+        for vc_v1 in [true, false] {
+            let results = run(
+                &eddsa_cose(&key, &vc_json(json!(&did), vc_v1)),
+                std::slice::from_ref(&did),
+                None,
+            );
+            assert_credential_valid(&results, if vc_v1 { "VC 1.1" } else { "VC 2.0" });
+            assert!(
+                results.informational.is_empty(),
+                "{:?}",
+                results.informational
+            );
+        }
+    }
+
+    /// The URL-safe decoder round-trips every byte, refuses the standard
+    /// alphabet, and tolerates padding.
+    #[test]
+    fn base64url_decoding_refuses_the_standard_alphabet() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(
+            base64_decode(&base64_encode(&data, true), true).as_deref(),
+            Some(data.as_slice())
+        );
+        assert_eq!(base64_decode("a+b/", true), None);
+        assert_eq!(
+            base64_decode("aGk=", true).as_deref(),
+            Some(b"hi".as_slice())
         );
     }
 

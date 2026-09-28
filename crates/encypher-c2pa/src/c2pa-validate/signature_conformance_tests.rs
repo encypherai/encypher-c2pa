@@ -163,6 +163,11 @@ impl Signer {
         Self::new(LeafShape::OcspResponder, NOT_BEFORE, NOT_AFTER)
     }
 
+    /// A claim signer whose leaf departs from the profile as `shape` says.
+    pub(crate) fn shaped(shape: LeafShape) -> Self {
+        Self::new(shape, NOT_BEFORE, NOT_AFTER)
+    }
+
     pub(crate) fn leaf_sha256(&self) -> String {
         use sha2::Digest as _;
         hex::encode(sha2::Sha256::digest(&self.leaf_der))

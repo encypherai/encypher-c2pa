@@ -442,6 +442,16 @@ impl VersionVerdict {
 
 /// Run the version ladder over a parsed manifest and its decoded claim.
 pub fn evaluate(manifest: &ParsedManifest, claim: &Value, format: AssetFormat) -> VersionVerdict {
+    evaluate_for(manifest, claim, Some(format))
+}
+
+/// [`evaluate`] without a host format when the caller verifies the content
+/// binding itself: the format floor is then the caller's to apply.
+pub(crate) fn evaluate_for(
+    manifest: &ParsedManifest,
+    claim: &Value,
+    format: Option<AssetFormat>,
+) -> VersionVerdict {
     let generation = claim_generation(manifest, claim);
     let declared = declared_spec_version(claim);
 
@@ -468,7 +478,7 @@ pub fn evaluate(manifest: &ParsedManifest, claim: &Value, format: AssetFormat) -
             ));
         }
     }
-    if let Some(min) = format_min_version(format) {
+    if let Some(min) = format.and_then(format_min_version) {
         minimums.push((
             min,
             format!(
