@@ -1856,6 +1856,10 @@ impl EmbeddedOcspStatus {
         }
     }
 
+    pub(super) fn ca_revoked(self) -> bool {
+        matches!(self, Self::CaRevoked | Self::LeafAndCaRevoked)
+    }
+
     fn blocks_trust(self) -> bool {
         matches!(
             self,

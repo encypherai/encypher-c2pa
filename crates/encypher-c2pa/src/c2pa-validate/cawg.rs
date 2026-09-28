@@ -106,7 +106,6 @@ fn is_identity_assertion_label(label: &str) -> bool {
 struct IdentityWorkCounts {
     identity_evaluations: usize,
     cryptographic_evaluations: usize,
-    ocsp_evaluations: usize,
 }
 
 #[cfg(test)]
@@ -597,25 +596,21 @@ fn verify_identity_assertion(
                 ctx.ocsp_verification_time,
                 ctx.cawg_trust,
             );
-            let reason = if matches!(
-                revocation_status,
-                IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
-            ) {
-                "ca_revoked"
+            if revocation_status.ca_revoked() {
+                report_identity_ca_revoked(ctx.results, url, revocation_status, false, reason);
             } else {
-                reason
-            };
-            ctx.results.push_failure_with_details(
-                CAWG_X509_CREDENTIAL_UNTRUSTED,
-                url.into(),
-                "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
-                    .into(),
-                json!({
-                    "reason": reason,
-                    "chain_trusted": false,
-                    "revocation_status": revocation_status.as_str(),
-                }),
-            );
+                ctx.results.push_failure_with_details(
+                    CAWG_X509_CREDENTIAL_UNTRUSTED,
+                    url.into(),
+                    "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
+                        .into(),
+                    json!({
+                        "reason": reason,
+                        "chain_trusted": false,
+                        "revocation_status": revocation_status.as_str(),
+                    }),
+                );
+            }
             return;
         }
         IdentityTrust::Trusted(evidence) => {
@@ -666,20 +661,13 @@ fn verify_identity_assertion(
                 ctx.ocsp_verification_time,
                 ctx.cawg_trust,
             );
-            if matches!(
-                revocation_status,
-                IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
-            ) {
-                ctx.results.push_failure_with_details(
-                    CAWG_X509_CREDENTIAL_UNTRUSTED,
-                    url.into(),
-                    "stapled OCSP evidence reports a CA certificate in the identity chain revoked"
-                        .into(),
-                    json!({
-                        "reason": "ca_revoked",
-                        "chain_trusted": false,
-                        "revocation_status": revocation_status.as_str(),
-                    }),
+            if revocation_status.ca_revoked() {
+                report_identity_ca_revoked(
+                    ctx.results,
+                    url,
+                    revocation_status,
+                    false,
+                    "ca_revoked",
                 );
                 return;
             }
@@ -724,33 +712,30 @@ fn verify_identity_assertion(
         revocation_status,
         IdentityRevocationStatus::LeafRevoked | IdentityRevocationStatus::LeafAndCaRevoked
     );
-    // CAWG 1.3 "Determining revocation from online OCSP response" is the same
-    // procedure the C2PA claim signer follows, with CAWG's own status codes.
-    let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
-    if matches!(
-        revocation_status,
-        IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
-    ) {
-        ctx.results.push_failure_with_details(
-            CAWG_X509_CREDENTIAL_UNTRUSTED,
-            url.into(),
-            "stapled OCSP evidence reports a CA certificate in the identity chain revoked".into(),
-            json!({"reason": "ca_revoked"}),
+    if revocation_status.ca_revoked() {
+        report_identity_ca_revoked(
+            ctx.results,
+            url,
+            revocation_status,
+            trust.anchor_fingerprint.is_some(),
+            "ca_revoked",
         );
         return;
     }
     if embedded_leaf_revoked {
+        let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
         if super::any_online_ca_revoked(
             &targets,
             ctx.evidence,
             timestamp_trusted.then_some(at),
             ctx.ocsp_verification_time,
         ) {
-            ctx.results.push_failure(
-                CAWG_X509_CREDENTIAL_UNTRUSTED,
-                url.into(),
-                "online OCSP response reports a CA certificate in the identity chain revoked"
-                    .into(),
+            report_identity_ca_revoked(
+                ctx.results,
+                url,
+                IdentityRevocationStatus::CaRevoked,
+                trust.anchor_fingerprint.is_some(),
+                "ca_revoked",
             );
             return;
         }
@@ -767,6 +752,9 @@ fn verify_identity_assertion(
         );
         return;
     }
+    // CAWG 1.3 "Determining revocation from online OCSP response" is the same
+    // procedure the C2PA claim signer follows, with CAWG's own status codes.
+    let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
     let online = super::evaluate_online_ocsp(
         &targets,
         ctx.evidence,
@@ -775,10 +763,12 @@ fn verify_identity_assertion(
         crate::c2pa_trust::OnlineOcspPolicy::CawgIdentity,
     );
     if online.ca_revoked {
-        ctx.results.push_failure(
-            CAWG_X509_CREDENTIAL_UNTRUSTED,
-            url.into(),
-            "online OCSP response reports a CA certificate in the identity chain revoked".into(),
+        report_identity_ca_revoked(
+            ctx.results,
+            url,
+            IdentityRevocationStatus::CaRevoked,
+            trust.anchor_fingerprint.is_some(),
+            "ca_revoked",
         );
         return;
     }
@@ -1366,6 +1356,26 @@ fn identity_embedded_revocation_status(
         false,
     )
     .status
+}
+
+fn report_identity_ca_revoked(
+    results: &mut ValidationResults,
+    url: &str,
+    revocation_status: IdentityRevocationStatus,
+    chain_trusted: bool,
+    reason: &str,
+) {
+    debug_assert!(revocation_status.ca_revoked());
+    results.push_failure_with_details(
+        CAWG_X509_CREDENTIAL_UNTRUSTED,
+        url.into(),
+        "verified OCSP evidence reports a CA certificate in the identity chain revoked".into(),
+        json!({
+            "reason": reason,
+            "chain_trusted": chain_trusted,
+            "revocation_status": revocation_status.as_str(),
+        }),
+    );
 }
 
 fn report_identity_signing_validity(
@@ -5757,7 +5767,6 @@ pub(crate) mod tests {
                 identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
             let altered = alter_signed_role(&signed);
 
-            reset_identity_work_counts();
             let results = verdict_for_assertion(
                 &chain,
                 &altered,
@@ -5769,7 +5778,6 @@ pub(crate) mod tests {
             assert!(results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
             assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
-            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
         }
 
         #[test]
@@ -5780,7 +5788,6 @@ pub(crate) mod tests {
                 encypher_root_trust(&wrong_anchor.root_pem, CawgTrustSource::CallerSupplied);
             let altered = alter_signed_role(&identity_assertion(&chain));
 
-            reset_identity_work_counts();
             let results = identity_verdict_full(
                 &altered,
                 &binding_claim_refs(0x22),
@@ -5799,7 +5806,6 @@ pub(crate) mod tests {
             assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
             assert!(!results.has_failure(CAWG_X509_SIGNATURE_MISMATCH));
             assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
-            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
         }
 
         /// CAWG Identity 1.3 trust-model/scenarios.adoc applies revoked actor
@@ -5825,7 +5831,6 @@ pub(crate) mod tests {
             let assertion =
                 identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
 
-            reset_identity_work_counts();
             let results = identity_verdict_full(
                 &assertion,
                 &binding_claim_refs(0x22),
@@ -5853,7 +5858,64 @@ pub(crate) mod tests {
             assert_eq!(details["chain_trusted"], false);
             assert_eq!(details["revocation_status"], "leaf_revoked");
             assert!(results.network_needs.is_empty());
-            assert_eq!(identity_work_counts().ocsp_evaluations, 0);
+        }
+
+        #[test]
+        fn configured_untrusted_ca_evidence_preserves_the_trust_reason() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let unrelated = ocsp_chain();
+            let unrelated_trust =
+                encypher_root_trust(&unrelated.root_pem, CawgTrustSource::CallerSupplied);
+            let ca_revoked = answer(
+                &chain.root_der,
+                &chain.root_key,
+                &chain.issuing_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let verdict = |staples| {
+                let assertion = identity_assertion_with_root_and_staples(
+                    &chain,
+                    &tsa,
+                    AFTER_INTERIM_CUTOFF,
+                    staples,
+                );
+                identity_verdict_full(
+                    &assertion,
+                    &binding_claim_refs(0x22),
+                    false,
+                    "c2pa.hash.data",
+                    Some(&unrelated_trust),
+                    None,
+                    true,
+                    Some(&tsa.trust_list()),
+                    &TimestampAssertionIndex::default(),
+                    AFTER_INTERIM_CUTOFF,
+                    None,
+                    OnlineEvidence::default(),
+                )
+            };
+            let details = |results: &ValidationResults| {
+                results
+                    .failure
+                    .iter()
+                    .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                    .and_then(|status| status.details.clone())
+                    .expect("configured-untrusted details")
+            };
+
+            let baseline = verdict(Vec::new());
+            let revoked = verdict(vec![ca_revoked]);
+            let baseline_details = details(&baseline);
+            let revoked_details = details(&revoked);
+            assert_eq!(revoked_details["reason"], baseline_details["reason"]);
+            assert_ne!(revoked_details["reason"], "ca_revoked");
+            assert_eq!(revoked_details["chain_trusted"], false);
+            assert_eq!(revoked_details["revocation_status"], "ca_revoked");
+            assert!(!revoked.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
         }
 
         #[test]
@@ -6117,19 +6179,17 @@ pub(crate) mod tests {
                 OnlineEvidence::default(),
             );
 
+            assert!(results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
             assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
             let failure = results
                 .failure
                 .iter()
                 .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
                 .expect("revoked CA rejects the identity credential");
-            assert_eq!(
-                failure
-                    .details
-                    .as_ref()
-                    .and_then(|details| details["reason"].as_str()),
-                Some("ca_revoked")
-            );
+            let details = failure.details.as_ref().expect("CA revocation details");
+            assert_eq!(details["reason"], "ca_revoked");
+            assert_eq!(details["chain_trusted"], true);
+            assert_eq!(details["revocation_status"], "ca_revoked");
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
         }
 
@@ -6509,7 +6569,17 @@ pub(crate) mod tests {
             );
 
             assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
+            assert!(results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            let failure = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                .expect("online CA revocation rejects the identity credential");
+            let details = failure.details.as_ref().expect("CA revocation details");
+            assert_eq!(details["reason"], "ca_revoked");
+            assert_eq!(details["chain_trusted"], true);
+            assert_eq!(details["revocation_status"], "ca_revoked");
         }
 
         /// CA-chain handling predates the CAWG leaf's open freshness window.
