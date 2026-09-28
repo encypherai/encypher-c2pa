@@ -4222,6 +4222,7 @@ pub(crate) mod tests {
             &index,
             AFTER_INTERIM_CUTOFF,
             None,
+            &[],
             Default::default(),
         );
 
@@ -4261,6 +4262,7 @@ pub(crate) mod tests {
             &index,
             AFTER_INTERIM_CUTOFF,
             None,
+            &[],
             Default::default(),
         );
 
@@ -4293,6 +4295,7 @@ pub(crate) mod tests {
             &index,
             AFTER_INTERIM_CUTOFF,
             None,
+            &[],
             Default::default(),
         );
 
@@ -4434,6 +4437,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             datetime!(2029-01-01 0:00 UTC),
             None,
+            &[],
             Default::default(),
         );
 
@@ -4475,6 +4479,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             AFTER_INTERIM_CUTOFF,
             None,
+            &[],
             Default::default(),
         );
 
@@ -4507,6 +4512,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             datetime!(2029-01-01 0:00 UTC),
             None,
+            &[],
             Default::default(),
         );
 
@@ -4884,7 +4890,7 @@ pub(crate) mod tests {
         };
         let hard_reference = assertion_reference(hard_label, &hard_box);
 
-        let b_label = "cawg.identity__secondary";
+        let b_label = "cawg.identity__1";
         let b_bytes = encypher_identity_assertion_for(
             identity_payload_over(vec![hard_reference.clone()]),
             &chain,
@@ -5218,6 +5224,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             validation_time,
             claim_timestamp,
+            &[],
             Default::default(),
         )
     }
@@ -6217,6 +6224,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
 
@@ -6260,6 +6268,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
 
@@ -6312,6 +6321,7 @@ pub(crate) mod tests {
                     &TimestampAssertionIndex::default(),
                     AFTER_INTERIM_CUTOFF,
                     None,
+                    &[],
                     OnlineEvidence::default(),
                 )
             };
@@ -6362,6 +6372,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
 
@@ -6409,6 +6420,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
 
@@ -6459,6 +6471,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
 
@@ -6520,6 +6533,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 datetime!(2029-01-01 0:00 UTC),
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
             assert_eq!(
@@ -6558,6 +6572,7 @@ pub(crate) mod tests {
                 &TimestampAssertionIndex::default(),
                 datetime!(2029-01-01 0:00 UTC),
                 None,
+                &[],
                 OnlineEvidence::default(),
             );
             assert_eq!(
