@@ -138,6 +138,111 @@ assert.ok(
       explanation.includes("timestamp_time_in_future"),
   ),
 );
+
+const allStatuses = (value) =>
+  ["success", "informational", "failure"].flatMap(
+    (bucket) => value.validation_results[bucket] ?? [],
+  );
+const statusAt = (value, code, url) =>
+  allStatuses(value).find((status) => status.code === code && status.url === url);
+const assertNoIdentitySubject = (status) => {
+  const details = status.details ?? {};
+  assert.equal("subject_organization" in details, false);
+  assert.equal("subject_common_name" in details, false);
+  assert.equal("certificate_trusted" in details, false);
+};
+
+// The packed npm artifact must preserve trusted, unevaluated, and rejected
+// X.509 subject evidence on the exact assertion label being evaluated.
+const subjectAsset = await readFile(
+  resolve(root, "tests/vectors/cawg/generated/identity-1.2/assets/x509-es256-jpeg.jpg"),
+);
+const subjectClaimTrust = await readFile(
+  resolve(root, "tests/vectors/cawg/generated/identity-1.2/certs/claim-es256.cert.pem"),
+  "utf8",
+);
+const subjectIdentityTrust = await readFile(
+  resolve(root, "tests/vectors/cawg/generated/identity-1.2/certs/es256.cert.pem"),
+  "utf8",
+);
+const subjectOptions = {
+  no_default_trust: true,
+  trust_pem: subjectClaimTrust,
+  cawg_trust_pem: subjectIdentityTrust,
+  validation_time: "2026-08-06T00:00:00Z",
+  telemetry: { enabled: false },
+};
+const trustedSubjectReport = verify(subjectAsset, "image/jpeg", subjectOptions);
+const trustedSubject = statusAt(
+  trustedSubjectReport,
+  "cawg.identity.trusted",
+  "cawg.identity",
+);
+assert.ok(trustedSubject);
+assert.equal(trustedSubject.details.certificate_trusted, true);
+assert.equal(trustedSubject.details.subject_organization, "Encypher Test Vectors");
+assert.equal(
+  trustedSubject.details.subject_common_name,
+  "CAWG Identity 1.2 ES256 Test Actor",
+);
+
+const unevaluatedSubjectReport = verify(subjectAsset, "image/jpeg", {
+  no_default_trust: true,
+  trust_pem: subjectClaimTrust,
+  validation_time: "2026-08-06T00:00:00Z",
+  telemetry: { enabled: false },
+});
+const unevaluatedSubject = statusAt(
+  unevaluatedSubjectReport,
+  "cawg.identity.well-formed",
+  "cawg.identity",
+);
+assert.ok(unevaluatedSubject);
+assert.equal("certificate_trusted" in unevaluatedSubject.details, true);
+assert.equal(unevaluatedSubject.details.certificate_trusted, false);
+assert.equal(
+  unevaluatedSubject.details.subject_organization,
+  "Encypher Test Vectors",
+);
+
+const unrelatedIdentityTrust = await readFile(
+  resolve(
+    root,
+    "tests/vectors/cawg/generated/identity-1.2/certs/es256-wrong-eku.cert.pem",
+  ),
+  "utf8",
+);
+const rejectedSubjectReport = verify(subjectAsset, "image/jpeg", {
+  no_default_trust: true,
+  trust_pem: subjectClaimTrust,
+  cawg_trust_pem: unrelatedIdentityTrust,
+  validation_time: "2026-08-06T00:00:00Z",
+  telemetry: { enabled: false },
+});
+const rejectedSubject = statusAt(
+  rejectedSubjectReport,
+  "cawg.x509.credential.untrusted",
+  "cawg.identity",
+);
+assert.ok(rejectedSubject);
+assertNoIdentitySubject(rejectedSubject);
+
+const icaAsset = await readFile(
+  resolve(
+    root,
+    "tests/vectors/cawg/external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__success.jpg",
+  ),
+);
+const icaStatuses = allStatuses(
+  verify(icaAsset, "image/jpeg", {
+    no_default_trust: true,
+    telemetry: { enabled: false },
+  }),
+).filter(({ code }) => code.startsWith("cawg.ica."));
+assert.ok(icaStatuses.length > 0);
+for (const status of icaStatuses) {
+  assertNoIdentitySubject(status);
+}
 assert.throws(
   () => verifyFragmented(asset, [new Uint8Array([1])], "image/jpeg"),
   /unsupported_mime/,

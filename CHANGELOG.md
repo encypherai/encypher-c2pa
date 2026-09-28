@@ -38,6 +38,16 @@ All notable changes to this project are recorded here.
 - `VerifyOptions::ocsp_responses` accepts an empty DER value as the sentinel for a response body received but discarded under a size bound. `ocsp_unreachable` is reserved for a query that delivered no response.
 - CAWG identity instance labels now follow C2PA 2.4 section 6.4: uniqueness is "accomplished by adding a double-underscore and a monotonically increasing index to the label." The verifier ignores malformed `cawg.identity__*` labels such as `__0`, a leading-zero suffix, or a non-decimal suffix instead of interpreting them as identity assertions.
 
+## 1.3.1 - 2026-09-28
+
+### Added
+
+- Terminal CAWG X.509 identity statuses expose the validated leaf certificate's sanitized `subject_organization` and `subject_common_name`, plus an explicit `certificate_trusted` boolean. Configured-chain failures disclose no subject fields.
+
+### Changed
+
+- `signature_info.common_name` and `signature_info.issuer` now use the same strict UTF-8, control-stripping, 256-byte subject-name decoder as CAWG identity details. Unsupported legacy encodings are omitted instead of converted lossily.
+
 ## 1.3.0 - 2026-09-27
 
 ### Added

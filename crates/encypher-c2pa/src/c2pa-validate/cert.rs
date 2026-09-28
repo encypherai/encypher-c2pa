@@ -12,14 +12,15 @@
 use crate::c2pa_cbor::{decode, Value};
 use crate::c2pa_crypto::CoseAlg;
 use const_oid::ObjectIdentifier;
-use der::Decode;
+use der::{Decode, Tag, Tagged};
 use time::OffsetDateTime;
-use x509_cert::Certificate;
+use x509_cert::{name::Name, Certificate};
 
 /// `id-at-commonName`.
-const OID_AT_COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+pub(crate) const OID_AT_COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
 /// `id-at-organizationName`.
-const OID_AT_ORGANIZATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.10");
+pub(crate) const OID_AT_ORGANIZATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.10");
+const MAX_REPORT_NAME_BYTES: usize = 256;
 
 /// Information extracted from the signing certificate and COSE algorithm, used
 /// to render the `signature_info` object in the reader report.
@@ -82,8 +83,8 @@ pub fn signature_info(leaf_der: &[u8], cose_sign1: &[u8]) -> SignatureInfo {
         ..SignatureInfo::default()
     };
     if let Ok(cert) = Certificate::from_der(leaf_der) {
-        info.common_name = attribute(&cert, OID_AT_COMMON_NAME, true);
-        info.issuer = attribute(&cert, OID_AT_ORGANIZATION, false);
+        info.common_name = name_attribute(&cert.tbs_certificate.subject, OID_AT_COMMON_NAME);
+        info.issuer = name_attribute(&cert.tbs_certificate.issuer, OID_AT_ORGANIZATION);
         info.cert_serial_number = Some(serial_decimal(
             cert.tbs_certificate.serial_number.as_bytes(),
         ));
@@ -91,23 +92,54 @@ pub fn signature_info(leaf_der: &[u8], cose_sign1: &[u8]) -> SignatureInfo {
     info
 }
 
-/// Look up a distinguished-name attribute by OID on the subject (`subject =
-/// true`) or issuer (`subject = false`) name.
-fn attribute(cert: &Certificate, oid: ObjectIdentifier, subject: bool) -> Option<String> {
-    let name = if subject {
-        &cert.tbs_certificate.subject
-    } else {
-        &cert.tbs_certificate.issuer
-    };
-    for rdn in name.0.iter() {
-        for atav in rdn.0.iter() {
-            if atav.oid == oid {
-                let raw = atav.value.value();
-                return Some(String::from_utf8_lossy(raw).into_owned());
+/// Return the first attribute with `oid` in decoded DER RDN/AVA order.
+///
+/// Report names accept modern RFC 5280 DirectoryString encodings plus IA5String
+/// compatibility input. The first matching attribute is terminal: an unusable
+/// value is omitted rather than replaced by a later attacker-selected value.
+/// `der` 0.7.10 rejects UniversalString while parsing the certificate, before
+/// a value could reach this decoder.
+pub(crate) fn name_attribute(name: &Name, oid: ObjectIdentifier) -> Option<String> {
+    for rdn in &name.0 {
+        for attribute in rdn.0.iter() {
+            if attribute.oid != oid {
+                continue;
             }
+            if !matches!(
+                attribute.value.tag(),
+                Tag::PrintableString | Tag::Utf8String | Tag::Ia5String
+            ) {
+                return None;
+            }
+            let raw = std::str::from_utf8(attribute.value.value()).ok()?;
+            let mut sanitized = String::with_capacity(raw.len().min(MAX_REPORT_NAME_BYTES));
+            for character in raw
+                .chars()
+                .filter(|character| !is_display_control(*character))
+            {
+                if sanitized.len() + character.len_utf8() > MAX_REPORT_NAME_BYTES {
+                    return None;
+                }
+                sanitized.push(character);
+            }
+            return (!sanitized.is_empty()).then_some(sanitized);
         }
     }
     None
+}
+
+fn is_display_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0000}'..='\u{001f}'
+            | '\u{007f}'..='\u{009f}'
+            | '\u{061c}'
+            | '\u{200b}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 /// True when the certificate's `notBefore`/`notAfter` window contains `t`.
@@ -169,6 +201,179 @@ fn serial_decimal(be_bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use der::{asn1::SetOfVec, Encode, Tag};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+    use x509_cert::{
+        attr::AttributeTypeAndValue,
+        name::{Name, RdnSequence, RelativeDistinguishedName},
+    };
+
+    fn name_attribute_value(
+        oid: ObjectIdentifier,
+        tag: Tag,
+        bytes: impl Into<Box<[u8]>>,
+    ) -> AttributeTypeAndValue {
+        AttributeTypeAndValue {
+            oid,
+            value: der::Any::new(tag, bytes).expect("test attribute"),
+        }
+    }
+
+    fn name(attributes: Vec<AttributeTypeAndValue>) -> Name {
+        RdnSequence(
+            attributes
+                .into_iter()
+                .map(|attribute| {
+                    RelativeDistinguishedName(
+                        SetOfVec::try_from(vec![attribute]).expect("one attribute RDN"),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn test_certificate() -> Certificate {
+        let key = KeyPair::generate().expect("test key");
+        let mut params = CertificateParams::new(vec!["subject.example".into()]).expect("params");
+        let mut subject = DistinguishedName::new();
+        subject.push(DnType::OrganizationName, "Original Issuer");
+        subject.push(DnType::CommonName, "Original Subject");
+        params.distinguished_name = subject;
+        let der = params.self_signed(&key).expect("certificate");
+        Certificate::from_der(der.der()).expect("parse certificate")
+    }
+
+    fn removed_display_code_points() -> Vec<char> {
+        let mut code_points: Vec<char> = (0..=0x1f)
+            .chain(0x7f..=0x9f)
+            .filter_map(char::from_u32)
+            .collect();
+        code_points.extend(
+            [
+                0x061c, 0x200b, 0x200e, 0x200f, 0x2028, 0x2029, 0x202a, 0x202b, 0x202c, 0x202d,
+                0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff,
+            ]
+            .into_iter()
+            .filter_map(char::from_u32),
+        );
+        code_points
+    }
+
+    #[test]
+    fn name_attribute_strips_each_display_control_and_preserves_scripts() {
+        for control in removed_display_code_points() {
+            let value = format!("出{control}版");
+            let subject = name(vec![name_attribute_value(
+                OID_AT_ORGANIZATION,
+                Tag::Utf8String,
+                value.into_bytes(),
+            )]);
+            assert_eq!(
+                name_attribute(&subject, OID_AT_ORGANIZATION).as_deref(),
+                Some("出版"),
+                "U+{:04X}",
+                control as u32
+            );
+        }
+
+        let preserved = "出版社\u{200c}\u{200d}";
+        let subject = name(vec![name_attribute_value(
+            OID_AT_ORGANIZATION,
+            Tag::Utf8String,
+            preserved.as_bytes().to_vec(),
+        )]);
+        assert_eq!(
+            name_attribute(&subject, OID_AT_ORGANIZATION).as_deref(),
+            Some(preserved)
+        );
+    }
+
+    #[test]
+    fn name_attribute_enforces_utf8_byte_boundary_without_truncation() {
+        for (value, expected) in [
+            ("a".repeat(256), Some("a".repeat(256))),
+            ("a".repeat(257), None),
+            (
+                format!("{}é", "a".repeat(254)),
+                Some(format!("{}é", "a".repeat(254))),
+            ),
+            (format!("{}é", "a".repeat(255)), None),
+        ] {
+            let subject = name(vec![name_attribute_value(
+                OID_AT_ORGANIZATION,
+                Tag::Utf8String,
+                value.into_bytes(),
+            )]);
+            assert_eq!(name_attribute(&subject, OID_AT_ORGANIZATION), expected);
+        }
+    }
+
+    #[test]
+    fn unusable_first_attribute_never_falls_through() {
+        for first in [vec![0x00], vec![b'x'; 257]] {
+            let subject = name(vec![
+                name_attribute_value(OID_AT_ORGANIZATION, Tag::Utf8String, first),
+                name_attribute_value(
+                    OID_AT_ORGANIZATION,
+                    Tag::Utf8String,
+                    b"Later Organization".to_vec(),
+                ),
+            ]);
+            assert_eq!(name_attribute(&subject, OID_AT_ORGANIZATION), None);
+        }
+    }
+
+    #[test]
+    fn name_attribute_accepts_only_report_string_encodings() {
+        for tag in [Tag::BmpString, Tag::TeletexString] {
+            let subject = name(vec![name_attribute_value(
+                OID_AT_ORGANIZATION,
+                tag,
+                b"hidden".to_vec(),
+            )]);
+            assert_eq!(name_attribute(&subject, OID_AT_ORGANIZATION), None);
+        }
+        let invalid_utf8 = name(vec![name_attribute_value(
+            OID_AT_ORGANIZATION,
+            Tag::Utf8String,
+            vec![0xff],
+        )]);
+        assert_eq!(name_attribute(&invalid_utf8, OID_AT_ORGANIZATION), None);
+        for tag in [Tag::PrintableString, Tag::Ia5String] {
+            let subject = name(vec![name_attribute_value(
+                OID_AT_ORGANIZATION,
+                tag,
+                b"Compatible".to_vec(),
+            )]);
+            assert_eq!(
+                name_attribute(&subject, OID_AT_ORGANIZATION).as_deref(),
+                Some("Compatible")
+            );
+        }
+    }
+
+    #[test]
+    fn signature_info_uses_sanitized_bounded_name_attributes() {
+        let mut certificate = test_certificate();
+        certificate.tbs_certificate.issuer = name(vec![name_attribute_value(
+            OID_AT_ORGANIZATION,
+            Tag::Utf8String,
+            "Safe\u{202e} Issuer".as_bytes().to_vec(),
+        )]);
+        let der = certificate.to_der().expect("re-encode certificate");
+        assert_eq!(
+            signature_info(&der, &[]).issuer.as_deref(),
+            Some("Safe Issuer")
+        );
+
+        certificate.tbs_certificate.issuer = name(vec![name_attribute_value(
+            OID_AT_ORGANIZATION,
+            Tag::BmpString,
+            vec![0x00, b'B'],
+        )]);
+        let der = certificate.to_der().expect("re-encode certificate");
+        assert_eq!(signature_info(&der, &[]).issuer, None);
+    }
 
     #[test]
     fn serial_decimal_handles_zero_and_sign_guard() {
