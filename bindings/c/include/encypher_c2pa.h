@@ -13,6 +13,12 @@ extern "C" {
 #endif
 
 /*
+ * Parses and resolves options_json without reading an asset. Returns an
+ * allocated UTF-8 JSON envelope. options_json may be NULL for defaults.
+ */
+char *encypher_c2pa_validate_options(const char *options_json);
+
+/*
  * Returns an allocated UTF-8 JSON envelope. options_json may be NULL.
  * This function makes a telemetry request only after saved consent or an explicit option.
  *

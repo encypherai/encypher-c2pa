@@ -470,6 +470,33 @@ func VerifyStream(initSegment []byte, segments [][]byte, mimeType string, encaps
 	return envelope.Report, nil
 }
 
+func validateOptions(options *Options) error {
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return err
+	}
+	opts := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(opts))
+
+	result := C.encypher_c2pa_validate_options(opts)
+	if result == nil {
+		return errors.New("verifier returned no option validation result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+
+	var envelope responseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return fmt.Errorf("decode option validation response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return envelope.Error
+		}
+		return errors.New("option validation failed without a structured error")
+	}
+	return nil
+}
+
 // marshalOptions encodes caller options, stamping the Go SDK name on telemetry.
 func marshalOptions(options *Options) ([]byte, error) {
 	if options == nil {
@@ -567,6 +594,9 @@ func TelemetryEnabled() (*bool, error) {
 
 // VerifyFile reads and verifies a regular local asset up to 128 MiB.
 func VerifyFile(path, mimeType string, options *Options) (*Report, error) {
+	if err := validateOptions(options); err != nil {
+		return nil, err
+	}
 	asset, err := readPathAsset(path, maxPathAssetBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read asset: %w", err)

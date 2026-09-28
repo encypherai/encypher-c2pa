@@ -80,12 +80,12 @@ Each test cites its requirement id. Configuration tests run the options JSON the
 
 - An untimestamped S/MIME identity whose anchor arrives as `smime_interim` is trusted before the cutoff, refused with `trusted_timestamp_required` after it, and accepted after it with a trusted time stamp from before it; the same anchor as `base` stays trusted after the cutoff (023/025/027, consumer side of 024).
 - An `smime_interim` certificate, direct or anchor, does not satisfy the documentSigning anchor requirement; a `base` one does. A documentSigning + emailProtection credential refused as documentSigning is accepted by the interim emailProtection entry before the cutoff (018).
-- Masking: a cross-certified issuing CA with one path to an interim root and one to a base root is accepted on the base path after the cutoff without a time stamp (018/025).
+- Masking: a cross-certified issuing CA with one path to an interim root and one to a base root is accepted on the base path after the cutoff without a time stamp. An in-force CA from a non-admitted profile may bridge to an admitted anchor, but may not terminate the path itself (018/025).
 - Duplicates: the same root listed `smime_interim` first and `base` second is evaluated under base rules; an out-of-window first entry does not shadow an in-window second (018, DELTA-009).
 - A CA certificate inside a configuration anchors a chain, a self-issued X.509 v1 root without BasicConstraints anchors a chain, and a self-issued v3 end entity without BasicConstraints stays a direct match (031).
 - A configuration window refuses chained and direct matches outside it, measured at the trusted time stamp when there is one (DELTA-009).
 - Errors: empty `certificates_pem`, unparseable bound, and `not_before` > `not_after` each fail resolution with `invalid_trust_material` naming the entry index; an unknown profile fails option parsing. Public path entry points resolve these options before opening an asset, detached manifest, or stream segment.
-- Go round-trip carries `cawg_trust_configurations`; Python `verify` and `verify_stream` validate and forward the kwarg; two repeated CLI files concatenate in order, with a semantic error in the second file naming its concatenated entry index.
+- Go round-trip carries `cawg_trust_configurations`, and Go `VerifyFile` returns an indexed trust-material error before opening a missing asset. Python `verify` and `verify_stream` validate and forward the kwarg; two repeated CLI files concatenate in order, with a semantic error in the second file naming its concatenated entry index.
 
 ## Out of scope
 

@@ -12,6 +12,54 @@ use encypher_c2pa::{
 };
 use serde_json::json;
 
+/// Parse and resolve verification options without reading an asset.
+///
+/// The result is `{"ok":true}` or
+/// `{"ok":false,"error":{"code":...,"message":...}}`. The caller owns the
+/// returned string and must release it with [`encypher_c2pa_free_string`].
+/// `options_json` may be null, which validates the default options.
+///
+/// # Safety
+/// A non-null `options_json` must point to a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_validate_options(
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let options = if options_json.is_null() {
+            VerifyOptions::default()
+        } else {
+            // SAFETY: The caller guarantees a NUL-terminated string.
+            let raw = match unsafe { CStr::from_ptr(options_json) }.to_str() {
+                Ok(value) => value,
+                Err(error) => {
+                    return error_json(
+                        "invalid_options",
+                        &format!("options_json is not UTF-8: {error}"),
+                    )
+                }
+            };
+            match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            }
+        };
+
+        match options.validate() {
+            Ok(()) => json!({ "ok": true }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "option validation aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
 /// Verify one in-memory asset and return an allocated UTF-8 JSON envelope.
 ///
 /// The result is `{"ok":true,"report":...}` or

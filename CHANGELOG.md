@@ -18,7 +18,8 @@ All notable changes to this project are recorded here.
 - CAWG trust anchors are kept per accepted EKU. An interim source (the packaged Mozilla and IPTC lists, or an `smime_interim` entry) no longer satisfies the `id-kp-documentSigning` anchor requirement, so a document-signing identity trusted only through one of them now reads `cawg.x509.credential.untrusted` with `document_signing_anchor_required`. A credential that also carries `emailProtection` with an approved policy is then evaluated as an S/MIME identity.
 - For `emailProtection`, validator-configured entries are tried before interim sources, so a credential with both a base path and a refused interim path is accepted on the base path and reports the base entry's `trust_source`.
 - A caller-bounded `cawg_allowed_certs_pem` entry now honours `trust_anchor_not_before`/`trust_anchor_not_after`, measured at the credential's trusted time stamp or the validation time, as chain anchors already did.
-- Rust `verify_file`, every CLI asset-loading branch, and Python `verify`/`verify_stream` now resolve options before opening an asset, detached manifest, or stream segment. Malformed trust material therefore returns `invalid_trust_material` even when an asset path is missing.
+- Rust `verify_file`, Go `VerifyFile`, every CLI asset-loading branch, and Python `verify`/`verify_stream` now resolve options before opening an asset, detached manifest, or stream segment. The C ABI exposes `encypher_c2pa_validate_options` so path-based bindings can apply the same canonical resolution. Malformed trust material therefore returns `invalid_trust_material` even when an asset path is missing.
+- Configured CA certificates that are in force for the requested purpose may bridge a path as ordinary intermediates regardless of profile; only an entry eligible for that trust decision may terminate the path.
 
 ## 1.3.0 - 2026-09-27
 

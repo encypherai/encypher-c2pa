@@ -270,6 +270,21 @@ func TestPathReaderAcceptsExactBoundaryWithSmallLimit(t *testing.T) {
 	}
 }
 
+func TestVerifyFileResolvesOptionsBeforeOpeningTheAsset(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.jpg")
+	_, err := VerifyFile(missing, "image/jpeg", &Options{
+		CAWGTrustConfigurations: []CAWGTrustConfiguration{{
+			Profile:         CAWGTrustProfileBase,
+			CertificatesPEM: "",
+		}},
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "invalid_trust_material") ||
+		!strings.Contains(err.Error(), "cawg_trust_configurations[0].certificates_pem") {
+		t.Fatalf("expected trust configuration error before asset I/O, got %v", err)
+	}
+}
+
 func TestVerifyFileRejectsSparseAssetOverPathLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oversized.jpg")
 	file, err := os.Create(path)
