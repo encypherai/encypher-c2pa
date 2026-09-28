@@ -1,7 +1,8 @@
 # CAWG Identity 1.3 X.509 Conformance
 
-**Status:** implementation approved
+**Status:** completion gate cleared
 **Plan gate:** cleared at review cycle 3 (Astra 9.5/10/10; Opus 9.6/9.7/9.7)
+**Completion gate:** cleared at review cycle 5 on `bf876e4f8` (Astra 10/10/10; Opus 9.6/9.6/9.8)
 **Goal:** make the public verifier apply CAWG Identity 1.3 revocation and identity-reference rules, with one documented outside-window deviation pending upstream clarification, then close the assigned public-side coverage gaps with observable regressions.
 
 ## Behavior changes
@@ -235,3 +236,15 @@ establish historical non-revocation.
 - Prove credential trust precedes signature validation, signature mismatch suppresses revoked actor status, configured-untrusted and no-root identities retain authenticated offline revocation evidence without assigning actor status, no-root CA revocation is credential-untrusted, chain validity precedes revocation, and anchorless document-signing revocation carries `details.chain_trusted: false`.
 - The affected crate tests pass.
 - The branch is committed and opened as a public pull request.
+
+## Follow-up list
+
+These low-severity items are outside TEAM_461's cleared completion gate:
+
+- Add a direct regression for the combined `LeafAndCaRevoked` detail when a
+  stapled response revokes the leaf and online evidence revokes a CA.
+- Refine the configured-untrusted explanation so it does not imply that every
+  trust failure is specifically a failure to reach an anchor.
+- Make the public strict-encoding regression assert the exact
+  `cawg.x509.signature.mismatch` code rather than accepting any `cawg.*`
+  failure.
