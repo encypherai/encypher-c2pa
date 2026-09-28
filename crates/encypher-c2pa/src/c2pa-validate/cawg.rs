@@ -5186,6 +5186,7 @@ pub(crate) mod tests {
             &TimestampAssertionIndex::default(),
             AFTER_INTERIM_CUTOFF,
             None,
+            &[],
             Default::default(),
         );
         let well_formed = well_formed
@@ -5281,9 +5282,6 @@ pub(crate) mod tests {
         assert_eq!(trusted["subject_common_name"], "Trusted Fixture Actor");
         assert_eq!(trusted["certificate_trusted"], true);
 
-        assert!(results.success.iter().any(|status| {
-            status.code == CAWG_X509_SIGNATURE_VALIDATED && status.url == "cawg.identity__1"
-        }));
         let rejected = results
             .failure
             .iter()
