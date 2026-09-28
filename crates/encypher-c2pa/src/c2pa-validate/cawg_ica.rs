@@ -1509,6 +1509,9 @@ mod tests {
         let details = status.details.as_ref().unwrap();
         assert_eq!(details["credential"], credential);
         assert_eq!(details["issuer_metadata"]["trust_source"], "direct_issuer");
+        assert!(details.get("subject_organization").is_none());
+        assert!(details.get("subject_common_name").is_none());
+        assert!(details.get("certificate_trusted").is_none());
     }
 
     /// Splice a legacy v1 `sigTst` unprotected header into a finished COSE.

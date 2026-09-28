@@ -1,7 +1,7 @@
 # CAWG Identity Certificate Subject Details
 
 **Date:** 2026-09-28
-**Status:** PLAN GATE PENDING
+**Status:** IMPLEMENTED - COMPLETION REVIEW
 **Owner:** PublicIdentitySubject
 **Release:** 1.3.1
 
@@ -41,7 +41,7 @@ Selection is first-match and fail-closed: inspect RDNs and their AVAs in decoded
 Each value:
 
 1. accepts RFC 5280 DirectoryString PrintableString and UTF8String tags; IA5String is accepted only as compatibility leniency;
-2. omits BMPString, TeletexString, UniversalString, unknown tags, and byte content that is not valid UTF-8;
+2. omits BMPString and TeletexString, unknown tags, and byte content that is not valid UTF-8. `der` 0.7.10 rejects UniversalString while parsing the certificate, so a UniversalString subject never reaches the field decoder;
 3. has exactly these display controls removed: C0 (`U+0000`-`U+001F`), DEL and C1 (`U+007F`-`U+009F`), Arabic letter mark (`U+061C`), zero-width space (`U+200B`), left-to-right and right-to-left marks (`U+200E`, `U+200F`), line and paragraph separators (`U+2028`, `U+2029`), bidi embedding and override controls (`U+202A`-`U+202E`), bidi isolate controls (`U+2066`-`U+2069`), and byte-order mark/zero-width no-break space (`U+FEFF`);
 4. preserves all other Unicode, including non-Latin scripts and the script-significant ZWNJ/ZWJ (`U+200C`, `U+200D`);
 5. is omitted if empty after sanitization;
@@ -67,12 +67,14 @@ TDD coverage in the CAWG validator module will prove:
 - a configured but untrusted chain reports no subject fields;
 - every C0, C1, and named bidi/invisible code point is stripped while ZWNJ/ZWJ and non-Latin scripts are preserved;
 - exactly 256 UTF-8 bytes are kept, 257 are omitted, and a multibyte character crossing the boundary is omitted intact;
-- invalid UTF-8, BMPString, TeletexString, and UniversalString are omitted;
+- invalid UTF-8, BMPString, and TeletexString are omitted, while UniversalString is rejected during certificate parsing;
 - if the first O or CN is control-only or oversized, the field is omitted even when a later matching attribute is usable;
 - ICA statuses remain free of these X.509 subject fields;
 - the packed Node smoke uses the frozen, redistributable `x509-es256-jpeg.jpg` corpus vector with its recorded claim and identity certificates. It exercises the same assertion as trusted, well-formed with no CAWG trust material, and rejected against an unrelated configured CAWG certificate. Exact `status.url` matching proves each outcome belongs to `cawg.identity`; the configured rejection exposes no subject fields. The existing corpus index records the fixture source, license, expected status codes, and SHA-256.
 
 After the focused Rust test is green, run the repository suite required for this public change, build the release browser WASM package, and run a Node smoke against the packed `@encypherai/c2pa` package. The smoke will verify a real CAWG X.509 fixture and read O/CN from terminal status details.
+
+The plan originally called for a new multi-identity binary fixture. It was dropped after both current and pinned c2pa-rs generators emitted an invalid hard binding when two dynamic identity assertions were added. No invalid asset was retained. The replacement in-crate test builds two signed identity assertions with distinct X.509 leaves in one parsed manifest, trusts only the first chain, and proves exact-label terminal binding plus same-label failure precedence after the rejected identity has already recorded a lower-level signature success.
 
 ## Delivery
 

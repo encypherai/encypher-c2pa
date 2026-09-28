@@ -97,6 +97,8 @@ pub fn signature_info(leaf_der: &[u8], cose_sign1: &[u8]) -> SignatureInfo {
 /// Report names accept modern RFC 5280 DirectoryString encodings plus IA5String
 /// compatibility input. The first matching attribute is terminal: an unusable
 /// value is omitted rather than replaced by a later attacker-selected value.
+/// `der` 0.7.10 rejects UniversalString while parsing the certificate, before
+/// a value could reach this decoder.
 pub(crate) fn name_attribute(name: &Name, oid: ObjectIdentifier) -> Option<String> {
     for rdn in &name.0 {
         for attribute in rdn.0.iter() {

@@ -3965,10 +3965,30 @@ pub(crate) mod tests {
     /// the leaf, the production S/MIME policy on both CAs, and the selected
     /// S/MIME policy on the leaf.
     fn runtime_encypher_chain(policy: &str) -> RuntimeEncypherChain {
+        runtime_encypher_chain_named(
+            policy,
+            "Encypher Corporation",
+            "Encypher CAWG Runtime Publisher",
+        )
+    }
+
+    fn runtime_encypher_chain_named(
+        policy: &str,
+        leaf_organization: &str,
+        leaf_common_name: &str,
+    ) -> RuntimeEncypherChain {
         fn name(common_name: &str) -> DistinguishedName {
             let mut name = DistinguishedName::new();
             name.push(DnType::CountryName, "US");
             name.push(DnType::OrganizationName, "Encypher Corporation");
+            name.push(DnType::CommonName, common_name);
+            name
+        }
+
+        fn leaf_name(organization: &str, common_name: &str) -> DistinguishedName {
+            let mut name = DistinguishedName::new();
+            name.push(DnType::CountryName, "US");
+            name.push(DnType::OrganizationName, organization);
             name.push(DnType::CommonName, common_name);
             name
         }
@@ -4012,7 +4032,7 @@ pub(crate) mod tests {
         let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).expect("P-384 leaf key");
         let mut leaf_params = CertificateParams::new(vec!["identity.fixture.encypher.test".into()])
             .expect("leaf params");
-        leaf_params.distinguished_name = name("Encypher CAWG Runtime Publisher");
+        leaf_params.distinguished_name = leaf_name(leaf_organization, leaf_common_name);
         leaf_params.not_before = datetime!(2026-12-31 23:55 UTC);
         leaf_params.not_after = datetime!(2028-01-02 0:00 UTC);
         leaf_params.is_ca = IsCa::ExplicitNoCa;
@@ -5180,6 +5200,126 @@ pub(crate) mod tests {
             "Encypher CAWG Runtime Publisher"
         );
         assert_eq!(well_formed["certificate_trusted"], false);
+    }
+
+    #[test]
+    fn multiple_x509_identities_keep_subjects_bound_to_exact_terminal_outcomes() {
+        let trusted_chain = runtime_encypher_chain_named(
+            ORGANIZATION_VALIDATED_STRICT_POLICY,
+            "Trusted Fixture Organization",
+            "Trusted Fixture Actor",
+        );
+        let rejected_chain = runtime_encypher_chain_named(
+            ORGANIZATION_VALIDATED_STRICT_POLICY,
+            "Rejected Fixture Organization",
+            "Rejected Fixture Actor",
+        );
+        let trusted_bytes = encypher_identity_assertion(&trusted_chain, None);
+        let rejected_bytes = encypher_identity_assertion(&rejected_chain, None);
+        let trust = encypher_root_trust(&trusted_chain.root_pem, CawgTrustSource::CallerSupplied);
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![
+                ("cawg.identity".into(), trusted_bytes.as_slice()),
+                ("cawg.identity__1".into(), rejected_bytes.as_slice()),
+            ],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 1),
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity__1", 2),
+            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22),
+        ]);
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let primary_binding = claim_refs
+            .references
+            .iter()
+            .find(|reference| reference.label == Some("c2pa.hash.data"))
+            .expect("hard binding");
+        let timestamp_index = TimestampAssertionIndex::default();
+        let mut results = ValidationResults::default();
+        {
+            let mut ctx = IdentityContext {
+                manifest: &manifest,
+                claim: &claim,
+                validation_time: AFTER_INTERIM_CUTOFF,
+                claim_timestamp: None,
+                cawg_trust: Some(&trust),
+                cawg_allowed_certs: None,
+                ocsp_verification_time: AFTER_INTERIM_CUTOFF,
+                document_signing_require_anchor: false,
+                tsa_trust: None,
+                timestamp_index: &timestamp_index,
+                did_documents: None,
+                allow_legacy_encoding: false,
+                ica_trusted_issuers: None,
+                ica_trust_anchors: None,
+                ica_status_lists: None,
+                evidence: Default::default(),
+                ingredients: IngredientResolution::default(),
+                results: &mut results,
+            };
+            verify_identity_assertions(&mut ctx, &claim_refs, Some(primary_binding), &[]);
+        }
+
+        let trusted = results
+            .success
+            .iter()
+            .find(|status| status.code == CAWG_IDENTITY_TRUSTED && status.url == "cawg.identity")
+            .and_then(|status| status.details.as_ref())
+            .expect("trusted terminal details");
+        assert_eq!(
+            trusted["subject_organization"],
+            "Trusted Fixture Organization"
+        );
+        assert_eq!(trusted["subject_common_name"], "Trusted Fixture Actor");
+        assert_eq!(trusted["certificate_trusted"], true);
+
+        assert!(results.success.iter().any(|status| {
+            status.code == CAWG_X509_SIGNATURE_VALIDATED && status.url == "cawg.identity__1"
+        }));
+        let rejected = results
+            .failure
+            .iter()
+            .find(|status| {
+                status.code == CAWG_X509_CREDENTIAL_UNTRUSTED && status.url == "cawg.identity__1"
+            })
+            .and_then(|status| status.details.as_ref())
+            .expect("rejected terminal details");
+        assert!(rejected.get("subject_organization").is_none());
+        assert!(rejected.get("subject_common_name").is_none());
+        assert!(rejected.get("certificate_trusted").is_none());
+        for status in results
+            .success
+            .iter()
+            .chain(&results.informational)
+            .chain(&results.failure)
+            .filter(|status| status.url == "cawg.identity__1")
+        {
+            let details = status.details.as_ref();
+            assert!(details
+                .and_then(|value| value.get("subject_organization"))
+                .is_none());
+            assert!(details
+                .and_then(|value| value.get("subject_common_name"))
+                .is_none());
+            assert!(details
+                .and_then(|value| value.get("certificate_trusted"))
+                .is_none());
+        }
+        assert!(!results.success.iter().any(|status| {
+            status.url == "cawg.identity__1"
+                && matches!(
+                    status.code.as_str(),
+                    CAWG_IDENTITY_TRUSTED | CAWG_IDENTITY_WELL_FORMED
+                )
+        }));
     }
 
     /// The same leaf, the same chain, the same instant: configured as an

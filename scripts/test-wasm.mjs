@@ -153,8 +153,7 @@ const assertNoIdentitySubject = (status) => {
 };
 
 // The packed npm artifact must preserve trusted, unevaluated, and rejected
-// X.509 subject evidence. Read exact assertion labels so two identities can
-// never be paired through array position or a prefix-only match.
+// X.509 subject evidence on the exact assertion label being evaluated.
 const subjectAsset = await readFile(
   resolve(root, "tests/vectors/cawg/generated/identity-1.2/assets/x509-es256-jpeg.jpg"),
 );
@@ -234,12 +233,14 @@ const icaAsset = await readFile(
     "tests/vectors/cawg/external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__claim_aggregation__ica_validation__success.jpg",
   ),
 );
-for (const status of allStatuses(
+const icaStatuses = allStatuses(
   verify(icaAsset, "image/jpeg", {
     no_default_trust: true,
     telemetry: { enabled: false },
   }),
-).filter(({ code }) => code.startsWith("cawg.ica."))) {
+).filter(({ code }) => code.startsWith("cawg.ica."));
+assert.ok(icaStatuses.length > 0);
+for (const status of icaStatuses) {
   assertNoIdentitySubject(status);
 }
 assert.throws(
