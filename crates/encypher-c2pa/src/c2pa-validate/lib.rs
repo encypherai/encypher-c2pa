@@ -2891,7 +2891,10 @@ fn verify_manifest_bound<'a>(
     // cert-time as a non-invalidating caveat.
     let sig_constructed = sig_ok && structure_ok;
 
-    let signature_block_start = results.failure.len();
+    // The status that makes `sig_ok` false, for the deferred gate: the
+    // mismatch or algorithm code, or `signingCredential.invalid` when no leaf
+    // was extracted. An unacceptable leaf is reported but never gates.
+    let mut signature_gate: Option<&'static str> = None;
     match leaf {
         Some(_leaf_der) => {
             // An unacceptable claim signer (CA cert, keyCertSign, wrong/any
@@ -2938,6 +2941,7 @@ fn verify_manifest_bound<'a>(
                     _ => (CLAIM_SIGNATURE_MISMATCH, "claim signature invalid".into()),
                 };
                 results.push_failure(code, sig_url.clone(), explanation);
+                signature_gate = Some(code);
             }
             // When sig_ok but outside validity, claimSignature.validated is
             // intentionally suppressed; the outsideValidity failure below
@@ -2948,6 +2952,7 @@ fn verify_manifest_bound<'a>(
                 "no integrity-protected signing certificate in signature".into()
             });
             results.push_failure(SIGNING_CREDENTIAL_INVALID, sig_url.clone(), explanation);
+            signature_gate = Some(SIGNING_CREDENTIAL_INVALID);
             results.push_failure(
                 CLAIM_SIGNATURE_MISMATCH,
                 sig_url.clone(),
@@ -2955,7 +2960,6 @@ fn verify_manifest_bound<'a>(
             );
         }
     }
-    let signature_block_end = results.failure.len();
 
     if leaf.is_some() {
         if in_validity {
@@ -2993,11 +2997,7 @@ fn verify_manifest_bound<'a>(
         if let Some(capture) = capture.as_deref_mut() {
             capture.gate_code = first_fatal
                 .clone()
-                .or_else(|| {
-                    results.failure[signature_block_start..signature_block_end]
-                        .first()
-                        .map(|status| status.code.clone())
-                })
+                .or_else(|| signature_gate.map(str::to_string))
                 .or_else(|| (!in_validity).then(|| CLAIM_SIGNATURE_OUTSIDE_VALIDITY.to_string()));
         }
     }
@@ -16902,7 +16902,7 @@ mod tests {
     /// what the gate reports when it closes, and what never leaks into the
     /// identity slice.
     mod caller_verified_binding {
-        use super::super::signature_conformance_tests::Signer;
+        use super::super::signature_conformance_tests::{LeafShape, Signer};
         use super::*;
         use crate::c2pa_core::jumbf::{
             assertion_box, compress_manifest_type_prefixed, parse_superbox, UUID_UPDATE_MANIFEST,
@@ -17311,9 +17311,10 @@ mod tests {
 
         /// When the gate closes, the reported status follows the documented
         /// precedence: an early return beats an earlier fatal status, a fatal
-        /// structure status beats the signature block, the signature block's
-        /// first failure beats the validity failure, and the validity failure
-        /// is reported last.
+        /// structure status beats the signature, the status that made the
+        /// signature unusable beats the validity failure, and the validity
+        /// failure is reported last. An unacceptable claim-signing leaf is
+        /// reported but never gates, so it never names the gate.
         #[test]
         fn a_closed_gate_reports_the_status_the_precedence_selects() {
             let data = data_hash();
@@ -17369,7 +17370,20 @@ mod tests {
                 )
                 .as_deref(),
                 Some(SIGNING_CREDENTIAL_INVALID),
-                "the signature block's first failure"
+                "no leaf could be extracted"
+            );
+
+            let unacceptable = Signer::shaped(LeafShape::SoleTimeStamping);
+            let other = claim_over(&[("c2pa.hash.data", data_hash())], &[], false);
+            assert_eq!(
+                gate(
+                    build_manifest(ACTIVE, &boxes, &sound, &unacceptable.sign(&other)),
+                    generous,
+                    validation_time(),
+                )
+                .as_deref(),
+                Some(CLAIM_SIGNATURE_MISMATCH),
+                "the mismatch gates, not the unacceptable leaf reported before it"
             );
 
             let after_expiry =
@@ -17383,6 +17397,16 @@ mod tests {
                 .as_deref(),
                 Some(CLAIM_SIGNATURE_OUTSIDE_VALIDITY),
                 "the validity failure under a strict profile"
+            );
+            assert_eq!(
+                gate(
+                    build_manifest(ACTIVE, &boxes, &sound, &unacceptable.sign(&sound)),
+                    EngineProfile::strict(SpecVersion::V2_4),
+                    after_expiry,
+                )
+                .as_deref(),
+                Some(CLAIM_SIGNATURE_OUTSIDE_VALIDITY),
+                "the validity failure gates, not the unacceptable leaf"
             );
         }
 

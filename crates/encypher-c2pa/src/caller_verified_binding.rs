@@ -11,6 +11,8 @@
 //! binding and every other C2PA check for the exact same store bytes, and it
 //! is compiled only with the non-default `caller-verified-binding` feature.
 
+use std::collections::HashMap;
+
 use crate::c2pa_core::{ComplianceLevel, EngineProfile, OperatingMode, SpecVersion};
 use crate::c2pa_validate::{verify_identity_with_caller_verified_binding, CawgTrustInputs};
 use crate::{
@@ -104,10 +106,14 @@ pub enum CawgEvaluation {
 }
 
 /// Resolved CAWG evaluation policy. Construction validates every trust and
-/// evidence input once.
+/// evidence input once, so one evaluator can serve many evaluations. Its
+/// validation instant is fixed: `options.validation_time` is required.
 pub struct CawgEvaluator {
     resolved: ResolvedOptions,
-    options: VerifyOptions,
+    did_documents: Option<HashMap<String, serde_json::Value>>,
+    ica_trusted_issuers: Option<Vec<String>>,
+    ica_trust_anchors: Option<Vec<String>>,
+    ica_status_lists: Option<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for CawgEvaluator {
@@ -124,6 +130,11 @@ impl CawgEvaluator {
     /// `online: Some(true)`, and a non-empty `external_data` are rejected:
     /// this evaluator never fetches, and a posture flag that disagreed with
     /// `profile` would be ambiguous.
+    ///
+    /// `validation_time` is required. Every evaluation judges certificate
+    /// validity, time stamps, and OCSP freshness at that instant, so an
+    /// omitted value would silently freeze the clock at construction for as
+    /// long as the evaluator lives.
     pub fn new(options: &VerifyOptions, profile: &CawgProfile) -> Result<Self, Error> {
         if options.strict_conformance {
             return Err(Error::Verification(
@@ -145,11 +156,20 @@ impl CawgEvaluator {
                 "external_data must be empty: the evaluator never reads external content".into(),
             ));
         }
+        if options.validation_time.is_none() {
+            return Err(Error::Verification(
+                "validation_time is required: the evaluator judges every evaluation at one fixed instant"
+                    .into(),
+            ));
+        }
         let mut resolved = ResolvedOptions::resolve(options)?;
         resolved.profile = profile.profile;
         Ok(Self {
             resolved,
-            options: options.clone(),
+            did_documents: options.cawg_did_documents.clone(),
+            ica_trusted_issuers: options.cawg_ica_trusted_issuers.clone(),
+            ica_trust_anchors: options.cawg_ica_trust_anchors.clone(),
+            ica_status_lists: options.cawg_ica_status_lists.clone(),
         })
     }
 
@@ -177,10 +197,10 @@ impl CawgEvaluator {
             self.resolved.cawg_trust(),
             self.resolved.cawg_allowed_certs(),
             self.resolved.cawg_document_signing_require_anchor,
-            self.options.cawg_did_documents.as_ref(),
-            self.options.cawg_ica_trusted_issuers.as_deref(),
-            self.options.cawg_ica_trust_anchors.as_deref(),
-            self.options.cawg_ica_status_lists.as_ref(),
+            self.did_documents.as_ref(),
+            self.ica_trusted_issuers.as_deref(),
+            self.ica_trust_anchors.as_deref(),
+            self.ica_status_lists.as_ref(),
         );
         let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             verify_identity_with_caller_verified_binding(

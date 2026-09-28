@@ -11,8 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use encypher_c2pa::{
-    detached_manifest_evidence, verify_with_options, CawgEvaluation, CawgEvaluator, CawgProfile,
-    CawgStoreHost, Error, TelemetryOptions, VerifyOptions,
+    detached_manifest_evidence, verify_with_manifest_store, verify_with_options, CawgEvaluation,
+    CawgEvaluator, CawgProfile, CawgStoreHost, Error, TelemetryOptions, VerificationReport,
+    VerifyOptions,
 };
 
 fn vector(path: &str) -> Vec<u8> {
@@ -230,6 +231,68 @@ fn options_the_evaluator_cannot_honour_are_rejected() {
         }),
         "external_data",
     );
+    // Without a fixed instant a long-lived evaluator would judge every later
+    // evaluation at its construction time.
+    reject(offline(VerifyOptions::default()), "validation_time");
+}
+
+/// `cawg_document_signing_require_anchor`: `None` keeps the default, so a
+/// documentSigning identity with no configured anchor is well-formed but not
+/// trusted; `Some(false)` lifts the requirement. The embedded, detached, and
+/// caller-verified-binding entry points all honour it.
+#[test]
+fn the_document_signing_anchor_requirement_follows_the_option() {
+    let asset = vector(ES256_JPEG);
+    let store = store_of(&asset, "image/jpeg");
+    let report_codes = |report: VerificationReport| -> Vec<String> {
+        report
+            .cawg_statuses()
+            .iter()
+            .map(|status| status.code.clone())
+            .collect()
+    };
+    for (require_anchor, trusted) in [(None, false), (Some(true), false), (Some(false), true)] {
+        let options = VerifyOptions {
+            cawg_allowed_certs_pem: None,
+            cawg_document_signing_require_anchor: require_anchor,
+            ..es256_options()
+        };
+        let outcomes = [
+            (
+                "embedded",
+                report_codes(verify_with_options(&asset, "image/jpeg", &options).expect("verify")),
+            ),
+            (
+                "detached",
+                report_codes(
+                    verify_with_manifest_store(&asset, &store, "image/jpeg", &options)
+                        .expect("verify"),
+                ),
+            ),
+            (
+                "caller-verified binding",
+                codes(
+                    &CawgEvaluator::new(&options, &generous())
+                        .expect("evaluator")
+                        .evaluate_with_caller_verified_binding(&store, CawgStoreHost::Asset)
+                        .expect("evaluation"),
+                ),
+            ),
+        ];
+        for (entry_point, codes) in outcomes {
+            let has = |code: &str| codes.iter().any(|c| c == code);
+            assert_eq!(
+                has("cawg.identity.trusted"),
+                trusted,
+                "{entry_point}, {require_anchor:?}: {codes:?}"
+            );
+            assert_eq!(
+                has("cawg.identity.well-formed"),
+                !trusted,
+                "{entry_point}, {require_anchor:?}: {codes:?}"
+            );
+        }
+    }
 }
 
 #[test]
