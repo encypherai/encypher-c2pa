@@ -4609,25 +4609,58 @@ mod tests {
             .expect("encode identity assertion")
         }
 
-        /// Verify one identity assertion from `chain` against caller-supplied
-        /// online evidence, at an instant inside every certificate validity
-        /// window and inside every minted response's freshness interval.
-        fn verdict(chain: &OcspChain, evidence: OnlineEvidence<'_>) -> ValidationResults {
+        fn identity_assertion_with_staples(
+            chain: &OcspChain,
+            tsa: &TestTsa,
+            signed_at: OffsetDateTime,
+            staples: Vec<Vec<u8>>,
+        ) -> Vec<u8> {
+            let base = identity_assertion(chain);
+            let input =
+                timestamp_input(&fixture_identity_cose(&base)).expect("identity timestamp input");
+            let token = tsa.token(&input, signed_at);
+            let mut headers = sig_tst_header(
+                "sigTst2",
+                vec![timestamp_token_entry(token)],
+            );
+            headers.push((
+                Value::Text("rVals".into()),
+                Value::Map(vec![(
+                    Value::Text("ocspVals".into()),
+                    Value::Array(staples.into_iter().map(Value::Bytes).collect()),
+                )]),
+            ));
+            with_unprotected_headers(&base, headers)
+        }
+
+        fn verdict_for_assertion(
+            chain: &OcspChain,
+            assertion: &[u8],
+            tsa_trust: Option<&TrustList>,
+            evidence: OnlineEvidence<'_>,
+        ) -> ValidationResults {
             let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
             identity_verdict_full(
-                &identity_assertion(chain),
+                assertion,
                 &binding_claim_refs(0x22),
                 false,
                 "c2pa.hash.data",
                 Some(&trust),
                 None,
                 true,
-                None,
+                tsa_trust,
                 &TimestampAssertionIndex::default(),
                 AFTER_INTERIM_CUTOFF,
                 None,
                 evidence,
             )
+        }
+
+        /// Verify one identity assertion from `chain` against caller-supplied
+        /// online evidence, at an instant inside every certificate validity
+        /// window and inside every minted response's freshness interval.
+        fn verdict(chain: &OcspChain, evidence: OnlineEvidence<'_>) -> ValidationResults {
+            verdict_for_assertion(chain, &identity_assertion(chain), None, evidence)
         }
 
         /// Verify with one minted response per certificate.
@@ -4683,6 +4716,116 @@ mod tests {
                 evidence_key(&chain.issuing_der),
                 answer(&chain.root_der, &chain.root_key, &chain.issuing_der, status),
             )
+        }
+
+        /// CAWG-ID13-X509-VALIDATING-A-055 / CAWG-ID13-X509VALB-002..003:
+        /// end-to-end `rVals` evidence produces the CAWG leaf status.
+        #[test]
+        fn stapled_identity_responses_report_good_and_revoked() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let good = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::Good,
+            );
+            let good_assertion =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![good]);
+            let good_results = verdict_for_assertion(
+                &chain,
+                &good_assertion,
+                Some(&tsa.trust_list()),
+                OnlineEvidence::default(),
+            );
+            assert!(good_results.has_success(CAWG_X509_OCSP_NOT_REVOKED));
+            assert_eq!(failure_codes(&good_results), Vec::<&str>::new());
+
+            let revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let revoked_assertion =
+                identity_assertion_with_staples(&chain, &tsa, AFTER_INTERIM_CUTOFF, vec![revoked]);
+            let revoked_results = verdict_for_assertion(
+                &chain,
+                &revoked_assertion,
+                Some(&tsa.trust_list()),
+                OnlineEvidence::default(),
+            );
+            assert_eq!(
+                failure_codes(&revoked_results),
+                [CAWG_IDENTITY_CREDENTIAL_REVOKED]
+            );
+        }
+
+        /// CAWG-ID13-X509-VALIDATING-A-057: an unusable first response does
+        /// not prevent a later qualifying response from settling the leaf.
+        #[test]
+        fn stapled_identity_responses_try_invalid_before_valid() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let good = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::Good,
+            );
+            let assertion = identity_assertion_with_staples(
+                &chain,
+                &tsa,
+                AFTER_INTERIM_CUTOFF,
+                vec![b"not DER".to_vec(), good],
+            );
+            let results = verdict_for_assertion(
+                &chain,
+                &assertion,
+                Some(&tsa.trust_list()),
+                OnlineEvidence::default(),
+            );
+
+            assert!(results.has_success(CAWG_X509_OCSP_NOT_REVOKED));
+            assert_eq!(failure_codes(&results), Vec::<&str>::new());
+        }
+
+        /// CAWG-ID13-X509-VALIDATING-A-061: embedded OCSP cannot establish
+        /// historical non-revocation without a valid signed time stamp.
+        #[test]
+        fn stapled_good_without_a_time_stamp_does_not_establish_not_revoked() {
+            let chain = ocsp_chain();
+            let good = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::Good,
+            );
+            let assertion = with_unprotected_headers(
+                &identity_assertion(&chain),
+                vec![(
+                    Value::Text("rVals".into()),
+                    Value::Map(vec![(
+                        Value::Text("ocspVals".into()),
+                        Value::Array(vec![Value::Bytes(good)]),
+                    )]),
+                )],
+            );
+            let results = verdict_for_assertion(
+                &chain,
+                &assertion,
+                None,
+                OnlineEvidence::default(),
+            );
+
+            assert!(!results.has_success(CAWG_X509_OCSP_NOT_REVOKED));
+            assert!(results.has_informational(CAWG_X509_OCSP_SKIPPED));
         }
 
         #[test]
