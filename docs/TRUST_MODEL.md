@@ -111,18 +111,21 @@ When online checks are allowed, the SDK asks the responder the certificate
 names and verifies the signed response exactly as it verifies a stapled one.
 An SDK endpoint or SSRF policy refusal happens before I/O; on both the C2PA
 claim-signer and CAWG identity lanes it remains `*.ocsp.skipped` with the
-unresolved network need. Only an attempted query that delivered no response is
-`*.ocsp.inaccessible`. A received body that was discarded under the size
-limit is carried to pass two as an empty DER entry in `ocsp_responses`, not in
+unresolved network need. A received body discarded under the size limit is
+carried to pass two as an empty DER entry in `ocsp_responses`, not in
 `ocsp_unreachable`.
 
-For CAWG identity validation, received malformed or unauthorized OCSP bytes
-are `com.encypher.cawg.x509.ocsp.unusableResponse`; a signed response outside
-CAWG's open `(thisUpdate,nextUpdate)` interval is
+For CAWG identity validation, only an attempted query that delivered no
+response is `cawg.x509.ocsp.inaccessible`. Received malformed or unauthorized
+bytes are `com.encypher.cawg.x509.ocsp.unusableResponse`; a signed response
+outside CAWG's open `(thisUpdate,nextUpdate)` interval is
 `com.encypher.cawg.x509.ocsp.outsideWindow`. Neither outcome means the
 responder was inaccessible. A qualifying stapled revocation is terminal over
-every optional online outcome. C2PA claim-signer validation keeps its existing
-online response-window and registered report codes.
+every optional online outcome. Embedded evidence is evaluated across the
+identity certificate chain; optional online evidence settles the leaf only.
+C2PA claim-signer validation keeps its existing response-window policy and
+registered report mapping, under which a query that returns no usable current
+answer is `signingCredential.ocsp.inaccessible`.
 
 When a manifest staples several OCSP responses for one certificate and they
 disagree, the default posture treats any `revoked` response as decisive. Under

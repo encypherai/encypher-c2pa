@@ -302,7 +302,7 @@ fn verdict_for(
         OnlinePolicy::CawgIdentity => (
             effective > this_update
                 && next_update.is_some_and(|next_update| effective < next_update),
-            effective > this_update,
+            attested.is_none() || effective > this_update,
         ),
     };
 
@@ -317,18 +317,16 @@ fn verdict_for(
             } else {
                 match policy {
                     OnlinePolicy::C2paClaim => OnlineVerdict::Unusable,
-                    OnlinePolicy::CawgIdentity => OnlineVerdict::OutsideWindow {
-                        refresh_may_cover,
-                    },
+                    OnlinePolicy::CawgIdentity => {
+                        OnlineVerdict::OutsideWindow { refresh_may_cover }
+                    }
                 }
             }
         }
         OcspStatus::Revoked {
             revocation_time, ..
         } => match attested {
-            Some(attested) if in_window && revocation_time > attested => {
-                OnlineVerdict::NotRevoked
-            }
+            Some(attested) if in_window && revocation_time > attested => OnlineVerdict::NotRevoked,
             _ => OnlineVerdict::Revoked,
         },
         OcspStatus::Unknown => OnlineVerdict::Unknown,
@@ -608,11 +606,7 @@ mod tests {
             next_update: None,
         });
         assert_eq!(
-            pair.evaluate_with(
-                &unbounded,
-                Some(SIGNED_AT),
-                OnlinePolicy::CawgIdentity,
-            ),
+            pair.evaluate_with(&unbounded, Some(SIGNED_AT), OnlinePolicy::CawgIdentity,),
             OnlineVerdict::OutsideWindow {
                 refresh_may_cover: true,
             }

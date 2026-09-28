@@ -611,8 +611,9 @@ impl OnlineEvidence<'_> {
             .map(Vec::as_slice)
     }
 
-    /// True when the responder for `certificate_sha256_hex` was tried and gave
-    /// no usable answer.
+    /// True when the responder for `certificate_sha256_hex` was tried and
+    /// delivered no response. Received but unusable responses are represented
+    /// in `ocsp_responses`.
     fn ocsp_is_unreachable(&self, certificate_sha256_hex: &str) -> bool {
         self.ocsp_unreachable
             .is_some_and(|list| list.iter().any(|entry| entry == certificate_sha256_hex))
@@ -2251,16 +2252,14 @@ pub(super) fn evaluate_online_ocsp(
     let mut outcome = OnlineOcspOutcome::default();
     for (position, target) in targets.iter().enumerate() {
         let leaf_outcome = match evidence.ocsp_response(&target.certificate_sha256_hex) {
-            Some(der) => OnlineOcspLeafOutcome::Received(
-                crate::c2pa_trust::evaluate_ocsp_online(
-                    der,
-                    target.issuer,
-                    target.subject,
-                    attested,
-                    verification_time,
-                    policy,
-                ),
-            ),
+            Some(der) => OnlineOcspLeafOutcome::Received(crate::c2pa_trust::evaluate_ocsp_online(
+                der,
+                target.issuer,
+                target.subject,
+                attested,
+                verification_time,
+                policy,
+            )),
             None if evidence.ocsp_is_unreachable(&target.certificate_sha256_hex) => {
                 OnlineOcspLeafOutcome::Unreachable
             }
@@ -2310,42 +2309,36 @@ fn record_ocsp_status(
             EmbeddedOcspStatus::CaRevoked | EmbeddedOcspStatus::LeafAndCaRevoked
         );
     match online.leaf {
-        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::NotRevoked)) => {
-            results.push_success_with_details(
+        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::NotRevoked)) => results
+            .push_success_with_details(
                 SIGNING_CREDENTIAL_OCSP_NOT_REVOKED,
                 sig_url.into(),
                 "online OCSP response: signing certificate not revoked at signing".into(),
                 online_ocsp_details(),
-            )
-        }
-        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)) => {
-            results.push_failure_with_details(
+            ),
+        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)) => results
+            .push_failure_with_details(
                 SIGNING_CREDENTIAL_OCSP_REVOKED,
                 sig_url.into(),
                 "online OCSP response: signing certificate revoked".into(),
                 online_ocsp_details(),
-            )
-        }
-        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unknown)) => {
-            results.push_informational_with_details(
+            ),
+        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unknown)) => results
+            .push_informational_with_details(
                 SIGNING_CREDENTIAL_OCSP_UNKNOWN,
                 sig_url.into(),
-                "online OCSP response reports an unknown status for the signing certificate"
-                    .into(),
+                "online OCSP response reports an unknown status for the signing certificate".into(),
                 online_ocsp_details(),
-            )
-        }
+            ),
         Some(OnlineOcspLeafOutcome::Received(
             OnlineOcspVerdict::Unusable | OnlineOcspVerdict::OutsideWindow { .. },
         ))
-        | Some(OnlineOcspLeafOutcome::Unreachable) => {
-            results.push_informational_with_details(
-                SIGNING_CREDENTIAL_OCSP_INACCESSIBLE,
-                sig_url.into(),
-                "the signing certificate's OCSP query produced no usable response".into(),
-                online_ocsp_details(),
-            )
-        }
+        | Some(OnlineOcspLeafOutcome::Unreachable) => results.push_informational_with_details(
+            SIGNING_CREDENTIAL_OCSP_INACCESSIBLE,
+            sig_url.into(),
+            "the signing certificate's OCSP query produced no usable response".into(),
+            online_ocsp_details(),
+        ),
         None => match embedded.status {
             EmbeddedOcspStatus::NotRevoked => results.push_success(
                 SIGNING_CREDENTIAL_OCSP_NOT_REVOKED,
@@ -2919,8 +2912,9 @@ fn verify_manifest<'a>(
         ocsp_verification_time,
         crate::c2pa_trust::OnlineOcspPolicy::C2paClaim,
     );
-    let ocsp_blocks_trust =
-        ocsp_outcome.status.blocks_trust() || online_ocsp.ca_revoked || online_ocsp.leaf_is_revoked();
+    let ocsp_blocks_trust = ocsp_outcome.status.blocks_trust()
+        || online_ocsp.ca_revoked
+        || online_ocsp.leaf_is_revoked();
     record_ocsp_status(
         ocsp_outcome,
         &online_ocsp,

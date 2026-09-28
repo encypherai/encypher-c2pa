@@ -177,7 +177,9 @@ pub struct VerifyOptions {
     pub cawg_ica_status_lists: Option<HashMap<String, String>>,
     /// OCSP responses a caller obtained online, keyed by the lowercase hex
     /// SHA-256 of the certificate's DER and encoded as standard base64 of the
-    /// DER `OCSPResponse`.
+    /// DER `OCSPResponse`. An empty decoded value is the sentinel for a
+    /// response body that arrived but was discarded under a size bound; it is
+    /// received, unusable evidence rather than an unreachable responder.
     ///
     /// The SDK never fetches these for you at this layer: supply them from
     /// your own OCSP client, or let the SDK's consent-gated fetcher do it. A
@@ -185,11 +187,12 @@ pub struct VerifyOptions {
     /// signed by an authorized responder for the certificate in question, and
     /// it is evaluated under the C2PA 2.4 and CAWG 1.3 online rules.
     pub ocsp_responses: Option<HashMap<String, String>>,
-    /// Certificates whose OCSP responder was queried without a usable answer,
-    /// by the same lowercase hex SHA-256 key.
+    /// Certificates whose OCSP responder was queried but delivered no
+    /// response, by the same lowercase hex SHA-256 key. A response that
+    /// arrived but was unusable belongs in `ocsp_responses`.
     ///
-    /// Each entry registers the `signingCredential.ocsp.inaccessible` (or
-    /// `cawg.x509.ocsp.inaccessible`) informational code in place of the
+    /// Each entry registers `signingCredential.ocsp.inaccessible` or, for a
+    /// CAWG identity, `cawg.x509.ocsp.inaccessible`, in place of the
     /// `ocsp.skipped` code a purely offline run reports.
     pub ocsp_unreachable: Option<Vec<String>>,
     /// Content of cloud-data and hashed external-reference assertions, keyed

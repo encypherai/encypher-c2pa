@@ -1599,11 +1599,7 @@ mod tests {
         };
         let responses = tlv(
             0x30,
-            &[
-                single(CertIdMutation::Serial),
-                single(CertIdMutation::None),
-            ]
-            .concat(),
+            &[single(CertIdMutation::Serial), single(CertIdMutation::None)].concat(),
         );
         let mut response_data = responder_id(&responder_der, true);
         response_data.extend(tlv(0x18, b"20260101000000Z"));
