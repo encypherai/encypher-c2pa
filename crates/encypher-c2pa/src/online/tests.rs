@@ -593,16 +593,93 @@ impl Fetcher for ScriptedFetcher {
             }),
             Some(Err(detail)) => Err(FetchErr {
                 blocked: false,
+                received_response: false,
                 detail: detail.clone(),
                 requests_used: 1,
             }),
             None => Err(FetchErr {
                 blocked: true,
+                received_response: false,
                 detail: format!("{} was not scripted", request.url),
                 requests_used: 1,
             }),
         }
     }
+}
+
+struct RefusedOcspFetcher {
+    received_response: bool,
+}
+
+impl Fetcher for RefusedOcspFetcher {
+    fn fetch(&self, _request: &FetchRequest<'_>) -> FetchResult {
+        Err(FetchErr {
+            blocked: true,
+            received_response: self.received_response,
+            detail: if self.received_response {
+                "the response exceeded the OCSP body limit".to_string()
+            } else {
+                "the endpoint was refused before I/O".to_string()
+            },
+            requests_used: usize::from(self.received_response),
+        })
+    }
+}
+
+fn one_ocsp_need(purpose: OcspPurpose) -> Vec<NetworkNeed> {
+    vec![NetworkNeed::Ocsp {
+        purpose,
+        responder_url: "http://ocsp.test/".to_string(),
+        request_der: b"request".to_vec(),
+        certificate_sha256_hex: "aa11".to_string(),
+    }]
+}
+
+/// A both-lane SDK policy refusal never becomes `*.ocsp.inaccessible`.
+/// The empty evidence makes the second pass report skipped and keep its need.
+#[test]
+fn a_pre_io_ocsp_refusal_carries_no_unreachable_evidence_on_either_lane() {
+    for purpose in [
+        OcspPurpose::ClaimSigner,
+        OcspPurpose::CawgIdentity {
+            assertion_label: "cawg.identity".to_string(),
+        },
+    ] {
+        let (requests, evidence) = fetch_all(
+            &RefusedOcspFetcher {
+                received_response: false,
+            },
+            &one_ocsp_need(purpose),
+        );
+        assert_eq!(requests[0].outcome, "blocked");
+        assert!(evidence.ocsp_responses.is_empty());
+        assert!(evidence.ocsp_unreachable.is_empty());
+        let options = apply_evidence(&VerifyOptions::default(), &evidence);
+        assert!(options.ocsp_responses.is_none());
+        assert!(options.ocsp_unreachable.is_none());
+    }
+}
+
+/// CAWG-ID13-X509VALB-006: an oversized OCSP body was received but is unusable,
+/// so pass two receives the agreed empty-DER sentinel rather than an
+/// unreachable marker.
+#[test]
+fn an_oversized_ocsp_body_carries_an_empty_der_response() {
+    let (requests, evidence) = fetch_all(
+        &RefusedOcspFetcher {
+            received_response: true,
+        },
+        &one_ocsp_need(OcspPurpose::CawgIdentity {
+            assertion_label: "cawg.identity".to_string(),
+        }),
+    );
+
+    assert_eq!(requests[0].outcome, "blocked");
+    assert_eq!(
+        evidence.ocsp_responses.get("aa11").map(String::as_str),
+        Some("")
+    );
+    assert!(evidence.ocsp_unreachable.is_empty());
 }
 
 #[test]

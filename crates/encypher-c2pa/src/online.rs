@@ -109,9 +109,12 @@ pub struct NetworkRequest {
 pub(crate) struct OnlineEvidence {
     /// A manifest store retrieved from the URI the asset declares.
     pub(crate) manifest_store: Option<Vec<u8>>,
-    /// Certificate SHA-256 (lowercase hex) -> base64 DER OCSPResponse.
+    /// Certificate SHA-256 (lowercase hex) -> base64 DER OCSPResponse. An
+    /// empty value is the pass-two sentinel for a body that arrived but was
+    /// discarded under the size limit; it evaluates as unusable evidence.
     pub(crate) ocsp_responses: HashMap<String, String>,
-    /// Certificate SHA-256 (lowercase hex) whose responder gave no usable answer.
+    /// Certificate SHA-256 (lowercase hex) whose responder was contacted but
+    /// delivered no response. SDK policy refusals are not unreachable.
     pub(crate) ocsp_unreachable: Vec<String>,
     /// Need URI -> base64 content bytes.
     pub(crate) external_data: HashMap<String, String>,
@@ -315,6 +318,9 @@ pub(crate) struct FetchOk {
 pub(crate) struct FetchErr {
     /// True when this SDK refused, false when the network or server did.
     pub(crate) blocked: bool,
+    /// True when a response body arrived but was discarded before it could be
+    /// carried to pass two. Currently this is the oversized-body case.
+    pub(crate) received_response: bool,
     pub(crate) detail: String,
     pub(crate) requests_used: usize,
 }
@@ -328,6 +334,7 @@ pub(crate) trait Fetcher {
 fn blocked(detail: impl Into<String>, requests_used: usize) -> FetchErr {
     FetchErr {
         blocked: true,
+        received_response: false,
         detail: detail.into(),
         requests_used,
     }
@@ -352,13 +359,6 @@ pub(crate) fn fetch_all(
                 outcome: "skipped".to_string(),
                 detail: format!("the {MAX_REQUESTS} request budget for one verification is spent"),
             });
-            if let NetworkNeed::Ocsp {
-                certificate_sha256_hex,
-                ..
-            } = need
-            {
-                push_unreachable(&mut evidence, certificate_sha256_hex);
-            }
             continue;
         }
 
@@ -418,6 +418,7 @@ pub(crate) fn fetch_all(
             }
             Err(FetchErr {
                 blocked,
+                received_response,
                 detail,
                 requests_used,
             }) => {
@@ -427,7 +428,13 @@ pub(crate) fn fetch_all(
                     ..
                 } = need
                 {
-                    push_unreachable(&mut evidence, certificate_sha256_hex);
+                    if received_response {
+                        evidence
+                            .ocsp_responses
+                            .insert(certificate_sha256_hex.clone(), String::new());
+                    } else if !blocked {
+                        push_unreachable(&mut evidence, certificate_sha256_hex);
+                    }
                 }
                 (
                     if blocked { "blocked" } else { "failed" }.to_string(),
@@ -616,6 +623,16 @@ pub(crate) mod native {
     fn failed(detail: impl Into<String>, requests_used: usize) -> FetchErr {
         FetchErr {
             blocked: false,
+            received_response: false,
+            detail: detail.into(),
+            requests_used,
+        }
+    }
+
+    fn oversized(detail: impl Into<String>, requests_used: usize) -> FetchErr {
+        FetchErr {
+            blocked: true,
+            received_response: true,
             detail: detail.into(),
             requests_used,
         }
@@ -871,7 +888,7 @@ pub(crate) mod native {
             return Err(failed(error.to_string(), used));
         }
         if bytes.len() > limit {
-            return Err(blocked(
+            return Err(oversized(
                 format!("the response is larger than the {limit} byte limit"),
                 used,
             ));

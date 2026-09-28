@@ -119,6 +119,9 @@ Extension codes use the `com.encypher.` prefix, as C2PA 2.4 requires of codes ou
 | `com.encypher.assertion.boxesHash.overlappingRestartSegments` | informational | A JPEG box hash matched the overlapping restart layout c2pa-rs writes rather than the C2PA 2.4 layout. Default posture only. |
 | `com.encypher.cawg.metadata.invalid`, `com.encypher.cawg.trainingMining.invalid` | failure (assertion-scoped) | The CAWG metadata or training-and-mining assertion is malformed. Never changes C2PA integrity. |
 | `com.encypher.cawg.trainingMining.effectiveUse` | informational | `details.entries` maps each standard use to `declaredUse`, `effectiveUse`, and any `constraintInfo`. |
+| `com.encypher.cawg.x509.ocsp.outsideWindow` | informational | A signed OCSP response about the identity certificate did not cover the effective validation instant under CAWG's open interval. |
+| `com.encypher.cawg.x509.ocsp.unusableResponse` | informational | OCSP response bytes arrived for the identity certificate but were malformed, unauthorized, oversized, or about another certificate. |
+| `com.encypher.cawg.x509.time_of_signing.afterTimestamp` | informational | The protected identity `iat` is inside the certificate chain validity window but later than the trusted time stamp. |
 | `com.encypher.ocsp.conflictingRevokedResponse` | informational | Strict mode only: a qualifying `good` OCSP response outranked a stapled `revoked` one. |
 | `com.encypher.conformance.trustedTimeStampMissing` | failure | Strict mode only: the Conformance Program requires a trusted timestamp. |
 | `com.encypher.conformance.revocationInformationMissing` | failure | Strict mode only: the Conformance Program requires usable revocation information. The default posture reports `signingCredential.ocsp.skipped`. |

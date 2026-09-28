@@ -22,7 +22,8 @@ pub(crate) mod ocsp;
 mod profile;
 pub(crate) use ocsp::online::{
     build_request as build_ocsp_request, evaluate as evaluate_ocsp_online,
-    responder_url as ocsp_responder_url, OnlineVerdict as OnlineOcspVerdict,
+    responder_url as ocsp_responder_url, OnlinePolicy as OnlineOcspPolicy,
+    OnlineVerdict as OnlineOcspVerdict,
 };
 pub(crate) use ocsp::{
     evaluate_verified as evaluate_ocsp_verified, OcspStatus, MAX_OCSP_RESPONSE_BYTES,

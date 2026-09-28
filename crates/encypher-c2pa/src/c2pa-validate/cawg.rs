@@ -69,10 +69,21 @@ pub const CAWG_X509_TIME_OF_SIGNING_INSIDE_VALIDITY: &str =
     "cawg.x509.time_of_signing.inside_validity";
 pub const CAWG_X509_TIME_OF_SIGNING_OUTSIDE_VALIDITY: &str =
     "cawg.x509.time_of_signing.outside_validity";
+/// The protected `iat` is inside the credential validity window but later
+/// than the trusted time-stamp used for signature validation.
+pub const CAWG_X509_TIME_OF_SIGNING_AFTER_TIMESTAMP: &str =
+    "com.encypher.cawg.x509.time_of_signing.afterTimestamp";
 pub const CAWG_X509_OCSP_NOT_REVOKED: &str = "cawg.x509.ocsp.not_revoked";
 pub const CAWG_X509_OCSP_SKIPPED: &str = "cawg.x509.ocsp.skipped";
-/// An online OCSP query for the identity certificate returned no usable answer.
+/// An online OCSP query was attempted, but the responder or transport returned
+/// no response.
 pub const CAWG_X509_OCSP_INACCESSIBLE: &str = "cawg.x509.ocsp.inaccessible";
+/// An accepted response did not cover the effective validation instant.
+pub const CAWG_X509_OCSP_OUTSIDE_WINDOW: &str =
+    "com.encypher.cawg.x509.ocsp.outsideWindow";
+/// Response bytes arrived but could not establish a usable OCSP answer.
+pub const CAWG_X509_OCSP_UNUSABLE_RESPONSE: &str =
+    "com.encypher.cawg.x509.ocsp.unusableResponse";
 /// An OCSP response reported `unknown` for the identity certificate.
 pub const CAWG_X509_OCSP_UNKNOWN: &str = "cawg.x509.ocsp.unknown";
 /// Vendor-namespaced informational status for an explicitly enabled legacy
@@ -215,6 +226,8 @@ pub(super) fn verify_identity_assertions(
         );
         return;
     }
+    let reference_cycles = identity_reference_cycles(claim_refs, &ctx.manifest.label);
+
 
     for reference in &claim_refs.references {
         let Some(label) = reference.label else {
@@ -236,6 +249,7 @@ pub(super) fn verify_identity_assertions(
             primary_binding,
             certificate_status_assertions,
             label,
+            reference_cycles.contains(label),
         );
     }
 }
@@ -255,6 +269,7 @@ fn verify_identity_assertion(
     primary_binding: Option<&ClaimAssertionReference<'_>>,
     certificate_status_assertions: &[&[u8]],
     url: &str,
+    reference_cycle: bool,
 ) {
     #[cfg(test)]
     record_identity_work(|counts| counts.identity_evaluations += 1);
@@ -321,14 +336,6 @@ fn verify_identity_assertion(
         .get("sig_type")
         .and_then(Value::as_text)
         .expect("shape validator guarantees sig_type");
-    let referenced_identity = referenced.iter().any(|reference| {
-        reference
-            .get("url")
-            .and_then(Value::as_text)
-            .and_then(|url| super::assertion_label_for_manifest(url, &ctx.manifest.label))
-            .is_some_and(is_identity_assertion_label)
-    });
-    let reference_cycle = identity_reference_cycle(claim_refs, &ctx.manifest.label, url);
 
     // The hash algorithm a referenced assertion inherits when it omits `alg`.
     let claim_alg = ctx.claim.get("alg").and_then(Value::as_text);
@@ -356,16 +363,11 @@ fn verify_identity_assertion(
             "referenced_assertions contains a duplicate".into(),
         );
     }
-    if mismatch || referenced_identity {
+    if mismatch || reference_cycle {
         let (explanation, reason) = if reference_cycle {
             (
                 "referenced_assertions creates a CAWG identity reference cycle",
                 "reference_cycle",
-            )
-        } else if referenced_identity {
-            (
-                "referenced_assertions contains another CAWG identity assertion",
-                "identity_assertion_reference",
             )
         } else {
             (
@@ -443,7 +445,7 @@ fn verify_identity_assertion(
             "referenced_assertions does not contain exactly the primary hard binding".into(),
         );
     }
-    if duplicate || mismatch || referenced_identity || !hard_binding_valid {
+    if duplicate || mismatch || reference_cycle || !hard_binding_valid {
         return;
     }
 
@@ -551,12 +553,57 @@ fn verify_identity_assertion(
         ctx.evidence,
         timestamp_trusted.then_some(at),
         ctx.ocsp_verification_time,
+        crate::c2pa_trust::OnlineOcspPolicy::CawgIdentity,
     );
+    let embedded_leaf_revoked = matches!(
+        revocation_status,
+        IdentityRevocationStatus::LeafRevoked | IdentityRevocationStatus::LeafAndCaRevoked
+    );
+    if embedded_leaf_revoked {
+        ctx.results.push_failure(
+            CAWG_IDENTITY_CREDENTIAL_REVOKED,
+            url.into(),
+            "verified stapled OCSP evidence reports the identity signing certificate revoked"
+                .into(),
+        );
+        return;
+    }
+
+    let embedded_ca_revoked = matches!(
+        revocation_status,
+        IdentityRevocationStatus::CaRevoked | IdentityRevocationStatus::LeafAndCaRevoked
+    );
+    if embedded_ca_revoked || online.ca_revoked {
+        ctx.results.push_failure(
+            CAWG_X509_CREDENTIAL_UNTRUSTED,
+            url.into(),
+            "verified OCSP evidence reports a CA certificate in the identity chain revoked".into(),
+        );
+        return;
+    }
+
     let purpose = super::OcspPurpose::CawgIdentity {
         assertion_label: url.rsplit('/').next().unwrap_or(url).to_string(),
     };
+    let leaf_targets = &targets[..targets.len().min(1)];
+    let embedded_good = revocation_status == IdentityRevocationStatus::NotRevoked;
+    if embedded_good
+        && !matches!(
+            online.leaf,
+            Some(super::OnlineOcspLeafOutcome::Received(
+                OnlineOcspVerdict::NotRevoked | OnlineOcspVerdict::Revoked
+            ))
+        )
+    {
+        ctx.results.push_success(
+            CAWG_X509_OCSP_NOT_REVOKED,
+            url.into(),
+            "verified stapled OCSP evidence reports the identity leaf not revoked".into(),
+        );
+    }
+
     let leaf_revoked = match online.leaf {
-        Some(OnlineOcspVerdict::NotRevoked) => {
+        Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::NotRevoked)) => {
             ctx.results.push_success(
                 CAWG_X509_OCSP_NOT_REVOKED,
                 url.into(),
@@ -564,8 +611,8 @@ fn verify_identity_assertion(
             );
             false
         }
-        Some(OnlineOcspVerdict::Revoked) => true,
-        Some(OnlineOcspVerdict::Unknown) => {
+        Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)) => true,
+        Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unknown)) => {
             ctx.results.push_informational(
                 CAWG_X509_OCSP_UNKNOWN,
                 url.into(),
@@ -573,51 +620,50 @@ fn verify_identity_assertion(
             );
             false
         }
-        Some(OnlineOcspVerdict::Unusable) => {
+        Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unusable)) => {
+            ctx.results.push_informational(
+                CAWG_X509_OCSP_UNUSABLE_RESPONSE,
+                url.into(),
+                "received OCSP bytes did not contain a usable answer for the identity certificate"
+                    .into(),
+            );
+            super::record_ocsp_needs(leaf_targets, &purpose, &mut ctx.results.network_needs);
+            false
+        }
+        Some(super::OnlineOcspLeafOutcome::Received(
+            OnlineOcspVerdict::OutsideWindow { refresh_may_cover },
+        )) => {
+            ctx.results.push_informational(
+                CAWG_X509_OCSP_OUTSIDE_WINDOW,
+                url.into(),
+                "the OCSP response does not cover the identity's effective validation time".into(),
+            );
+            if refresh_may_cover {
+                super::record_ocsp_needs(leaf_targets, &purpose, &mut ctx.results.network_needs);
+            }
+            false
+        }
+        Some(super::OnlineOcspLeafOutcome::Unreachable) => {
             ctx.results.push_informational(
                 CAWG_X509_OCSP_INACCESSIBLE,
                 url.into(),
-                "the OCSP responder for the identity certificate returned no usable response"
-                    .into(),
+                "the OCSP responder for the identity certificate returned no response".into(),
             );
             false
         }
         None => {
-            match revocation_status {
-                IdentityRevocationStatus::NotRevoked => ctx.results.push_success(
-                    CAWG_X509_OCSP_NOT_REVOKED,
+            if !embedded_good {
+                ctx.results.push_informational(
+                    CAWG_X509_OCSP_SKIPPED,
                     url.into(),
-                    "verified OCSP evidence reports the identity leaf not revoked".into(),
-                ),
-                // No online check was made, which 1.3 reports as
-                // `ocsp.skipped`, alongside the query that would settle it.
-                IdentityRevocationStatus::Skipped | IdentityRevocationStatus::NotChecked => {
-                    ctx.results.push_informational(
-                        CAWG_X509_OCSP_SKIPPED,
-                        url.into(),
-                        "no online OCSP check was performed, and stapled evidence did not establish the identity leaf status"
-                            .into(),
-                    );
-                    super::record_ocsp_needs(&targets, &purpose, &mut ctx.results.network_needs);
-                }
-                _ => {}
+                    "no online OCSP check was performed, and stapled evidence did not establish the identity leaf status"
+                        .into(),
+                );
+                super::record_ocsp_needs(&targets, &purpose, &mut ctx.results.network_needs);
             }
-            matches!(
-                revocation_status,
-                IdentityRevocationStatus::LeafRevoked | IdentityRevocationStatus::LeafAndCaRevoked
-            )
+            false
         }
     };
-    // CAWG 1.3: a revoked CA in the identity chain rejects the assertion with
-    // `cawg.x509.credential.untrusted`.
-    if online.ca_revoked {
-        ctx.results.push_failure(
-            CAWG_X509_CREDENTIAL_UNTRUSTED,
-            url.into(),
-            "online OCSP response reports a CA certificate in the identity chain revoked".into(),
-        );
-        return;
-    }
     if leaf_revoked {
         ctx.results.push_failure(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
@@ -801,26 +847,55 @@ fn valid_hashed_uri(value: &Value) -> bool {
             .is_none_or(|alg| alg.as_text().is_some_and(|alg| !alg.is_empty()))
 }
 
-fn identity_reference_cycle(
-    claim_refs: &ClaimAssertionRefs<'_>,
+struct IdentityReferenceCycles<'a> {
+    labels: [Option<&'a str>; MAX_IDENTITY_ASSERTIONS],
+    len: usize,
+    members: u64,
+}
+
+impl IdentityReferenceCycles<'_> {
+    fn contains(&self, label: &str) -> bool {
+        self.labels[..self.len]
+            .iter()
+            .position(|candidate| *candidate == Some(label))
+            .is_some_and(|index| self.members & (1_u64 << index) != 0)
+    }
+}
+
+/// Compute cycle membership once for every local identity assertion.
+///
+/// The caller enforces the 64-identity cap before this runs. Each row is a
+/// fixed-width reachability bitset, so adversarial graphs cannot recurse or
+/// allocate work proportional to attacker-selected path depth.
+fn identity_reference_cycles<'a>(
+    claim_refs: &'a ClaimAssertionRefs<'_>,
     manifest_label: &str,
-    start_label: &str,
-) -> bool {
-    fn visit(
-        claim_refs: &ClaimAssertionRefs<'_>,
-        manifest_label: &str,
-        label: &str,
-        visiting: &mut HashSet<String>,
-        visited: &mut HashSet<String>,
-    ) -> bool {
-        if !visiting.insert(label.to_string()) {
-            return true;
+) -> IdentityReferenceCycles<'a> {
+    let mut graph = IdentityReferenceCycles {
+        labels: [None; MAX_IDENTITY_ASSERTIONS],
+        len: 0,
+        members: 0,
+    };
+    for reference in &claim_refs.references {
+        let Some(label) = reference
+            .label
+            .filter(|label| is_identity_assertion_label(label))
+        else {
+            continue;
+        };
+        if graph.labels[..graph.len].contains(&Some(label)) {
+            continue;
         }
-        if visited.contains(label) {
-            visiting.remove(label);
-            return false;
-        }
-        let cycle = claim_refs
+        graph.labels[graph.len] = Some(label);
+        graph.len += 1;
+    }
+
+    let mut reach = [0_u64; MAX_IDENTITY_ASSERTIONS];
+    for (source, label) in graph.labels[..graph.len].iter().enumerate() {
+        let Some(label) = *label else {
+            continue;
+        };
+        let Some(references) = claim_refs
             .indexed(label)
             .and_then(|assertion| assertion.decoded.as_ref())
             .and_then(|assertion| assertion.get("signer_payload"))
@@ -829,30 +904,41 @@ fn identity_reference_cycle(
                 Value::Array(references) => Some(references),
                 _ => None,
             })
-            .is_some_and(|references| {
-                references.iter().any(|reference| {
-                    reference
-                        .get("url")
-                        .and_then(Value::as_text)
-                        .and_then(|url| super::assertion_label_for_manifest(url, manifest_label))
-                        .filter(|target| is_identity_assertion_label(target))
-                        .is_some_and(|target| {
-                            visit(claim_refs, manifest_label, target, visiting, visited)
-                        })
-                })
-            });
-        visiting.remove(label);
-        visited.insert(label.to_string());
-        cycle
+        else {
+            continue;
+        };
+        for reference in references {
+            let Some(target) = reference
+                .get("url")
+                .and_then(Value::as_text)
+                .and_then(|url| super::assertion_label_for_manifest(url, manifest_label))
+                .filter(|target| is_identity_assertion_label(target))
+            else {
+                continue;
+            };
+            if let Some(destination) = graph.labels[..graph.len]
+                .iter()
+                .position(|candidate| *candidate == Some(target))
+            {
+                reach[source] |= 1_u64 << destination;
+            }
+        }
     }
 
-    visit(
-        claim_refs,
-        manifest_label,
-        start_label,
-        &mut HashSet::new(),
-        &mut HashSet::new(),
-    )
+    for intermediate in 0..graph.len {
+        let through = reach[intermediate];
+        for row in &mut reach[..graph.len] {
+            if *row & (1_u64 << intermediate) != 0 {
+                *row |= through;
+            }
+        }
+    }
+    for (index, row) in reach[..graph.len].iter().enumerate() {
+        if row & (1_u64 << index) != 0 {
+            graph.members |= 1_u64 << index;
+        }
+    }
+    graph
 }
 
 fn map_keys_are_unique(value: &Value) -> bool {
@@ -1124,7 +1210,9 @@ fn report_identity_timestamp_defect(
 }
 
 /// The optional "claimed time of signing" from the protected `iat` header.
-/// Absence produces no status; presence yields exactly one informational code.
+/// Absence or a malformed NumericDate produces no status. A usable value is
+/// judged against certificate validity; chronology relative to an attested
+/// time is reported separately.
 fn report_time_of_signing(
     signature: &[u8],
     chain: &[Vec<u8>],
@@ -1132,17 +1220,15 @@ fn report_time_of_signing(
     results: &mut ValidationResults,
     url: &str,
 ) {
-    let signed_at = match protected_iat(signature) {
-        Ok(None) => return,
-        Ok(Some(iat)) => numeric_date_to_time(iat),
-        Err(_) => None,
+    let Ok(Some(iat)) = protected_iat(signature) else {
+        return;
     };
-    let inside = signed_at.is_some_and(|signed_at| {
-        chain
-            .iter()
-            .all(|certificate| certificate_valid_at(certificate, signed_at))
-            && attested.is_none_or(|attested| signed_at <= attested)
-    });
+    let Some(signed_at) = numeric_date_to_time(iat) else {
+        return;
+    };
+    let inside = chain
+        .iter()
+        .all(|certificate| certificate_valid_at(certificate, signed_at));
     if inside {
         results.push_informational(
             CAWG_X509_TIME_OF_SIGNING_INSIDE_VALIDITY,
@@ -1150,11 +1236,18 @@ fn report_time_of_signing(
             "the claimed time of signing falls inside the identity certificate chain's validity"
                 .into(),
         );
+        if attested.is_some_and(|attested| signed_at > attested) {
+            results.push_informational(
+                CAWG_X509_TIME_OF_SIGNING_AFTER_TIMESTAMP,
+                url.into(),
+                "the claimed time of signing is later than the trusted time stamp".into(),
+            );
+        }
     } else {
         results.push_informational(
             CAWG_X509_TIME_OF_SIGNING_OUTSIDE_VALIDITY,
             url.into(),
-            "the claimed time of signing falls outside the identity certificate chain's validity, is later than the attested time, or is not a usable NumericDate"
+            "the claimed time of signing falls outside the identity certificate chain's validity"
                 .into(),
         );
     }
@@ -2329,6 +2422,7 @@ mod tests {
 
         assert_eq!(identity_work_counts(), IdentityWorkCounts::default());
         assert_eq!(results.failure.len(), 1);
+
         assert_eq!(results.failure[0].code, CAWG_IDENTITY_CBOR_INVALID);
         assert!(results.failure[0].explanation.contains("maximum is 64"));
         assert!(results.success.is_empty());
@@ -2352,6 +2446,74 @@ mod tests {
             (Value::Text("signature".into()), Value::Bytes(vec![1])),
             (Value::Text("pad1".into()), Value::Bytes(Vec::new())),
         ])
+    }
+    fn reference_graph_members(edges: &[Vec<usize>]) -> Vec<bool> {
+        assert!(edges.len() <= MAX_IDENTITY_ASSERTIONS);
+        let labels: Vec<String> = (0..edges.len())
+            .map(|index| {
+                if index == 0 {
+                    "cawg.identity".to_string()
+                } else {
+                    format!("cawg.identity__{index}")
+                }
+            })
+            .collect();
+        let assertion_values: Vec<Value> = edges
+            .iter()
+            .map(|targets| {
+                identity_assertion_map(
+                    targets
+                        .iter()
+                        .map(|target| {
+                            hashed_uri(
+                                &format!(
+                                    "self#jumbf=/c2pa/test/c2pa.assertions/{}",
+                                    labels[*target]
+                                ),
+                                0x44,
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let assertion_bytes: Vec<Vec<u8>> = assertion_values
+            .iter()
+            .map(|assertion| {
+                encode(assertion, Profile::CanonicalForHashedSubstructures)
+                    .expect("encode graph identity")
+            })
+            .collect();
+        let assertions = labels
+            .iter()
+            .zip(&assertion_bytes)
+            .map(|(label, bytes)| (label.clone(), bytes.as_slice()))
+            .collect();
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions,
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+        let claim = claim_with_references(
+            labels
+                .iter()
+                .map(|label| {
+                    hashed_uri(
+                        &format!("self#jumbf=/c2pa/test/c2pa.assertions/{label}"),
+                        0x44,
+                    )
+                })
+                .collect(),
+        );
+        let claim_refs =
+            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let cycles = identity_reference_cycles(&claim_refs, "test");
+        labels.iter().map(|label| cycles.contains(label)).collect()
     }
 
     /// Run `verify_identity_assertion` against a minimal single-assertion
@@ -2484,6 +2646,8 @@ mod tests {
         let claim = claim_with_references(claim_refs.to_vec());
         let indexed_refs =
             ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
+        let reference_cycle =
+            identity_reference_cycles(&indexed_refs, "test").contains("cawg.identity");
         let primary_binding = indexed_refs
             .references
             .iter()
@@ -2519,6 +2683,7 @@ mod tests {
             Some(primary_binding),
             &[],
             "cawg.identity",
+            reference_cycle,
         );
         results
     }
@@ -2617,8 +2782,11 @@ mod tests {
         let results = identity_verdict(&assertion, &binding_claim_refs(0x22));
         assert_eq!(failure_codes(&results), [CAWG_IDENTITY_CBOR_INVALID]);
     }
+    /// CAWG-ID13-ASSERTION-CREATION-017 /
+    /// CAWG-ID13-X509-VALIDATING-A-003: an acyclic identity-to-identity
+    /// reference is in scope and is checked like any other hashed URI.
     #[test]
-    fn referenced_identity_assertion_is_rejected() {
+    fn referenced_identity_assertion_is_allowed_when_acyclic() {
         let reference = hashed_uri(
             "self#jumbf=/c2pa/test/c2pa.assertions/cawg.identity__secondary",
             0x44,
@@ -2627,17 +2795,51 @@ mod tests {
         let mut claim_refs = binding_claim_refs(0x22);
         claim_refs.push(reference);
         let results = identity_verdict(&assertion, &claim_refs);
-        let failure = results
-            .failure
-            .iter()
-            .find(|status| status.code == CAWG_IDENTITY_ASSERTION_MISMATCH)
-            .expect("identity reference must fail");
+
+
+        assert!(
+            !results
+                .failure
+                .iter()
+                .any(|status| status.code == CAWG_IDENTITY_ASSERTION_MISMATCH),
+            "{:?}",
+            results.failure
+        );
+    }
+    /// CAWG-ID13-ASSERTION-CREATION-017: every member of a multi-node cycle is
+    /// rejected, while a parent that merely reaches a separate cycle is not a
+    /// cycle member itself.
+    #[test]
+    fn identity_reference_cycles_mark_only_cycle_members() {
         assert_eq!(
-            failure
-                .details
-                .as_ref()
-                .and_then(|details| details["reason"].as_str()),
-            Some("identity_assertion_reference")
+            reference_graph_members(&[vec![1], vec![0]]),
+            vec![true, true]
+        );
+        assert_eq!(
+            reference_graph_members(&[vec![1], vec![2], vec![1]]),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            reference_graph_members(&[vec![1], vec![2], vec![]]),
+            vec![false, false, false]
+        );
+    }
+
+    /// CAWG-ID13-ASSERTION-CREATION-017: the maximum permitted acyclic chain
+    /// is evaluated iteratively without recursion or false cycle membership.
+    #[test]
+    fn sixty_four_identity_reference_chain_is_acyclic() {
+        let mut edges = vec![Vec::new(); MAX_IDENTITY_ASSERTIONS];
+        for (index, edge) in edges
+            .iter_mut()
+            .enumerate()
+            .take(MAX_IDENTITY_ASSERTIONS - 1)
+        {
+            edge.push(index + 1);
+        }
+        assert_eq!(
+            reference_graph_members(&edges),
+            vec![false; MAX_IDENTITY_ASSERTIONS]
         );
     }
 
@@ -3287,7 +3489,7 @@ mod tests {
         chain: &RuntimeEncypherChain,
         timestamp: Option<(&TestTsa, OffsetDateTime)>,
         algorithm: i128,
-        iat: Option<OffsetDateTime>,
+        iat: Option<Value>,
     ) -> Vec<u8> {
         use p384::ecdsa::signature::Signer as _;
         use p384::pkcs8::DecodePrivateKey as _;
@@ -3305,10 +3507,7 @@ mod tests {
             ),
         ];
         if let Some(iat) = iat {
-            protected_headers.push((
-                Value::Integer(6),
-                Value::Integer(iat.unix_timestamp().into()),
-            ));
+            protected_headers.push((Value::Integer(6), iat));
         }
         let protected = encode(
             &Value::Map(protected_headers),
@@ -3666,6 +3865,24 @@ mod tests {
         assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
     }
 
+    /// CAWG-ID13-X509VALB-027: an invalid TSA path reports the optional
+    /// credential diagnostic alongside the required untrusted result.
+    #[test]
+    fn invalid_tsa_credential_reports_both_registered_codes() {
+        let mut results = ValidationResults::default();
+        report_identity_timestamp_defect(
+            TokenFailure::CredentialInvalid,
+            "certificate profile rejected",
+            &mut results,
+            "cawg.identity",
+        );
+
+        assert!(
+            results.has_informational(CAWG_X509_TIME_STAMP_CREDENTIAL_INVALID)
+        );
+        assert!(results.has_informational(CAWG_X509_TIME_STAMP_UNTRUSTED));
+    }
+
     /// CAWG-ID13-X509-VALIDATING-A-041,043: a trusted `genTime`, rather than
     /// current validation time, controls every identity-chain certificate.
     #[test]
@@ -3787,14 +4004,18 @@ mod tests {
             &chain,
             None,
             -35,
-            Some(datetime!(2027-03-01 0:00 UTC)),
+            Some(Value::Integer(
+                datetime!(2027-03-01 0:00 UTC).unix_timestamp().into(),
+            )),
         );
         let outside = encypher_identity_assertion_with_protected_headers(
             identity_payload("cawg.publisher:primary", None),
             &chain,
             None,
             -35,
-            Some(datetime!(2026-06-01 0:00 UTC)),
+            Some(Value::Integer(
+                datetime!(2026-06-01 0:00 UTC).unix_timestamp().into(),
+            )),
         );
 
         let inside_results =
@@ -3806,6 +4027,60 @@ mod tests {
             encypher_verdict(&outside, &trust, AFTER_INTERIM_CUTOFF, None, None);
         assert!(outside_results.has_informational(CAWG_X509_TIME_OF_SIGNING_OUTSIDE_VALIDITY));
         assert!(!outside_results.has_informational(CAWG_X509_TIME_OF_SIGNING_INSIDE_VALIDITY));
+    }
+
+    /// CAWG-ID13-X509-VALIDATING-A-049 / CAWG-ID13-X509VALB-029: chronology
+    /// does not replace the mandatory certificate-validity result, and an
+    /// unusable protected `iat` produces no validity code.
+    #[test]
+    fn protected_identity_iat_reports_chronology_separately() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+        let tsa = TestTsa::new(
+            datetime!(2026-01-01 0:00 UTC),
+            datetime!(2030-01-01 0:00 UTC),
+        );
+        let later = encypher_identity_assertion_with_protected_headers(
+            identity_payload("cawg.publisher:primary", None),
+            &chain,
+            Some((&tsa, datetime!(2027-03-01 0:00 UTC))),
+            -35,
+            Some(Value::Integer(
+                datetime!(2027-04-01 0:00 UTC).unix_timestamp().into(),
+            )),
+        );
+        let later_results = encypher_verdict(
+            &later,
+            &trust,
+            AFTER_INTERIM_CUTOFF,
+            Some(&tsa.trust_list()),
+            None,
+        );
+        assert!(
+            later_results.has_informational(CAWG_X509_TIME_OF_SIGNING_INSIDE_VALIDITY)
+        );
+        assert!(
+            later_results.has_informational(CAWG_X509_TIME_OF_SIGNING_AFTER_TIMESTAMP)
+        );
+        assert!(
+            !later_results.has_informational(CAWG_X509_TIME_OF_SIGNING_OUTSIDE_VALIDITY)
+        );
+
+        let malformed = encypher_identity_assertion_with_protected_headers(
+            identity_payload("cawg.publisher:primary", None),
+            &chain,
+            None,
+            -35,
+            Some(Value::Text("not a NumericDate".into())),
+        );
+        let malformed_results =
+            encypher_verdict(&malformed, &trust, AFTER_INTERIM_CUTOFF, None, None);
+        assert!(
+            !malformed_results.has_informational(CAWG_X509_TIME_OF_SIGNING_INSIDE_VALIDITY)
+        );
+        assert!(
+            !malformed_results.has_informational(CAWG_X509_TIME_OF_SIGNING_OUTSIDE_VALIDITY)
+        );
     }
 
     /// The C2PA hashed-URI CDDL: "If this field is absent, the hash algorithm
@@ -3845,6 +4120,46 @@ mod tests {
         );
 
         assert_eq!(failure_codes(&results), Vec::<&str>::new());
+        assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
+    }
+
+    /// CAWG-ID13-ASSERTION-CREATION-017 /
+    /// CAWG-ID13-X509-VALIDATING-A-003: a signed acyclic reference to another
+    /// claim-bound identity is validated like every other hashed URI.
+    #[test]
+    fn signed_identity_reference_is_accepted_when_hash_bound_and_acyclic() {
+        let binding =
+            hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
+        let secondary = hashed_uri(
+            "self#jumbf=/c2pa/test/c2pa.assertions/cawg.identity__secondary",
+            0x44,
+        );
+        let payload = identity_payload_over(vec![binding.clone(), secondary.clone()]);
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let bytes = encypher_identity_assertion_for(payload, &chain, None);
+        let mut claim_refs = binding_claim_refs(0x22);
+        claim_refs.push(secondary);
+        let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+        let results = identity_verdict_full(
+            &bytes,
+            &claim_refs,
+            false,
+            "c2pa.hash.data",
+            Some(&trust),
+            None,
+            true,
+            None,
+            &TimestampAssertionIndex::default(),
+            AFTER_INTERIM_CUTOFF,
+            None,
+            Default::default(),
+        );
+
+        assert!(
+            !results.has_failure(CAWG_IDENTITY_ASSERTION_MISMATCH),
+            "{:?}",
+            results.failure
+        );
         assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
     }
 
@@ -4744,6 +5059,43 @@ mod tests {
             assert!(good_results.has_success(CAWG_X509_OCSP_NOT_REVOKED));
             assert_eq!(failure_codes(&good_results), Vec::<&str>::new());
 
+            for (case, staple) in [
+                ("malformed", b"not DER".to_vec()),
+                (
+                    "unauthorized",
+                    answer(
+                        &chain.issuing_der,
+                        &chain.root_key,
+                        &chain.leaf_der,
+                        FixtureStatus::Good,
+                    ),
+                ),
+            ] {
+                let assertion = identity_assertion_with_staples(
+                    &chain,
+                    &tsa,
+                    AFTER_INTERIM_CUTOFF,
+                    vec![staple],
+                );
+                let results = verdict_for_assertion(
+                    &chain,
+                    &assertion,
+                    Some(&tsa.trust_list()),
+                    OnlineEvidence::default(),
+                );
+                assert!(
+                    results.has_informational(CAWG_X509_OCSP_SKIPPED),
+                    "{case}: {:?}",
+                    results
+                );
+                assert!(
+                    !results.has_success(CAWG_X509_OCSP_NOT_REVOKED)
+                        && !results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED),
+                    "{case}: {:?}",
+                    results
+                );
+            }
+
             let revoked = answer(
                 &chain.issuing_der,
                 &chain.issuing_key,
@@ -4826,6 +5178,124 @@ mod tests {
 
             assert!(!results.has_success(CAWG_X509_OCSP_NOT_REVOKED));
             assert!(results.has_informational(CAWG_X509_OCSP_SKIPPED));
+        }
+
+        /// CAWG-ID13-X509VALB-003: a qualifying stapled revoked leaf is
+        /// terminal for absent, unreachable, unusable, good, revoked, unknown,
+        /// and outside-window online outcomes.
+        #[test]
+        fn stapled_revocation_overrides_every_online_leaf_outcome() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion = identity_assertion_with_staples(
+                &chain,
+                &tsa,
+                AFTER_INTERIM_CUTOFF,
+                vec![revoked],
+            );
+            let leaf_key = evidence_key(&chain.leaf_der);
+            let unreachable = vec![leaf_key.clone()];
+            let invalid = HashMap::from([(leaf_key.clone(), Vec::new())]);
+            let good = HashMap::from([leaf_response(&chain, FixtureStatus::Good)]);
+            let online_revoked =
+                HashMap::from([leaf_response(&chain, FixtureStatus::RevokedAt(REVOKED_AT))]);
+            let unknown = HashMap::from([leaf_response(&chain, FixtureStatus::Unknown)]);
+            let outside = HashMap::from([(
+                leaf_key,
+                response(
+                    &chain.issuing_der,
+                    &chain.leaf_der,
+                    &Responder {
+                        certificate_der: &chain.issuing_der,
+                        key: &chain.issuing_key,
+                        embed_certificate: false,
+                    },
+                    ResponseSpec {
+                        status: FixtureStatus::Good,
+                        produced_at: b"20260101000000Z",
+                        this_update: b"20260101000000Z",
+                        next_update: Some(b"20260201000000Z"),
+                    },
+                ),
+            )]);
+
+            let cases = [
+                ("absent", OnlineEvidence::default()),
+                (
+                    "unreachable",
+                    OnlineEvidence {
+                        ocsp_unreachable: Some(&unreachable),
+                        ..OnlineEvidence::default()
+                    },
+                ),
+                (
+                    "unusable",
+                    OnlineEvidence {
+                        ocsp_responses: Some(&invalid),
+                        ..OnlineEvidence::default()
+                    },
+                ),
+                (
+                    "good",
+                    OnlineEvidence {
+                        ocsp_responses: Some(&good),
+                        ..OnlineEvidence::default()
+                    },
+                ),
+                (
+                    "revoked",
+                    OnlineEvidence {
+                        ocsp_responses: Some(&online_revoked),
+                        ..OnlineEvidence::default()
+                    },
+                ),
+                (
+                    "unknown",
+                    OnlineEvidence {
+                        ocsp_responses: Some(&unknown),
+                        ..OnlineEvidence::default()
+                    },
+                ),
+                (
+                    "outside-window",
+                    OnlineEvidence {
+                        ocsp_responses: Some(&outside),
+                        ..OnlineEvidence::default()
+                    },
+                ),
+            ];
+            for (case, evidence) in cases {
+                let results = verdict_for_assertion(
+                    &chain,
+                    &assertion,
+                    Some(&tsa.trust_list()),
+                    evidence,
+                );
+                assert_eq!(
+                    failure_codes(&results),
+                    [CAWG_IDENTITY_CREDENTIAL_REVOKED],
+                    "{case}: {:?}",
+                    results.failure
+                );
+                assert!(
+                    !results.has_success(CAWG_X509_OCSP_NOT_REVOKED)
+                        && !results.has_informational(CAWG_X509_OCSP_INACCESSIBLE)
+                        && !results.has_informational(CAWG_X509_OCSP_UNKNOWN)
+                        && !results.has_informational(CAWG_X509_OCSP_UNUSABLE_RESPONSE)
+                        && !results.has_informational(CAWG_X509_OCSP_OUTSIDE_WINDOW),
+                    "{case}: {:?}",
+                    results
+                );
+            }
         }
 
         #[test]

@@ -99,9 +99,38 @@ With online checks off, the verification result depends only on the asset bytes,
 
 Revocation is evaluated only when usable evidence is embedded in the credential. Without such evidence, the report says `not_checked`. This is different from `not_revoked`.
 
-Online OCSP is optional and consent-gated. With online checks off, `signingCredential.ocsp.skipped` means that no usable stapled response established the certificate's status and no responder was contacted. It does not mean that the responder returned `good`, or that the certificate was proved not revoked. Workflows that need a current status can staple an OCSP response, carry a certificate-status assertion, allow online checks, or use a hosted verification service. When online checks are allowed, the SDK asks the responder the certificate names, verifies the signed response exactly as it verifies a stapled one, and registers `*.ocsp.inaccessible` when the responder was tried and gave no usable answer.
+Online OCSP is optional and consent-gated. With online checks off,
+`signingCredential.ocsp.skipped` means that no usable stapled response
+established the certificate's status and no responder was contacted. It does
+not mean that the responder returned `good`, or that the certificate was
+proved not revoked. Workflows that need a current status can staple an OCSP
+response, carry a certificate-status assertion, allow online checks, or use a
+hosted verification service.
 
-When a manifest staples several OCSP responses for one certificate and they disagree, the default posture treats any `revoked` response as decisive. Under `strict_conformance`, a qualifying `good` response settles the status, as the C2PA 2.4 validation rules specify, and the outranked `revoked` response is reported as the informational `com.encypher.ocsp.conflictingRevokedResponse`. CAWG identity revocation stays fail-closed in both postures.
+When online checks are allowed, the SDK asks the responder the certificate
+names and verifies the signed response exactly as it verifies a stapled one.
+An SDK endpoint or SSRF policy refusal happens before I/O; on both the C2PA
+claim-signer and CAWG identity lanes it remains `*.ocsp.skipped` with the
+unresolved network need. Only an attempted query that delivered no response is
+`*.ocsp.inaccessible`. A received body that was discarded under the size
+limit is carried to pass two as an empty DER entry in `ocsp_responses`, not in
+`ocsp_unreachable`.
+
+For CAWG identity validation, received malformed or unauthorized OCSP bytes
+are `com.encypher.cawg.x509.ocsp.unusableResponse`; a signed response outside
+CAWG's open `(thisUpdate,nextUpdate)` interval is
+`com.encypher.cawg.x509.ocsp.outsideWindow`. Neither outcome means the
+responder was inaccessible. A qualifying stapled revocation is terminal over
+every optional online outcome. C2PA claim-signer validation keeps its existing
+online response-window and registered report codes.
+
+When a manifest staples several OCSP responses for one certificate and they
+disagree, the default posture treats any `revoked` response as decisive. Under
+`strict_conformance`, a qualifying `good` response settles the status, as the
+C2PA 2.4 validation rules specify, and the outranked `revoked` response is
+reported as the informational
+`com.encypher.ocsp.conflictingRevokedResponse`. CAWG identity revocation stays
+fail-closed in both postures.
 
 A verifier working from the packaged snapshot knows its date but cannot prove that the material is still current, and online checks do not change that: trust lists are a snapshot policy, not a fetch. `freshness.status` therefore remains `unknown` in schema 1.0. Encypher will publish a refresh release within 30 days after a packaged upstream source changes. Callers do not need to wait for that release: they can pass current lists through the caller-supplied trust options at any time.
 

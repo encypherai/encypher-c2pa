@@ -1,6 +1,7 @@
 # CAWG Identity 1.3 X.509 Conformance
 
-**Status:** plan gate
+**Status:** implementation approved
+**Plan gate:** cleared at review cycle 3 (Astra 9.5/10/10; Opus 9.6/9.7/9.7)
 **Goal:** make the public verifier apply CAWG Identity 1.3 revocation and identity-reference rules, with one documented outside-window deviation pending upstream clarification, then close the assigned public-side coverage gaps with observable regressions.
 
 ## Behavior changes

@@ -8,13 +8,13 @@
 //! responder from the certificate's Authority Information Access extension,
 //! and later evaluates whatever DER `OCSPResponse` the caller hands back.
 //!
-//! The online policy differs from the stapled policy in [`super`]: C2PA 2.4
-//! Validation, "Determining revocation from online OCSP response", and CAWG
-//! Identity 1.3, "Determining revocation from online OCSP response", both
-//! measure the response's `(thisUpdate, nextUpdate)` window against the
-//! attested time-stamp when there is one and against the current real-world
-//! time when there is not, and both let a `revoked` response that was revoked
-//! *after* the attested signing time still establish "not revoked at signing".
+//! The verification lane chooses the online response window. C2PA claim
+//! validation keeps the verifier's established inclusive-`thisUpdate` and
+//! absent-`nextUpdate` fallback. CAWG Identity 1.3 applies the literal open
+//! `(thisUpdate,nextUpdate)` interval and requires `nextUpdate`. Both use a
+//! trusted attested time when one exists and the verification time otherwise,
+//! and both let a `revoked` response issued after the attested signing time
+//! establish "not revoked at signing".
 
 use const_oid::ObjectIdentifier;
 use der::{Decode, Encode};
@@ -38,6 +38,13 @@ const OID_AD_OCSP: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.
 /// value in an attacker-supplied certificate is dropped rather than carried.
 const MAX_RESPONDER_URL_BYTES: usize = 2_048;
 
+/// Which specification lane supplies the online OCSP time-window rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnlinePolicy {
+    C2paClaim,
+    CawgIdentity,
+}
+
 /// What an accepted online OCSP response establishes about one certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OnlineVerdict {
@@ -47,9 +54,12 @@ pub(crate) enum OnlineVerdict {
     Revoked,
     /// The responder does not know this certificate.
     Unknown,
-    /// No usable answer: unparseable, unauthorized responder, wrong
-    /// certificate, or a response too stale to satisfy RFC 6960 §3.2
-    /// requirements 5 and 6.
+    /// A response about this certificate was accepted, but it did not cover
+    /// the effective validation instant. A fresh response can help only when
+    /// the instant is later than the response window.
+    OutsideWindow { refresh_may_cover: bool },
+    /// Received bytes were unparseable, unauthorized, or about another
+    /// certificate.
     Unusable,
 }
 
@@ -147,8 +157,7 @@ fn serial_number(subject: &Certificate) -> Vec<u8> {
     tlv(0x02, trimmed)
 }
 
-/// Evaluate an online OCSP response for `subject_der` under the C2PA 2.4 and
-/// CAWG 1.3 online rules, which are word-for-word the same procedure.
+/// Evaluate an online OCSP response for `subject_der` under `policy`.
 ///
 /// `attested` is the time from a *valid* time-stamp, or `None` when the
 /// signature has none. `verification_time` is the current real-world time (or
@@ -159,6 +168,7 @@ pub(crate) fn evaluate(
     subject_der: &[u8],
     attested: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
+    policy: OnlinePolicy,
 ) -> OnlineVerdict {
     let Some(accepted) = super::accept(der, issuer_der, subject_der, verification_time) else {
         return OnlineVerdict::Unusable;
@@ -170,12 +180,14 @@ pub(crate) fn evaluate(
         accepted.produced_at,
         attested,
         verification_time,
+        policy,
     ) else {
         return OnlineVerdict::Unusable;
     };
-    // One request asks about one certificate, so a conforming responder sends
-    // one matching `SingleResponse`. Fold fail-closed anyway: a revoked answer
-    // is never outranked by a good one in the same response.
+    reduce_verdicts(verdicts)
+}
+
+fn reduce_verdicts(verdicts: impl IntoIterator<Item = OnlineVerdict>) -> OnlineVerdict {
     verdicts
         .into_iter()
         .reduce(|left, right| {
@@ -186,7 +198,21 @@ pub(crate) fn evaluate(
             } else if left == OnlineVerdict::Unknown || right == OnlineVerdict::Unknown {
                 OnlineVerdict::Unknown
             } else {
-                OnlineVerdict::Unusable
+                match (left, right) {
+                    (
+                        OnlineVerdict::OutsideWindow {
+                            refresh_may_cover: left,
+                        },
+                        OnlineVerdict::OutsideWindow {
+                            refresh_may_cover: right,
+                        },
+                    ) => OnlineVerdict::OutsideWindow {
+                        refresh_may_cover: left || right,
+                    },
+                    (outside @ OnlineVerdict::OutsideWindow { .. }, _)
+                    | (_, outside @ OnlineVerdict::OutsideWindow { .. }) => outside,
+                    _ => OnlineVerdict::Unusable,
+                }
             }
         })
         .unwrap_or(OnlineVerdict::Unusable)
@@ -203,6 +229,7 @@ fn single_response_verdicts(
     produced_at: OffsetDateTime,
     attested: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
+    policy: OnlinePolicy,
 ) -> Option<Vec<OnlineVerdict>> {
     let mut preflight = Der::new(responses);
     let mut response_count = 0usize;
@@ -239,6 +266,7 @@ fn single_response_verdicts(
             produced_at,
             attested,
             verification_time,
+            policy,
         ));
     }
     Some(verdicts)
@@ -252,34 +280,33 @@ fn verdict_for(
     produced_at: OffsetDateTime,
     attested: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
+    policy: OnlinePolicy,
 ) -> OnlineVerdict {
-    // "If the `certStatus` field of the response is `unknown`, a
-    // `signingCredential.ocsp.unknown` informational code shall be recorded."
-    // An `unknown` answer carries no status to be stale about, so the
-    // freshness window does not change what it means.
+    // An `unknown` answer carries no certificate status to be stale about.
     if status == OcspStatus::Unknown {
         return OnlineVerdict::Unknown;
     }
 
-    let covers = |instant: OffsetDateTime| {
-        if instant < this_update {
-            return false;
-        }
-        match next_update {
-            Some(next_update) => instant < next_update,
-            // RFC 6960 §3.2 requirement 6 applies "when available". With no
-            // `nextUpdate` there is no interval, so the same 24-hour bound
-            // C2PA 2.4 puts on the stapled procedure bounds this one.
-            None => produced_at
-                .checked_add(time::Duration::hours(24))
-                .is_some_and(|limit| instant < limit),
-        }
+    let effective = attested.unwrap_or(verification_time);
+    let (in_window, refresh_may_cover) = match policy {
+        OnlinePolicy::C2paClaim => (
+            effective >= this_update
+                && match next_update {
+                    Some(next_update) => effective < next_update,
+                    None => produced_at
+                        .checked_add(time::Duration::hours(24))
+                        .is_some_and(|limit| effective < limit),
+                },
+            true,
+        ),
+        OnlinePolicy::CawgIdentity => (
+            effective > this_update
+                && next_update.is_some_and(|next_update| effective < next_update),
+            effective > this_update,
+        ),
     };
-    let in_window = covers(attested.unwrap_or(verification_time));
 
     match status {
-        // "The `certStatus` field of the response is `good`, or `revoked` but
-        // with a `revocationReason` of `removeFromCRL`."
         OcspStatus::Good
         | OcspStatus::Revoked {
             reason: Some(OcspRevocationReason::RemoveFromCrl),
@@ -288,22 +315,18 @@ fn verdict_for(
             if in_window {
                 OnlineVerdict::NotRevoked
             } else {
-                // Requirements 5 and 6 of RFC 6960 §3.2 are conditions for
-                // accepting the response at all, so a stale one is no answer
-                // rather than a revocation.
-                OnlineVerdict::Unusable
+                match policy {
+                    OnlinePolicy::C2paClaim => OnlineVerdict::Unusable,
+                    OnlinePolicy::CawgIdentity => OnlineVerdict::OutsideWindow {
+                        refresh_may_cover,
+                    },
+                }
             }
         }
-        // "If the `certStatus` field of the response is `revoked` but with a
-        // `revocationReason` that is not `removeFromCRL`, it shall establish
-        // the signer's certificate was not revoked at the time of signing if
-        // ... the attested time falls within the `(thisUpdate,nextUpdate)`
-        // interval of the response, and the `revocationTime` in the response
-        // is after the attested time-stamp."
         OcspStatus::Revoked {
             revocation_time, ..
         } => match attested {
-            Some(attested) if covers(attested) && revocation_time > attested => {
+            Some(attested) if in_window && revocation_time > attested => {
                 OnlineVerdict::NotRevoked
             }
             _ => OnlineVerdict::Revoked,
@@ -449,7 +472,23 @@ mod tests {
         }
 
         fn evaluate(&self, der: &[u8], attested: Option<OffsetDateTime>) -> OnlineVerdict {
-            evaluate(der, &self.issuer_der, &self.subject_der, attested, NOW)
+            self.evaluate_with(der, attested, OnlinePolicy::C2paClaim)
+        }
+
+        fn evaluate_with(
+            &self,
+            der: &[u8],
+            attested: Option<OffsetDateTime>,
+            policy: OnlinePolicy,
+        ) -> OnlineVerdict {
+            evaluate(
+                der,
+                &self.issuer_der,
+                &self.subject_der,
+                attested,
+                NOW,
+                policy,
+            )
         }
     }
 
@@ -530,6 +569,85 @@ mod tests {
         assert_eq!(pair.evaluate(&open_ended, None), OnlineVerdict::Unusable);
     }
 
+    /// CAWG-ID13-X509VALB-011: CAWG uses the literal open interval and does
+    /// not borrow the C2PA claim lane's absent-nextUpdate fallback.
+    #[test]
+    fn cawg_window_is_open_and_requires_next_update() {
+        let pair = pair(Some("http://ocsp.example/responder"));
+        let bounded = pair.issuer_signed(ResponseSpec {
+            status: FixtureStatus::Good,
+            produced_at: b"20260101000000Z",
+            this_update: b"20260101000000Z",
+            next_update: Some(b"20260201000000Z"),
+        });
+        assert_eq!(
+            pair.evaluate_with(
+                &bounded,
+                Some(datetime!(2026-01-01 0:00 UTC)),
+                OnlinePolicy::CawgIdentity,
+            ),
+            OnlineVerdict::OutsideWindow {
+                refresh_may_cover: false,
+            }
+        );
+        assert_eq!(
+            pair.evaluate_with(
+                &bounded,
+                Some(datetime!(2026-02-01 0:00 UTC)),
+                OnlinePolicy::CawgIdentity,
+            ),
+            OnlineVerdict::OutsideWindow {
+                refresh_may_cover: true,
+            }
+        );
+
+        let unbounded = pair.issuer_signed(ResponseSpec {
+            status: FixtureStatus::Good,
+            produced_at: b"20251231120000Z",
+            this_update: b"20251231120000Z",
+            next_update: None,
+        });
+        assert_eq!(
+            pair.evaluate_with(
+                &unbounded,
+                Some(SIGNED_AT),
+                OnlinePolicy::CawgIdentity,
+            ),
+            OnlineVerdict::OutsideWindow {
+                refresh_may_cover: true,
+            }
+        );
+        assert_eq!(
+            pair.evaluate_with(
+                &unbounded,
+                Some(datetime!(2025-12-31 12:00 UTC)),
+                OnlinePolicy::CawgIdentity,
+            ),
+            OnlineVerdict::OutsideWindow {
+                refresh_may_cover: false,
+            }
+        );
+    }
+
+    /// CAWG-ID13-X509VALB-006: only an actual revoked status dominates the
+    /// matching entries in one BasicOCSPResponse.
+    #[test]
+    fn multi_response_reduction_does_not_treat_window_miss_as_revocation() {
+        assert_eq!(
+            reduce_verdicts([
+                OnlineVerdict::OutsideWindow {
+                    refresh_may_cover: true,
+                },
+                OnlineVerdict::NotRevoked,
+            ]),
+            OnlineVerdict::NotRevoked
+        );
+        assert_eq!(
+            reduce_verdicts([OnlineVerdict::NotRevoked, OnlineVerdict::Revoked]),
+            OnlineVerdict::Revoked
+        );
+    }
+
     #[test]
     fn an_unknown_status_is_reported_as_unknown() {
         let pair = pair(Some("http://ocsp.example/responder"));
@@ -600,7 +718,14 @@ mod tests {
             ResponseSpec::fresh(FixtureStatus::Good),
         );
         assert_eq!(
-            evaluate(&good, &issuer_der, &subject_der, Some(SIGNED_AT), NOW),
+            evaluate(
+                &good,
+                &issuer_der,
+                &subject_der,
+                Some(SIGNED_AT),
+                NOW,
+                OnlinePolicy::C2paClaim,
+            ),
             OnlineVerdict::Unusable
         );
     }
@@ -616,7 +741,8 @@ mod tests {
                 &mine.issuer_der,
                 &mine.subject_der,
                 Some(SIGNED_AT),
-                NOW
+                NOW,
+                OnlinePolicy::C2paClaim,
             ),
             OnlineVerdict::Unusable
         );
