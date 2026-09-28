@@ -2782,8 +2782,7 @@ mod tests {
         let results = identity_verdict(&assertion, &binding_claim_refs(0x22));
         assert_eq!(failure_codes(&results), [CAWG_IDENTITY_CBOR_INVALID]);
     }
-    /// CAWG-ID13-ASSERTION-CREATION-017 /
-    /// CAWG-ID13-X509-VALIDATING-A-003: an acyclic identity-to-identity
+    /// CAWG-ID13-ASSERTION-CREATION-017: an acyclic identity-to-identity
     /// reference is in scope and is checked like any other hashed URI.
     #[test]
     fn referenced_identity_assertion_is_allowed_when_acyclic() {
@@ -4123,8 +4122,7 @@ mod tests {
         assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
     }
 
-    /// CAWG-ID13-ASSERTION-CREATION-017 /
-    /// CAWG-ID13-X509-VALIDATING-A-003: a signed acyclic reference to another
+    /// CAWG-ID13-ASSERTION-CREATION-017: a signed acyclic reference to another
     /// claim-bound identity is validated like every other hashed URI.
     #[test]
     fn signed_identity_reference_is_accepted_when_hash_bound_and_acyclic() {
