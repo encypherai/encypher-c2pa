@@ -13791,6 +13791,161 @@ mod tests {
         assert_eq!(visited, vec![b"sibling-revoked".to_vec()]);
     }
 
+    /// CAWG-ID13-X509-VALIDATING-A-051/A-056: certificate-status evidence is
+    /// collected across the manifest store before the active manifest's CAWG
+    /// identity is interpreted. A later manifest's matching revoked-CA response
+    /// changes the active identity from trusted to credential.untrusted.
+    #[test]
+    fn later_manifest_certificate_status_changes_the_active_cawg_verdict() {
+        let assertion_reference = |label: &str, payload: &[u8]| {
+            vmap(vec![
+                (
+                    "url",
+                    Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                ),
+                ("alg", Value::Text("sha256".into())),
+                ("hash", Value::Bytes(Sha256::digest(payload).to_vec())),
+            ])
+        };
+        let data_hash = enc(&vmap(vec![
+            ("exclusions", Value::Array(Vec::new())),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(Sha256::digest([]).to_vec())),
+        ]));
+        let actions = enc(&vmap(vec![(
+            "actions",
+            Value::Array(vec![vmap(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ])]),
+        )]));
+        let data_reference = assertion_reference("c2pa.hash.data", &data_hash);
+        let fixture =
+            cawg::tests::online_ocsp::store_wide_revoked_ca_fixture(data_reference.clone());
+        let identity_reference = assertion_reference("cawg.identity", &fixture.identity);
+        let action_reference = assertion_reference("c2pa.actions.v2", &actions);
+        let active_claim = enc(&vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:active-cawg".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("Encypher Fixture".into()))]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(vec![data_reference, action_reference, identity_reference]),
+            ),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+        ]));
+        let signer = signature_conformance_tests::Signer::conformant();
+        let claim_signature = signer.sign(&active_claim);
+        let claim_chain = extract_x5chain(&claim_signature).expect("claim x5chain");
+        let claim_trust = TrustList::from_certificates(
+            crate::c2pa_trust::AnchorPurpose::ClaimSigning,
+            [claim_chain.last().expect("claim root").clone()],
+        );
+        let status_reference =
+            assertion_reference("c2pa.certificate-status", &fixture.certificate_status);
+        let later_claim = enc(&vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:later-status".into())),
+            ("created_assertions", Value::Array(vec![status_reference])),
+        ]));
+
+        let run = |include_later_status: bool| {
+            let active = ParsedManifest {
+                label: "urn:c2pa:active-cawg".into(),
+                manifest_jumbf: &[],
+                assertions: vec![
+                    ("c2pa.hash.data".into(), data_hash.as_slice()),
+                    ("c2pa.actions.v2".into(), actions.as_slice()),
+                    ("cawg.identity".into(), fixture.identity.as_slice()),
+                ],
+                assertion_jumbf: vec![
+                    ("c2pa.hash.data".into(), data_hash.as_slice()),
+                    ("c2pa.actions.v2".into(), actions.as_slice()),
+                    ("cawg.identity".into(), fixture.identity.as_slice()),
+                ],
+                claim_cbor: Some(&active_claim),
+                signature_cose: Some(&claim_signature),
+                claim_count: 1,
+                claim_box_label: Some("c2pa.claim.v2".into()),
+            };
+            let mut manifests = vec![active];
+            if include_later_status {
+                manifests.push(ParsedManifest {
+                    label: "urn:c2pa:later-status".into(),
+                    manifest_jumbf: &[],
+                    assertions: vec![(
+                        "c2pa.certificate-status".into(),
+                        fixture.certificate_status.as_slice(),
+                    )],
+                    assertion_jumbf: Vec::new(),
+                    claim_cbor: Some(&later_claim),
+                    signature_cose: None,
+                    claim_count: 1,
+                    claim_box_label: Some("c2pa.claim.v2".into()),
+                });
+            }
+            let manifest_hashes = std::collections::HashMap::new();
+            let input = VerifyInput {
+                data: &[],
+                mime: "application/c2pa",
+                claim_signer_trust: Some(&claim_trust),
+                tsa_trust: Some(&fixture.tsa_trust),
+                allowed_certs: None,
+                validation_time: Some(
+                    OffsetDateTime::from_unix_timestamp(1_811_808_000).expect("2027-06-01 UTC"),
+                ),
+                profile: EngineProfile::GENEROUS,
+                evidence: Default::default(),
+                cawg_strict_encoding: false,
+            };
+            let mut report_decode_nodes = MAX_REPORT_DECODED_VALUE_NODES;
+            verify_manifest(
+                &manifests[0],
+                StoreContext {
+                    manifests: &manifests,
+                    manifest_hashes: &manifest_hashes,
+                },
+                &input,
+                AssetFormat::C2paStore,
+                &[],
+                None,
+                CawgTrustInputs {
+                    trust: Some(&fixture.cawg_trust),
+                    allowed_certs: None,
+                    document_signing_require_anchor: true,
+                    did_documents: None,
+                    ica_trusted_issuers: None,
+                    ica_trust_anchors: None,
+                    ica_status_lists: None,
+                },
+                &mut report_decode_nodes,
+            )
+        };
+
+        let absent = run(false);
+        assert!(
+            absent.results.has_success("cawg.identity.trusted"),
+            "{:#?}",
+            absent.results
+        );
+        assert!(!absent.results.has_failure("cawg.x509.credential.untrusted"));
+
+        let present = run(true);
+        assert!(present
+            .results
+            .has_failure("cawg.x509.credential.untrusted"));
+        assert!(!present.results.has_success("cawg.identity.trusted"));
+        assert!(!present
+            .results
+            .has_failure("cawg.identity.credential_revoked"));
+    }
+
     #[test]
     fn store_wide_status_excludes_undeclared_and_cross_manifest_sources() {
         let empty_claim = enc(&vmap(vec![

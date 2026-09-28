@@ -440,6 +440,8 @@ fn generated_bestpractice_vector_covers_editorial_metadata() {
     assert_eq!(urls, expected);
 }
 
+/// CAWG-ID13-TRUST-MODEL-056: a C2PA manifest failure suppresses all CAWG
+/// identity interpretation, including well-formed and trusted success codes.
 /// The corpus certificates are valid 2026-08-01..2036-08-01. Outside that
 /// window the claim credential is outside validity and the CAWG identity lane
 /// is not evaluated at all: no `cawg.*` code of any polarity is emitted.

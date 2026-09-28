@@ -36,6 +36,7 @@ All notable changes to this project are recorded here.
 - An SDK refusal before network I/O, including endpoint-policy rejection and request-budget exhaustion, leaves claim-signer and CAWG identity OCSP skipped with an unresolved network need. For CAWG identities, only a query that delivered no response is inaccessible; discarded response bodies are unusable evidence, and valid responses outside their freshness interval are reported as outside-window evidence.
 - A malformed protected CAWG identity `iat` emits no time-of-signing validity code. A usable value is judged against the identity certificate chain, and a value later than the trusted time stamp carries a separate chronology result.
 - `VerifyOptions::ocsp_responses` accepts an empty DER value as the sentinel for a response body received but discarded under a size bound. `ocsp_unreachable` is reserved for a query that delivered no response.
+- CAWG identity instance labels now follow C2PA 2.4 section 6.4: uniqueness is "accomplished by adding a double-underscore and a monotonically increasing index to the label." The verifier ignores malformed `cawg.identity__*` labels such as `__0`, a leading-zero suffix, or a non-decimal suffix instead of interpreting them as identity assertions.
 
 ## 1.3.0 - 2026-09-27
 
