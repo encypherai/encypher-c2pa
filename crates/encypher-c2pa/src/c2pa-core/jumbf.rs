@@ -501,24 +501,70 @@ fn decompress_manifest_superbox(parsed: &Superbox<'_>) -> Result<(Vec<u8>, [u8; 
     if stream.is_empty() {
         return Err(JumbfError::CompressedManifestShape("brob box is empty"));
     }
+    let (manifest, inner) = inflate_brob_payload(stream, &parsed.label)?;
+    if !matches!(
+        inner.type_uuid,
+        UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+    ) {
+        return Err(JumbfError::NotAManifestSuperbox);
+    }
+    if inner.label != parsed.label {
+        return Err(JumbfError::CompressedManifestLabelMismatch {
+            compressed: parsed.label.clone(),
+            manifest: inner.label,
+        });
+    }
+    Ok((manifest, inner.type_uuid))
+}
+
+/// Inflate a `brob` payload in either layout C2PA producers write.
+///
+/// C2PA 2.4 11.2.4 says the payload is "the compressed bytes of the entire
+/// manifest superbox"; 11.1.3.2 bases the box on the JPEG XL `brob` box,
+/// which carries the original 4-byte box type before the Brotli stream. The
+/// type-prefixed reading is tried first, and wins, when the payload starts
+/// with `jumb` and the remainder inflates to one manifest superbox carrying
+/// `label`. An inflate that exceeds the bound fails closed and is never
+/// retried. Otherwise the whole payload is inflated.
+fn inflate_brob_payload(
+    stream: &[u8],
+    label: &str,
+) -> Result<(Vec<u8>, SuperboxHeader), JumbfError> {
+    if let Some(rest) = stream.strip_prefix(TYPE_JUMB.as_slice()) {
+        match brotli_decompress_bounded(rest) {
+            Err(JumbfError::DecompressedTooLarge) => return Err(JumbfError::DecompressedTooLarge),
+            Ok(manifest) => {
+                if let Ok(inner) = superbox_header(&manifest) {
+                    if inner.label == label
+                        && matches!(
+                            inner.type_uuid,
+                            UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
+                        )
+                    {
+                        return Ok((manifest, inner));
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
     let manifest = brotli_decompress_bounded(stream)?;
-    let inner_type_uuid = {
-        let inner = parse_superbox(&manifest)?;
-        if !matches!(
-            inner.type_uuid,
-            UUID_MANIFEST | UUID_LEGACY_MANIFEST | UUID_UPDATE_MANIFEST
-        ) {
-            return Err(JumbfError::NotAManifestSuperbox);
-        }
-        if inner.label != parsed.label {
-            return Err(JumbfError::CompressedManifestLabelMismatch {
-                compressed: parsed.label.clone(),
-                manifest: inner.label,
-            });
-        }
-        inner.type_uuid
-    };
-    Ok((manifest, inner_type_uuid))
+    let inner = superbox_header(&manifest)?;
+    Ok((manifest, inner))
+}
+
+/// The type UUID and label of a superbox, owned so the bytes can move.
+struct SuperboxHeader {
+    type_uuid: [u8; 16],
+    label: String,
+}
+
+fn superbox_header(bytes: &[u8]) -> Result<SuperboxHeader, JumbfError> {
+    let parsed = parse_superbox(bytes)?;
+    Ok(SuperboxHeader {
+        type_uuid: parsed.type_uuid,
+        label: parsed.label,
+    })
 }
 
 /// Return whether a manifest store carries at least one compressed manifest.
@@ -1888,6 +1934,54 @@ mod tests {
                     reason.as_ref(),
                     JumbfError::CompressedManifestLabelMismatch { .. }
                 )
+        ));
+    }
+
+    /// The Encypher signer writes the `brob` payload in the JPEG XL form: the
+    /// 4-byte original box type (`jumb`) followed by the Brotli stream of the
+    /// whole manifest superbox. That layout expands too, with the same stored
+    /// hash domain as the literal layout.
+    #[test]
+    fn type_prefixed_brob_payload_expands_with_its_stored_hash_domain() {
+        let manifest = build_manifest("urn:c2pa:prefixed", &[], &[0xa0], &[0xd2, 0x84]);
+        let mut payload = TYPE_JUMB.to_vec();
+        payload.extend_from_slice(&brotli_compress(&manifest));
+        let compressed = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:prefixed",
+            &[box_bytes(TYPE_BROB, &payload)],
+            None,
+        );
+        let stored_content = superbox_content(&compressed).unwrap().to_vec();
+        let store = build_manifest_store(&[compressed]);
+
+        let expanded = expand_store(&store).unwrap();
+        let parsed = parse_manifest_store(expanded.bytes()).unwrap();
+        assert_eq!(parsed.manifests[0].label, "urn:c2pa:prefixed");
+        assert_eq!(expanded.stored_content(0), Some(stored_content.as_slice()));
+    }
+
+    /// A prefixed payload that inflates past the bound fails closed: it is
+    /// never retried as a literal payload.
+    #[test]
+    fn type_prefixed_brob_payload_is_bounded() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_MANIFEST_BYTES + 1];
+        let mut payload = TYPE_JUMB.to_vec();
+        payload.extend_from_slice(&brotli_compress(&oversized));
+        let compressed = superbox(
+            &UUID_COMPRESSED_MANIFEST,
+            "urn:c2pa:prefixed-oversized",
+            &[box_bytes(TYPE_BROB, &payload)],
+            None,
+        );
+        let error = match expand_store(&build_manifest_store(&[compressed])) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized expansion must fail"),
+        };
+        assert!(matches!(
+            error,
+            JumbfError::CompressedManifestInvalid { reason, .. }
+                if matches!(reason.as_ref(), JumbfError::DecompressedTooLarge)
         ));
     }
 }

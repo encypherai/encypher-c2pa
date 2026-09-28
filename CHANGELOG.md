@@ -20,6 +20,7 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- A compressed manifest whose `brob` payload carries the JPEG XL type prefix (`jumb` followed by the Brotli stream) now expands. The type-prefixed reading wins when the payload starts with `jumb` and the remainder inflates to a manifest carrying the compressed manifest's label; otherwise the whole payload is inflated as before. An inflate over the bound still fails closed and is never retried. C2PA 2.4 11.2.4 and 11.1.3.2 leave the layout open; both are now read.
 - CAWG ICA revocation entries now process an omitted `statusSize` as 1, reject zero and non-integer values as malformed, and report sizes other than 1 as unsupported instead of reading one bit.
 - CAWG trust anchors are kept per accepted EKU. An interim source (the packaged Mozilla and IPTC lists, or an `smime_interim` entry) no longer satisfies the `id-kp-documentSigning` anchor requirement, so a document-signing identity trusted only through one of them now reads `cawg.x509.credential.untrusted` with `document_signing_anchor_required`. A credential that also carries `emailProtection` with an approved policy is then evaluated as an S/MIME identity.
 - For `emailProtection`, validator-configured entries are tried before interim sources, so a credential with both a base path and a refused interim path is accepted on the base path and reports the base entry's `trust_source`.
