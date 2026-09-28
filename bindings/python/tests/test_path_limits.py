@@ -22,6 +22,7 @@ native.extensions_json = lambda: json.dumps(
 native.formats_json = lambda: "[]"
 native.get_telemetry_preference = lambda: None
 native.set_telemetry_preference = lambda enabled: None
+native.validate_options = lambda *args: None
 native.verify_bytes = lambda *args: "{}"
 native.verify_detached_bytes = lambda *args: "{}"
 native.verify_fragmented_bytes = lambda *args: "{}"
@@ -202,3 +203,83 @@ def test_new_extensions_use_the_public_registry(
 
     encypher_c2pa.verify(path)
     assert observed["mime_type"] == expected
+
+
+@pytest.mark.parametrize("entrypoint", ["verify", "verify_stream"])
+def test_invalid_options_win_over_missing_asset_paths(
+    entrypoint: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / ("missing.mp4" if entrypoint == "verify_stream" else "missing.jpg")
+
+    def reject(_options_json: str) -> None:
+        raise ValueError(
+            "invalid_trust_material: "
+            "cawg_trust_configurations[0].certificates_pem: no certificates"
+        )
+
+    monkeypatch.setattr(encypher_c2pa, "_validate_options", reject)
+    with pytest.raises(ValueError, match="invalid_trust_material"):
+        if entrypoint == "verify_stream":
+            encypher_c2pa.verify_stream(
+                missing,
+                [tmp_path / "missing.m4s"],
+                "video/mp4",
+                cawg_trust_configurations=[
+                    {"profile": "base", "certificates_pem": ""}
+                ],
+            )
+        else:
+            encypher_c2pa.verify(
+                missing,
+                "image/jpeg",
+                cawg_trust_configurations=[
+                    {"profile": "base", "certificates_pem": ""}
+                ],
+            )
+
+
+@pytest.mark.parametrize("entrypoint", ["verify", "verify_stream"])
+def test_cawg_trust_configurations_are_forwarded_to_validation_and_verification(
+    entrypoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configurations = [
+        {
+            "profile": "smime_interim",
+            "certificates_pem": "certificate",
+            "not_after": "2027-03-31T23:59:59Z",
+        }
+    ]
+    validated = []
+    verified = []
+    monkeypatch.setattr(
+        encypher_c2pa,
+        "_validate_options",
+        lambda options_json: validated.append(json.loads(options_json)),
+    )
+
+    if entrypoint == "verify_stream":
+        def capture_stream(*args):
+            verified.append(json.loads(args[-1]))
+            return "{}"
+
+        monkeypatch.setattr(encypher_c2pa, "verify_stream_bytes", capture_stream)
+        encypher_c2pa.verify_stream(
+            b"init",
+            [b"segment"],
+            "video/mp4",
+            cawg_trust_configurations=configurations,
+        )
+    else:
+        def capture_verify(_asset, _mime, options_json):
+            verified.append(json.loads(options_json))
+            return "{}"
+
+        monkeypatch.setattr(encypher_c2pa, "verify_bytes", capture_verify)
+        encypher_c2pa.verify(
+            b"asset",
+            "image/jpeg",
+            cawg_trust_configurations=configurations,
+        )
+
+    assert validated[0]["cawg_trust_configurations"] == configurations
+    assert verified[0]["cawg_trust_configurations"] == configurations

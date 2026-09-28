@@ -18,6 +18,7 @@ from ._native import (
     formats_json,
     get_telemetry_preference,
     set_telemetry_preference,
+    validate_options as _validate_options,
     verify_bytes,
     verify_detached_bytes,
     verify_fragmented_bytes,
@@ -149,25 +150,6 @@ def verify(
     ``online_allow_private_networks=True`` is intranet mode: it lets those
     fetches reach loopback and private addresses and accept plaintext http.
     """
-    if isinstance(asset, (str, Path)):
-        path = Path(asset)
-        data = _read_path(path)
-        if mime_type is None:
-            mime_type = _infer_mime_type(path)
-    elif isinstance(asset, (bytes, bytearray, memoryview)):
-        data = asset
-    else:
-        raise TypeError("asset must be bytes or a filesystem path")
-
-    if not mime_type:
-        raise ValueError("mime_type is required when it cannot be inferred from a path")
-
-    if telemetry is not None:
-        try:
-            set_telemetry_preference(bool(telemetry))
-        except Exception:
-            pass
-
     options = {
         "trust_pem": trust_pem,
         "tsa_trust_pem": tsa_trust_pem,
@@ -204,6 +186,27 @@ def verify(
             "sdk_name": "python",
         },
     }
+    options_json = json.dumps(options)
+    _validate_options(options_json)
+
+    if isinstance(asset, (str, Path)):
+        path = Path(asset)
+        data = _read_path(path)
+        if mime_type is None:
+            mime_type = _infer_mime_type(path)
+    elif isinstance(asset, (bytes, bytearray, memoryview)):
+        data = asset
+    else:
+        raise TypeError("asset must be bytes or a filesystem path")
+
+    if not mime_type:
+        raise ValueError("mime_type is required when it cannot be inferred from a path")
+
+    if telemetry is not None:
+        try:
+            set_telemetry_preference(bool(telemetry))
+        except Exception:
+            pass
     if manifest_store is not None:
         if fragments is not None:
             raise ValueError("manifest_store cannot be combined with fragments")
@@ -213,9 +216,9 @@ def verify(
             store = manifest_store
         else:
             raise TypeError("manifest_store must be bytes or a filesystem path")
-        report = verify_detached_bytes(data, store, mime_type, json.dumps(options))
+        report = verify_detached_bytes(data, store, mime_type, options_json)
     elif fragments is None:
-        report = verify_bytes(data, mime_type, json.dumps(options))
+        report = verify_bytes(data, mime_type, options_json)
     else:
         fragment_data = []
         for fragment in fragments:
@@ -225,9 +228,7 @@ def verify(
                 fragment_data.append(fragment)
             else:
                 raise TypeError("each fragment must be bytes or a filesystem path")
-        report = verify_fragmented_bytes(
-            data, fragment_data, mime_type, json.dumps(options)
-        )
+        report = verify_fragmented_bytes(data, fragment_data, mime_type, options_json)
     return json.loads(report)
 
 
@@ -279,34 +280,6 @@ def verify_stream(
     recomputed ``chain_valid`` for per-segment streams. Trust and telemetry
     options behave exactly as in :func:`verify`.
     """
-    if isinstance(init_segment, (str, Path)):
-        path = Path(init_segment)
-        init_data: Any = _read_path(path)
-        if mime_type is None:
-            mime_type = _infer_mime_type(path)
-    elif isinstance(init_segment, (bytes, bytearray, memoryview)):
-        init_data = init_segment
-    else:
-        raise TypeError("init_segment must be bytes or a filesystem path")
-
-    if not mime_type:
-        raise ValueError("mime_type is required when it cannot be inferred from a path")
-
-    segment_data = []
-    for segment in segments:
-        if isinstance(segment, (str, Path)):
-            segment_data.append(_read_path(Path(segment)))
-        elif isinstance(segment, (bytes, bytearray, memoryview)):
-            segment_data.append(segment)
-        else:
-            raise TypeError("each segment must be bytes or a filesystem path")
-
-    if telemetry is not None:
-        try:
-            set_telemetry_preference(bool(telemetry))
-        except Exception:
-            pass
-
     options = {
         "trust_pem": trust_pem,
         "tsa_trust_pem": tsa_trust_pem,
@@ -341,6 +314,36 @@ def verify_stream(
             "sdk_name": "python",
         },
     }
+    options_json = json.dumps(options)
+    _validate_options(options_json)
+
+    if isinstance(init_segment, (str, Path)):
+        path = Path(init_segment)
+        init_data: Any = _read_path(path)
+        if mime_type is None:
+            mime_type = _infer_mime_type(path)
+    elif isinstance(init_segment, (bytes, bytearray, memoryview)):
+        init_data = init_segment
+    else:
+        raise TypeError("init_segment must be bytes or a filesystem path")
+
+    if not mime_type:
+        raise ValueError("mime_type is required when it cannot be inferred from a path")
+
+    segment_data = []
+    for segment in segments:
+        if isinstance(segment, (str, Path)):
+            segment_data.append(_read_path(Path(segment)))
+        elif isinstance(segment, (bytes, bytearray, memoryview)):
+            segment_data.append(segment)
+        else:
+            raise TypeError("each segment must be bytes or a filesystem path")
+
+    if telemetry is not None:
+        try:
+            set_telemetry_preference(bool(telemetry))
+        except Exception:
+            pass
     return json.loads(
         verify_stream_bytes(
             init_data,
@@ -348,7 +351,7 @@ def verify_stream(
             mime_type,
             encapsulation,
             method,
-            json.dumps(options),
+            options_json,
         )
     )
 

@@ -1,6 +1,6 @@
 # Typed CAWG Trust Configurations
 
-**Status:** plan gate cleared at cycle 2 (astra6 9.5/10/10, opus55 9.5/9.5/9.5); implementing
+**Status:** implemented; completion fixes verified (885 Rust tests, Go, Python, CLI, formatting, Clippy, and public-surface gate)
 **Current Goal:** a caller can hand the verifier the Mozilla email root store and the IPTC lists as interim S/MIME sources, so the 31 March 2027 cutoff and the trusted-time-stamp condition apply to them, and each source can carry its own trust window.
 
 ## Overview
@@ -34,9 +34,9 @@ pub struct CawgTrustConfiguration {
 }
 ```
 
-- `base`: an entry the validator configured itself. Accepts `id-kp-documentSigning`. As permitted local policy, it also accepts `id-kp-emailProtection` with one of the six CA/B Forum policies, without interim conditions. Same rules as `cawg_trust_pem` today (`trust_source: caller_supplied`).
-- `smime_interim`: one of the two interim sources. Accepts `id-kp-emailProtection` with one of the six policies, only under interim condition 1 (`trust_source: smime_interim`).
-- Each certificate is placed by content, not by list: a CA certificate (BasicConstraints `cA = TRUE`) becomes a chain anchor, and so does a self-issued certificate (subject equals issuer) with no BasicConstraints extension, because version 1 roots still appear in root stores and RFC 5280 treats a trust anchor as a name and key. Any other certificate is a direct match. Placement never makes an end-entity certificate an issuer: a non-CA certificate carrying BasicConstraints `cA = FALSE` is only ever a direct match.
+- `base`: an entry the validator configured itself. Accepts `id-kp-documentSigning`. As permitted local policy, it also accepts `id-kp-emailProtection` with one of the six CA/B Forum policies, without interim conditions. Direct matches report `trust_source: allowed_list`; anchored document-signing matches report `document_signing`; anchored S/MIME matches report `caller_supplied`.
+- `smime_interim`: one of the two interim sources. Accepts `id-kp-emailProtection` with one of the six policies, only under interim condition 1. Direct matches report `trust_source: allowed_list`; anchored matches report `smime_interim`.
+- Each certificate is placed by content, not by list: a CA certificate (BasicConstraints `cA = TRUE`) becomes a chain anchor, and so does a self-issued X.509 v1 certificate (subject equals issuer) with no BasicConstraints extension. Any other certificate is a direct match. A self-issued v3 end-entity certificate without BasicConstraints remains a direct match and cannot issue credentials.
 - Bounds belong to the configuration. The global `trust_anchor_not_before`/`trust_anchor_not_after` keep bounding only `cawg_trust_pem`, `cawg_allowed_certs_pem`, and the claim/TSA inputs.
 - `cawg_trust_pem` and `cawg_allowed_certs_pem` stay, unchanged in meaning. Removing them is a breaking change under the report compatibility policy.
 - Configurations are appended after `cawg_trust_pem`/`cawg_allowed_certs_pem`, in the order given.
@@ -82,10 +82,10 @@ Each test cites its requirement id. Configuration tests run the options JSON the
 - An `smime_interim` certificate, direct or anchor, does not satisfy the documentSigning anchor requirement; a `base` one does. A documentSigning + emailProtection credential refused as documentSigning is accepted by the interim emailProtection entry before the cutoff (018).
 - Masking: a cross-certified issuing CA with one path to an interim root and one to a base root is accepted on the base path after the cutoff without a time stamp (018/025).
 - Duplicates: the same root listed `smime_interim` first and `base` second is evaluated under base rules; an out-of-window first entry does not shadow an in-window second (018, DELTA-009).
-- A CA certificate inside a configuration anchors a chain, a self-issued root without BasicConstraints anchors a chain, an end-entity certificate matches directly and keeps its source's interim conditions (031).
+- A CA certificate inside a configuration anchors a chain, a self-issued X.509 v1 root without BasicConstraints anchors a chain, and a self-issued v3 end entity without BasicConstraints stays a direct match (031).
 - A configuration window refuses chained and direct matches outside it, measured at the trusted time stamp when there is one (DELTA-009).
-- Errors: empty `certificates_pem`, unparseable bound, and `not_before` > `not_after` each fail resolution with `invalid_trust_material` naming the entry index; an unknown profile fails option parsing.
-- Go round-trip test carries `cawg_trust_configurations`; Python binding forwards the kwarg; CLI flag reaches the options.
+- Errors: empty `certificates_pem`, unparseable bound, and `not_before` > `not_after` each fail resolution with `invalid_trust_material` naming the entry index; an unknown profile fails option parsing. Public path entry points resolve these options before opening an asset, detached manifest, or stream segment.
+- Go round-trip carries `cawg_trust_configurations`; Python `verify` and `verify_stream` validate and forward the kwarg; two repeated CLI files concatenate in order, with a semantic error in the second file naming its concatenated entry index.
 
 ## Out of scope
 

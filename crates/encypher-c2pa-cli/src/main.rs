@@ -342,6 +342,10 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 },
                 online_allow_private_networks,
             };
+            // Resolve trust and validation options before opening the asset,
+            // detached manifest, or stream fragments. Every branch below then
+            // observes the same canonical validation and error ordering.
+            options.validate()?;
             // Declared stream verification is a different question with a
             // different answer shape (per-segment results, a chain verdict), so
             // it returns its own report rather than being squeezed into the

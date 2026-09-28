@@ -1288,9 +1288,13 @@ fn identity_certificate_trust(
     let policy = has_eku(OID_KP_EMAIL_PROTECTION)
         .then(|| approved_smime_policy(leaf))
         .flatten();
+    let base_direct = direct_match(leaf, at, allowed, base);
+    let base_chain = std::cell::OnceCell::new();
+    let base_chain =
+        || *base_chain.get_or_init(|| chain_trust_anchor(leaf, intermediates, at, trust, base));
 
     if has_eku(OID_KP_DOCUMENT_SIGNING) {
-        if let Some(entry) = direct_match(leaf, at, allowed, base) {
+        if let Some(entry) = base_direct {
             return Ok(IdentityTrustEvidence {
                 source: "allowed_list",
                 accepted_eku: Some(OID_KP_DOCUMENT_SIGNING),
@@ -1298,7 +1302,7 @@ fn identity_certificate_trust(
                 anchor_fingerprint: Some(entry.fingerprint()),
             });
         }
-        let anchor = chain_trust_anchor(leaf, intermediates, at, trust, base);
+        let anchor = base_chain();
         if !document_signing_require_anchor || anchor.is_some() {
             return Ok(IdentityTrustEvidence {
                 source: "document_signing",
@@ -1331,10 +1335,10 @@ fn identity_certificate_trust(
     // credential store and also chain to an anchor, and a chain may reach
     // both a base and an interim anchor. Base entries carry no time
     // condition, so they are offered the credential first.
-    if let Some(entry) = direct_match(leaf, at, allowed, base) {
+    if let Some(entry) = base_direct {
         return Ok(accepted("allowed_list", entry));
     }
-    if let Some(anchor) = chain_trust_anchor(leaf, intermediates, at, trust, base) {
+    if let Some(anchor) = base_chain() {
         return Ok(accepted(anchor.cawg_source.label(), anchor));
     }
     let Some((source, entry)) = direct_match(leaf, at, allowed, interim)
@@ -1424,12 +1428,13 @@ mod tests {
     use super::*;
     use crate::c2pa_trust::{timestamp_fixture::TestTsa, validate_chain};
     use const_oid::ObjectIdentifier;
-    use der::Encode;
+    use der::{Decode, Encode, EncodePem};
     use rcgen::{
         BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
         ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P384_SHA384,
     };
     use time::macros::datetime;
+    use x509_cert::Certificate;
 
     fn der_sequence(content: Vec<u8>) -> Vec<u8> {
         assert!(content.len() < 128);
@@ -3773,10 +3778,20 @@ mod tests {
         let leaf = leaf_params
             .signed_by(&leaf_key, &root, &root_key)
             .expect("leaf under the legacy root");
+        // rcgen emits v3 certificates. Re-encode the trust anchor as the v1
+        // shape this compatibility rule is for. A trust anchor's self-
+        // signature and extensions are not part of path processing; its name
+        // and public key remain the ones that issued `leaf`.
+        let mut legacy_root = Certificate::from_der(root.der()).expect("parse root");
+        legacy_root.tbs_certificate.version = x509_cert::certificate::Version::V1;
+        legacy_root.tbs_certificate.extensions = None;
+        let legacy_root_pem = legacy_root
+            .to_pem(der::pem::LineEnding::LF)
+            .expect("encode v1 root");
 
         let options: crate::VerifyOptions = serde_json::from_value(json!({
             "no_default_trust": true,
-            "cawg_trust_configurations": [trust_configuration("smime_interim", &root.pem(), None, None)],
+            "cawg_trust_configurations": [trust_configuration("smime_interim", &legacy_root_pem, None, None)],
         }))
         .expect("options JSON");
         let resolved = crate::ResolvedOptions::resolve(&options).expect("resolve options");

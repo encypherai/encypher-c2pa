@@ -224,6 +224,82 @@ fn chain_builder_skips_same_subject_ca_with_wrong_key() {
 }
 
 #[test]
+fn non_admitted_anchor_can_bridge_to_an_admitted_anchor() {
+    let (root, root_key) = make_named_ca("Admitted Root");
+    let bridge_key = KeyPair::generate().expect("bridge key");
+    let mut bridge_params =
+        CertificateParams::new(vec!["bridge.example".to_string()]).expect("bridge params");
+    let mut bridge_name = DistinguishedName::new();
+    bridge_name.push(DnType::CommonName, "Profile Bridge");
+    bridge_params.distinguished_name = bridge_name;
+    bridge_params.not_before = datetime!(2025-01-01 0:00 UTC);
+    bridge_params.not_after = datetime!(2027-01-01 0:00 UTC);
+    bridge_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    bridge_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    bridge_params.use_authority_key_identifier_extension = true;
+    let bridge = bridge_params
+        .signed_by(&bridge_key, &root, &root_key)
+        .expect("bridge certificate");
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params =
+        CertificateParams::new(vec!["leaf.example".to_string()]).expect("leaf params");
+    leaf_params.not_before = datetime!(2025-01-01 0:00 UTC);
+    leaf_params.not_after = datetime!(2027-01-01 0:00 UTC);
+    leaf_params.is_ca = IsCa::ExplicitNoCa;
+    leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+    leaf_params.use_authority_key_identifier_extension = true;
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &bridge, &bridge_key)
+        .expect("issued leaf");
+
+    let mut trust = TrustList::from_certificates(
+        AnchorPurpose::ClaimSigning,
+        [bridge.der().to_vec(), root.der().to_vec()],
+    );
+    trust.anchors[0].cawg_source = CawgTrustSource::SmimeInterim;
+    trust.anchors[1].cawg_source = CawgTrustSource::CallerSupplied;
+    let result = validate_chain_admitting(
+        leaf.der(),
+        &[],
+        &trust,
+        AnchorPurpose::ClaimSigning,
+        Some(datetime!(2026-01-01 0:00 UTC)),
+        |anchor| anchor.cawg_source == CawgTrustSource::CallerSupplied,
+    );
+    assert!(result.trusted, "{:?}", result.reason);
+    assert_eq!(result.anchor, Some(1));
+}
+
+#[test]
+fn self_issued_v3_end_entity_without_basic_constraints_stays_a_direct_match() {
+    let key = KeyPair::generate().expect("key");
+    let mut params = CertificateParams::new(vec!["actor.example".to_string()]).expect("params");
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, "Self-issued CAWG Actor");
+    params.distinguished_name = name;
+    params.not_before = datetime!(2025-01-01 0:00 UTC);
+    params.not_after = datetime!(2027-01-01 0:00 UTC);
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    let certificate = params.self_signed(&key).expect("self-issued certificate");
+    let der = certificate.der().to_vec();
+    let parsed = Certificate::from_der(&der).expect("certificate");
+    assert_eq!(
+        parsed.tbs_certificate.version,
+        x509_cert::certificate::Version::V3
+    );
+    assert!(!has_extension(&parsed, OID_EXT_BASIC_CONSTRAINTS));
+
+    let (anchors, direct) =
+        TrustList::from_certificates(AnchorPurpose::CawgIdentity, [der.clone()])
+            .split_certificate_authorities();
+    assert!(anchors.anchors.is_empty());
+    assert!(direct.contains_certificate(&der));
+}
+
+#[test]
 fn validation_time_before_not_before_is_untrusted() {
     let (der, _) = make_cert(|_| {});
     let trust = claim_signing_anchors([der.clone()]);

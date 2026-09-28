@@ -6,7 +6,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
-- `cawg_trust_configurations` (CLI `--cawg-trust-configurations`): typed CAWG Identity 1.3 trust sources. A caller that supplies the Mozilla email root store or the IPTC Verified News Publishers lists itself can declare them `smime_interim`, so the 31 March 2027 cutoff and the trusted-time-stamp condition apply to them. Before this, caller-supplied copies were accepted under the base model with no time limit. Each entry carries its own `not_before`/`not_after`, and may mix CA and end-entity certificates: CA certificates, and self-issued roots without BasicConstraints, anchor chains; other certificates match directly. Python (`cawg_trust_configurations=`) and Go (`Options.CAWGTrustConfigurations`) expose it; the C and WASM bindings accept it in their options JSON.
+- `cawg_trust_configurations` (CLI `--cawg-trust-configurations`): typed CAWG Identity 1.3 trust sources. A caller that supplies the Mozilla email root store or the IPTC Verified News Publishers lists itself can declare them `smime_interim`, so the 31 March 2027 cutoff and the trusted-time-stamp condition apply to them. Before this, caller-supplied copies were accepted under the base model with no time limit. Each entry carries its own `not_before`/`not_after`, and may mix CA and end-entity certificates: certificates with BasicConstraints `cA = TRUE` and self-issued X.509 v1 certificates without BasicConstraints anchor chains; other certificates, including self-issued v3 end entities without BasicConstraints, match directly. Python (`cawg_trust_configurations=`) and Go (`Options.CAWGTrustConfigurations`) expose it; the C and WASM bindings accept it in their options JSON.
 
 ### Security
 
@@ -18,6 +18,7 @@ All notable changes to this project are recorded here.
 - CAWG trust anchors are kept per accepted EKU. An interim source (the packaged Mozilla and IPTC lists, or an `smime_interim` entry) no longer satisfies the `id-kp-documentSigning` anchor requirement, so a document-signing identity trusted only through one of them now reads `cawg.x509.credential.untrusted` with `document_signing_anchor_required`. A credential that also carries `emailProtection` with an approved policy is then evaluated as an S/MIME identity.
 - For `emailProtection`, validator-configured entries are tried before interim sources, so a credential with both a base path and a refused interim path is accepted on the base path and reports the base entry's `trust_source`.
 - A caller-bounded `cawg_allowed_certs_pem` entry now honours `trust_anchor_not_before`/`trust_anchor_not_after`, measured at the credential's trusted time stamp or the validation time, as chain anchors already did.
+- Rust `verify_file`, every CLI asset-loading branch, and Python `verify`/`verify_stream` now resolve options before opening an asset, detached manifest, or stream segment. Malformed trust material therefore returns `invalid_trust_material` even when an asset path is missing.
 
 ## 1.3.0 - 2026-09-27
 

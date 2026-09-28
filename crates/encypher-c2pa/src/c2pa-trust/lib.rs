@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use thiserror::Error;
 use time::OffsetDateTime;
 use x509_cert::ext::pkix::{BasicConstraints, CertificatePolicies, ExtendedKeyUsage};
-use x509_cert::Certificate;
+use x509_cert::{certificate::Version, Certificate};
 
 // ---------------------------------------------------------------------------
 // OID constants
@@ -324,10 +324,8 @@ impl TrustList {
         self
     }
 
-    /// The configured certificate equal to `der`, whatever its purpose or
-    /// window. Used by the private-credential ("allowed") store, which trusts
-    /// an end-entity certificate directly rather than as an anchor, and which
-    /// still needs the entry that configured it.
+    /// The first configured certificate equal to `der`, whatever its purpose
+    /// or trust window.
     pub fn find_certificate(&self, der: &[u8]) -> Option<&TrustAnchor> {
         self.anchors.iter().find(|anchor| anchor.certificate == der)
     }
@@ -380,15 +378,15 @@ impl TrustList {
     /// "MAY include both CA and end-entity certificates", so a list is sorted
     /// by what each certificate is rather than by the list it was published
     /// in. An anchor is a CA certificate (BasicConstraints `cA = TRUE`) or a
-    /// self-issued certificate with no BasicConstraints extension: version 1
-    /// roots still appear in root stores, and RFC 5280 treats a trust anchor
-    /// as a name and key. A certificate that states `cA = FALSE` is never an
-    /// issuer.
+    /// self-issued X.509 v1 certificate, whose format predates the
+    /// BasicConstraints extension. A v3 certificate without BasicConstraints,
+    /// including a self-issued end entity, is never promoted to an issuer.
     pub fn split_certificate_authorities(self) -> (Self, Self) {
         let (authorities, end_entities) = self.anchors.into_iter().partition(|anchor| {
             Certificate::from_der(&anchor.certificate).is_ok_and(|cert| {
                 is_ca_certificate(&cert)
-                    || (cert.tbs_certificate.subject == cert.tbs_certificate.issuer
+                    || (cert.tbs_certificate.version == Version::V1
+                        && cert.tbs_certificate.subject == cert.tbs_certificate.issuer
                         && !has_extension(&cert, OID_EXT_BASIC_CONSTRAINTS))
             })
         });
@@ -626,9 +624,12 @@ pub fn validate_chain_admitting(
     // claim signer.
     let leaf_acceptable = leaf_is_acceptable_claim_signer(&leaf);
 
-    // Only anchors configured for this purpose, and in force at `at`, may
-    // terminate a path. The same certificate configured twice keeps its first
-    // entry, so a duplicate cannot silently relabel an anchor.
+    // Every in-force certificate configured for this purpose can bridge a
+    // path. Only an anchor accepted by `admit` may terminate it. Keeping those
+    // roles separate lets, for example, a CA listed under one CAWG profile
+    // bridge to an eligible root under another profile without widening the
+    // set of trusted termination points. The same admitted certificate
+    // configured twice keeps its first entry.
     let mut anchor_indices: HashMap<String, usize> = HashMap::new();
     let mut candidates: Vec<Certificate> = Vec::new();
     for der in intermediates_der {
@@ -636,11 +637,13 @@ pub fn validate_chain_admitting(
             candidates.push(c);
         }
     }
-    for (index, anchor) in trust.active_anchors(purpose, at, admit) {
+    for (index, anchor) in trust.active_anchors(purpose, at, |_| true) {
         if let Ok(c) = Certificate::from_der(&anchor.certificate) {
-            anchor_indices
-                .entry(fingerprint_hex(&anchor.certificate))
-                .or_insert(index);
+            if admit(anchor) {
+                anchor_indices
+                    .entry(fingerprint_hex(&anchor.certificate))
+                    .or_insert(index);
+            }
             candidates.push(c);
         }
     }
