@@ -188,34 +188,33 @@ pub(crate) fn evaluate(
 }
 
 fn reduce_verdicts(verdicts: impl IntoIterator<Item = OnlineVerdict>) -> OnlineVerdict {
-    verdicts
-        .into_iter()
-        .reduce(|left, right| {
-            if left == OnlineVerdict::Revoked || right == OnlineVerdict::Revoked {
-                OnlineVerdict::Revoked
-            } else if left == OnlineVerdict::NotRevoked || right == OnlineVerdict::NotRevoked {
-                OnlineVerdict::NotRevoked
-            } else if left == OnlineVerdict::Unknown || right == OnlineVerdict::Unknown {
-                OnlineVerdict::Unknown
-            } else {
-                match (left, right) {
-                    (
-                        OnlineVerdict::OutsideWindow {
-                            refresh_may_cover: left,
-                        },
-                        OnlineVerdict::OutsideWindow {
-                            refresh_may_cover: right,
-                        },
-                    ) => OnlineVerdict::OutsideWindow {
-                        refresh_may_cover: left || right,
-                    },
-                    (outside @ OnlineVerdict::OutsideWindow { .. }, _)
-                    | (_, outside @ OnlineVerdict::OutsideWindow { .. }) => outside,
-                    _ => OnlineVerdict::Unusable,
-                }
-            }
-        })
-        .unwrap_or(OnlineVerdict::Unusable)
+    fn rank(verdict: OnlineVerdict) -> u8 {
+        match verdict {
+            OnlineVerdict::Unusable => 0,
+            OnlineVerdict::OutsideWindow { .. } => 1,
+            OnlineVerdict::Unknown => 2,
+            OnlineVerdict::NotRevoked => 3,
+            OnlineVerdict::Revoked => 4,
+        }
+    }
+
+    let mut best = OnlineVerdict::Unusable;
+    let mut refresh_may_cover = false;
+    for verdict in verdicts {
+        if let OnlineVerdict::OutsideWindow {
+            refresh_may_cover: refresh,
+        } = verdict
+        {
+            refresh_may_cover |= refresh;
+        }
+        if rank(verdict) > rank(best) {
+            best = verdict;
+        }
+    }
+    match best {
+        OnlineVerdict::OutsideWindow { .. } => OnlineVerdict::OutsideWindow { refresh_may_cover },
+        verdict => verdict,
+    }
 }
 
 /// One verdict per `SingleResponse` whose `CertID` names this certificate.

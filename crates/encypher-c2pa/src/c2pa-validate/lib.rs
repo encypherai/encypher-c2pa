@@ -2237,9 +2237,10 @@ impl OnlineOcspOutcome {
     }
 }
 
-/// Evaluate caller-supplied OCSP evidence for each certificate of a chain
-/// under the selected specification lane.
+/// Evaluate caller-supplied OCSP evidence for each certificate of a chain.
 ///
+/// `policy` governs the leaf. CA positions retain the established C2PA window
+/// policy so adding the CAWG leaf policy cannot change chain handling.
 /// `attested` is the time from a trusted time-stamp, or `None` when the
 /// signature has no usable one.
 pub(super) fn evaluate_online_ocsp(
@@ -2251,6 +2252,11 @@ pub(super) fn evaluate_online_ocsp(
 ) -> OnlineOcspOutcome {
     let mut outcome = OnlineOcspOutcome::default();
     for (position, target) in targets.iter().enumerate() {
+        let target_policy = if position == 0 {
+            policy
+        } else {
+            crate::c2pa_trust::OnlineOcspPolicy::C2paClaim
+        };
         let leaf_outcome = match evidence.ocsp_response(&target.certificate_sha256_hex) {
             Some(der) => OnlineOcspLeafOutcome::Received(crate::c2pa_trust::evaluate_ocsp_online(
                 der,
@@ -2258,7 +2264,7 @@ pub(super) fn evaluate_online_ocsp(
                 target.subject,
                 attested,
                 verification_time,
-                policy,
+                target_policy,
             )),
             None if evidence.ocsp_is_unreachable(&target.certificate_sha256_hex) => {
                 OnlineOcspLeafOutcome::Unreachable

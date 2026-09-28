@@ -580,38 +580,24 @@ fn verify_identity_assertion(
     };
     let leaf_targets = &targets[..targets.len().min(1)];
     let embedded_good = revocation_status == IdentityRevocationStatus::NotRevoked;
-    if embedded_good
-        && !matches!(
-            online.leaf,
-            Some(super::OnlineOcspLeafOutcome::Received(
-                OnlineOcspVerdict::NotRevoked | OnlineOcspVerdict::Revoked
-            ))
-        )
-    {
-        ctx.results.push_success(
-            CAWG_X509_OCSP_NOT_REVOKED,
-            url.into(),
-            "verified stapled OCSP evidence reports the identity leaf not revoked".into(),
-        );
-    }
 
-    let leaf_revoked = match online.leaf {
+    let (leaf_revoked, online_settled) = match online.leaf {
         Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::NotRevoked)) => {
             ctx.results.push_success(
                 CAWG_X509_OCSP_NOT_REVOKED,
                 url.into(),
                 "online OCSP response reports the identity leaf not revoked".into(),
             );
-            false
+            (false, true)
         }
-        Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)) => true,
+        Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)) => (true, true),
         Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unknown)) => {
             ctx.results.push_informational(
                 CAWG_X509_OCSP_UNKNOWN,
                 url.into(),
                 "the OCSP responder reports an unknown status for the identity certificate".into(),
             );
-            false
+            (false, false)
         }
         Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unusable)) => {
             ctx.results.push_informational(
@@ -621,7 +607,7 @@ fn verify_identity_assertion(
                     .into(),
             );
             super::record_ocsp_needs(leaf_targets, &purpose, &mut ctx.results.network_needs);
-            false
+            (false, false)
         }
         Some(super::OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::OutsideWindow {
             refresh_may_cover,
@@ -634,7 +620,7 @@ fn verify_identity_assertion(
             if refresh_may_cover {
                 super::record_ocsp_needs(leaf_targets, &purpose, &mut ctx.results.network_needs);
             }
-            false
+            (false, false)
         }
         Some(super::OnlineOcspLeafOutcome::Unreachable) => {
             ctx.results.push_informational(
@@ -642,7 +628,7 @@ fn verify_identity_assertion(
                 url.into(),
                 "the OCSP responder for the identity certificate returned no response".into(),
             );
-            false
+            (false, false)
         }
         None => {
             if !embedded_good {
@@ -654,9 +640,16 @@ fn verify_identity_assertion(
                 );
                 super::record_ocsp_needs(&targets, &purpose, &mut ctx.results.network_needs);
             }
-            false
+            (false, false)
         }
     };
+    if embedded_good && !online_settled {
+        ctx.results.push_success(
+            CAWG_X509_OCSP_NOT_REVOKED,
+            url.into(),
+            "verified stapled OCSP evidence reports the identity leaf not revoked".into(),
+        );
+    }
     if leaf_revoked {
         ctx.results.push_failure(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
@@ -4179,39 +4172,72 @@ mod tests {
         assert!(results.has_success(CAWG_IDENTITY_TRUSTED));
     }
 
-    /// CAWG-ID13-ASSERTION-CREATION-017: two signed identities are bound by
-    /// their real assertion-box hashes through the normal reference and CAWG
-    /// verifier paths. Tampering with B breaks the claim binding.
+    /// CAWG-ID13-ASSERTION-CREATION-017: a fully signed manifest store binds
+    /// both signed identities through their real assertion-box hashes. The
+    /// public detached-store verifier accepts A -> B, while a changed B fails
+    /// its claim binding.
     #[test]
     fn signed_identity_reference_is_accepted_when_hash_bound_and_acyclic() {
+        const MANIFEST_LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-000000000461";
+        let asset = [
+            0xff, 0xd8, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x00, 0xff,
+            0xd9,
+        ];
         let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
-        let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
         let hard_label = "c2pa.hash.data";
         let hard_payload = encode(
-            &Value::Map(vec![(
-                Value::Text("hash".into()),
-                Value::Bytes(vec![0x22; 32]),
-            )]),
+            &Value::Map(vec![
+                (Value::Text("alg".into()), Value::Text("sha256".into())),
+                (
+                    Value::Text("hash".into()),
+                    Value::Bytes(sha2::Sha256::digest(asset).to_vec()),
+                ),
+                (Value::Text("exclusions".into()), Value::Array(Vec::new())),
+            ]),
             Profile::CanonicalForHashedSubstructures,
         )
         .expect("hard binding");
+        let actions_label = "c2pa.actions.v2";
+        let actions_payload = encode(
+            &Value::Map(vec![(
+                Value::Text("actions".into()),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        Value::Text("action".into()),
+                        Value::Text("c2pa.created".into()),
+                    ),
+                    (
+                        Value::Text("digitalSourceType".into()),
+                        Value::Text(
+                            "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                        ),
+                    ),
+                ])]),
+            )]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("actions");
         let hard_box = crate::c2pa_core::jumbf::assertion_box(hard_label, &hard_payload, None);
-        let hard_jumbf = crate::c2pa_core::jumbf::superbox_content(&hard_box)
-            .expect("hard binding content")
-            .to_vec();
-        let hard_reference = Value::Map(vec![
-            (
-                Value::Text("url".into()),
-                Value::Text(format!(
-                    "self#jumbf=/c2pa/test/c2pa.assertions/{hard_label}"
-                )),
-            ),
-            (Value::Text("alg".into()), Value::Text("sha256".into())),
-            (
-                Value::Text("hash".into()),
-                Value::Bytes(sha2::Sha256::digest(&hard_jumbf).to_vec()),
-            ),
-        ]);
+        let actions_box =
+            crate::c2pa_core::jumbf::assertion_box(actions_label, &actions_payload, None);
+        let assertion_reference = |label: &str, assertion_box: &[u8]| {
+            let content = crate::c2pa_core::jumbf::superbox_content(assertion_box)
+                .expect("assertion-box content");
+            Value::Map(vec![
+                (
+                    Value::Text("url".into()),
+                    Value::Text(format!(
+                        "self#jumbf=/c2pa/{MANIFEST_LABEL}/c2pa.assertions/{label}"
+                    )),
+                ),
+                (Value::Text("alg".into()), Value::Text("sha256".into())),
+                (
+                    Value::Text("hash".into()),
+                    Value::Bytes(sha2::Sha256::digest(content).to_vec()),
+                ),
+            ])
+        };
+        let hard_reference = assertion_reference(hard_label, &hard_box);
 
         let b_label = "cawg.identity__secondary";
         let b_bytes = encypher_identity_assertion_for(
@@ -4220,20 +4246,7 @@ mod tests {
             None,
         );
         let b_box = crate::c2pa_core::jumbf::assertion_box(b_label, &b_bytes, None);
-        let b_jumbf = crate::c2pa_core::jumbf::superbox_content(&b_box)
-            .expect("B assertion content")
-            .to_vec();
-        let b_reference = Value::Map(vec![
-            (
-                Value::Text("url".into()),
-                Value::Text(format!("self#jumbf=/c2pa/test/c2pa.assertions/{b_label}")),
-            ),
-            (Value::Text("alg".into()), Value::Text("sha256".into())),
-            (
-                Value::Text("hash".into()),
-                Value::Bytes(sha2::Sha256::digest(&b_jumbf).to_vec()),
-            ),
-        ]);
+        let b_reference = assertion_reference(b_label, &b_box);
 
         let a_label = "cawg.identity";
         let a_bytes = encypher_identity_assertion_for(
@@ -4242,153 +4255,101 @@ mod tests {
             None,
         );
         let a_box = crate::c2pa_core::jumbf::assertion_box(a_label, &a_bytes, None);
-        let a_jumbf = crate::c2pa_core::jumbf::superbox_content(&a_box)
-            .expect("A assertion content")
-            .to_vec();
-        let a_reference = Value::Map(vec![
+        let references = vec![
+            assertion_reference(a_label, &a_box),
+            b_reference,
+            hard_reference,
+            assertion_reference(actions_label, &actions_box),
+        ];
+        let claim = Value::Map(vec![
             (
-                Value::Text("url".into()),
-                Value::Text(format!("self#jumbf=/c2pa/test/c2pa.assertions/{a_label}")),
+                Value::Text("instanceID".into()),
+                Value::Text("xmp:iid:team-461-a-to-b".into()),
+            ),
+            (
+                Value::Text("claim_generator_info".into()),
+                Value::Map(vec![(
+                    Value::Text("name".into()),
+                    Value::Text("Encypher TEAM_461 fixture".into()),
+                )]),
             ),
             (Value::Text("alg".into()), Value::Text("sha256".into())),
             (
-                Value::Text("hash".into()),
-                Value::Bytes(sha2::Sha256::digest(&a_jumbf).to_vec()),
+                Value::Text("created_assertions".into()),
+                Value::Array(references),
+            ),
+            (
+                Value::Text("signature".into()),
+                Value::Text(format!("self#jumbf=/c2pa/{MANIFEST_LABEL}/c2pa.signature")),
             ),
         ]);
-        let claim = claim_with_references(vec![a_reference, b_reference, hard_reference]);
-        let assertions = [
-            (a_label.to_string(), a_bytes),
-            (b_label.to_string(), b_bytes),
-            (hard_label.to_string(), hard_payload),
-        ];
-        let jumbf = [
-            (a_label.to_string(), a_jumbf),
-            (b_label.to_string(), b_jumbf),
-            (hard_label.to_string(), hard_jumbf),
-        ];
-        let manifest = ParsedManifest {
-            label: "test".into(),
-            manifest_jumbf: &[],
-            assertions: assertions
-                .iter()
-                .map(|(label, bytes)| (label.clone(), bytes.as_slice()))
-                .collect(),
-            assertion_jumbf: jumbf
-                .iter()
-                .map(|(label, bytes)| (label.clone(), bytes.as_slice()))
-                .collect(),
-            claim_cbor: None,
-            signature_cose: None,
-            claim_count: 1,
-            claim_box_label: Some("c2pa.claim.v2".into()),
-        };
-        let mut claim_refs =
-            ClaimAssertionRefs::build(&manifest, &claim, super::super::ClaimGeneration::V2);
-        let mut results = ValidationResults::default();
-        super::super::verify_assertion_bindings(
-            &claim,
-            &mut claim_refs,
-            super::super::ClaimGeneration::V2,
-            "test",
-            super::super::EngineProfile::GENEROUS,
-            &mut results,
+        let claim_cbor = encode(&claim, Profile::LegacyPipelineBDefinite).expect("claim");
+        let claim_signer = super::super::signature_conformance_tests::Signer::conformant();
+        let claim_signature = claim_signer.sign(&claim_cbor);
+        let manifest = crate::c2pa_core::jumbf::build_manifest(
+            MANIFEST_LABEL,
+            &[
+                hard_box.clone(),
+                actions_box.clone(),
+                b_box.clone(),
+                a_box.clone(),
+            ],
+            &claim_cbor,
+            &claim_signature,
         );
-        super::super::refs::verify_assertion_references(
-            &claim,
-            &claim_refs,
-            super::super::ClaimGeneration::V2,
-            super::super::EngineProfile::GENEROUS,
-            "test",
-            std::slice::from_ref(&manifest),
-            &mut results,
-        );
-        let primary_binding = claim_refs
-            .references
-            .iter()
-            .find(|reference| reference.label == Some(hard_label))
-            .expect("primary binding");
-        let timestamp_index = TimestampAssertionIndex::default();
-        verify_identity_assertions(
-            &mut IdentityContext {
-                manifest: &manifest,
-                claim: &claim,
-                validation_time: AFTER_INTERIM_CUTOFF,
-                claim_timestamp: None,
-                cawg_trust: Some(&trust),
-                cawg_allowed_certs: None,
-                ocsp_verification_time: AFTER_INTERIM_CUTOFF,
-                document_signing_require_anchor: true,
-                tsa_trust: None,
-                timestamp_index: &timestamp_index,
-                did_documents: None,
-                allow_legacy_encoding: false,
-                ica_trusted_issuers: None,
-                ica_trust_anchors: None,
-                ica_status_lists: None,
-                evidence: Default::default(),
-                ingredients: IngredientResolution::default(),
-                results: &mut results,
+        let store = crate::c2pa_core::jumbf::build_manifest_store(&[manifest]);
+        let options = crate::VerifyOptions {
+            cawg_trust_pem: Some(chain.root_pem.clone()),
+            no_default_trust: true,
+            validation_time: Some("2027-06-01T00:00:00Z".into()),
+            telemetry: crate::TelemetryOptions {
+                enabled: Some(false),
+                ..Default::default()
             },
-            &claim_refs,
-            Some(primary_binding),
-            &[],
-        );
-        assert!(
-            !results.has_failure(super::super::ASSERTION_HASHED_URI_MISMATCH)
-                && !results.has_failure(CAWG_IDENTITY_ASSERTION_MISMATCH)
-                && results.has_success(CAWG_IDENTITY_TRUSTED),
-            "{results:?}"
-        );
-
-        let mut tampered_b_jumbf = jumbf[1].1.clone();
-        let last = tampered_b_jumbf.last_mut().expect("B content byte");
-        *last ^= 1;
-        let tampered_jumbf = [
-            (a_label.to_string(), jumbf[0].1.clone()),
-            (b_label.to_string(), tampered_b_jumbf),
-            (hard_label.to_string(), jumbf[2].1.clone()),
-        ];
-        let tampered_manifest = ParsedManifest {
-            label: "test".into(),
-            manifest_jumbf: &[],
-            assertions: assertions
-                .iter()
-                .map(|(label, bytes)| (label.clone(), bytes.as_slice()))
-                .collect(),
-            assertion_jumbf: tampered_jumbf
-                .iter()
-                .map(|(label, bytes)| (label.clone(), bytes.as_slice()))
-                .collect(),
-            claim_cbor: None,
-            signature_cose: None,
-            claim_count: 1,
-            claim_box_label: Some("c2pa.claim.v2".into()),
+            online: Some(false),
+            ..Default::default()
         };
-        let mut tampered_refs = ClaimAssertionRefs::build(
-            &tampered_manifest,
-            &claim,
-            super::super::ClaimGeneration::V2,
+
+        let report = crate::verify_with_manifest_store(&asset, &store, "image/jpeg", &options)
+            .expect("public verification");
+        assert_eq!(report.integrity, "valid", "{report:#?}");
+        assert_eq!(report.signature, "valid", "{report:#?}");
+        assert_eq!(report.hard_binding, "match", "{report:#?}");
+        assert_eq!(
+            report
+                .validation_results
+                .success
+                .iter()
+                .filter(|status| status.code == CAWG_IDENTITY_TRUSTED)
+                .count(),
+            2,
+            "{report:#?}"
         );
-        let mut tampered_results = ValidationResults::default();
-        super::super::verify_assertion_bindings(
-            &claim,
-            &mut tampered_refs,
-            super::super::ClaimGeneration::V2,
-            "test",
-            super::super::EngineProfile::GENEROUS,
-            &mut tampered_results,
+        assert!(!report
+            .validation_results
+            .failure
+            .iter()
+            .any(|status| status.code == CAWG_IDENTITY_ASSERTION_MISMATCH));
+
+        let mut tampered_b = b_bytes;
+        *tampered_b.last_mut().expect("B content byte") ^= 1;
+        let tampered_b_box = crate::c2pa_core::jumbf::assertion_box(b_label, &tampered_b, None);
+        let tampered_manifest = crate::c2pa_core::jumbf::build_manifest(
+            MANIFEST_LABEL,
+            &[hard_box, actions_box, tampered_b_box, a_box],
+            &claim_cbor,
+            &claim_signature,
         );
-        super::super::refs::verify_assertion_references(
-            &claim,
-            &tampered_refs,
-            super::super::ClaimGeneration::V2,
-            super::super::EngineProfile::GENEROUS,
-            "test",
-            std::slice::from_ref(&tampered_manifest),
-            &mut tampered_results,
-        );
-        assert!(tampered_results.has_failure(super::super::ASSERTION_HASHED_URI_MISMATCH));
+        let tampered_store = crate::c2pa_core::jumbf::build_manifest_store(&[tampered_manifest]);
+        let tampered =
+            crate::verify_with_manifest_store(&asset, &tampered_store, "image/jpeg", &options)
+                .expect("tampered verification report");
+        assert_ne!(tampered.integrity, "valid", "{tampered:#?}");
+        assert!(tampered
+            .validation_results
+            .failure
+            .iter()
+            .any(|status| status.code == super::super::ASSERTION_HASHED_URI_MISMATCH));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5310,14 +5271,12 @@ mod tests {
                 );
                 assert!(
                     results.has_informational(CAWG_X509_OCSP_SKIPPED),
-                    "{case}: {:?}",
-                    results
+                    "{case}: {results:?}"
                 );
                 assert!(
                     !results.has_success(CAWG_X509_OCSP_NOT_REVOKED)
                         && !results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED),
-                    "{case}: {:?}",
-                    results
+                    "{case}: {results:?}"
                 );
             }
 
@@ -5339,6 +5298,51 @@ mod tests {
                 failure_codes(&revoked_results),
                 [CAWG_IDENTITY_CREDENTIAL_REVOKED]
             );
+        }
+
+        /// Embedded CA revocation keeps the established trust-path behavior:
+        /// the assertion signature is still checked, then the credential is
+        /// rejected as untrusted with a machine-readable CA reason.
+        #[test]
+        fn stapled_ca_revocation_preserves_signature_and_trust_reporting() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let ca_revoked = answer(
+                &chain.root_der,
+                &chain.root_key,
+                &chain.issuing_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion = identity_assertion_with_staples(
+                &chain,
+                &tsa,
+                AFTER_INTERIM_CUTOFF,
+                vec![ca_revoked],
+            );
+            let results = verdict_for_assertion(
+                &chain,
+                &assertion,
+                Some(&tsa.trust_list()),
+                OnlineEvidence::default(),
+            );
+
+            assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            let failure = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                .expect("revoked CA rejects the identity credential");
+            assert_eq!(
+                failure
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["reason"].as_str()),
+                Some("ca_revoked")
+            );
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
         }
 
         /// CAWG-ID13-X509-VALIDATING-A-057: an unusable first response does
@@ -5505,8 +5509,7 @@ mod tests {
                         && !results.has_informational(CAWG_X509_OCSP_UNKNOWN)
                         && !results.has_informational(CAWG_X509_OCSP_UNUSABLE_RESPONSE)
                         && !results.has_informational(CAWG_X509_OCSP_OUTSIDE_WINDOW),
-                    "{case}: {:?}",
-                    results
+                    "{case}: {results:?}"
                 );
             }
         }
@@ -5715,6 +5718,36 @@ mod tests {
                     leaf_response(&chain, FixtureStatus::Good),
                     issuing_response(&chain, FixtureStatus::RevokedAt(REVOKED_AT)),
                 ]),
+            );
+
+            assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+        }
+
+        /// CA-chain handling predates the CAWG leaf's open freshness window.
+        /// At `thisUpdate` with no `nextUpdate`, the established inclusive
+        /// 24-hour policy still accepts a verified CA revocation.
+        #[test]
+        fn a_ca_response_keeps_the_established_claim_window_policy() {
+            let chain = ocsp_chain();
+            let ca_response = response(
+                &chain.root_der,
+                &chain.issuing_der,
+                &Responder {
+                    certificate_der: &chain.root_der,
+                    key: &chain.root_key,
+                    embed_certificate: false,
+                },
+                ResponseSpec {
+                    status: FixtureStatus::RevokedAt(REVOKED_AT),
+                    produced_at: b"20270601000000Z",
+                    this_update: b"20270601000000Z",
+                    next_update: None,
+                },
+            );
+            let results = verdict_with_responses(
+                &chain,
+                HashMap::from([(evidence_key(&chain.issuing_der), ca_response)]),
             );
 
             assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
