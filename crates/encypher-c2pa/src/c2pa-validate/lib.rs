@@ -36,7 +36,7 @@
 
 mod assertion_semantics;
 mod cache;
-mod cawg;
+pub(crate) mod cawg;
 mod cawg_metadata;
 mod cawg_training_mining;
 mod exclusions;
@@ -80,7 +80,7 @@ mod refs;
 mod report;
 mod revocation;
 #[cfg(test)]
-mod signature_conformance_tests;
+pub(crate) mod signature_conformance_tests;
 pub(crate) mod stream;
 mod timestamp_assertion;
 mod update_manifest;
@@ -581,11 +581,16 @@ pub struct VerifyInput<'a> {
 #[derive(Clone, Copy, Default)]
 pub struct OnlineEvidence<'a> {
     /// OCSP responses, keyed by the lowercase hex SHA-256 of the subject
-    /// certificate's DER, with the DER `OCSPResponse` as the value.
+    /// certificate's DER, with the DER `OCSPResponse` as the value. An empty
+    /// DER value is the SDK's sentinel for a response body it received but
+    /// rejected before storage, such as an oversized body; it is unusable
+    /// evidence, not an unreachable responder.
     pub ocsp_responses: Option<&'a std::collections::HashMap<String, Vec<u8>>>,
-    /// Certificates whose responder was queried without a usable answer, by
+    /// Certificates whose responder was queried but delivered no response, by
     /// the same hex SHA-256 key. Each one registers the `ocsp.inaccessible`
-    /// informational code instead of `ocsp.skipped`.
+    /// informational code instead of `ocsp.skipped`. Received but unusable
+    /// responses belong in `ocsp_responses`, using empty DER when the original
+    /// bytes were discarded under a size limit.
     pub ocsp_unreachable: Option<&'a [String]>,
     /// External assertion content, keyed by the URI the assertion declares.
     pub external_data: Option<&'a std::collections::HashMap<String, Vec<u8>>>,
@@ -606,8 +611,9 @@ impl OnlineEvidence<'_> {
             .map(Vec::as_slice)
     }
 
-    /// True when the responder for `certificate_sha256_hex` was tried and gave
-    /// no usable answer.
+    /// True when the responder for `certificate_sha256_hex` was tried and
+    /// delivered no response. Received but unusable responses are represented
+    /// in `ocsp_responses`.
     fn ocsp_is_unreachable(&self, certificate_sha256_hex: &str) -> bool {
         self.ocsp_unreachable
             .is_some_and(|list| list.iter().any(|entry| entry == certificate_sha256_hex))
@@ -1850,6 +1856,10 @@ impl EmbeddedOcspStatus {
         }
     }
 
+    pub(super) fn ca_revoked(self) -> bool {
+        matches!(self, Self::CaRevoked | Self::LeafAndCaRevoked)
+    }
+
     fn blocks_trust(self) -> bool {
         matches!(
             self,
@@ -2198,11 +2208,21 @@ pub(super) fn record_ocsp_needs(
     }
 }
 
+/// Provenance for the leaf certificate's online OCSP outcome.
+#[derive(Clone, Copy)]
+pub(super) enum OnlineOcspLeafOutcome {
+    /// The responder returned bytes, which were evaluated under the lane's
+    /// policy even when those bytes proved unusable.
+    Received(OnlineOcspVerdict),
+    /// A request was attempted, but the server or transport returned no body.
+    Unreachable,
+}
+
 /// What caller-supplied online OCSP evidence established for a chain.
 #[derive(Default)]
 pub(super) struct OnlineOcspOutcome {
-    /// The leaf's verdict, when online evidence covered the leaf at all.
-    leaf: Option<OnlineOcspVerdict>,
+    /// The leaf's outcome, when online evidence covered the leaf at all.
+    leaf: Option<OnlineOcspLeafOutcome>,
     /// A CA certificate in the chain was reported revoked.
     ca_revoked: bool,
 }
@@ -2212,11 +2232,19 @@ impl OnlineOcspOutcome {
     fn is_empty(&self) -> bool {
         self.leaf.is_none() && !self.ca_revoked
     }
+
+    fn leaf_is_revoked(&self) -> bool {
+        matches!(
+            self.leaf,
+            Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked))
+        )
+    }
 }
 
-/// Evaluate caller-supplied OCSP evidence for each certificate of a chain
-/// under the C2PA 2.4 / CAWG 1.3 online rules.
+/// Evaluate caller-supplied OCSP evidence for each certificate of a chain.
 ///
+/// `policy` governs the leaf. CA positions retain the established C2PA window
+/// policy so adding the CAWG leaf policy cannot change chain handling.
 /// `attested` is the time from a trusted time-stamp, or `None` when the
 /// signature has no usable one.
 pub(super) fn evaluate_online_ocsp(
@@ -2224,31 +2252,66 @@ pub(super) fn evaluate_online_ocsp(
     evidence: OnlineEvidence<'_>,
     attested: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
+    policy: crate::c2pa_trust::OnlineOcspPolicy,
 ) -> OnlineOcspOutcome {
     let mut outcome = OnlineOcspOutcome::default();
     for (position, target) in targets.iter().enumerate() {
-        let verdict = match evidence.ocsp_response(&target.certificate_sha256_hex) {
-            Some(der) => crate::c2pa_trust::evaluate_ocsp_online(
+        let target_policy = if position == 0 {
+            policy
+        } else {
+            crate::c2pa_trust::OnlineOcspPolicy::C2paClaim
+        };
+        let leaf_outcome = match evidence.ocsp_response(&target.certificate_sha256_hex) {
+            Some(der) => OnlineOcspLeafOutcome::Received(crate::c2pa_trust::evaluate_ocsp_online(
                 der,
                 target.issuer,
                 target.subject,
                 attested,
                 verification_time,
-            ),
+                target_policy,
+            )),
             None if evidence.ocsp_is_unreachable(&target.certificate_sha256_hex) => {
-                OnlineOcspVerdict::Unusable
+                OnlineOcspLeafOutcome::Unreachable
             }
             None => continue,
         };
         if position == 0 {
-            outcome.leaf = Some(verdict);
-        } else if verdict == OnlineOcspVerdict::Revoked {
-            // C2PA 2.4: a CA revoked at the effective time rejects the claim
-            // signature with `signingCredential.untrusted`.
+            outcome.leaf = Some(leaf_outcome);
+        } else if matches!(
+            leaf_outcome,
+            OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)
+        ) {
+            // A received, verified revoked response about a CA rejects the
+            // chain. Transport failure and unusable bytes never manufacture
+            // CA revocation.
             outcome.ca_revoked = true;
         }
     }
     outcome
+}
+
+/// Check only CA positions when a terminal embedded leaf verdict makes online
+/// leaf work irrelevant. CA responses retain the C2PA window policy.
+pub(super) fn any_online_ca_revoked(
+    targets: &[OcspTarget<'_>],
+    evidence: OnlineEvidence<'_>,
+    attested: Option<OffsetDateTime>,
+    verification_time: OffsetDateTime,
+) -> bool {
+    targets.iter().skip(1).any(|target| {
+        evidence
+            .ocsp_response(&target.certificate_sha256_hex)
+            .is_some_and(|der| {
+                crate::c2pa_trust::evaluate_ocsp_online(
+                    der,
+                    target.issuer,
+                    target.subject,
+                    attested,
+                    verification_time,
+                    crate::c2pa_trust::OnlineOcspPolicy::C2paClaim,
+                ) == OnlineOcspVerdict::Revoked
+            })
+    })
 }
 
 /// Report the claim signer's revocation outcome from embedded and online
@@ -2280,28 +2343,34 @@ fn record_ocsp_status(
             EmbeddedOcspStatus::CaRevoked | EmbeddedOcspStatus::LeafAndCaRevoked
         );
     match online.leaf {
-        Some(OnlineOcspVerdict::NotRevoked) => results.push_success_with_details(
-            SIGNING_CREDENTIAL_OCSP_NOT_REVOKED,
-            sig_url.into(),
-            "online OCSP response: signing certificate not revoked at signing".into(),
-            online_ocsp_details(),
-        ),
-        Some(OnlineOcspVerdict::Revoked) => results.push_failure_with_details(
-            SIGNING_CREDENTIAL_OCSP_REVOKED,
-            sig_url.into(),
-            "online OCSP response: signing certificate revoked".into(),
-            online_ocsp_details(),
-        ),
-        Some(OnlineOcspVerdict::Unknown) => results.push_informational_with_details(
-            SIGNING_CREDENTIAL_OCSP_UNKNOWN,
-            sig_url.into(),
-            "online OCSP response reports an unknown status for the signing certificate".into(),
-            online_ocsp_details(),
-        ),
-        Some(OnlineOcspVerdict::Unusable) => results.push_informational_with_details(
+        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::NotRevoked)) => results
+            .push_success_with_details(
+                SIGNING_CREDENTIAL_OCSP_NOT_REVOKED,
+                sig_url.into(),
+                "online OCSP response: signing certificate not revoked at signing".into(),
+                online_ocsp_details(),
+            ),
+        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Revoked)) => results
+            .push_failure_with_details(
+                SIGNING_CREDENTIAL_OCSP_REVOKED,
+                sig_url.into(),
+                "online OCSP response: signing certificate revoked".into(),
+                online_ocsp_details(),
+            ),
+        Some(OnlineOcspLeafOutcome::Received(OnlineOcspVerdict::Unknown)) => results
+            .push_informational_with_details(
+                SIGNING_CREDENTIAL_OCSP_UNKNOWN,
+                sig_url.into(),
+                "online OCSP response reports an unknown status for the signing certificate".into(),
+                online_ocsp_details(),
+            ),
+        Some(OnlineOcspLeafOutcome::Received(
+            OnlineOcspVerdict::Unusable | OnlineOcspVerdict::OutsideWindow { .. },
+        ))
+        | Some(OnlineOcspLeafOutcome::Unreachable) => results.push_informational_with_details(
             SIGNING_CREDENTIAL_OCSP_INACCESSIBLE,
             sig_url.into(),
-            "the OCSP responder for the signing certificate returned no usable response".into(),
+            "the signing certificate's OCSP query produced no usable response".into(),
             online_ocsp_details(),
         ),
         None => match embedded.status {
@@ -2875,10 +2944,11 @@ fn verify_manifest<'a>(
         input.evidence,
         signing_time,
         ocsp_verification_time,
+        crate::c2pa_trust::OnlineOcspPolicy::C2paClaim,
     );
     let ocsp_blocks_trust = ocsp_outcome.status.blocks_trust()
         || online_ocsp.ca_revoked
-        || online_ocsp.leaf == Some(OnlineOcspVerdict::Revoked);
+        || online_ocsp.leaf_is_revoked();
     record_ocsp_status(
         ocsp_outcome,
         &online_ocsp,

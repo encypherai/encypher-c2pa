@@ -73,10 +73,7 @@
       "credential_type": "x509",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.x509.signature.validated",
           "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
-          "com.encypher.cawg.legacyProfile",
           "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
@@ -86,14 +83,11 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.x509.signature.validated",
           "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
-          "com.encypher.cawg.legacyProfile",
           "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
-      "notes": "The COSE signature covers the serde field-order signer_payload encoding that c2pa-rs writes. The default posture accepts it with com.encypher.cawg.legacyProfile, and the signer reaches no configured CAWG trust anchor, so CAWG Identity 1.3 reports cawg.x509.credential.untrusted; --strict-conformance requires the 1.3 deterministic CBOR and reports cawg.x509.signature.mismatch.",
+      "notes": "The COSE signature covers the serde field-order signer_payload encoding that c2pa-rs writes, but its signer reaches no configured CAWG trust anchor. CAWG Identity 1.3 reports cawg.x509.credential.untrusted and stops before signature validation in both default and strict-conformance modes.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/cli__tests__fixtures__C_with_CAWG_data.jpg",
       "sha256": "fa0b257c863cb5b367135a017813ce0c1fbfc690a03e94acdd047c25c2d1ed46",
       "size": 139636,
@@ -106,8 +100,7 @@
       "spec_profile": "legacy non-deterministic signer_payload encoding",
       "strict_expected": {
         "required_codes": [
-          "cawg.x509.signature.mismatch",
-          "cawg.x509.ocsp.skipped",
+          "cawg.x509.credential.untrusted",
           "com.encypher.cawg.trainingMining.effectiveUse"
         ]
       },
@@ -1219,10 +1212,7 @@
       "credential_type": "x509",
       "current_sdk_observation": {
         "required_codes": [
-          "cawg.x509.signature.validated",
-          "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
-          "com.encypher.cawg.legacyProfile"
+          "cawg.x509.credential.untrusted"
         ]
       },
       "fixed_validation_time": "2025-05-01T00:00:00Z",
@@ -1231,13 +1221,10 @@
       "mime_type": "image/jpeg",
       "normative_expected": {
         "required_codes": [
-          "cawg.x509.signature.validated",
-          "cawg.x509.credential.untrusted",
-          "cawg.x509.ocsp.skipped",
-          "com.encypher.cawg.legacyProfile"
+          "cawg.x509.credential.untrusted"
         ]
       },
-      "notes": "Top-level extra fields remain tolerated. Its COSE signature covers the serde field-order signer_payload encoding that c2pa-rs writes, which the default posture accepts with com.encypher.cawg.legacyProfile. The signer certificate reaches no configured CAWG trust anchor, which CAWG Identity 1.3 reports as cawg.x509.credential.untrusted. Under --strict-conformance the v1 claim already fails the 2.4 target, so CAWG is not evaluated.",
+      "notes": "Top-level extra fields remain tolerated, but this signer certificate reaches no configured CAWG trust anchor. CAWG Identity 1.3 reports cawg.x509.credential.untrusted and stops before signature validation. Under --strict-conformance the v1 claim already fails the 2.4 target, so CAWG is not evaluated.",
       "path": "external/contentauth-c2pa-rs/d7f13829/assets/sdk__src__identity__tests__fixtures__validation_method__extra_field.jpg",
       "sha256": "e62265aa94dc71aaff10224356d868d6958208f47ddc73f271aaa1a01ecaf0a5",
       "size": 252940,

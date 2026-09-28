@@ -47,6 +47,7 @@ fn cawg_strict_encoding_refuses_field_order_identity_payloads() {
     let run = |cawg_strict_encoding: bool| {
         let options = VerifyOptions {
             cawg_strict_encoding,
+            no_default_trust: true,
             validation_time: Some("2025-05-01T00:00:00Z".into()),
             telemetry: TelemetryOptions {
                 enabled: Some(false),

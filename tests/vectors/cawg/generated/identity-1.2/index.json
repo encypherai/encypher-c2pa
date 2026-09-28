@@ -365,8 +365,7 @@
           "claimSignature.validated",
           "assertion.hashedURI.match",
           "assertion.dataHash.match",
-          "signingCredential.trusted",
-          "cawg.x509.signature.validated"
+          "signingCredential.trusted"
         ],
         "required_failure_codes": [
           "cawg.x509.credential.untrusted"

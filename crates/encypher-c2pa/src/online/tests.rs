@@ -593,16 +593,179 @@ impl Fetcher for ScriptedFetcher {
             }),
             Some(Err(detail)) => Err(FetchErr {
                 blocked: false,
+                received_response: false,
                 detail: detail.clone(),
                 requests_used: 1,
             }),
             None => Err(FetchErr {
                 blocked: true,
+                received_response: false,
                 detail: format!("{} was not scripted", request.url),
                 requests_used: 1,
             }),
         }
     }
+}
+
+struct RefusedOcspFetcher {
+    received_response: bool,
+}
+
+impl Fetcher for RefusedOcspFetcher {
+    fn fetch(&self, _request: &FetchRequest<'_>) -> FetchResult {
+        Err(FetchErr {
+            blocked: true,
+            received_response: self.received_response,
+            detail: if self.received_response {
+                "the response exceeded the OCSP body limit".to_string()
+            } else {
+                "the endpoint was refused before I/O".to_string()
+            },
+            requests_used: usize::from(self.received_response),
+        })
+    }
+}
+
+fn sdk_ocsp_needs(
+    fixture: &crate::c2pa_validate::cawg::tests::SdkOnlineManifestFixture,
+) -> Vec<NetworkNeed> {
+    vec![
+        NetworkNeed::Ocsp {
+            purpose: OcspPurpose::ClaimSigner,
+            responder_url: "http://ocsp.test/responder".to_string(),
+            request_der: b"claim request".to_vec(),
+            certificate_sha256_hex: fixture.claim_leaf_sha256.clone(),
+        },
+        NetworkNeed::Ocsp {
+            purpose: OcspPurpose::CawgIdentity {
+                assertion_label: "cawg.identity".to_string(),
+            },
+            responder_url: "http://ocsp.cawg.test/responder".to_string(),
+            request_der: b"identity request".to_vec(),
+            certificate_sha256_hex: fixture.identity_leaf_sha256.clone(),
+        },
+    ]
+}
+
+fn report_has_status(report: &crate::VerificationReport, code: &str) -> bool {
+    report
+        .validation_results
+        .success
+        .iter()
+        .chain(&report.validation_results.informational)
+        .chain(&report.validation_results.failure)
+        .any(|status| status.code == code)
+}
+
+fn report_retains_ocsp_need(report: &crate::VerificationReport, certificate_sha256: &str) -> bool {
+    report.network.needed.iter().any(|need| {
+        need.get("certificate_sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(certificate_sha256)
+    })
+}
+
+/// A pre-I/O refusal supplies no evidence. The real SDK verification pass
+/// therefore reports both lanes skipped, never inaccessible, and retains both
+/// certificate needs without attempting another fetch.
+#[test]
+fn a_pre_io_ocsp_refusal_carries_no_unreachable_evidence_on_either_lane() {
+    let fixture = crate::c2pa_validate::cawg::tests::sdk_online_manifest_fixture();
+    let needs = sdk_ocsp_needs(&fixture);
+    let (requests, evidence) = fetch_all(
+        &RefusedOcspFetcher {
+            received_response: false,
+        },
+        &needs,
+    );
+    assert!(requests.iter().all(|request| request.outcome == "blocked"));
+    assert!(evidence.ocsp_responses.is_empty());
+    assert!(evidence.ocsp_unreachable.is_empty());
+
+    let options = apply_evidence(&fixture.options, &evidence);
+    assert_eq!(options.online, Some(false));
+    assert!(options.ocsp_responses.is_none());
+    assert!(options.ocsp_unreachable.is_none());
+    let report =
+        crate::verify_with_manifest_store(&fixture.asset, &fixture.store, "image/jpeg", &options)
+            .expect("second verification pass");
+
+    assert!(report_has_status(
+        &report,
+        crate::c2pa_validate::SIGNING_CREDENTIAL_OCSP_SKIPPED
+    ));
+    assert!(report_has_status(
+        &report,
+        crate::c2pa_validate::cawg::CAWG_X509_OCSP_SKIPPED
+    ));
+    assert!(!report_has_status(
+        &report,
+        crate::c2pa_validate::SIGNING_CREDENTIAL_OCSP_INACCESSIBLE
+    ));
+    assert!(!report_has_status(
+        &report,
+        crate::c2pa_validate::cawg::CAWG_X509_OCSP_INACCESSIBLE
+    ));
+    assert!(report_retains_ocsp_need(
+        &report,
+        &fixture.claim_leaf_sha256
+    ));
+    assert!(report_retains_ocsp_need(
+        &report,
+        &fixture.identity_leaf_sha256
+    ));
+    assert!(!report.network.enabled);
+}
+
+/// CAWG-ID13-X509VALB-006: an oversized OCSP body was received but is unusable.
+/// The empty-DER sentinel reaches the real verification pass, which reports
+/// unusable response, not inaccessible, and retains the identity leaf need.
+#[test]
+fn an_oversized_ocsp_body_carries_an_empty_der_response() {
+    let fixture = crate::c2pa_validate::cawg::tests::sdk_online_manifest_fixture();
+    let identity_need = NetworkNeed::Ocsp {
+        purpose: OcspPurpose::CawgIdentity {
+            assertion_label: "cawg.identity".to_string(),
+        },
+        responder_url: "http://ocsp.cawg.test/responder".to_string(),
+        request_der: b"identity request".to_vec(),
+        certificate_sha256_hex: fixture.identity_leaf_sha256.clone(),
+    };
+    let (requests, evidence) = fetch_all(
+        &RefusedOcspFetcher {
+            received_response: true,
+        },
+        &[identity_need],
+    );
+    assert_eq!(requests[0].outcome, "blocked");
+    assert_eq!(
+        evidence
+            .ocsp_responses
+            .get(&fixture.identity_leaf_sha256)
+            .map(String::as_str),
+        Some("")
+    );
+    assert!(evidence.ocsp_unreachable.is_empty());
+
+    let options = apply_evidence(&fixture.options, &evidence);
+    assert_eq!(options.online, Some(false));
+    let report =
+        crate::verify_with_manifest_store(&fixture.asset, &fixture.store, "image/jpeg", &options)
+            .expect("second verification pass");
+
+    assert!(report_has_status(
+        &report,
+        crate::c2pa_validate::cawg::CAWG_X509_OCSP_UNUSABLE_RESPONSE
+    ));
+    assert!(!report_has_status(
+        &report,
+        crate::c2pa_validate::cawg::CAWG_X509_OCSP_INACCESSIBLE
+    ));
+    assert!(report_retains_ocsp_need(
+        &report,
+        &fixture.identity_leaf_sha256
+    ));
+    assert!(!report.network.enabled);
 }
 
 #[test]
@@ -696,15 +859,23 @@ fn the_request_budget_bounds_one_verification() {
         .map(|url| (url.as_str(), Ok(&b"x"[..])))
         .collect();
     let fetcher = ScriptedFetcher::new(&script);
-    let needs: Vec<NetworkNeed> = urls
+    let mut needs: Vec<NetworkNeed> = urls
         .iter()
         .map(|uri| NetworkNeed::ExternalData {
             uri: uri.clone(),
             assertion_label: "c2pa.cloud-data".to_string(),
         })
         .collect();
+    needs.push(NetworkNeed::Ocsp {
+        purpose: OcspPurpose::CawgIdentity {
+            assertion_label: "cawg.identity".to_string(),
+        },
+        responder_url: "http://ocsp.test/over-budget".to_string(),
+        request_der: b"over budget".to_vec(),
+        certificate_sha256_hex: "over-budget-certificate".to_string(),
+    });
 
-    let (requests, _) = fetch_all(&fetcher, &needs);
+    let (requests, evidence) = fetch_all(&fetcher, &needs);
 
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), MAX_REQUESTS);
     assert_eq!(
@@ -718,8 +889,13 @@ fn the_request_budget_bounds_one_verification() {
         .iter()
         .filter(|request| request.outcome == "skipped")
         .collect();
-    assert_eq!(skipped.len(), 20 - MAX_REQUESTS);
+    assert_eq!(skipped.len(), 21 - MAX_REQUESTS);
     assert!(skipped[0].detail.contains("budget"), "{skipped:?}");
+    assert_eq!(
+        skipped.last().map(|request| request.purpose.as_str()),
+        Some("ocsp.cawg_identity")
+    );
+    assert!(evidence.ocsp_unreachable.is_empty());
 }
 
 /// Offline is not silence: the report still says what a fetch would settle.
