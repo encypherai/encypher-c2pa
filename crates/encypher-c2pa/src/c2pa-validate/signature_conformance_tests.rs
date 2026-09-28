@@ -903,6 +903,68 @@ mod online_ocsp {
         assert!(out.results.has_success(SIGNING_CREDENTIAL_TRUSTED));
     }
 
+    /// TEAM_461 lane guard: C2PA's existing online window includes
+    /// `thisUpdate`, even though CAWG Identity 1.3 uses a strict open interval.
+    #[test]
+    fn claim_signer_accepts_effective_time_equal_to_this_update() {
+        let signer = responder_signer();
+        let responses = HashMap::from([(
+            leaf_key(&signer),
+            online_response(
+                &signer,
+                ResponseSpec {
+                    status: FixtureStatus::Good,
+                    produced_at: b"20260601000000Z",
+                    this_update: b"20260601000000Z",
+                    next_update: Some(b"20270101000000Z"),
+                },
+            ),
+        )]);
+        let out = verify_with_evidence(
+            &signer,
+            OnlineEvidence {
+                ocsp_responses: Some(&responses),
+                ..OnlineEvidence::default()
+            },
+        );
+
+        assert!(out.results.has_success(SIGNING_CREDENTIAL_OCSP_NOT_REVOKED));
+        assert!(!out
+            .results
+            .has_informational(SIGNING_CREDENTIAL_OCSP_INACCESSIBLE));
+    }
+
+    /// TEAM_461 lane guard: C2PA keeps the existing `producedAt + 24h`
+    /// fallback when an online response omits `nextUpdate`.
+    #[test]
+    fn claim_signer_accepts_missing_next_update_inside_twenty_four_hours() {
+        let signer = responder_signer();
+        let responses = HashMap::from([(
+            leaf_key(&signer),
+            online_response(
+                &signer,
+                ResponseSpec {
+                    status: FixtureStatus::Good,
+                    produced_at: b"20260531120000Z",
+                    this_update: b"20260531120000Z",
+                    next_update: None,
+                },
+            ),
+        )]);
+        let out = verify_with_evidence(
+            &signer,
+            OnlineEvidence {
+                ocsp_responses: Some(&responses),
+                ..OnlineEvidence::default()
+            },
+        );
+
+        assert!(out.results.has_success(SIGNING_CREDENTIAL_OCSP_NOT_REVOKED));
+        assert!(!out
+            .results
+            .has_informational(SIGNING_CREDENTIAL_OCSP_INACCESSIBLE));
+    }
+
     #[test]
     fn a_revoked_online_response_rejects_the_signature() {
         let signer = responder_signer();
