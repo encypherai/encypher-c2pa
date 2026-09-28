@@ -1512,6 +1512,7 @@ mod tests {
         assert!(details.get("subject_organization").is_none());
         assert!(details.get("subject_common_name").is_none());
         assert!(details.get("certificate_trusted").is_none());
+        assert!(details.get("credential_sha256").is_none());
     }
 
     /// Splice a legacy v1 `sigTst` unprotected header into a finished COSE.

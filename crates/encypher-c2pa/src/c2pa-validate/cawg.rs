@@ -557,6 +557,10 @@ fn verify_identity_assertion(
         );
         return;
     }
+    let parsed_leaf = {
+        use der::Decode as _;
+        x509_cert::Certificate::from_der(leaf).ok()
+    };
 
     let attested = identity_timestamp(
         signature,
@@ -585,6 +589,7 @@ fn verify_identity_assertion(
         timestamp_trusted,
     ) {
         IdentityTrust::Untrusted(reason) => {
+            let credential_sha256 = leaf_credential_sha256(leaf, parsed_leaf.as_ref());
             let revocation_status = identity_embedded_revocation_status(
                 signature,
                 certificate_status_assertions,
@@ -594,18 +599,28 @@ fn verify_identity_assertion(
                 ctx.cawg_trust,
             );
             if revocation_status.ca_revoked() {
-                report_identity_ca_revoked(ctx.results, url, revocation_status, false, reason);
+                report_identity_ca_revoked(
+                    ctx.results,
+                    url,
+                    revocation_status,
+                    false,
+                    credential_sha256.as_deref(),
+                    reason,
+                );
             } else {
                 ctx.results.push_failure_with_details(
                     CAWG_X509_CREDENTIAL_UNTRUSTED,
                     url.into(),
                     "no chain of trust reaches a configured CAWG trust anchor for this identity credential"
                         .into(),
-                    json!({
-                        "reason": reason,
-                        "chain_trusted": false,
-                        "revocation_status": revocation_status.as_str(),
-                    }),
+                    with_credential_sha256(
+                        json!({
+                            "reason": reason,
+                            "chain_trusted": false,
+                            "revocation_status": revocation_status.as_str(),
+                        }),
+                        credential_sha256.as_deref(),
+                    ),
                 );
             }
             return;
@@ -650,6 +665,7 @@ fn verify_identity_assertion(
             {
                 return;
             }
+            let credential_sha256 = leaf_credential_sha256(leaf, parsed_leaf.as_ref());
             let revocation_status = identity_embedded_revocation_status(
                 signature,
                 certificate_status_assertions,
@@ -664,6 +680,7 @@ fn verify_identity_assertion(
                     url,
                     revocation_status,
                     false,
+                    credential_sha256.as_deref(),
                     "ca_revoked",
                 );
                 return;
@@ -675,8 +692,9 @@ fn verify_identity_assertion(
                 "CAWG identity signature validated but no configured trust root accepted the credential"
                     .into(),
                 terminal_identity_details(
-                    leaf,
+                    parsed_leaf.as_ref(),
                     false,
+                    credential_sha256.as_deref(),
                     json!({
                         "trust_source": "none",
                         "accepted_eku": accepted_eku,
@@ -697,6 +715,7 @@ fn verify_identity_assertion(
     if !report_identity_signing_validity(signature, &chain, at, attested, ctx.results, url) {
         return;
     }
+    let credential_sha256 = leaf_credential_sha256(leaf, parsed_leaf.as_ref());
 
     // CAWG identity revocation stays fail-closed in both postures: the
     // conformance reading of VAL-STRU-0027 is a C2PA claim-signer rule, and
@@ -719,6 +738,7 @@ fn verify_identity_assertion(
             url,
             revocation_status,
             trust.anchor_fingerprint.is_some(),
+            credential_sha256.as_deref(),
             "ca_revoked",
         );
         return;
@@ -736,20 +756,33 @@ fn verify_identity_assertion(
                 url,
                 IdentityRevocationStatus::CaRevoked,
                 trust.anchor_fingerprint.is_some(),
+                credential_sha256.as_deref(),
                 "ca_revoked",
             );
             return;
         }
+        let chain_trusted = trust.anchor_fingerprint.is_some();
+        let details = json!({
+            "chain_trusted": chain_trusted,
+            "trust_source": trust.source,
+            "anchor_fingerprint": trust.anchor_fingerprint,
+        });
+        let details = if chain_trusted {
+            terminal_identity_details(
+                parsed_leaf.as_ref(),
+                true,
+                credential_sha256.as_deref(),
+                details,
+            )
+        } else {
+            with_credential_sha256(details, credential_sha256.as_deref())
+        };
         ctx.results.push_failure_with_details(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
             url.into(),
             "verified stapled OCSP evidence reports the identity signing certificate revoked"
                 .into(),
-            json!({
-                "chain_trusted": trust.anchor_fingerprint.is_some(),
-                "trust_source": trust.source,
-                "anchor_fingerprint": trust.anchor_fingerprint,
-            }),
+            details,
         );
         return;
     }
@@ -769,6 +802,7 @@ fn verify_identity_assertion(
             url,
             IdentityRevocationStatus::CaRevoked,
             trust.anchor_fingerprint.is_some(),
+            credential_sha256.as_deref(),
             "ca_revoked",
         );
         return;
@@ -850,15 +884,27 @@ fn verify_identity_assertion(
         );
     }
     if leaf_revoked {
+        let chain_trusted = trust.anchor_fingerprint.is_some();
+        let details = json!({
+            "chain_trusted": chain_trusted,
+            "trust_source": trust.source,
+            "anchor_fingerprint": trust.anchor_fingerprint,
+        });
+        let details = if chain_trusted {
+            terminal_identity_details(
+                parsed_leaf.as_ref(),
+                true,
+                credential_sha256.as_deref(),
+                details,
+            )
+        } else {
+            with_credential_sha256(details, credential_sha256.as_deref())
+        };
         ctx.results.push_failure_with_details(
             CAWG_IDENTITY_CREDENTIAL_REVOKED,
             url.into(),
             "verified OCSP evidence reports the identity signing certificate revoked".into(),
-            json!({
-                "chain_trusted": trust.anchor_fingerprint.is_some(),
-                "trust_source": trust.source,
-                "anchor_fingerprint": trust.anchor_fingerprint,
-            }),
+            details,
         );
         return;
     }
@@ -868,8 +914,9 @@ fn verify_identity_assertion(
         url.into(),
         "CAWG identity signature and X.509 trust policy validated".into(),
         terminal_identity_details(
-            leaf,
+            parsed_leaf.as_ref(),
             true,
+            credential_sha256.as_deref(),
             json!({
                 "trust_source": trust.source,
                 "accepted_eku": trust.accepted_eku,
@@ -884,18 +931,31 @@ fn verify_identity_assertion(
     );
 }
 
-/// Attach bounded display names to an X.509 identity's terminal status.
-///
-/// The explicit boolean keeps the trust outcome beside the subject even when a
-/// consumer retains only `details`. This helper is never called for configured
-/// untrusted chains or ICA credentials.
-fn terminal_identity_details(
+fn leaf_credential_sha256(
     leaf: &[u8],
-    certificate_trusted: bool,
-    mut details: serde_json::Value,
-) -> serde_json::Value {
-    use der::Decode as _;
+    certificate: Option<&x509_cert::Certificate>,
+) -> Option<String> {
+    use sha2::Digest as _;
 
+    certificate.map(|_| hex::encode(sha2::Sha256::digest(leaf)))
+}
+
+/// Attach bounded display names and their trust outcome to a terminal X.509
+/// identity status.
+///
+/// Trusted, well-formed, and chain-trusted revoked statuses use this helper.
+/// Configured-untrusted, CA-revoked untrusted, anchorless revoked, and ICA
+/// statuses never receive subject fields through it.
+fn terminal_identity_details(
+    certificate: Option<&x509_cert::Certificate>,
+    certificate_trusted: bool,
+    credential_sha256: Option<&str>,
+    details: serde_json::Value,
+) -> serde_json::Value {
+    let mut details = with_credential_sha256(details, credential_sha256);
+    let Some(certificate) = certificate else {
+        return details;
+    };
     let Some(object) = details.as_object_mut() else {
         return details;
     };
@@ -903,9 +963,6 @@ fn terminal_identity_details(
         "certificate_trusted".into(),
         serde_json::Value::Bool(certificate_trusted),
     );
-    let Ok(certificate) = x509_cert::Certificate::from_der(leaf) else {
-        return details;
-    };
     if let Some(organization) = super::cert::name_attribute(
         &certificate.tbs_certificate.subject,
         super::cert::OID_AT_ORGANIZATION,
@@ -922,6 +979,19 @@ fn terminal_identity_details(
         object.insert(
             "subject_common_name".into(),
             serde_json::Value::String(common_name),
+        );
+    }
+    details
+}
+
+fn with_credential_sha256(
+    mut details: serde_json::Value,
+    credential_sha256: Option<&str>,
+) -> serde_json::Value {
+    if let (Some(object), Some(credential_sha256)) = (details.as_object_mut(), credential_sha256) {
+        object.insert(
+            "credential_sha256".into(),
+            serde_json::Value::String(credential_sha256.to_owned()),
         );
     }
     details
@@ -1411,6 +1481,7 @@ fn report_identity_ca_revoked(
     url: &str,
     revocation_status: IdentityRevocationStatus,
     chain_trusted: bool,
+    credential_sha256: Option<&str>,
     reason: &str,
 ) {
     debug_assert!(revocation_status.ca_revoked());
@@ -1418,11 +1489,14 @@ fn report_identity_ca_revoked(
         CAWG_X509_CREDENTIAL_UNTRUSTED,
         url.into(),
         "verified OCSP evidence reports a CA certificate in the identity chain revoked".into(),
-        json!({
-            "reason": reason,
-            "chain_trusted": chain_trusted,
-            "revocation_status": revocation_status.as_str(),
-        }),
+        with_credential_sha256(
+            json!({
+                "reason": reason,
+                "chain_trusted": chain_trusted,
+                "revocation_status": revocation_status.as_str(),
+            }),
+            credential_sha256,
+        ),
     );
 }
 
@@ -3583,6 +3657,13 @@ pub(crate) mod tests {
         assert!(rejection.get("subject_organization").is_none());
         assert!(rejection.get("subject_common_name").is_none());
         assert!(rejection.get("certificate_trusted").is_none());
+        let leaf = extract_x5chain(&fixture_identity_cose(&bytes))
+            .expect("fixture x5chain")
+            .remove(0);
+        assert_eq!(
+            rejection["credential_sha256"],
+            hex::encode(sha2::Sha256::digest(&leaf))
+        );
     }
 
     /// With no CAWG trust material at all there is no root of trust to reach,
@@ -4201,6 +4282,165 @@ pub(crate) mod tests {
             encode(&cose, Profile::LegacyPipelineBDefinite).expect("re-encode COSE Sign1");
         encode(&assertion, Profile::CanonicalForHashedSubstructures)
             .expect("re-encode identity assertion")
+    }
+
+    fn encypher_identity_assertion_with_x5chain_headers(
+        chain: &RuntimeEncypherChain,
+        protected_x5chain: Option<(Value, Value)>,
+        unprotected: Vec<(Value, Value)>,
+    ) -> Vec<u8> {
+        use p384::ecdsa::signature::Signer as _;
+        use p384::pkcs8::DecodePrivateKey as _;
+
+        let payload = identity_payload("cawg.publisher:primary", None);
+        let canonical = encode(&payload, Profile::CanonicalForHashedSubstructures)
+            .expect("encode signer_payload");
+        let mut protected_headers = vec![(Value::Integer(1), Value::Integer(-35))];
+        if let Some(x5chain) = protected_x5chain {
+            protected_headers.push(x5chain);
+        }
+        let protected = encode(
+            &Value::Map(protected_headers),
+            Profile::LegacyPipelineBDefinite,
+        )
+        .expect("encode protected headers");
+        let sig_input = encode(
+            &Value::Array(vec![
+                Value::Text("Signature1".into()),
+                Value::Bytes(protected.clone()),
+                Value::Bytes(Vec::new()),
+                Value::Bytes(canonical),
+            ]),
+            Profile::LegacyPipelineBDefinite,
+        )
+        .expect("encode Sig_structure");
+        let key =
+            p384::ecdsa::SigningKey::from_pkcs8_pem(&chain.leaf_key_pem).expect("runtime leaf key");
+        let signature: p384::ecdsa::Signature = key.sign(&sig_input);
+        let cose = encode(
+            &Value::Tag(
+                18,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(unprotected),
+                    Value::Null,
+                    Value::Bytes(signature.to_der().as_bytes().to_vec()),
+                ])),
+            ),
+            Profile::LegacyPipelineBDefinite,
+        )
+        .expect("encode COSE_Sign1");
+        encode(
+            &Value::Map(vec![
+                (Value::Text("signer_payload".into()), payload),
+                (Value::Text("signature".into()), Value::Bytes(cose)),
+                (Value::Text("pad1".into()), Value::Bytes(Vec::new())),
+            ]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("encode identity assertion")
+    }
+
+    fn runtime_x5chain(chain: &RuntimeEncypherChain) -> Value {
+        Value::Array(vec![
+            Value::Bytes(chain.leaf_der.clone()),
+            Value::Bytes(chain.issuing_der.clone()),
+        ])
+    }
+
+    #[test]
+    fn credential_fingerprint_follows_existing_x5chain_bucket_and_label_precedence() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+        let expected = hex::encode(sha2::Sha256::digest(&chain.leaf_der));
+        let baseline = encypher_verdict(
+            &encypher_identity_assertion(&chain, None),
+            &trust,
+            AFTER_INTERIM_CUTOFF,
+            None,
+            None,
+        );
+        let decoy = Value::Bytes(vec![0x30, 0x00]);
+        let cases = [
+            (
+                "unprotected integer only",
+                None,
+                vec![(Value::Integer(33), runtime_x5chain(&chain))],
+            ),
+            (
+                "unprotected integer over protected text",
+                Some((Value::Text("x5chain".into()), decoy.clone())),
+                vec![(Value::Integer(33), runtime_x5chain(&chain))],
+            ),
+            (
+                "protected integer over unprotected text",
+                Some((Value::Integer(33), runtime_x5chain(&chain))),
+                vec![(Value::Text("x5chain".into()), decoy)],
+            ),
+        ];
+
+        for (case, protected, unprotected) in cases {
+            let assertion =
+                encypher_identity_assertion_with_x5chain_headers(&chain, protected, unprotected);
+            let results = encypher_verdict(&assertion, &trust, AFTER_INTERIM_CUTOFF, None, None);
+            assert_eq!(
+                failure_codes(&results),
+                failure_codes(&baseline),
+                "{case}: terminal verdict changed"
+            );
+            assert!(results.has_success(CAWG_X509_SIGNATURE_VALIDATED), "{case}");
+            assert!(results.has_success(CAWG_IDENTITY_TRUSTED), "{case}");
+            assert_eq!(trusted_details(&results)["credential_sha256"], expected);
+        }
+    }
+
+    #[test]
+    fn credential_fingerprint_requires_a_decodable_selected_leaf() {
+        let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
+        let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+        let ca_profile = actor_certificate(OID_KP_DOCUMENT_SIGNING, None, true);
+        let cases = [
+            ("not a certificate", b"not a certificate".to_vec(), None),
+            (
+                "decodable CA profile",
+                ca_profile.clone(),
+                Some(hex::encode(sha2::Sha256::digest(&ca_profile))),
+            ),
+        ];
+
+        for (case, selected_leaf, expected) in cases {
+            let assertion = encypher_identity_assertion_with_x5chain_headers(
+                &chain,
+                Some((Value::Integer(33), Value::Bytes(selected_leaf))),
+                Vec::new(),
+            );
+            let results = encypher_verdict(&assertion, &trust, AFTER_INTERIM_CUTOFF, None, None);
+            assert_eq!(
+                failure_codes(&results),
+                [CAWG_X509_CREDENTIAL_UNTRUSTED],
+                "{case}"
+            );
+            assert!(
+                !results.has_success(CAWG_X509_SIGNATURE_VALIDATED),
+                "{case}"
+            );
+            let details = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                .and_then(|status| status.details.as_ref())
+                .expect("untrusted details");
+            assert_eq!(
+                details
+                    .get("credential_sha256")
+                    .and_then(|value| value.as_str()),
+                expected.as_deref(),
+                "{case}"
+            );
+            assert!(details.get("subject_organization").is_none(), "{case}");
+            assert!(details.get("subject_common_name").is_none(), "{case}");
+            assert!(details.get("certificate_trusted").is_none(), "{case}");
+        }
     }
 
     fn sig_tst_header(version: &str, tokens: Vec<Value>) -> Vec<(Value, Value)> {
@@ -5164,6 +5404,7 @@ pub(crate) mod tests {
         let chain = runtime_encypher_chain(ORGANIZATION_VALIDATED_STRICT_POLICY);
         let bytes = encypher_identity_assertion(&chain, None);
         let trust = encypher_root_trust(&chain.root_pem, CawgTrustSource::CallerSupplied);
+        let credential_sha256 = hex::encode(sha2::Sha256::digest(&chain.leaf_der));
 
         let trusted = encypher_verdict(&bytes, &trust, AFTER_INTERIM_CUTOFF, None, None);
         let trusted = trusted_details(&trusted);
@@ -5173,6 +5414,7 @@ pub(crate) mod tests {
             "Encypher CAWG Runtime Publisher"
         );
         assert_eq!(trusted["certificate_trusted"], true);
+        assert_eq!(trusted["credential_sha256"], credential_sha256);
 
         let well_formed = identity_verdict_full(
             &bytes,
@@ -5201,6 +5443,7 @@ pub(crate) mod tests {
             "Encypher CAWG Runtime Publisher"
         );
         assert_eq!(well_formed["certificate_trusted"], false);
+        assert_eq!(well_formed["credential_sha256"], credential_sha256);
     }
 
     #[test]
@@ -5281,7 +5524,14 @@ pub(crate) mod tests {
         );
         assert_eq!(trusted["subject_common_name"], "Trusted Fixture Actor");
         assert_eq!(trusted["certificate_trusted"], true);
+        assert_eq!(
+            trusted["credential_sha256"],
+            hex::encode(sha2::Sha256::digest(&trusted_chain.leaf_der))
+        );
 
+        assert!(!results.success.iter().any(|status| {
+            status.code == CAWG_X509_SIGNATURE_VALIDATED && status.url == "cawg.identity__1"
+        }));
         let rejected = results
             .failure
             .iter()
@@ -5293,6 +5543,10 @@ pub(crate) mod tests {
         assert!(rejected.get("subject_organization").is_none());
         assert!(rejected.get("subject_common_name").is_none());
         assert!(rejected.get("certificate_trusted").is_none());
+        assert_eq!(
+            rejected["credential_sha256"],
+            hex::encode(sha2::Sha256::digest(&rejected_chain.leaf_der))
+        );
         for status in results
             .success
             .iter()
@@ -5969,6 +6223,13 @@ pub(crate) mod tests {
             hex::encode(sha2::Sha256::digest(certificate_der))
         }
 
+        fn assert_credential_digest_without_subject(details: &serde_json::Value, leaf_der: &[u8]) {
+            assert_eq!(details["credential_sha256"], evidence_key(leaf_der));
+            assert!(details.get("subject_organization").is_none());
+            assert!(details.get("subject_common_name").is_none());
+            assert!(details.get("certificate_trusted").is_none());
+        }
+
         /// Sign a CAWG identity assertion with the chain's ES256 leaf.
         fn identity_assertion(chain: &OcspChain) -> Vec<u8> {
             identity_assertion_for_payload(chain, identity_payload("cawg.publisher:primary", None))
@@ -6409,6 +6670,13 @@ pub(crate) mod tests {
             let details = revoked_status.details.as_ref().expect("revocation details");
             assert_eq!(details["trust_source"], "caller_supplied");
             assert!(details["anchor_fingerprint"].as_str().is_some());
+            assert_eq!(details["credential_sha256"], evidence_key(&chain.leaf_der));
+            assert_eq!(details["subject_organization"], "Encypher Corporation");
+            assert_eq!(
+                details["subject_common_name"],
+                "Encypher CAWG OCSP Publisher"
+            );
+            assert_eq!(details["certificate_trusted"], true);
             assert!(revoked_results.network_needs.is_empty());
         }
 
@@ -6443,6 +6711,21 @@ pub(crate) mod tests {
             assert!(results.has_success(CAWG_X509_CREDENTIAL_TRUSTED));
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
             assert!(!results.has_success(CAWG_X509_SIGNATURE_VALIDATED));
+            for status in results
+                .success
+                .iter()
+                .chain(&results.informational)
+                .chain(&results.failure)
+            {
+                assert!(
+                    status
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("credential_sha256"))
+                        .is_none(),
+                    "excluded signature-mismatch status leaked a credential fingerprint: {status:?}"
+                );
+            }
         }
 
         #[test]
@@ -6583,6 +6866,7 @@ pub(crate) mod tests {
             assert_ne!(revoked_details["reason"], "ca_revoked");
             assert_eq!(revoked_details["chain_trusted"], false);
             assert_eq!(revoked_details["revocation_status"], "ca_revoked");
+            assert_credential_digest_without_subject(&revoked_details, &chain.leaf_der);
             assert!(!revoked.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
         }
 
@@ -6677,6 +6961,7 @@ pub(crate) mod tests {
             assert_eq!(details["reason"], "ca_revoked");
             assert_eq!(details["chain_trusted"], false);
             assert_eq!(details["revocation_status"], "ca_revoked");
+            assert_credential_digest_without_subject(details, &chain.leaf_der);
             assert!(results.network_needs.is_empty());
         }
 
@@ -6726,6 +7011,10 @@ pub(crate) mod tests {
             assert_eq!(details["chain_trusted"], false);
             assert_eq!(details["trust_source"], "document_signing");
             assert!(details["anchor_fingerprint"].is_null());
+            assert_eq!(details["credential_sha256"], evidence_key(&chain.leaf_der));
+            assert!(details.get("subject_organization").is_none());
+            assert!(details.get("subject_common_name").is_none());
+            assert!(details.get("certificate_trusted").is_none());
         }
 
         /// Chain validity precedes revocation even when direct allow-list or
@@ -6863,7 +7152,54 @@ pub(crate) mod tests {
             assert_eq!(details["reason"], "ca_revoked");
             assert_eq!(details["chain_trusted"], true);
             assert_eq!(details["revocation_status"], "ca_revoked");
+            assert_credential_digest_without_subject(details, &chain.leaf_der);
             assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+        }
+
+        #[test]
+        fn online_ca_revocation_overrides_a_stapled_leaf_revocation_as_untrusted() {
+            let tsa = TestTsa::new(
+                datetime!(2026-01-01 0:00 UTC),
+                datetime!(2030-01-01 0:00 UTC),
+            );
+            let chain = ocsp_chain();
+            let stapled_leaf_revoked = answer(
+                &chain.issuing_der,
+                &chain.issuing_key,
+                &chain.leaf_der,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            );
+            let assertion = identity_assertion_with_staples(
+                &chain,
+                &tsa,
+                AFTER_INTERIM_CUTOFF,
+                vec![stapled_leaf_revoked],
+            );
+            let responses = HashMap::from([issuing_response(
+                &chain,
+                FixtureStatus::RevokedAt(REVOKED_AT),
+            )]);
+            let results = verdict_for_assertion(
+                &chain,
+                &assertion,
+                Some(&tsa.trust_list()),
+                OnlineEvidence {
+                    ocsp_responses: Some(&responses),
+                    ..OnlineEvidence::default()
+                },
+            );
+
+            assert_eq!(failure_codes(&results), [CAWG_X509_CREDENTIAL_UNTRUSTED]);
+            assert!(!results.has_failure(CAWG_IDENTITY_CREDENTIAL_REVOKED));
+            let details = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_X509_CREDENTIAL_UNTRUSTED)
+                .and_then(|status| status.details.as_ref())
+                .expect("online CA revocation details");
+            assert_eq!(details["chain_trusted"], true);
+            assert_eq!(details["revocation_status"], "ca_revoked");
+            assert_credential_digest_without_subject(details, &chain.leaf_der);
         }
 
         /// CAWG-ID13-X509-VALIDATING-A-057: an unusable first response does
@@ -7300,6 +7636,20 @@ pub(crate) mod tests {
 
             assert_eq!(failure_codes(&results), [CAWG_IDENTITY_CREDENTIAL_REVOKED]);
             assert!(!results.has_success(CAWG_IDENTITY_TRUSTED));
+            let details = results
+                .failure
+                .iter()
+                .find(|status| status.code == CAWG_IDENTITY_CREDENTIAL_REVOKED)
+                .and_then(|status| status.details.as_ref())
+                .expect("online leaf revocation details");
+            assert_eq!(details["chain_trusted"], true);
+            assert_eq!(details["credential_sha256"], evidence_key(&chain.leaf_der));
+            assert_eq!(details["subject_organization"], "Encypher Corporation");
+            assert_eq!(
+                details["subject_common_name"],
+                "Encypher CAWG OCSP Publisher"
+            );
+            assert_eq!(details["certificate_trusted"], true);
         }
 
         /// 1.3 separates the two rejections: a revoked CA in the chain is an
@@ -7327,6 +7677,7 @@ pub(crate) mod tests {
             assert_eq!(details["reason"], "ca_revoked");
             assert_eq!(details["chain_trusted"], true);
             assert_eq!(details["revocation_status"], "ca_revoked");
+            assert_credential_digest_without_subject(details, &chain.leaf_der);
         }
 
         /// CA-chain handling predates the CAWG leaf's open freshness window.
