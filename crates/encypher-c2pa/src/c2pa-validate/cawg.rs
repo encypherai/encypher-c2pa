@@ -562,7 +562,6 @@ fn verify_identity_assertion(
         return;
     }
 
-
     let attested = identity_timestamp(
         signature,
         &ctx.manifest.label,
@@ -655,14 +654,8 @@ fn verify_identity_assertion(
     let trust = match trust {
         Ok(evidence) => evidence,
         Err(trust_failure) => {
-            if !report_identity_signing_validity(
-                signature,
-                &chain,
-                at,
-                attested,
-                ctx.results,
-                url,
-            ) {
+            if !report_identity_signing_validity(signature, &chain, at, attested, ctx.results, url)
+            {
                 return;
             }
             let revocation_status = identity_embedded_revocation_status(
@@ -878,7 +871,6 @@ fn verify_identity_assertion(
         );
         return;
     }
-
 
     ctx.results.push_success_with_details(
         CAWG_IDENTITY_TRUSTED,
