@@ -1040,6 +1040,7 @@ fn check_revocation(
     };
     let mut found_supported = false;
     let mut unavailable = false;
+    let mut unsupported = false;
     for entry in entries {
         if entry.get("statusPurpose").and_then(Json::as_str) != Some("revocation")
             || !json_type_contains(entry.get("type"), "BitstringStatusListEntry")
@@ -1051,13 +1052,18 @@ fn check_revocation(
             Revocation::Revoked => return Revocation::Revoked,
             Revocation::NotRevoked => {}
             Revocation::Unavailable => unavailable = true,
-            _ => unreachable!("single supported status entry has a bounded result"),
+            Revocation::Unsupported => unsupported = true,
+            Revocation::NotPresent => {
+                unreachable!("a concrete status entry cannot be absent")
+            }
         }
     }
     if !found_supported {
         Revocation::Unsupported
     } else if unavailable {
         Revocation::Unavailable
+    } else if unsupported {
+        Revocation::Unsupported
     } else {
         Revocation::NotRevoked
     }
@@ -1067,6 +1073,16 @@ fn check_bitstring_status_entry(
     entry: &Json,
     status_lists: Option<&HashMap<String, String>>,
 ) -> Revocation {
+    let status_size = match entry.get("statusSize") {
+        None => 1,
+        Some(value) => match value.as_u64() {
+            Some(0) | None => return Revocation::Unavailable,
+            Some(size) => size,
+        },
+    };
+    if status_size != 1 {
+        return Revocation::Unsupported;
+    }
     let Some(list_url) = entry.get("statusListCredential").and_then(Json::as_str) else {
         return Revocation::Unavailable;
     };
@@ -1087,7 +1103,7 @@ fn check_bitstring_status_entry(
     let Some(byte) = bits.get(index / 8) else {
         return Revocation::Unavailable;
     };
-    if byte & (1 << (index % 8)) == 0 {
+    if byte & (0x80_u8 >> (index % 8)) == 0 {
         Revocation::NotRevoked
     } else {
         Revocation::Revoked
@@ -1372,7 +1388,7 @@ mod tests {
         });
         let lists = HashMap::from([(
             "https://status.example/list".into(),
-            base64_encode(&[0b0000_1000], false),
+            base64_encode(&[0b0001_0000], false),
         )]);
         let results = run(
             &eddsa_cose(&key, &credential),
@@ -1382,6 +1398,89 @@ mod tests {
         assert!(codes(&results.failure).contains(&CAWG_ICA_CREDENTIAL_REVOKED));
         assert!(!codes(&results.success).contains(&CAWG_ICA_CREDENTIAL_VALID));
     }
+
+    #[test]
+    fn bitstring_status_uses_most_significant_bit_order() {
+        let entry = |index: usize| {
+            json!({
+                "type": "BitstringStatusListEntry",
+                "statusPurpose": "revocation",
+                "statusSize": 1,
+                "statusListIndex": index.to_string(),
+                "statusListCredential": "https://status.example/list",
+            })
+        };
+        let list_url = "https://status.example/list".to_string();
+
+        // W3C Bitstring Status List index 3 is the fifth bit from the right.
+        // Its LSB-order twin, index 4, must remain clear.
+        let lists = HashMap::from([(
+            list_url.clone(),
+            base64_encode(&[0b0001_0000, 0b0000_0001], false),
+        )]);
+        assert!(matches!(
+            check_bitstring_status_entry(&entry(3), Some(&lists)),
+            Revocation::Revoked
+        ));
+        assert!(matches!(
+            check_bitstring_status_entry(&entry(4), Some(&lists)),
+            Revocation::NotRevoked
+        ));
+        assert!(matches!(
+            check_bitstring_status_entry(&entry(15), Some(&lists)),
+            Revocation::Revoked
+        ));
+
+        // The mirrored byte reverses those results and catches either
+        // accidental interpretation as least-significant-bit first.
+        let mirrored =
+            HashMap::from([(list_url, base64_encode(&[0b0000_1000, 0b0000_0000], false))]);
+        assert!(matches!(
+            check_bitstring_status_entry(&entry(3), Some(&mirrored)),
+            Revocation::NotRevoked
+        ));
+        assert!(matches!(
+            check_bitstring_status_entry(&entry(4), Some(&mirrored)),
+            Revocation::Revoked
+        ));
+    }
+
+    #[test]
+    fn unsupported_or_malformed_status_size_fails_closed() {
+        let entry = |status_size: Json| {
+            json!({
+                "type": "BitstringStatusListEntry",
+                "statusPurpose": "revocation",
+                "statusSize": status_size,
+                "statusListIndex": "3",
+                "statusListCredential": "https://status.example/list",
+            })
+        };
+        // With two-bit entries, index 3 occupies the final two bits. Both are
+        // set, but a validator that only implements one-bit entries must not
+        // reinterpret the clear W3C bit at index 3 as NotRevoked.
+        let lists = HashMap::from([(
+            "https://status.example/list".into(),
+            base64_encode(&[0b0000_0011], false),
+        )]);
+        let size_two = entry(json!(2));
+        assert!(matches!(
+            check_bitstring_status_entry(&size_two, Some(&lists)),
+            Revocation::Unsupported
+        ));
+        assert!(matches!(
+            check_revocation(Some(&size_two), Some(&lists)),
+            Revocation::Unsupported
+        ));
+
+        for malformed in [entry(json!(0)), entry(json!("1")), entry(json!(1.5))] {
+            assert!(matches!(
+                check_bitstring_status_entry(&malformed, Some(&lists)),
+                Revocation::Unavailable
+            ));
+        }
+    }
+
     #[test]
     fn any_revoked_entry_wins_across_multiple_supported_status_entries() {
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -1403,7 +1502,7 @@ mod tests {
         ]);
         let lists = HashMap::from([(
             "https://status.example/list".into(),
-            base64_encode(&[0b0000_1000], false),
+            base64_encode(&[0b0001_0000], false),
         )]);
         let results = run(
             &eddsa_cose(&key, &credential),

@@ -2,6 +2,16 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Security
+
+- CAWG ICA revocation lists are read most-significant-bit first, as W3C Bitstring Status List requires. The validator previously read each byte least-significant-bit first, which could invert a credential's revocation result.
+
+### Changed
+
+- CAWG ICA revocation entries now process an omitted `statusSize` as 1, reject zero and non-integer values as malformed, and report sizes other than 1 as unsupported instead of reading one bit.
+
 ## 1.3.0 - 2026-09-27
 
 ### Added
