@@ -2,6 +2,16 @@
 
 All notable changes to this project are recorded here.
 
+## 1.6.0 - 2026-10-01
+
+### Added
+
+- `local_evidence_with_options` (Rust) and `localEvidence` (browser WASM): verify an asset exactly as `verify_with_options`/`verify` do, and also return the embedded manifest-store bytes that verification read, their SHA-256, the SHA-256 of the asset, and the active manifest's hard binding (`algorithm`, such as `c2pa.hash.boxes`, and `status`: `match`, `mismatch`, or `unknown`). One verification pass produces every field, so a service that re-verifies the returned store checks the same bytes the local verdict was computed over without receiving the asset. `manifest_store` is `null` when the asset has no embedded store or the verdict came from a store fetched from a remote reference. An update manifest reports the binding it inherits from its parent standard manifest. In WASM, `manifest_store` is a `Uint8Array` and the package's TypeScript declarations type the result as `LocalEvidence`.
+
+### Fixed
+
+- A manifest store followed by zero bytes inside its carrier no longer fails with `general.error: N trailing bytes after top-level JUMBF box`. ZIP entries (EPUB, OpenDocument, Office Open XML), SFNT `C2PA` tables, ID3 `GEOB` frames (MP3 and FLAC), and the legacy FLAC `c2pa` APPLICATION block carry no length for the store itself, and signers reserve a fixed carrier size padded with zeros. The JUMBF box length now bounds the store in those carriers. Non-zero trailing bytes are still rejected.
+
 ## 1.5.0 - 2026-09-28
 
 ### Added
