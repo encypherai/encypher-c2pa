@@ -109,7 +109,9 @@ fn extract_native(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
             && block.data_len >= 4
             && &data[block.data_start..block.data_start + 4] == APP_ID
         {
-            found = Some(data[block.data_start + 4..block.end].to_vec());
+            found = Some(
+                super::logical_manifest_store(&data[block.data_start + 4..block.end]).to_vec(),
+            );
         }
     })?;
     Ok(found)
@@ -251,6 +253,30 @@ mod tests {
     }
 
     #[test]
+    fn extraction_trims_zero_filled_placeholder_tail() {
+        let store = dummy_manifest_store();
+        let mut padded = store.clone();
+        padded.resize(store.len() + 1024, 0);
+        let embedded = embed(&tiny_flac(), &padded).unwrap();
+        assert_eq!(
+            extract(&embedded).unwrap().as_deref(),
+            Some(store.as_slice())
+        );
+    }
+
+    #[test]
+    fn extraction_keeps_nonzero_trailing_bytes() {
+        let store = dummy_manifest_store();
+        let mut trailing = store.clone();
+        trailing.extend_from_slice(&[0, 0, 1]);
+        let embedded = embed(&tiny_flac(), &trailing).unwrap();
+        assert_eq!(
+            extract(&embedded).unwrap().as_deref(),
+            Some(trailing.as_slice())
+        );
+    }
+
+    #[test]
     fn bare_asset_has_no_manifest() {
         assert_eq!(extract(&tiny_flac()).unwrap(), None);
     }
@@ -285,11 +311,11 @@ mod tests {
         assert_eq!(&second[flac_start(&second).unwrap()..], source);
     }
 
-    #[test]
-    fn legacy_application_block_is_read_and_migrated() {
+    /// `tiny_flac` with a legacy native `c2pa` APPLICATION block carrying
+    /// `manifest`.
+    fn legacy_flac(manifest: &[u8]) -> Vec<u8> {
         let source = tiny_flac();
         let audio_start = walk_blocks(&source, |_| {}).unwrap();
-        let manifest = b"legacy-native-manifest";
         let mut legacy = source[..audio_start].to_vec();
         legacy[4] &= !FLAG_LAST;
         legacy.push(FLAG_LAST | BLOCK_APPLICATION);
@@ -298,6 +324,24 @@ mod tests {
         legacy.extend_from_slice(APP_ID);
         legacy.extend_from_slice(manifest);
         legacy.extend_from_slice(&source[audio_start..]);
+        legacy
+    }
+
+    #[test]
+    fn legacy_application_block_trims_zero_filled_placeholder_tail() {
+        let store = dummy_manifest_store();
+        let mut padded = store.clone();
+        padded.resize(store.len() + 1024, 0);
+        assert_eq!(
+            extract(&legacy_flac(&padded)).unwrap().as_deref(),
+            Some(store.as_slice())
+        );
+    }
+
+    #[test]
+    fn legacy_application_block_is_read_and_migrated() {
+        let manifest = b"legacy-native-manifest";
+        let legacy = legacy_flac(manifest);
 
         assert_eq!(extract(&legacy).unwrap().as_deref(), Some(&manifest[..]));
         let migrated = embed(&legacy, b"new-geob-manifest").unwrap();

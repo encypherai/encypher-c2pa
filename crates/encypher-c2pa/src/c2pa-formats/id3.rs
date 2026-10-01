@@ -146,6 +146,8 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 }
 
 /// Parse a GEOB body; return the binary object iff the MIME is `application/c2pa`.
+/// The object has no length of its own, so zero padding a signer reserved
+/// after the store is trimmed to the JUMBF box length.
 fn parse_geob(body: &[u8]) -> Option<Vec<u8>> {
     let encoding = *body.first()?;
     let wide = encoding == 1 || encoding == 2; // UTF-16 variants
@@ -156,7 +158,7 @@ fn parse_geob(body: &[u8]) -> Option<Vec<u8>> {
     }
     let (_filename, after_filename) = read_terminated(body, after_mime, wide)?;
     let (_desc, after_desc) = read_terminated(body, after_filename, wide)?;
-    Some(body[after_desc..].to_vec())
+    Some(super::logical_manifest_store(&body[after_desc..]).to_vec())
 }
 
 /// Embed the manifest in a clean ID3v2.3 `GEOB` frame. Any existing ID3v2 tag is
@@ -318,6 +320,30 @@ mod tests {
     fn bare_asset_has_no_manifest() {
         assert_eq!(extract(&bare_mp3()).unwrap(), None);
         assert_eq!(extract(&mp3_with_tag()).unwrap(), None);
+    }
+
+    #[test]
+    fn extraction_trims_zero_filled_placeholder_tail() {
+        let store = dummy_manifest_store();
+        let mut padded = store.clone();
+        padded.resize(store.len() + 1024, 0);
+        let embedded = embed(&bare_mp3(), &padded).unwrap();
+        assert_eq!(
+            extract(&embedded).unwrap().as_deref(),
+            Some(store.as_slice())
+        );
+    }
+
+    #[test]
+    fn extraction_keeps_nonzero_trailing_bytes() {
+        let store = dummy_manifest_store();
+        let mut trailing = store.clone();
+        trailing.extend_from_slice(&[0, 0, 1]);
+        let embedded = embed(&bare_mp3(), &trailing).unwrap();
+        assert_eq!(
+            extract(&embedded).unwrap().as_deref(),
+            Some(trailing.as_slice())
+        );
     }
 
     #[test]
