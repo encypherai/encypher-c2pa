@@ -51,6 +51,7 @@ const pkg = resolve(installRoot, "node_modules/@encypherai/c2pa");
 const {
   default: init,
   configureTelemetry,
+  localEvidence,
   telemetryEnabled,
   verify,
   verifyFragmented,
@@ -110,6 +111,58 @@ const detachedFailure = verifyWithManifestStore(
 );
 assert.notEqual(detachedFailure.integrity, "valid");
 assert.notEqual(detachedFailure.hard_binding, "match");
+
+// localEvidence returns the verify report plus the exact embedded store it
+// verified, as bytes, so a service can re-verify that store without the asset.
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const evidenceOptions = {
+  telemetry: { enabled: false },
+  validation_time: "2026-09-01T00:00:00Z",
+};
+const evidence = localEvidence(asset, "image/jpeg", evidenceOptions);
+assert.deepEqual(evidence.report, verify(asset, "image/jpeg", evidenceOptions));
+assert.ok(evidence.manifest_store instanceof Uint8Array);
+// signed_test.c2pa is this JPEG's store, extracted verbatim.
+assert.deepEqual(Buffer.from(evidence.manifest_store), sidecar);
+assert.equal(evidence.manifest_store_sha256, sha256(evidence.manifest_store));
+assert.equal(evidence.report.manifest_report.manifest_store_sha256, sha256(sidecar));
+assert.equal(evidence.asset_sha256, sha256(asset));
+assert.deepEqual(evidence.hard_binding, { algorithm: "c2pa.hash.data", status: "match" });
+const evidenceTampered = localEvidence(detachedTampered, "image/jpeg", evidenceOptions);
+assert.deepEqual(evidenceTampered.hard_binding, {
+  algorithm: "c2pa.hash.data",
+  status: "mismatch",
+});
+assert.equal(evidenceTampered.asset_sha256, sha256(detachedTampered));
+for (const [path, mime, algorithm] of [
+  [
+    "crates/encypher-c2pa/src/c2pa-validate/tests/fixtures/c2pa-rs-compressed/compressed_boxhash.png",
+    "image/png",
+    "c2pa.hash.boxes",
+  ],
+  [
+    "crates/encypher-c2pa/src/c2pa-validate/tests/fixtures/compressed-epub/application_epub_zip.epub",
+    "application/epub+zip",
+    "c2pa.hash.collection.data",
+  ],
+]) {
+  const bytes = await readFile(resolve(root, path));
+  const result = localEvidence(bytes, mime, evidenceOptions);
+  assert.deepEqual(result.hard_binding, { algorithm, status: "match" }, path);
+  assert.equal(result.manifest_store_sha256, sha256(result.manifest_store), path);
+}
+const unsigned = localEvidence(
+  new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x00, 0xff, 0xd9]),
+  "image/jpeg",
+  evidenceOptions,
+);
+assert.equal(unsigned.manifest_store, null);
+assert.equal(unsigned.manifest_store_sha256, null);
+assert.deepEqual(unsigned.hard_binding, { algorithm: null, status: "unknown" });
+assert.throws(
+  () => localEvidence(asset, "application/x-unknown", evidenceOptions),
+  /^unsupported_mime: /,
+);
 assert.ok(supportedMimeTypes().includes("video/mp4"));
 assert.ok(supportedMimeTypes().includes("text/tab-separated-values"));
 assert.ok(supportedMimeTypes().includes("application/vnd.oasis.opendocument.graphics"));

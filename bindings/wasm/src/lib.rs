@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 
 use encypher_c2pa::{
-    supported_mime_types, validation_failure_telemetry, verify_fragmented_with_options,
-    verify_stream_with_options, verify_with_manifest_store, verify_with_options, NetworkReport,
-    NetworkRequest, StreamEncapsulation, StreamMethod, VerifyOptions,
+    local_evidence_with_options, supported_mime_types, validation_failure_telemetry,
+    verify_fragmented_with_options, verify_stream_with_options, verify_with_manifest_store,
+    verify_with_options, Error, NetworkReport, NetworkRequest, StreamEncapsulation, StreamMethod,
+    VerificationReport, VerifyOptions,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -137,15 +138,85 @@ pub fn verify_js(
         options.telemetry.sdk_name = Some("browser".to_string());
     }
     let result = verify_with_options(asset, mime_type, &options);
-    if let Some(event) = validation_failure_telemetry(mime_type, &result, &options.telemetry) {
-        if let Ok(payload) = event.to_json() {
-            post_validation_failure(options.telemetry.endpoint(), &payload);
-        }
-    }
+    post_failure_telemetry(mime_type, &result, &options);
     let report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
     report
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| js_error("serialization_error", error.to_string()))
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const LOCAL_EVIDENCE_TS: &str = r#"
+/** Result of `localEvidence`. `report` is exactly what `verify` returns. */
+export interface LocalEvidence {
+  report: any;
+  manifest_store: Uint8Array | null;
+  manifest_store_sha256: string | null;
+  asset_sha256: string;
+  hard_binding: {
+    algorithm: string | null;
+    status: "match" | "mismatch" | "unknown";
+  };
+}
+"#;
+
+/// Verify an asset exactly as `verify` does and return what a service needs to
+/// re-verify the same manifest store without the asset.
+///
+/// The result carries the `verify` report, the embedded manifest-store bytes
+/// that report was computed over (a `Uint8Array`, or `null` when the asset has
+/// no embedded store), their SHA-256, the SHA-256 of the asset, and the active
+/// manifest's hard-binding label with this verification's verdict on it. One
+/// verification pass produces all of it. Like `verify`, this never touches
+/// the network apart from opt-in failure telemetry.
+#[wasm_bindgen(js_name = localEvidence, unchecked_return_type = "LocalEvidence")]
+pub fn local_evidence_js(
+    asset: &[u8],
+    mime_type: &str,
+    options: Option<JsValue>,
+) -> Result<JsValue, JsValue> {
+    let mut options = match options {
+        None => VerifyOptions::default(),
+        Some(value) if value.is_null() || value.is_undefined() => VerifyOptions::default(),
+        Some(value) => serde_wasm_bindgen::from_value(value)
+            .map_err(|error| js_error("invalid_options", error.to_string()))?,
+    };
+    if options.validation_time.is_none() {
+        options.validation_time = js_sys::Date::new_0().to_iso_string().as_string();
+    }
+    if options.telemetry.enabled.is_none() {
+        options.telemetry.enabled = Some(resolve_telemetry_preference());
+    }
+    if options.telemetry.enabled == Some(true) {
+        options.telemetry.sdk_name = Some("browser".to_string());
+    }
+    let evidence = match local_evidence_with_options(asset, mime_type, &options) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let thrown = js_error(error.code(), error.to_string());
+            post_failure_telemetry(mime_type, &Err(error), &options);
+            return Err(thrown);
+        }
+    };
+    // JSON-compatible like `verify`, except that `manifest_store` stays a
+    // `Uint8Array` instead of an array of numbers.
+    let value = evidence.serialize(
+        &serde_wasm_bindgen::Serializer::json_compatible().serialize_bytes_as_arrays(false),
+    );
+    post_failure_telemetry(mime_type, &Ok(evidence.report), &options);
+    value.map_err(|error| js_error("serialization_error", error.to_string()))
+}
+
+fn post_failure_telemetry(
+    mime_type: &str,
+    result: &Result<VerificationReport, Error>,
+    options: &VerifyOptions,
+) {
+    if let Some(event) = validation_failure_telemetry(mime_type, result, &options.telemetry) {
+        if let Ok(payload) = event.to_json() {
+            post_validation_failure(options.telemetry.endpoint(), &payload);
+        }
+    }
 }
 
 /// Verify an asset, fetching what it references.
@@ -265,11 +336,7 @@ pub fn verify_with_manifest_store_js(
         options.telemetry.sdk_name = Some("browser".to_string());
     }
     let result = verify_with_manifest_store(asset, manifest_store, mime_type, &options);
-    if let Some(event) = validation_failure_telemetry(mime_type, &result, &options.telemetry) {
-        if let Ok(payload) = event.to_json() {
-            post_validation_failure(options.telemetry.endpoint(), &payload);
-        }
-    }
+    post_failure_telemetry(mime_type, &result, &options);
     let report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
     report
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
@@ -315,11 +382,7 @@ pub fn verify_fragmented_js(
         .collect::<Result<_, _>>()?;
     let fragment_refs: Vec<&[u8]> = fragment_bytes.iter().map(Vec::as_slice).collect();
     let result = verify_fragmented_with_options(init_segment, &fragment_refs, mime_type, &options);
-    if let Some(event) = validation_failure_telemetry(mime_type, &result, &options.telemetry) {
-        if let Ok(payload) = event.to_json() {
-            post_validation_failure(options.telemetry.endpoint(), &payload);
-        }
-    }
+    post_failure_telemetry(mime_type, &result, &options);
     let report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
     report
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())

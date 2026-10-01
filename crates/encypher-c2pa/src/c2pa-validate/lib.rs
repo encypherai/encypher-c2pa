@@ -731,6 +731,15 @@ pub struct VerifyOutput {
     /// offline. Always populated, whether or not fetching is enabled, so a
     /// caller can tell the user what turning it on would contact.
     pub(crate) network_needs: Vec<NetworkNeed>,
+    /// The manifest-store bytes extracted from the asset and verified in this
+    /// pass. `None` when the asset carried no embedded store, and on the
+    /// detached and prehashed paths, where the caller supplied the store.
+    pub(crate) manifest_store: Option<Vec<u8>>,
+    /// Base label of the active manifest's sole primary hard-binding
+    /// assertion, inherited from the first standard manifest when the active
+    /// manifest is an update. `None` when the claim could not be decoded or
+    /// does not declare exactly one.
+    pub(crate) hard_binding_label: Option<String>,
 }
 
 /// Verify the C2PA manifest embedded in an asset.
@@ -1100,6 +1109,7 @@ fn verify_with_fragments_mode_and_expected_seeks(
         Ok(expanded) => expanded,
         Err(output) => {
             let mut out = *output;
+            out.manifest_store = Some(store_bytes);
             pdf_history::attach(
                 &mut out,
                 input,
@@ -1117,6 +1127,7 @@ fn verify_with_fragments_mode_and_expected_seeks(
                 return Err(error.into());
             }
             let mut out = jumbf_failure_output(&error, &store_bytes, input.profile);
+            out.manifest_store = Some(store_bytes);
             pdf_history::attach(
                 &mut out,
                 input,
@@ -1131,6 +1142,7 @@ fn verify_with_fragments_mode_and_expected_seeks(
         let mut out =
             no_manifest_output("manifest store contained no manifests", input.profile, true);
         stamp_manifest_store_hash(&mut out, &store_bytes);
+        out.manifest_store = Some(store_bytes);
         if out_of_scope {
             note_out_of_scope(&mut out, input.mime, input.profile);
         }
@@ -1198,6 +1210,7 @@ fn verify_with_fragments_mode_and_expected_seeks(
         expected_seek_positions,
         input.profile,
     );
+    out.manifest_store = Some(store_bytes);
     Ok(out)
 }
 
@@ -2663,6 +2676,27 @@ fn verify_manifest_bound<'a>(
     let generation = versions::claim_generation(manifest, &claim);
     let mut claim_refs = ClaimAssertionRefs::build(manifest, &claim, generation);
     let verdict = versions::evaluate_for(manifest, &claim, binding.format());
+    // An update manifest carries no hard binding of its own, so its content
+    // check and any identity inside it use the binding in the first standard
+    // manifest of its parentOf chain (C2PA 2.4 Validation, "Validate the
+    // Asset's Content").
+    let inherited_binding = inherited_hard_binding(manifest, store);
+    let hard_binding_label = if manifest.kind() == ManifestKind::Update {
+        inherited_binding
+            .as_ref()
+            .and_then(|(owner, reference, _)| {
+                reference
+                    .get("url")
+                    .and_then(Value::as_text)
+                    .and_then(|url| assertion_label_for_manifest(url, owner))
+            })
+    } else {
+        claim_refs
+            .binding_plan(binding.compound_ok())
+            .primary()
+            .and_then(|reference| reference.label)
+    }
+    .map(|label| base_assertion_label(label).to_string());
 
     // Strict target-version control (internal conformance analysis): in
     // Conformance mode the manifest is additionally held to the profile's
@@ -2760,7 +2794,7 @@ fn verify_manifest_bound<'a>(
             "no claim signature present".into(),
         );
         capture_early_return(&mut capture, CLAIM_SIGNATURE_MISSING);
-        return finish(
+        let mut output = finish(
             label,
             manifest,
             Some(&claim),
@@ -2772,6 +2806,8 @@ fn verify_manifest_bound<'a>(
             input.profile,
             report_decode_nodes,
         );
+        output.hard_binding_label = hard_binding_label;
+        return output;
     };
 
     // The accepted relative URI resolves inside the current manifest. The
@@ -2788,7 +2824,7 @@ fn verify_manifest_bound<'a>(
             "claim signature reference does not resolve to c2pa.signature".into(),
         );
         capture_early_return(&mut capture, CLAIM_SIGNATURE_MISSING);
-        return finish(
+        let mut output = finish(
             label,
             manifest,
             Some(&claim),
@@ -2800,6 +2836,8 @@ fn verify_manifest_bound<'a>(
             input.profile,
             report_decode_nodes,
         );
+        output.hard_binding_label = hard_binding_label;
+        return output;
     }
 
     // --- Signing certificate chain ---
@@ -3078,11 +3116,6 @@ fn verify_manifest_bound<'a>(
         if binding.format() == Some(AssetFormat::C2paStore) {
             verify_compound_content(&claim_refs, &label, store.manifest_hashes, &mut results);
         }
-        // An update manifest carries no hard binding of its own, so an identity
-        // inside one references the binding in the first standard manifest of
-        // its parentOf chain (C2PA 2.4 Validation, "Validate the Asset's
-        // Content").
-        let inherited_binding = inherited_hard_binding(manifest, store);
         // Named-actor trust is evaluated only when this exact asset and claim
         // have no C2PA-level failure and every referenced assertion still
         // matches its stored bytes. CAWG assertion failures are consumer-layer
@@ -3244,6 +3277,7 @@ fn verify_manifest_bound<'a>(
         report_decode_nodes,
     );
     ingredient_graph::attach(&mut output.report_json, &ingredient_deltas);
+    output.hard_binding_label = hard_binding_label;
     output
 }
 
@@ -9740,6 +9774,8 @@ fn finish(
         report_json,
         crjson: None,
         version_verdict: verdict,
+        manifest_store: None,
+        hard_binding_label: None,
     }
 }
 
@@ -9774,6 +9810,8 @@ fn no_manifest_output(explanation: &str, profile: EngineProfile, present: bool) 
         report_json,
         crjson: None,
         version_verdict: None,
+        manifest_store: None,
+        hard_binding_label: None,
     }
 }
 fn failure_only_output(
@@ -9812,6 +9850,8 @@ fn failure_only_output_with_details(
         results,
         crjson: None,
         version_verdict: None,
+        manifest_store: None,
+        hard_binding_label: None,
     };
     stamp_profile(&mut output, profile);
     output
@@ -9867,6 +9907,8 @@ fn container_failure_output(code: &str, explanation: &str, profile: EngineProfil
         report_json,
         crjson: None,
         version_verdict: None,
+        manifest_store: None,
+        hard_binding_label: None,
     }
 }
 
@@ -17234,6 +17276,44 @@ mod tests {
                 !codes.contains(&cawg::CAWG_IDENTITY_HARD_BINDING_MISSING),
                 "{codes:?}"
             );
+        }
+
+        /// The hard-binding label a pass reports is the binding its content
+        /// check uses: a standard manifest's own, and for an update manifest,
+        /// which declares none, the one its parent standard manifest declares.
+        #[test]
+        fn the_reported_hard_binding_label_follows_an_update_to_its_parent() {
+            let data = data_hash();
+            let fixture = Fixture::new(local_reference("c2pa.hash.data", &data));
+            let parent =
+                fixture.manifest(PARENT, &[("c2pa.hash.data", data), created_action()], &[]);
+            let update = as_update_manifest(&fixture.manifest(
+                ACTIVE,
+                &[(
+                    "c2pa.ingredient.v3",
+                    ingredient("parentOf", PARENT, &parent, &parent),
+                )],
+                &[],
+            ));
+            for store in [
+                build_manifest_store(std::slice::from_ref(&parent)),
+                build_manifest_store(&[parent.clone(), update]),
+            ] {
+                let input = VerifyInput {
+                    data: &store,
+                    mime: "application/c2pa",
+                    claim_signer_trust: Some(&fixture.claim_trust),
+                    tsa_trust: None,
+                    allowed_certs: None,
+                    validation_time: Some(validation_time()),
+                    profile: EngineProfile::GENEROUS,
+                    evidence: Default::default(),
+                    cawg_strict_encoding: false,
+                };
+                let output = verify(&input).expect("store verifies");
+                assert_eq!(output.hard_binding_label.as_deref(), Some("c2pa.hash.data"));
+                assert_eq!(output.manifest_store.as_deref(), Some(store.as_slice()));
+            }
         }
 
         /// A compressed ingredient manifest in either `brob` layout expands,

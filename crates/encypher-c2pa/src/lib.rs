@@ -383,6 +383,69 @@ pub struct DetachedManifestEvidence {
     pub carrier: Vec<u8>,
 }
 
+/// One local verification plus what a service needs to re-verify the same
+/// manifest store without receiving the asset.
+///
+/// Every field comes from a single verification pass. `manifest_store` is the
+/// exact embedded store that pass read, so a remote verifier checks the bytes
+/// the local verdict was computed over, not a second extraction.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalEvidence {
+    /// Exactly what [`verify_with_options`] returns for the same inputs.
+    pub report: VerificationReport,
+    /// The embedded manifest-store bytes that were verified. `None` when the
+    /// asset carries no embedded store, or when the verdict came from a store
+    /// fetched from a remote reference the asset declares.
+    #[serde(serialize_with = "serialize_optional_bytes")]
+    pub manifest_store: Option<Vec<u8>>,
+    /// Lowercase hex SHA-256 of `manifest_store`.
+    pub manifest_store_sha256: Option<String>,
+    /// Lowercase hex SHA-256 of the whole asset.
+    pub asset_sha256: String,
+    /// The active manifest's hard binding and this pass's verdict on it.
+    pub hard_binding: LocalHardBinding,
+}
+
+/// The hard binding a [`LocalEvidence`] pass checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalHardBinding {
+    /// Label of the active manifest's sole hard-binding assertion, such as
+    /// `c2pa.hash.boxes`. An update manifest reports the binding it inherits
+    /// from its parent standard manifest. `None` when there is no store, the
+    /// claim cannot be decoded, or it does not declare exactly one.
+    pub algorithm: Option<String>,
+    /// `match`, `mismatch`, or `unknown`, from the same pass's status codes.
+    pub status: String,
+}
+
+/// Bytes go to `serialize_bytes`, so a JavaScript binding receives a
+/// `Uint8Array` rather than an array of numbers.
+fn serialize_optional_bytes<S: serde::Serializer>(
+    value: &Option<Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(bytes) => serializer.serialize_bytes(bytes),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// What one verification pass read besides its report.
+#[derive(Default)]
+struct PassCapture {
+    manifest_store: Option<Vec<u8>>,
+    hard_binding_label: Option<String>,
+}
+
+impl PassCapture {
+    fn take(output: &mut crate::c2pa_validate::VerifyOutput) -> Self {
+        Self {
+            manifest_store: output.manifest_store.take(),
+            hard_binding_label: output.hard_binding_label.take(),
+        }
+    }
+}
+
 impl VerificationReport {
     pub fn to_json(&self) -> Result<String, Error> {
         serde_json::to_string(self).map_err(Error::Serialize)
@@ -529,14 +592,7 @@ pub fn verify_with_manifest_store(
 ) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let result = verify_with_manifest_store_inner(asset, manifest_store, mime_type, options);
-    if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
-        mime_type,
-        &result,
-        &options.telemetry,
-        telemetry_enabled,
-    ) {
-        telemetry::enqueue(options.telemetry.endpoint(), event);
-    }
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
     result
 }
 
@@ -547,7 +603,7 @@ fn verify_with_manifest_store_inner(
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
     let mime = resolve_mime(mime_type)?;
-    let (mut report, needs) = detached_pass(asset, manifest_store, &mime, options)?;
+    let (mut report, needs, _) = detached_pass(asset, manifest_store, &mime, options)?;
     let (network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
@@ -556,19 +612,19 @@ fn verify_with_manifest_store_inner(
     // The store the caller supplied is the one that binds this asset. Pass 2
     // re-reads it with the fetched evidence; it never swaps in another store.
     let next = online::apply_evidence(options, &evidence);
-    let (mut report, _) = detached_pass(asset, manifest_store, &mime, &next)?;
+    let (mut report, _, _) = detached_pass(asset, manifest_store, &mime, &next)?;
     report.network = network;
     Ok(report)
 }
 
 /// One offline verification of an asset against a separately held store, with
-/// the network needs it recorded.
+/// the network needs and capture it recorded.
 fn detached_pass(
     asset: &[u8],
     manifest_store: &[u8],
     mime: &str,
     options: &VerifyOptions,
-) -> Result<(VerificationReport, Vec<online::NetworkNeed>), Error> {
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     if manifest_store.is_empty() {
         return Err(Error::Verification("manifest store is empty".into()));
     }
@@ -579,7 +635,7 @@ fn detached_pass(
     }
     let resolved = ResolvedOptions::resolve(options)?;
     let input = resolved.input(asset, mime);
-    let output = crate::c2pa_validate::verify_detached_safe(
+    let mut output = crate::c2pa_validate::verify_detached_safe(
         manifest_store,
         asset,
         mime,
@@ -594,9 +650,11 @@ fn detached_pass(
     )
     .map_err(map_validate_error)?;
     let needs = online::network_needs(&output);
+    let capture = PassCapture::take(&mut output);
     Ok((
         report_from_output(output, mime.to_string(), &resolved),
         needs,
+        capture,
     ))
 }
 
@@ -612,6 +670,48 @@ pub fn verify_with_options(
     verify_with_resolved_options(data, None, mime_type, options, &resolved)
 }
 
+/// Verify asset bytes exactly as [`verify_with_options`] does and return the
+/// evidence a remote service needs to re-verify the same manifest store.
+///
+/// The report, the store bytes, and the hard-binding verdict all come from
+/// one verification pass. A remote verifier that checks `manifest_store`
+/// against `hard_binding` therefore evaluates the store the local verdict
+/// was computed over. Failure telemetry follows the same rules as
+/// [`verify_with_options`].
+pub fn local_evidence_with_options(
+    data: &[u8],
+    mime_type: &str,
+    options: &VerifyOptions,
+) -> Result<LocalEvidence, Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let (result, capture) =
+        match verify_with_options_inner(data, None, mime_type, options, &resolved) {
+            Ok((report, capture)) => (Ok(report), capture),
+            Err(error) => (Err(error), PassCapture::default()),
+        };
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    let report = result?;
+    let status = match report.hard_binding.as_str() {
+        "match" => "match",
+        "mismatch" => "mismatch",
+        _ => "unknown",
+    };
+    Ok(LocalEvidence {
+        manifest_store_sha256: capture
+            .manifest_store
+            .as_deref()
+            .map(|store| hex::encode(Sha256::digest(store))),
+        manifest_store: capture.manifest_store,
+        asset_sha256: hex::encode(Sha256::digest(data)),
+        hard_binding: LocalHardBinding {
+            algorithm: capture.hard_binding_label,
+            status: status.to_string(),
+        },
+        report,
+    })
+}
+
 fn verify_with_resolved_options(
     data: &[u8],
     fragments: Option<&[&[u8]]>,
@@ -620,16 +720,26 @@ fn verify_with_resolved_options(
     resolved: &ResolvedOptions,
 ) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
-    let result = verify_with_options_inner(data, fragments, mime_type, options, resolved);
+    let result = verify_with_options_inner(data, fragments, mime_type, options, resolved)
+        .map(|(report, _)| report);
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    result
+}
+
+fn enqueue_failure_telemetry(
+    mime_type: &str,
+    result: &Result<VerificationReport, Error>,
+    options: &VerifyOptions,
+    enabled: bool,
+) {
     if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
         mime_type,
-        &result,
+        result,
         &options.telemetry,
-        telemetry_enabled,
+        enabled,
     ) {
         telemetry::enqueue(options.telemetry.endpoint(), event);
     }
-    result
 }
 
 /// Verify a fragmented ISO BMFF stream with explicit trust, validation-time,
@@ -652,17 +762,11 @@ pub fn verify_fragmented_with_options(
         == Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
         verify_with_options_inner(init_segment, Some(fragments), &mime, options, &resolved)
+            .map(|(report, _)| report)
     } else {
         Err(Error::UnsupportedMime(mime))
     };
-    if let Some(event) = telemetry::validation_failure_telemetry_with_enabled(
-        mime_type,
-        &result,
-        &options.telemetry,
-        telemetry_enabled,
-    ) {
-        telemetry::enqueue(options.telemetry.endpoint(), event);
-    }
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
     result
 }
 
@@ -894,19 +998,22 @@ pub(crate) fn report_from_output(
     }
 }
 
+/// Verify with the online pass when evidence was gathered, returning the
+/// capture of the pass whose report is returned.
 fn verify_with_options_inner(
     data: &[u8],
     fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
     resolved: &ResolvedOptions,
-) -> Result<VerificationReport, Error> {
+) -> Result<(VerificationReport, PassCapture), Error> {
     let mime = resolve_mime(mime_type)?;
-    let (mut report, needs) = embedded_pass_resolved(data, fragments, &mime, options, resolved)?;
+    let (mut report, needs, capture) =
+        embedded_pass_resolved(data, fragments, &mime, options, resolved)?;
     let (mut network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
-        return Ok(report);
+        return Ok((report, capture));
     }
     let next = online::apply_evidence(options, &evidence);
     let second = match (evidence.manifest_store.as_deref(), fragments) {
@@ -917,9 +1024,9 @@ fn verify_with_options_inner(
         _ => embedded_pass(data, fragments, &mime, &next),
     };
     match second {
-        Ok((mut second, _)) => {
+        Ok((mut second, _, second_capture)) => {
             second.network = network;
-            Ok(second)
+            Ok((second, second_capture))
         }
         // What the server returned is not a manifest store this asset can be
         // verified against. That is an answer about the file, not a failure of
@@ -927,7 +1034,7 @@ fn verify_with_options_inner(
         Err(error) => {
             network.mark_unusable("remote_manifest", error.to_string());
             report.network = network;
-            Ok(report)
+            Ok((report, capture))
         }
     }
 }
@@ -939,7 +1046,7 @@ fn embedded_pass(
     fragments: Option<&[&[u8]]>,
     mime: &str,
     options: &VerifyOptions,
-) -> Result<(VerificationReport, Vec<online::NetworkNeed>), Error> {
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     let resolved = ResolvedOptions::resolve(options)?;
     embedded_pass_resolved(data, fragments, mime, options, &resolved)
 }
@@ -950,9 +1057,9 @@ fn embedded_pass_resolved(
     mime: &str,
     options: &VerifyOptions,
     resolved: &ResolvedOptions,
-) -> Result<(VerificationReport, Vec<online::NetworkNeed>), Error> {
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     let input = resolved.input(data, mime);
-    let output = match fragments {
+    let mut output = match fragments {
         Some(fragments) => verify_fragmented_safe(
             &input,
             fragments,
@@ -978,9 +1085,11 @@ fn embedded_pass_resolved(
     }
     .map_err(map_validate_error)?;
     let needs = online::network_needs(&output);
+    let capture = PassCapture::take(&mut output);
     Ok((
         report_from_output(output, mime.to_string(), resolved),
         needs,
+        capture,
     ))
 }
 
