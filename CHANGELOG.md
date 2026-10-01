@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## 1.7.0 - 2026-10-01
+
+### Added
+
+- Generic ZIP archives, including `.zip` and `.sketch` files, verify through the C2PA collection-hash path under both `application/zip` and `application/x-zip-based`. Both MIME types are returned by the supported-format APIs.
+
 ## 1.6.0 - 2026-10-01
 
 ### Added
