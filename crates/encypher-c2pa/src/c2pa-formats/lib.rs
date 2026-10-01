@@ -544,10 +544,11 @@ pub(crate) fn carrier_placement_error(
 
 /// Remove zero-filled capacity reserved after a complete top-level JUMBF box.
 ///
-/// ZIP entries and SFNT tables have no separate logical-content length. C2PA
-/// signers therefore reserve their fixed carrier size with zero bytes after the
-/// manifest store. The JUMBF box length remains authoritative. Non-zero trailing
-/// bytes stay visible so the strict parser rejects them.
+/// ZIP entries, SFNT tables, ID3 `GEOB` frames (MP3 and FLAC), and the legacy
+/// FLAC `c2pa` APPLICATION block carry no length for the store itself.
+/// C2PA signers therefore reserve their fixed carrier size with zero bytes
+/// after the manifest store. The JUMBF box length remains authoritative.
+/// Non-zero trailing bytes stay visible so the strict parser rejects them.
 fn logical_manifest_store(data: &[u8]) -> &[u8] {
     let Some(header) = data.get(..8) else {
         return data;
