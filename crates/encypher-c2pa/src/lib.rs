@@ -1218,6 +1218,8 @@ pub const SUPPORTED_EXTENSIONS: &[(&str, &str)] = &[
     ("ogg", "audio/ogg"),
     ("oga", "audio/ogg"),
     ("pdf", "application/pdf"),
+    ("zip", "application/zip"),
+    ("sketch", "application/zip"),
     ("epub", "application/epub+zip"),
     (
         "docx",
@@ -1608,6 +1610,14 @@ mod tests {
             mime_from_path(Path::new("data.tsv")),
             Some("text/tab-separated-values")
         );
+        assert_eq!(
+            mime_from_path(Path::new("archive.ZIP")),
+            Some("application/zip")
+        );
+        assert_eq!(
+            mime_from_path(Path::new("design.sketch")),
+            Some("application/zip")
+        );
     }
 
     /// A supported format with no extension can only be verified by passing
@@ -1621,6 +1631,7 @@ mod tests {
             "application/mp4",
             "video/x-m4v",
             "text/xml",
+            "application/x-zip-based",
         ];
         let unreachable: Vec<_> = supported_mime_types()
             .into_iter()
@@ -1664,12 +1675,14 @@ mod tests {
     #[test]
     fn format_list_is_sorted_and_contains_composition_formats() {
         let formats = supported_mime_types();
-        assert_eq!(formats.len(), 71);
+        assert_eq!(formats.len(), 73);
         assert!(formats.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(formats.contains(&"video/mp4"));
         assert!(formats.contains(&"image/jpeg"));
         assert!(formats.contains(&"text/tab-separated-values"));
         assert!(formats.contains(&"application/vnd.oasis.opendocument.graphics"));
+        assert!(formats.contains(&"application/zip"));
+        assert!(formats.contains(&"application/x-zip-based"));
     }
 
     #[test]

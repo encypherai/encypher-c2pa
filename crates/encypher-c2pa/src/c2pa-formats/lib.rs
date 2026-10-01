@@ -185,7 +185,9 @@ impl AssetFormat {
             "audio/flac" => Self::Flac,
             "audio/ogg" => Self::Ogg,
             "application/pdf" => Self::Pdf,
-            "application/epub+zip"
+            "application/zip"
+            | "application/x-zip-based"
+            | "application/epub+zip"
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
             | "application/vnd.ms-word.document.macroenabled.12"
@@ -805,6 +807,8 @@ mod tests {
             ("audio/flac", AssetFormat::Flac),
             ("audio/ogg", AssetFormat::Ogg),
             ("application/pdf", AssetFormat::Pdf),
+            ("application/zip", AssetFormat::Zip),
+            ("application/x-zip-based", AssetFormat::Zip),
             ("application/epub+zip", AssetFormat::Zip),
             (
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

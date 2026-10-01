@@ -166,6 +166,18 @@ assert.throws(
 assert.ok(supportedMimeTypes().includes("video/mp4"));
 assert.ok(supportedMimeTypes().includes("text/tab-separated-values"));
 assert.ok(supportedMimeTypes().includes("application/vnd.oasis.opendocument.graphics"));
+assert.ok(supportedMimeTypes().includes("application/zip"));
+assert.ok(supportedMimeTypes().includes("application/x-zip-based"));
+const signedZip = await readFile(resolve(root, "tests/fixtures/signed_generic.zip"));
+const tamperedZip = await readFile(resolve(root, "tests/fixtures/tampered_signed_generic.zip"));
+for (const mime of ["application/zip", "application/x-zip-based"]) {
+  const zipReport = verify(signedZip, mime);
+  assert.equal(zipReport.integrity, "valid", mime);
+  assert.equal(zipReport.hard_binding, "match", mime);
+  const tamperedZipReport = verify(tamperedZip, mime);
+  assert.equal(tamperedZipReport.integrity, "invalid", mime);
+  assert.equal(tamperedZipReport.hard_binding, "mismatch", mime);
+}
 const mp4 = await readFile(resolve(root, "tests/fixtures/signed_test.mp4"));
 const fragmented = verifyFragmented(mp4, [], "video/mp4");
 assert.equal(fragmented.integrity, "valid");

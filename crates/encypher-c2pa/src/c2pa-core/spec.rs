@@ -447,6 +447,14 @@ pub static FORMAT_REGISTRY: &[FormatEntry] = &[
     }, // A.9 structured
     // ---- v2.4 additions: packaged documents (ZIP family) + fonts ----
     FormatEntry {
+        mime: "application/zip",
+        versions: &[V2_4],
+    },
+    FormatEntry {
+        mime: "application/x-zip-based",
+        versions: &[V2_4],
+    },
+    FormatEntry {
         mime: "application/epub+zip",
         versions: &[V2_4],
     },
@@ -669,6 +677,8 @@ mod tests {
             "audio/flac",
             "font/otf",
             "application/epub+zip",
+            "application/zip",
+            "application/x-zip-based",
             "video/x-m4v",
         ] {
             assert!(
