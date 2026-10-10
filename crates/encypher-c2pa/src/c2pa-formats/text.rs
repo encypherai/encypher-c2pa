@@ -49,6 +49,35 @@ impl TextMethod {
     }
 }
 
+/// Which revision's text-carrier locating rules apply.
+///
+/// C2PA 2.4 and the proposed 2.5 differ in how a text carrier is located, not
+/// in how its hard binding is hashed:
+///
+/// - **Unstructured (A.8).** 2.4 names corrupted and duplicate wrappers with
+///   `manifest.text.*` failure codes and selects among several wrappers by the
+///   data-hash exclusion. 2.5 ignores any candidate that does not fully decode,
+///   treats zero or several valid wrappers as no manifest located, and admits
+///   any trailing padding: a wrapper is valid when its decoded selector run is
+///   at least `manifestLength + 13` bytes, and the whole run (padding
+///   included) is the wrapper's byte range. The 2.4 reader consumes only
+///   `0x00`/`0xFF` padding up to the deterministic padded length.
+/// - **Structured (A.9).** 2.4 reports `manifest.structuredText.*` failures.
+///   2.5 treats a missing, unpaired, duplicated, empty, or unusable block as
+///   no manifest located, trims only U+0020/U+0009/U+000A/U+000D, and accepts
+///   only a `data:application/c2pa;base64,` reference with valid Base64.
+/// - **HTML (A.7).** 2.4 counts matching elements anywhere in the document.
+///   2.5 ignores elements outside `head`; more than one in `head` is no
+///   manifest located.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextLocatorRules {
+    /// C2PA 2.4 (and the default).
+    #[default]
+    V2_4,
+    /// Proposed C2PA 2.5.
+    V2_5,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextDiagnostic {
     CorruptedWrapper,
@@ -93,7 +122,14 @@ struct UnstructuredWrapper {
     manifest_length: usize,
 }
 
-fn unstructured_wrappers(text: &str) -> Vec<UnstructuredWrapper> {
+/// Every complete `C2PATextManifestWrapper` in `text`.
+///
+/// A candidate is a U+FEFF followed by a run of variation selectors whose
+/// decoded header carries the magic, version 1, and a declared manifest length
+/// the run can hold. Candidates that cannot be fully decoded are skipped
+/// under both rule sets; only the measured span differs (see
+/// [`TextLocatorRules`]).
+fn unstructured_wrappers(text: &str, rules: TextLocatorRules) -> Vec<UnstructuredWrapper> {
     const HEADER_LEN: usize = 13;
     const MAGIC: &[u8; 8] = b"C2PATXT\0";
     const VERSION: u8 = 1;
@@ -140,16 +176,24 @@ fn unstructured_wrappers(text: &str) -> Vec<UnstructuredWrapper> {
             position += character.len_utf8();
         }
 
-        let padded_bound = start
-            .checked_add(c2pa_text::worst_case_wrapper_byte_length(manifest_length))
-            .unwrap_or(usize::MAX);
-        for character in text[position..run_end].chars() {
-            match crate::c2pa_formats::text_standard::vs_to_byte(character) {
-                Some(0x00 | 0xff) if position + character.len_utf8() <= padded_bound => {
-                    position += character.len_utf8();
+        match rules {
+            TextLocatorRules::V2_4 => {
+                let padded_bound = start
+                    .checked_add(c2pa_text::worst_case_wrapper_byte_length(manifest_length))
+                    .unwrap_or(usize::MAX);
+                for character in text[position..run_end].chars() {
+                    match crate::c2pa_formats::text_standard::vs_to_byte(character) {
+                        Some(0x00 | 0xff) if position + character.len_utf8() <= padded_bound => {
+                            position += character.len_utf8();
+                        }
+                        _ => break,
+                    }
                 }
-                _ => break,
             }
+            // 2.5 Validating a text data hash: "trailing bytes are padding and
+            // shall be ignored", and "The byte range of a wrapper includes any
+            // trailing padding bytes" - whatever their values.
+            TextLocatorRules::V2_5 => position = run_end,
         }
         wrappers.push(UnstructuredWrapper {
             start,
@@ -164,11 +208,28 @@ fn unstructured_wrappers(text: &str) -> Vec<UnstructuredWrapper> {
     wrappers
 }
 
+/// The one wrapper a reader may use: the first under 2.4, the only one under
+/// 2.5 (zero or several valid wrappers locate no manifest).
+fn selected_unstructured_wrapper(
+    text: &str,
+    rules: TextLocatorRules,
+) -> Option<UnstructuredWrapper> {
+    let wrappers = unstructured_wrappers(text, rules);
+    match rules {
+        TextLocatorRules::V2_4 => wrappers.into_iter().next(),
+        TextLocatorRules::V2_5 => match wrappers.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        },
+    }
+}
+
 pub(crate) fn unstructured_wrapper_spans(
     data: &[u8],
+    rules: TextLocatorRules,
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
     let text = std::str::from_utf8(data).map_err(|_| TextMethod::Unstructured.invalid_utf8())?;
-    Ok(unstructured_wrappers(text)
+    Ok(unstructured_wrappers(text, rules)
         .into_iter()
         .map(|wrapper| DataHashExclusion {
             start: wrapper.start,
@@ -177,6 +238,126 @@ pub(crate) fn unstructured_wrapper_spans(
         .collect())
 }
 
+/// The whitespace 2.5 trims from a structured-text manifest reference.
+const STRUCTURED_REFERENCE_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// The 2.5 structured-text manifest block: its byte span and the decoded
+/// store when the reference is a well-formed inline `data:` URI.
+///
+/// Locating the C2PA Manifest Store, Special Considerations for Structured
+/// Text: exactly one `BEGIN`/`END` pair, END after BEGIN; otherwise no block.
+fn structured_block_v2_5(text: &str) -> Option<((usize, usize), Option<Vec<u8>>)> {
+    let begin_delimiter = c2pa_text::structured::BEGIN_DELIMITER;
+    let end_delimiter = c2pa_text::structured::END_DELIMITER;
+    if text.matches(begin_delimiter).count() != 1 || text.matches(end_delimiter).count() != 1 {
+        return None;
+    }
+    let begin = text.find(begin_delimiter)? + begin_delimiter.len();
+    let end = text.find(end_delimiter)?;
+    if end < begin {
+        return None;
+    }
+    let span = structured_block_span(text)?;
+    let reference = text[begin..end].trim_matches(STRUCTURED_REFERENCE_WHITESPACE.as_slice());
+    // Only `data:application/c2pa;base64,<data>` embeds a store. A remote URI
+    // is optional to retrieve and this reader does not, so it locates no
+    // manifest, as does a `data:` URI with another media type or encoding, or
+    // an invalid Base64 payload.
+    let manifest = reference
+        .strip_prefix(c2pa_text::structured::DATA_URI_PREFIX)
+        .filter(|payload| !payload.is_empty())
+        .and_then(crate::c2pa_formats::util::base64_decode)
+        .filter(|bytes| !bytes.is_empty());
+    Some((span, manifest))
+}
+
+/// The 2.5 HTML manifest carrier: the single C2PA element inside `head`.
+struct HtmlHeadCarrier {
+    /// Byte span of the inline `script` element, `None` for a `link`.
+    script_span: Option<(usize, usize)>,
+    /// The decoded inline store, `None` for a `link` or invalid Base64.
+    manifest: Option<Vec<u8>>,
+}
+
+/// ASCII case-insensitive search for `needle` in `haystack` from `from`.
+fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || from > bytes.len() {
+        return None;
+    }
+    (from..=bytes.len().checked_sub(needle.len())?)
+        .find(|&index| bytes[index..index + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Byte offset of the next start tag named `name` (e.g. `<head`), requiring
+/// the name to end at `>`, `/`, or ASCII whitespace so `<header>` is not
+/// mistaken for `<head>`.
+fn find_start_tag(text: &str, name: &str, from: usize) -> Option<usize> {
+    let mut cursor = from;
+    loop {
+        let index = find_ascii_ci(text, name, cursor)?;
+        let next = text.as_bytes().get(index + name.len()).copied();
+        if matches!(next, Some(b'>' | b'/') | Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')) {
+            return Some(index);
+        }
+        cursor = index + name.len();
+    }
+}
+
+/// Locating the C2PA Manifest Store, Special Considerations for HTML (2.5):
+/// only elements inside `head` associate a store, and more than one there,
+/// or none, locates no manifest.
+fn html_head_carrier_v2_5(text: &str) -> Option<HtmlHeadCarrier> {
+    let head_open = find_start_tag(text, "<head", 0)?;
+    let head_body_start = head_open + text[head_open..].find('>')? + 1;
+    let head_body_end = find_ascii_ci(text, "</head", head_body_start)?;
+    let mut scripts: Vec<(usize, usize, &str)> = Vec::new();
+    let mut links = 0usize;
+
+    let mut cursor = head_body_start;
+    while let Some(open) = find_start_tag(text, "<script", cursor).filter(|i| *i < head_body_end)
+    {
+        let tag_end = open + text[open..].find('>')?;
+        let tag = &text[open..=tag_end];
+        cursor = tag_end + 1;
+        if !tag.contains("type=\"application/c2pa\"") {
+            continue;
+        }
+        let close = find_ascii_ci(text, "</script>", tag_end + 1)?;
+        if close >= head_body_end {
+            return None;
+        }
+        let element_end = close + "</script>".len();
+        scripts.push((open, element_end - open, &text[tag_end + 1..close]));
+        cursor = element_end;
+    }
+    let mut cursor = head_body_start;
+    while let Some(open) = find_start_tag(text, "<link", cursor).filter(|i| *i < head_body_end) {
+        let tag_end = open + text[open..].find('>')?;
+        if text[open..=tag_end].contains("rel=\"c2pa-manifest\"") {
+            links += 1;
+        }
+        cursor = tag_end + 1;
+    }
+    match (scripts.as_slice(), links) {
+        ([(start, length, content)], 0) => Some(HtmlHeadCarrier {
+            script_span: Some((*start, *length)),
+            manifest: crate::c2pa_formats::util::base64_decode(
+                content.trim_matches(|c: char| c.is_ascii_whitespace()),
+            )
+            .filter(|bytes| !bytes.is_empty()),
+        }),
+        ([], 1) => Some(HtmlHeadCarrier {
+            script_span: None,
+            manifest: None,
+        }),
+        _ => None,
+    }
+}
+
+/// The legacy (2.4) unstructured/structured carrier diagnostics. The 2.5
+/// locator reports none: every defect it covers locates no manifest instead.
 pub(crate) fn diagnostic(method: TextMethod, data: &[u8]) -> Option<TextDiagnostic> {
     let text = match std::str::from_utf8(data) {
         Ok(text) => text,
@@ -217,11 +398,15 @@ pub(crate) fn diagnostic(method: TextMethod, data: &[u8]) -> Option<TextDiagnost
 }
 
 /// Extract the raw manifest-store bytes from a text asset using `method`.
-pub(crate) fn extract(method: TextMethod, data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+pub(crate) fn extract(
+    method: TextMethod,
+    data: &[u8],
+    rules: TextLocatorRules,
+) -> Result<Option<Vec<u8>>, FormatError> {
     let text = std::str::from_utf8(data).map_err(|_| method.invalid_utf8())?;
-    match method {
-        TextMethod::Unstructured => {
-            let Some(wrapper) = unstructured_wrappers(text).into_iter().next() else {
+    match (method, rules) {
+        (TextMethod::Unstructured, _) => {
+            let Some(wrapper) = selected_unstructured_wrapper(text, rules) else {
                 return Ok(None);
             };
             let manifest = text[wrapper.manifest_start..]
@@ -231,17 +416,25 @@ pub(crate) fn extract(method: TextMethod, data: &[u8]) -> Result<Option<Vec<u8>>
                 .collect();
             Ok(Some(manifest))
         }
-        TextMethod::Structured => match c2pa_text::structured::extract_structured(text) {
-            // Only the inline `data:` reference carries bytes; a URL reference
-            // resolves elsewhere and yields no embedded manifest here.
-            Ok(ext) => Ok(ext.manifest),
-            Err(_) => Ok(None),
-        },
-        TextMethod::Html => match c2pa_text::html::extract_html(text) {
+        (TextMethod::Structured, TextLocatorRules::V2_4) => {
+            match c2pa_text::structured::extract_structured(text) {
+                // Only the inline `data:` reference carries bytes; a URL reference
+                // resolves elsewhere and yields no embedded manifest here.
+                Ok(ext) => Ok(ext.manifest),
+                Err(_) => Ok(None),
+            }
+        }
+        (TextMethod::Structured, TextLocatorRules::V2_5) => {
+            Ok(structured_block_v2_5(text).and_then(|(_, manifest)| manifest))
+        }
+        (TextMethod::Html, TextLocatorRules::V2_4) => match c2pa_text::html::extract_html(text) {
             Ok(Some(ext)) => Ok(ext.manifest),
             Ok(None) => Ok(None),
             Err(_) => Ok(None),
         },
+        (TextMethod::Html, TextLocatorRules::V2_5) => {
+            Ok(html_head_carrier_v2_5(text).and_then(|carrier| carrier.manifest))
+        }
     }
 }
 
@@ -342,15 +535,22 @@ use crate::c2pa_formats::DataHashExclusion;
 pub(crate) fn exclusions(
     method: TextMethod,
     data: &[u8],
+    rules: TextLocatorRules,
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
     let text = std::str::from_utf8(data).map_err(|_| method.invalid_utf8())?;
-    let range = match method {
-        TextMethod::Unstructured => unstructured_wrappers(text)
-            .into_iter()
-            .next()
+    let range = match (method, rules) {
+        (TextMethod::Unstructured, _) => selected_unstructured_wrapper(text, rules)
             .map(|wrapper| (wrapper.start, wrapper.length)),
-        TextMethod::Structured => structured_block_span(text),
-        TextMethod::Html => locate_span(text, "<script type=\"application/c2pa\"", "</script>"),
+        (TextMethod::Structured, TextLocatorRules::V2_4) => structured_block_span(text),
+        (TextMethod::Structured, TextLocatorRules::V2_5) => {
+            structured_block_v2_5(text).map(|(span, _)| span)
+        }
+        (TextMethod::Html, TextLocatorRules::V2_4) => {
+            locate_span(text, "<script type=\"application/c2pa\"", "</script>")
+        }
+        (TextMethod::Html, TextLocatorRules::V2_5) => {
+            html_head_carrier_v2_5(text).and_then(|carrier| carrier.script_span)
+        }
     };
     Ok(range
         .into_iter()
@@ -495,7 +695,7 @@ mod tests {
         // Engine padded embed: different bytes (padded) but same extracted manifest.
         let engine = embed(TextMethod::Unstructured, b"hello world", &manifest).unwrap();
         assert_eq!(
-            extract(TextMethod::Unstructured, &engine).unwrap(),
+            extract(TextMethod::Unstructured, &engine, TextLocatorRules::V2_4).unwrap(),
             Some(manifest)
         );
     }
@@ -517,7 +717,7 @@ mod tests {
     fn unstructured_round_trips() {
         let store = fake_store();
         let embedded = embed(TextMethod::Unstructured, b"a social post", &store).unwrap();
-        let out = extract(TextMethod::Unstructured, &embedded).unwrap();
+        let out = extract(TextMethod::Unstructured, &embedded, TextLocatorRules::V2_4).unwrap();
         assert_eq!(out, Some(store));
         // Carrier text is preserved as a visible prefix.
         assert!(String::from_utf8(embedded)
@@ -532,7 +732,7 @@ mod tests {
         let embedded = embed(TextMethod::Structured, src.as_bytes(), &store).unwrap();
         let text = String::from_utf8(embedded.clone()).unwrap();
         assert!(text.contains("BEGIN C2PA MANIFEST"));
-        let out = extract(TextMethod::Structured, &embedded).unwrap();
+        let out = extract(TextMethod::Structured, &embedded, TextLocatorRules::V2_4).unwrap();
         assert_eq!(out, Some(store));
     }
 
@@ -543,26 +743,33 @@ mod tests {
         let embedded = embed(TextMethod::Html, html.as_bytes(), &store).unwrap();
         let text = String::from_utf8(embedded.clone()).unwrap();
         assert!(text.contains("application/c2pa"));
-        let out = extract(TextMethod::Html, &embedded).unwrap();
+        let out = extract(TextMethod::Html, &embedded, TextLocatorRules::V2_4).unwrap();
         assert_eq!(out, Some(store));
     }
 
     #[test]
     fn no_manifest_is_none_not_error() {
-        assert_eq!(
-            extract(TextMethod::Unstructured, b"plain text").unwrap(),
-            None
-        );
-        assert_eq!(
-            extract(TextMethod::Structured, b"plain text").unwrap(),
-            None
-        );
-        assert_eq!(extract(TextMethod::Html, b"<html></html>").unwrap(), None);
+        for rules in [TextLocatorRules::V2_4, TextLocatorRules::V2_5] {
+            assert_eq!(
+                extract(TextMethod::Unstructured, b"plain text", rules).unwrap(),
+                None
+            );
+            assert_eq!(
+                extract(TextMethod::Structured, b"plain text", rules).unwrap(),
+                None
+            );
+            assert_eq!(
+                extract(TextMethod::Html, b"<html></html>", rules).unwrap(),
+                None
+            );
+        }
     }
 
     #[test]
     fn invalid_utf8_errors() {
-        assert!(extract(TextMethod::Unstructured, &[0xff, 0xfe]).is_err());
+        for rules in [TextLocatorRules::V2_4, TextLocatorRules::V2_5] {
+            assert!(extract(TextMethod::Unstructured, &[0xff, 0xfe], rules).is_err());
+        }
     }
 
     #[test]
@@ -577,17 +784,191 @@ mod tests {
         assert!(text.starts_with(src));
         // Manifest round-trips despite the comment wrapping.
         assert_eq!(
-            extract(TextMethod::Structured, &embedded).unwrap(),
+            extract(TextMethod::Structured, &embedded, TextLocatorRules::V2_4).unwrap(),
             Some(store)
         );
         // The data-hash exclusion spans the WHOLE comment block (markers
         // included); the original source lies entirely outside it.
-        let ex = exclusions(TextMethod::Structured, &embedded).unwrap();
+        let ex = exclusions(TextMethod::Structured, &embedded, TextLocatorRules::V2_4).unwrap();
         assert_eq!(ex.len(), 1);
         let excluded = &embedded[ex[0].start..ex[0].start + ex[0].length];
         assert!(excluded.starts_with(b"/* -----BEGIN C2PA MANIFEST-----"));
         assert!(excluded.ends_with(b"*/"));
         assert!(ex[0].start >= src.len());
         assert_eq!(&embedded[..src.len()], src.as_bytes());
+    }
+
+    /// Append padding selectors for `bytes` after an encoded wrapper.
+    fn with_padding(wrapper: &str, bytes: &[u8]) -> String {
+        let mut padded = wrapper.to_string();
+        for byte in bytes {
+            padded.push(crate::c2pa_formats::text_standard::byte_to_vs(*byte));
+        }
+        padded
+    }
+
+    #[test]
+    fn unstructured_padding_span_differs_by_revision() {
+        let store = fake_store();
+        let wrapper = c2pa_text::encode_wrapper(&store);
+        // The 2.5 generator procedure pads with 0x00 then 0x10 bytes; the 2.4
+        // reader consumes only 0x00/0xFF padding, so it stops at the first 0x10.
+        let text = format!("post{}", with_padding(&wrapper, &[0x00, 0x00, 0x10, 0x10]));
+        let v24 = unstructured_wrapper_spans(text.as_bytes(), TextLocatorRules::V2_4).unwrap();
+        let v25 = unstructured_wrapper_spans(text.as_bytes(), TextLocatorRules::V2_5).unwrap();
+        assert_eq!(v24.len(), 1);
+        assert_eq!(v25.len(), 1);
+        assert_eq!(v24[0].start, 4);
+        assert_eq!(v25[0].start, 4);
+        assert_eq!(
+            v25[0].length,
+            text.len() - 4,
+            "2.5 wrapper range includes every trailing padding selector"
+        );
+        assert_eq!(
+            v25[0].length - v24[0].length,
+            2 * '\u{E0100}'.len_utf8(),
+            "2.4 stops before the 0x10 padding"
+        );
+        // Both revisions decode the same store: padding never enters it.
+        for rules in [TextLocatorRules::V2_4, TextLocatorRules::V2_5] {
+            assert_eq!(
+                extract(TextMethod::Unstructured, text.as_bytes(), rules).unwrap(),
+                Some(store.clone())
+            );
+        }
+        // Existing 0xFF padding stays admitted under 2.5.
+        let legacy = format!("post{}", with_padding(&wrapper, &[0xff, 0xff, 0xff]));
+        assert_eq!(
+            extract(TextMethod::Unstructured, legacy.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            Some(store.clone())
+        );
+        let legacy_v25 =
+            unstructured_wrapper_spans(legacy.as_bytes(), TextLocatorRules::V2_5).unwrap();
+        let legacy_v24 =
+            unstructured_wrapper_spans(legacy.as_bytes(), TextLocatorRules::V2_4).unwrap();
+        assert_eq!(legacy_v25, legacy_v24);
+    }
+
+    #[test]
+    fn unstructured_multiple_wrappers_locate_nothing_under_v2_5() {
+        let first = c2pa_text::encode_wrapper(&[1, 2, 3]);
+        let second = c2pa_text::encode_wrapper(&[4, 5, 6]);
+        let text = format!("{first} text {second}");
+        assert_eq!(
+            extract(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            extract(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            None
+        );
+        assert!(exclusions(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_5)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unstructured_malformed_candidate_is_ignored_under_v2_5() {
+        let mut truncated = c2pa_text::encode_wrapper(&[9, 9, 9]);
+        truncated.pop();
+        let valid = c2pa_text::encode_wrapper(&[7, 7]);
+        let text = format!("{truncated} body {valid}");
+        assert_eq!(
+            extract(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            Some(vec![7, 7])
+        );
+        assert_eq!(
+            extract(
+                TextMethod::Unstructured,
+                truncated.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_v2_5_trims_only_ascii_whitespace_and_requires_c2pa_data_uri() {
+        use c2pa_text::structured::{BEGIN_DELIMITER as BEGIN, END_DELIMITER as END};
+
+        let inline = format!("x\n# {BEGIN}\t data:application/c2pa;base64,AQID \r{END}\n");
+        for rules in [TextLocatorRules::V2_4, TextLocatorRules::V2_5] {
+            assert_eq!(
+                extract(TextMethod::Structured, inline.as_bytes(), rules).unwrap(),
+                Some(vec![1, 2, 3])
+            );
+        }
+        // U+00A0 is Unicode whitespace (trimmed by 2.4's reader) but not one of
+        // the four characters 2.5 trims, so the 2.5 reference is not a data URI.
+        let nbsp = format!("x\n# {BEGIN}\u{a0}data:application/c2pa;base64,AQID {END}\n");
+        assert_eq!(
+            extract(TextMethod::Structured, nbsp.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            extract(TextMethod::Structured, nbsp.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            None
+        );
+        let wrong_type = format!("# {BEGIN} data:text/plain;base64,AQID {END}\n");
+        let bad_base64 = format!("# {BEGIN} data:application/c2pa;base64,*** {END}\n");
+        let doubled = format!("{inline}{inline}");
+        for text in [wrong_type, bad_base64, doubled] {
+            assert_eq!(
+                extract(TextMethod::Structured, text.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+                None
+            );
+            assert!(
+                exclusions(TextMethod::Structured, text.as_bytes(), TextLocatorRules::V2_5)
+                    .unwrap()
+                    .is_empty()
+                    || text.matches(BEGIN).count() == 1
+            );
+        }
+    }
+
+    #[test]
+    fn html_v2_5_scopes_discovery_to_head() {
+        let body_only = "<html><head><title>t</title></head><body>\
+            <script type=\"application/c2pa\">AQID</script></body></html>";
+        assert_eq!(
+            extract(TextMethod::Html, body_only.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            extract(TextMethod::Html, body_only.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            None
+        );
+
+        let head_and_body = "<html><HEAD>\n<script type=\"application/c2pa\"> AQID\n</script>\
+            </head><body><script type=\"application/c2pa\">BAUG</script></body></html>";
+        assert_eq!(
+            extract(TextMethod::Html, head_and_body.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            None,
+            "2.4 counts the body element and finds two"
+        );
+        assert_eq!(
+            extract(TextMethod::Html, head_and_body.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        let span =
+            exclusions(TextMethod::Html, head_and_body.as_bytes(), TextLocatorRules::V2_5).unwrap();
+        assert_eq!(span.len(), 1);
+        let excluded = &head_and_body[span[0].start..span[0].start + span[0].length];
+        assert!(excluded.starts_with("<script") && excluded.ends_with("</script>"));
+        assert!(excluded.contains("AQID"));
+
+        let two_in_head = "<html><head><script type=\"application/c2pa\">AQID</script>\
+            <link rel=\"c2pa-manifest\" href=\"https://x/m.c2pa\"></head></html>";
+        assert_eq!(
+            extract(TextMethod::Html, two_in_head.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            None
+        );
+        let header_not_head = "<header><script type=\"application/c2pa\">AQID</script></header>";
+        assert_eq!(
+            extract(TextMethod::Html, header_not_head.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            None
+        );
     }
 }

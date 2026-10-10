@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Spec revisions the evaluator accepts, as the private CLI spells them.
-const SPEC_VERSIONS: [&str; 6] = ["1.4", "2.0", "2.1", "2.2", "2.3", "2.4"];
+const SPEC_VERSIONS: [&str; 7] = ["1.4", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5"];
 
 /// The caller's engine profile: spec revision, operating mode, and
 /// compliance bar. `VerifyOptions::strict_conformance` can only express 2.4
@@ -33,9 +33,11 @@ pub struct CawgProfile {
 }
 
 impl CawgProfile {
-    /// `spec_version` is one of "1.4", "2.0", "2.1", "2.2", "2.3", "2.4".
-    /// `conformance_mode` selects the conformance operating mode, and
-    /// `compliance_program` the conformance-program compliance bar.
+    /// `spec_version` is one of "1.4", "2.0", "2.1", "2.2", "2.3", "2.4", or
+    /// "2.5". `conformance_mode` selects the conformance operating mode, and
+    /// `compliance_program` the conformance-program compliance bar. The
+    /// proposed 2.5 policy has no conformance profile, so "2.5" is accepted
+    /// only with both flags false.
     pub fn new(
         spec_version: &str,
         conformance_mode: bool,
@@ -51,6 +53,11 @@ impl CawgProfile {
                     SPEC_VERSIONS.join(", ")
                 ))
             })?;
+        if version >= SpecVersion::V2_5 && (conformance_mode || compliance_program) {
+            return Err(Error::Verification(
+                "spec_version \"2.5\" is a regular validation policy; conformance_mode and compliance_program must be false".into(),
+            ));
+        }
         let mode = if conformance_mode {
             OperatingMode::Conformance
         } else {
@@ -126,10 +133,10 @@ impl std::fmt::Debug for CawgEvaluator {
 }
 
 impl CawgEvaluator {
-    /// Posture comes only from `profile`. `strict_conformance: true`,
-    /// `online: Some(true)`, and a non-empty `external_data` are rejected:
-    /// this evaluator never fetches, and a posture flag that disagreed with
-    /// `profile` would be ambiguous.
+    /// Posture comes only from `profile`. `strict_conformance: true`, any
+    /// `spec_version`, `online: Some(true)`, and a non-empty `external_data`
+    /// are rejected: this evaluator never fetches, and a posture flag that
+    /// disagreed with `profile` would be ambiguous.
     ///
     /// `validation_time` is required. Every evaluation judges certificate
     /// validity, time stamps, and OCSP freshness at that instant, so an
@@ -139,6 +146,12 @@ impl CawgEvaluator {
         if options.strict_conformance {
             return Err(Error::Verification(
                 "strict_conformance must be false: the evaluator takes its posture from CawgProfile"
+                    .into(),
+            ));
+        }
+        if options.spec_version.is_some() {
+            return Err(Error::Verification(
+                "spec_version must be None: the evaluator takes its spec revision from CawgProfile"
                     .into(),
             ));
         }

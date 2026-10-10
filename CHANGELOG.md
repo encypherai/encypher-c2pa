@@ -2,6 +2,19 @@
 
 All notable changes to this project are recorded here.
 
+## 1.8.0 - unreleased
+
+### Added
+
+- `VerifyOptions::spec_version` (CLI `--spec`, Python `spec_version=`, Go `Options.SpecVersion`, C/WASM `spec_version` JSON field): an explicit C2PA validation policy. `None` and `"2.4"` are the same policy and produce byte-identical reports. `"2.5"` validates under the proposed C2PA 2.5 draft (specs-core `cd61a4d1`) and reports `profile: "c2pa-2.5"`; it is a regular validation policy, not a certified conformance profile, and is refused with `strict_conformance`. Any other value fails with the new `Error::UnsupportedSpecVersion` (`unsupported_spec_version`) before asset I/O. The policy is never inferred from a manifest's declared `specVersion`.
+- Rules applied only under `"2.5"`: unstructured-text wrappers admit any trailing padding and the whole selector run is the wrapper range; corrupted candidates are ignored and zero or several valid wrappers locate no manifest; structured text trims only ASCII whitespace and accepts only a valid `data:application/c2pa;base64,` reference, otherwise no manifest is located; HTML discovery is scoped to `head`; `manifest.inaccessible.malformed` for unreadable stores; `claim.actions.missing`; `when`/`whenStart`/`whenEnd` and `processStart`/`processEnd` ordering (`assertion.action.malformed`, `assertion.metadata.malformed`); redacted ingredient references (`assertion.redacted`), the `c2pa.deleted` ingredient rule, and `assertion.action.ingredientLocationMismatch`; ingredient `relatedAssertions`; `c2pa.linked-resource-integrity` structure checks with a per-entry `skipped` result; hard bindings and the multi-asset fallback counted only from `created_assertions`; a fragmented BMFF hash carrying both `hash` and `merkle` is malformed and an `ftyp` exclusion is optional; ESP256/384/512 claim signatures with their bound curves; `ingredient.unknownProvenance` is no longer recorded; `allActionsIncluded` and the new assertions enter a 2.5 rung of the version ladder, which the default policy never shows.
+- Fail-closed 2.5 constructs: a sole `c2pa.hash.segment` binding reports `com.encypher.assertion.segmentHash.unevaluated`, and an ML-DSA claim signature reports `algorithm.unsupported` because this verifier has no ML-DSA implementation. New 2.5 carriers (append-only text, WARC, MIDI, TTML, ONNX, SafeTensors, Parquet, BlockFact) remain unsupported.
+- `detached_manifest_evidence_with_options`, `C2PA_PROFILE_2_5`, and `SPEC_VERSIONS`. `CawgProfile::new` accepts `"2.5"` in regular mode only, and `CawgEvaluator::new` rejects a `spec_version` in its options.
+
+### Changed
+
+- Failure telemetry reports the profile of the policy that produced the report (`c2pa-2.4` or `c2pa-2.5`).
+
 ## 1.7.0 - 2026-10-01
 
 ### Added

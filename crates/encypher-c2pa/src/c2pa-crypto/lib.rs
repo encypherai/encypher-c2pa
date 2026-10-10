@@ -16,7 +16,8 @@ mod timestamp;
 pub(crate) use alg::CoseAlg;
 pub(crate) use cose::{
     extract_claim_tsa_tokens, extract_cose_alg, extract_tsa_tokens, extract_x5chain,
-    timestamp_input, timestamp_input_v1, verify_claim, visit_ocsp_staples, ClaimTimestampVersion,
+    timestamp_input, timestamp_input_v1, verify_claim, verify_claim_with, visit_ocsp_staples,
+    ClaimAlgorithmList, ClaimTimestampVersion,
 };
 pub(crate) use error::CryptoError;
 pub(crate) use session::{cose_key_id, verify_with_cose_key};

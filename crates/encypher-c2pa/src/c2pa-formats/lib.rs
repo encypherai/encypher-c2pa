@@ -473,8 +473,11 @@ pub(crate) use zip::{
 /// (monolithic chunked-mdat merkle validation).
 pub(crate) use bmff::bmff_mdat_payloads;
 
+pub(crate) use text::TextLocatorRules;
+
 /// Return a registered text-container failure when an embedded wrapper or
-/// structured-text reference is present but unusable.
+/// structured-text reference is present but unusable (C2PA 2.4 locator only;
+/// the 2.5 locator treats every such defect as no manifest located).
 pub(crate) fn text_diagnostic(format: AssetFormat, data: &[u8]) -> Option<text::TextDiagnostic> {
     match format {
         AssetFormat::TextUnstructured => text::diagnostic(text::TextMethod::Unstructured, data),
@@ -485,8 +488,9 @@ pub(crate) fn text_diagnostic(format: AssetFormat, data: &[u8]) -> Option<text::
 
 pub(crate) fn unstructured_text_wrapper_spans(
     data: &[u8],
+    rules: TextLocatorRules,
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
-    text::unstructured_wrapper_spans(data)
+    text::unstructured_wrapper_spans(data, rules)
 }
 
 /// A remote C2PA Manifest Store declaration read out of the asset's bytes.
@@ -580,12 +584,24 @@ fn logical_manifest_store(data: &[u8]) -> &[u8] {
     }
 }
 
-/// Extract the raw JUMBF manifest-store bytes from `data`.
+/// Extract the raw JUMBF manifest-store bytes from `data` under the C2PA 2.4
+/// text locator (the signer's and every default reader's rules).
 ///
 /// Returns `Ok(Some(bytes))` with the manifest-store superbox (suitable for
 /// [`crate::c2pa_core::jumbf::parse_manifest_store`]), `Ok(None)` if the asset is valid
 /// but has no manifest, or `Err` if the container is malformed.
 pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    extract_manifest_with(format, data, TextLocatorRules::V2_4)
+}
+
+/// [`extract_manifest`] under an explicit text locator. Only the text formats
+/// read `rules`; every other container locates its store identically in 2.4
+/// and 2.5.
+pub(crate) fn extract_manifest_with(
+    format: AssetFormat,
+    data: &[u8],
+    rules: TextLocatorRules,
+) -> Result<Option<Vec<u8>>, FormatError> {
     let manifest = match format {
         AssetFormat::Jpeg => jpeg::extract(data),
         AssetFormat::Png => png::extract(data),
@@ -601,9 +617,13 @@ pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u
         AssetFormat::Ogg => ogg::extract(data),
         AssetFormat::Font => font::extract(data),
         AssetFormat::Jxl => jxl::extract(data),
-        AssetFormat::TextUnstructured => text::extract(text::TextMethod::Unstructured, data),
-        AssetFormat::TextStructured { .. } => text::extract(text::TextMethod::Structured, data),
-        AssetFormat::TextHtml => text::extract(text::TextMethod::Html, data),
+        AssetFormat::TextUnstructured => {
+            text::extract(text::TextMethod::Unstructured, data, rules)
+        }
+        AssetFormat::TextStructured { .. } => {
+            text::extract(text::TextMethod::Structured, data, rules)
+        }
+        AssetFormat::TextHtml => text::extract(text::TextMethod::Html, data, rules),
         // The bytes ARE the manifest store; return verbatim (empty => no manifest).
         AssetFormat::C2paStore => {
             if data.is_empty() {
@@ -741,6 +761,16 @@ pub fn compute_data_hash_exclusions(
     format: AssetFormat,
     asset_with_placeholder: &[u8],
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
+    compute_data_hash_exclusions_with(format, asset_with_placeholder, TextLocatorRules::V2_4)
+}
+
+/// [`compute_data_hash_exclusions`] under an explicit text locator, so a 2.5
+/// verification measures the carrier its own locator selected.
+pub(crate) fn compute_data_hash_exclusions_with(
+    format: AssetFormat,
+    asset_with_placeholder: &[u8],
+    rules: TextLocatorRules,
+) -> Result<Vec<DataHashExclusion>, FormatError> {
     match format {
         AssetFormat::Jpeg => jpeg::exclusions(asset_with_placeholder),
         AssetFormat::Png => png::exclusions(asset_with_placeholder),
@@ -748,13 +778,19 @@ pub fn compute_data_hash_exclusions(
         AssetFormat::Riff => riff::exclusions(asset_with_placeholder),
         AssetFormat::Flac => flac::exclusions(asset_with_placeholder),
         AssetFormat::Ogg => ogg::exclusions(asset_with_placeholder),
-        AssetFormat::TextUnstructured => {
-            text::exclusions(text::TextMethod::Unstructured, asset_with_placeholder)
+        AssetFormat::TextUnstructured => text::exclusions(
+            text::TextMethod::Unstructured,
+            asset_with_placeholder,
+            rules,
+        ),
+        AssetFormat::TextStructured { .. } => text::exclusions(
+            text::TextMethod::Structured,
+            asset_with_placeholder,
+            rules,
+        ),
+        AssetFormat::TextHtml => {
+            text::exclusions(text::TextMethod::Html, asset_with_placeholder, rules)
         }
-        AssetFormat::TextStructured { .. } => {
-            text::exclusions(text::TextMethod::Structured, asset_with_placeholder)
-        }
-        AssetFormat::TextHtml => text::exclusions(text::TextMethod::Html, asset_with_placeholder),
         AssetFormat::Tiff => tiff::exclusions(asset_with_placeholder),
         AssetFormat::Gif => gif::exclusions(asset_with_placeholder),
         AssetFormat::Svg => svg::exclusions(asset_with_placeholder),

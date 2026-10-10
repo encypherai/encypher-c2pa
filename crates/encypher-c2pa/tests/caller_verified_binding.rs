@@ -297,16 +297,29 @@ fn the_document_signing_anchor_requirement_follows_the_option() {
 
 #[test]
 fn unknown_spec_versions_are_rejected() {
-    for version in ["1.3", "2.5", ""] {
+    for version in ["1.3", "2.6", "2.5.0", ""] {
         let error = CawgProfile::new(version, false, false).expect_err(version);
         assert!(
             matches!(&error, Error::Verification(message) if message.contains("spec_version")),
             "{version}: {error}"
         );
     }
-    for version in ["1.4", "2.0", "2.1", "2.2", "2.3", "2.4"] {
+    for version in ["1.4", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5"] {
         CawgProfile::new(version, false, false).unwrap_or_else(|e| panic!("{version}: {e}"));
     }
+    // The proposed 2.5 policy has no conformance profile.
+    for (mode, program) in [(true, false), (false, true), (true, true)] {
+        assert!(CawgProfile::new("2.5", mode, program).is_err());
+    }
+    // The evaluator takes its revision from the profile, never from options.
+    let options = VerifyOptions {
+        spec_version: Some("2.4".into()),
+        validation_time: Some("2026-01-01T00:00:00Z".into()),
+        ..VerifyOptions::default()
+    };
+    let error = CawgEvaluator::new(&options, &CawgProfile::new("2.4", false, false).unwrap())
+        .expect_err("spec_version in options is ambiguous");
+    assert!(error.to_string().contains("spec_version"));
 }
 
 /// A manifest store superbox with the same description box and no children.

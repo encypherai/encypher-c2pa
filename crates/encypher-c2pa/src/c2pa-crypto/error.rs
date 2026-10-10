@@ -12,6 +12,12 @@ pub enum CryptoError {
     #[error("unsupported COSE algorithm id: {0}")]
     UnsupportedAlg(i128),
 
+    /// The COSE `alg` header names an algorithm the selected C2PA revision
+    /// allows but this verifier does not implement (ML-DSA under 2.5). The
+    /// signature is not evaluated, so it can never verify.
+    #[error("COSE algorithm id {0} is allowed by the selected C2PA revision but not implemented by this verifier")]
+    UnimplementedAlg(i128),
+
     /// CBOR encoding failed while building a COSE structure.
     #[error("CBOR encode failed: {0}")]
     Encode(#[from] EncodeError),

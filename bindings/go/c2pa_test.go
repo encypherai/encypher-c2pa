@@ -345,3 +345,32 @@ func TestVerifyFileRejectsFIFOWithoutBlocking(t *testing.T) {
 		t.Fatal("VerifyFile blocked while opening a FIFO")
 	}
 }
+
+func TestSpecVersionSelectsThePolicyAndRejectsUnknownValues(t *testing.T) {
+	asset, err := os.ReadFile(filepath.Join("..", "..", "tests", "fixtures", "signed_test.jpg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		spec    string
+		profile string
+	}{{"", "c2pa-2.4"}, {"2.4", "c2pa-2.4"}, {"2.5", "c2pa-2.5"}} {
+		report, err := Verify(asset, "image/jpeg", &Options{SpecVersion: tc.spec, ValidationTime: "2026-01-01T00:00:00Z"})
+		if err != nil {
+			t.Fatalf("spec %q: %v", tc.spec, err)
+		}
+		if report.Profile != tc.profile {
+			t.Fatalf("spec %q reported profile %q, want %q", tc.spec, report.Profile, tc.profile)
+		}
+	}
+	missing := filepath.Join(t.TempDir(), "missing.jpg")
+	for _, options := range []*Options{
+		{SpecVersion: "2.6"},
+		{SpecVersion: "2.5", StrictConformance: true},
+	} {
+		_, err := VerifyFile(missing, "image/jpeg", options)
+		if err == nil || !strings.Contains(err.Error(), "unsupported_spec_version") {
+			t.Fatalf("%+v: expected unsupported_spec_version before asset I/O, got %v", options, err)
+		}
+	}
+}

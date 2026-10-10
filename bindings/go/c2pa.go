@@ -83,9 +83,15 @@ type Options struct {
 	// ExpectedSeekPositions are zero-based indexes into supplied fragments or
 	// stream segments where the player expects a discontinuity. Single-asset
 	// verification ignores them.
-	ExpectedSeekPositions []int  `json:"expected_seek_positions,omitempty"`
-	StrictConformance     bool   `json:"strict_conformance,omitempty"`
-	ValidationTime        string `json:"validation_time,omitempty"`
+	ExpectedSeekPositions []int `json:"expected_seek_positions,omitempty"`
+	// SpecVersion selects the C2PA validation policy: "" or "2.4" (the
+	// default, identical reports) or "2.5" for the proposed C2PA 2.5 draft.
+	// "2.5" reports profile "c2pa-2.5" and cannot be combined with
+	// StrictConformance. Any other value fails with unsupported_spec_version
+	// before the asset is read.
+	SpecVersion       string `json:"spec_version,omitempty"`
+	StrictConformance bool   `json:"strict_conformance,omitempty"`
+	ValidationTime    string `json:"validation_time,omitempty"`
 	// Online allows this call to fetch what the asset references: a manifest
 	// store held elsewhere, certificate revocation status, a did:web
 	// document, externally stored content. Nil leaves it off unless the

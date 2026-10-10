@@ -127,7 +127,12 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+/// Report `profile` of the default C2PA 2.4 validation policy.
 pub const C2PA_PROFILE: &str = "c2pa-2.4";
+/// Report `profile` of the explicitly selected proposed C2PA 2.5 policy.
+pub const C2PA_PROFILE_2_5: &str = "c2pa-2.5";
+/// Every value [`VerifyOptions::spec_version`] accepts. `None` means `"2.4"`.
+pub const SPEC_VERSIONS: &[&str] = &["2.4", "2.5"];
 const MAX_MANIFEST_STORE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PATH_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 /// Largest DER `OCSPResponse` accepted as caller-supplied evidence.
@@ -213,12 +218,30 @@ pub struct VerifyOptions {
     /// player expects a discontinuity. Values must be unique, strictly
     /// increasing, and in bounds. Ignored by single-asset verification.
     pub expected_seek_positions: Vec<usize>,
+    /// C2PA validation policy: `"2.4"` or `"2.5"`. `None` is the default and
+    /// is identical to `"2.4"`, the current behavior and reports.
+    ///
+    /// `"2.5"` validates under the proposed C2PA 2.5 draft (specs-core
+    /// `cd61a4d1`): its text-carrier locating rules, padding admission,
+    /// action and assertion-metadata time checks, `relatedAssertions`, linked
+    /// resource integrity, `claim.actions.missing`,
+    /// `manifest.inaccessible.malformed`, BMFF hash rules, and the ESP claim
+    /// signature algorithms. Reports carry `profile: "c2pa-2.5"`. It is a
+    /// regular validation policy, not a certified conformance profile, so it
+    /// cannot be combined with `strict_conformance`. New 2.5 carriers
+    /// (append-only text, WARC, MIDI, TTML, ML-model and BlockFact formats)
+    /// remain unsupported, and a `c2pa.hash.segment` or ML-DSA signature fails
+    /// closed as unevaluated.
+    ///
+    /// Any other value fails with [`Error::UnsupportedSpecVersion`] before
+    /// asset I/O. The policy is never inferred from what a manifest declares.
+    pub spec_version: Option<String>,
     /// Apply the C2PA 2.4 Conformance Program posture instead of the default
     /// generous core-spec read. This raises applicable SHOULD requirements to
     /// the conformance bar and emits strict diagnostics in the reader report.
     /// It also requires CAWG Identity 1.3 deterministic `signer_payload` CBOR;
     /// the default accepts the CAWG 1.1 field order with
-    /// `com.encypher.cawg.legacyProfile`.
+    /// `com.encypher.cawg.legacyProfile`. Available only with the 2.4 policy.
     pub strict_conformance: bool,
     /// Refuse the CAWG field-order `signer_payload` encoding that c2pa-rs
     /// writes, without applying the rest of the conformance posture. When
@@ -477,6 +500,8 @@ pub enum Error {
     InvalidTrust(String),
     #[error("invalid validation time: {0}")]
     InvalidValidationTime(String),
+    #[error("unsupported spec version: {0}")]
+    UnsupportedSpecVersion(String),
     #[error("verification failed: {0}")]
     Verification(String),
     #[error("could not read asset: {0}")]
@@ -495,6 +520,7 @@ impl Error {
             Self::UnsupportedMime(_) => "unsupported_mime",
             Self::InvalidTrust(_) => "invalid_trust_material",
             Self::InvalidValidationTime(_) => "invalid_validation_time",
+            Self::UnsupportedSpecVersion(_) => "unsupported_spec_version",
             Self::Verification(_) => "verification_error",
             Self::Io(_) => "io_error",
             Self::OnlinePreference(_) => "online_preference_error",
@@ -530,7 +556,7 @@ pub fn verify_fragmented(
     )
 }
 /// Extract the signed manifest store and its contiguous carrier for detached
-/// server validation.
+/// server validation, locating it under the default C2PA 2.4 policy.
 ///
 /// This is read-only. It never performs network I/O and never constructs or
 /// writes a manifest. `Ok(None)` means the asset has no embedded manifest or
@@ -539,18 +565,39 @@ pub fn detached_manifest_evidence(
     data: &[u8],
     mime_type: &str,
 ) -> Result<Option<DetachedManifestEvidence>, Error> {
+    detached_manifest_evidence_with_options(data, mime_type, &VerifyOptions::default())
+}
+
+/// [`detached_manifest_evidence`] under the policy `options.spec_version`
+/// selects. Only the text carriers locate their store differently under 2.5
+/// (one valid wrapper, head-scoped HTML, strict structured references), so
+/// a 2.5 extraction returns exactly the store a 2.5 verification reads.
+///
+/// Only `spec_version` and `strict_conformance` are read; an unknown policy
+/// fails with [`Error::UnsupportedSpecVersion`] before the asset is parsed.
+pub fn detached_manifest_evidence_with_options(
+    data: &[u8],
+    mime_type: &str,
+    options: &VerifyOptions,
+) -> Result<Option<DetachedManifestEvidence>, Error> {
+    let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
+    let rules = if profile.version >= SpecVersion::V2_5 {
+        crate::c2pa_formats::TextLocatorRules::V2_5
+    } else {
+        crate::c2pa_formats::TextLocatorRules::V2_4
+    };
     let mime = canonicalize_mime(mime_type);
     let format = crate::c2pa_formats::AssetFormat::from_mime(&mime)
         .ok_or_else(|| Error::UnsupportedMime(mime.clone()))?;
     if !crate::c2pa_formats::supports_hash_mode(&mime) {
         return Ok(None);
     }
-    let Some(manifest_store) = crate::c2pa_formats::extract_manifest(format, data)
+    let Some(manifest_store) = crate::c2pa_formats::extract_manifest_with(format, data, rules)
         .map_err(|error| Error::Verification(error.to_string()))?
     else {
         return Ok(None);
     };
-    let spans = crate::c2pa_formats::compute_data_hash_exclusions(format, data)
+    let spans = crate::c2pa_formats::compute_data_hash_exclusions_with(format, data, rules)
         .map_err(|error| Error::Verification(error.to_string()))?;
     let [span] = spans.as_slice() else {
         return Ok(None);
@@ -796,6 +843,10 @@ pub(crate) struct ResolvedOptions {
 
 impl ResolvedOptions {
     pub(crate) fn resolve(options: &VerifyOptions) -> Result<Self, Error> {
+        // The policy selector is resolved first, so an unknown value fails
+        // before any trust material is parsed or asset read.
+        let profile =
+            resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
         let use_defaults = !options.no_default_trust;
         let validation_time = parse_validation_time(options.validation_time.as_deref())?;
         let custom_claim_trust = options.trust_pem.is_some() || options.allowed_list_pem.is_some();
@@ -858,11 +909,7 @@ impl ResolvedOptions {
                 (false, true) => "caller_supplied_static_material",
                 (false, false) => "none",
             },
-            profile: if options.strict_conformance {
-                EngineProfile::strict(SpecVersion::V2_4)
-            } else {
-                EngineProfile::GENEROUS
-            },
+            profile,
             cawg_strict_encoding: options.cawg_strict_encoding,
             cawg_document_signing_require_anchor: options
                 .cawg_document_signing_require_anchor
@@ -906,6 +953,44 @@ impl ResolvedOptions {
 
     pub(crate) fn cawg_allowed_certs(&self) -> Option<&TrustList> {
         self.cawg_allowed_certs.as_ref().map(ResolvedTrust::get)
+    }
+}
+
+/// The engine profile for the caller's policy selection.
+///
+/// `None` and `"2.4"` are the same policy and resolve to the same profile, so
+/// the two produce byte-identical reports. `"2.5"` is the proposed 2.5 draft
+/// read under the generous core-spec posture only: it has no certified format
+/// scope, so pairing it with `strict_conformance` is refused rather than
+/// silently evaluated against the 2.4 conformance profile.
+fn resolve_profile(spec_version: Option<&str>, strict: bool) -> Result<EngineProfile, Error> {
+    match (spec_version, strict) {
+        (None | Some("2.4"), true) => Ok(EngineProfile::strict(SpecVersion::V2_4)),
+        (None | Some("2.4"), false) => Ok(EngineProfile::GENEROUS),
+        (Some("2.5"), true) => Err(Error::UnsupportedSpecVersion(
+            "strict_conformance is not defined for the proposed C2PA 2.5 policy; use spec_version \"2.4\" for the conformance posture or disable strict_conformance".into(),
+        )),
+        (Some("2.5"), false) => Ok(EngineProfile {
+            version: SpecVersion::V2_5,
+            ..EngineProfile::GENEROUS
+        }),
+        (Some(other), _) => Err(Error::UnsupportedSpecVersion(format!(
+            "spec_version {other:?} is not one of {}",
+            SPEC_VERSIONS
+                .iter()
+                .map(|version| format!("{version:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// The report `profile` for an engine profile's validation policy.
+fn report_profile(profile: EngineProfile) -> &'static str {
+    if profile.version >= SpecVersion::V2_5 {
+        C2PA_PROFILE_2_5
+    } else {
+        C2PA_PROFILE
     }
 }
 
@@ -981,7 +1066,7 @@ pub(crate) fn report_from_output(
     );
     VerificationReport {
         schema_version: REPORT_SCHEMA_VERSION.to_string(),
-        profile: C2PA_PROFILE.to_string(),
+        profile: report_profile(resolved.profile).to_string(),
         mime_type: mime,
         present,
         integrity,

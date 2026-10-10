@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
-    allow_interactive_online_consent, detached_manifest_evidence, mime_from_path,
+    allow_interactive_online_consent, detached_manifest_evidence_with_options, mime_from_path,
     online_preference, set_online_preference, set_telemetry_enabled, supported_mime_types,
     telemetry_preference, verify_file, verify_fragmented_with_options, verify_stream_with_options,
     verify_with_manifest_store, verify_with_options, CawgTrustConfiguration, Error,
@@ -150,9 +150,15 @@ enum Command {
         cawg_strict_encoding: bool,
         /// Apply the C2PA 2.4 Conformance Program posture: SHOULD requirements
         /// the program raises become failures, and CAWG signer payloads must
-        /// use CAWG Identity 1.3 deterministic CBOR.
+        /// use CAWG Identity 1.3 deterministic CBOR. Not available with
+        /// `--spec 2.5`.
         #[arg(long)]
         strict_conformance: bool,
+        /// C2PA validation policy: `2.4` (the default and current behavior) or
+        /// `2.5` (the proposed 2.5 draft, regular validation only). Any other
+        /// value fails with `unsupported_spec_version` before the asset is read.
+        #[arg(long, visible_alias = "spec-version", value_name = "2.4|2.5")]
+        spec: Option<String>,
         /// RFC 3339 validation instant (default: current UTC time).
         #[arg(long, visible_alias = "validation-time", value_name = "RFC3339")]
         time: Option<String>,
@@ -268,6 +274,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             cawg_ica_status_lists,
             cawg_strict_encoding,
             strict_conformance,
+            spec,
             time,
             telemetry,
             no_telemetry,
@@ -330,6 +337,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 expected_seek_positions: expected_seek,
                 cawg_strict_encoding,
                 strict_conformance,
+                spec_version: spec,
                 validation_time: time,
                 telemetry: TelemetryOptions {
                     enabled: explicit_telemetry,
@@ -373,7 +381,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 };
                 let bytes = read_path_asset(&asset)?;
                 let report = verify_with_options(&bytes, &mime, &options)?;
-                let evidence = detached_manifest_evidence(&bytes, &mime)?;
+                let evidence = detached_manifest_evidence_with_options(&bytes, &mime, &options)?;
                 let endpoint = encypher_api_endpoint
                     .unwrap_or_else(|| encypher_api::DEFAULT_ENDPOINT.to_string());
                 let api_key = std::env::var("ENCYPHER_API_KEY")

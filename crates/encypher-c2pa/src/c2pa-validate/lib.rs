@@ -81,6 +81,7 @@ mod report;
 mod revocation;
 #[cfg(test)]
 pub(crate) mod signature_conformance_tests;
+mod spec25;
 pub(crate) mod stream;
 mod timestamp_assertion;
 mod update_manifest;
@@ -97,7 +98,7 @@ use crate::c2pa_core::jumbf::{
     AssertionContentType, ExpandedStore, JumbfError, ManifestKind, ParsedManifest, ParsedStore,
 };
 pub(crate) use crate::c2pa_core::{ComplianceLevel, EngineProfile, OperatingMode, SpecVersion};
-use crate::c2pa_crypto::{extract_x5chain, verify_claim, visit_ocsp_staples, CryptoError};
+use crate::c2pa_crypto::{extract_x5chain, verify_claim_with, visit_ocsp_staples, CryptoError};
 use crate::c2pa_formats::{text_standard, AssetFormat};
 use crate::c2pa_trust::{validate_chain, OnlineOcspVerdict, TrustList, MAX_OCSP_RESPONSE_BYTES};
 use serde::Serialize;
@@ -1007,7 +1008,17 @@ fn verify_with_fragments_mode_and_expected_seeks(
         (Vec::new(), None)
     };
 
-    if let Some(diagnostic) = crate::c2pa_formats::text_diagnostic(format, input.data) {
+    // C2PA 2.4 names a corrupted unstructured wrapper and each unusable
+    // structured-text reference with a `manifest.*` failure. The 2.5 locator
+    // ("Locating the C2PA Manifest Store ... is not itself associated with a
+    // validation status code") treats every one of them as no manifest
+    // located, which the 2.5 text locator below implements.
+    let diagnostic = if spec25::applies(input.profile) {
+        None
+    } else {
+        crate::c2pa_formats::text_diagnostic(format, input.data)
+    };
+    if let Some(diagnostic) = diagnostic {
         let mut out = container_failure_output(
             diagnostic.code(),
             "text manifest carrier is malformed or cannot be resolved",
@@ -1040,7 +1051,11 @@ fn verify_with_fragments_mode_and_expected_seeks(
         }
     }
 
-    let store_bytes = match crate::c2pa_formats::extract_manifest(format, input.data) {
+    let store_bytes = match crate::c2pa_formats::extract_manifest_with(
+        format,
+        input.data,
+        spec25::text_rules(input.profile),
+    ) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             // C2PA 2.4 Validation, By Reference: with no embedded store, a
@@ -2675,7 +2690,15 @@ fn verify_manifest_bound<'a>(
     // the output and is finalized in `finish` (cleared when Invalid).
     let generation = versions::claim_generation(manifest, &claim);
     let mut claim_refs = ClaimAssertionRefs::build(manifest, &claim, generation);
-    let verdict = versions::evaluate_for(manifest, &claim, binding.format());
+    // The ladder frame follows the caller's selected policy, never the
+    // manifest's declaration: the default 2.4 policy keeps the historical
+    // 1.4-2.4 frame, and only an explicit 2.5 selection adds the 2.5 rung.
+    let verdict = versions::evaluate_for(
+        manifest,
+        &claim,
+        binding.format(),
+        versions::ladder_ceiling(input.profile.version),
+    );
     // An update manifest carries no hard binding of its own, so its content
     // check and any identity inside it use the binding in the first standard
     // manifest of its parentOf chain (C2PA 2.4 Validation, "Validate the
@@ -2914,7 +2937,9 @@ fn verify_manifest_bound<'a>(
         });
 
     // Cryptographic verification of the claim signature against the leaf.
-    let sig_verification = leaf.map(|d| verify_claim(cose, claim_cbor, d));
+    let sig_verification = leaf.map(|d| {
+        verify_claim_with(cose, claim_cbor, d, spec25::claim_algorithms(input.profile))
+    });
     let sig_ok = matches!(sig_verification, Some(Ok(())));
 
     let generous = is_generous(input.profile);
@@ -2971,6 +2996,16 @@ fn verify_manifest_bound<'a>(
                     Some(Err(CryptoError::UnsupportedAlg(id))) => (
                         ALGORITHM_UNSUPPORTED,
                         format!("claim signature algorithm {id} is not on the C2PA allowed list"),
+                    ),
+                    // Allowed by the selected 2.5 policy (ML-DSA) but not
+                    // implementable here: the signature was never evaluated,
+                    // so it fails closed under the registered
+                    // unsupported-algorithm code rather than verifying.
+                    Some(Err(CryptoError::UnimplementedAlg(id))) => (
+                        ALGORITHM_UNSUPPORTED,
+                        format!(
+                            "claim signature algorithm {id} (ML-DSA) is allowed by C2PA 2.5 but not implemented by this verifier; the signature was not evaluated"
+                        ),
                     ),
                     Some(Err(error)) => (
                         CLAIM_SIGNATURE_MISMATCH,
@@ -3972,6 +4007,21 @@ fn claim_structure_first_fatal(
             );
             mark_fatal(&mut fatal, results);
         }
+        // 2.5 Update Manifest Assertions adds `c2pa.hash.segment` to the hard
+        // bindings an update manifest shall not carry.
+        if spec25::applies(profile)
+            && claim_refs
+                .declaration_labels
+                .iter()
+                .any(|label| spec25::is_segment_hash_label(label))
+        {
+            results.push_failure(
+                MANIFEST_UPDATE_INVALID,
+                format!("self#jumbf=/c2pa/{}", manifest.label),
+                "update manifest carries a c2pa.hash.segment hard binding".into(),
+            );
+            mark_fatal(&mut fatal, results);
+        }
         if !inspection.wrong_parents && !inspection.invalid {
             match update_manifest::resolve_standard(manifest, store.manifests) {
                 Ok(standard) => match standard.claim_cbor.and_then(|bytes| decode(bytes).ok()) {
@@ -4123,13 +4173,50 @@ fn claim_structure_first_fatal(
     // checked above for forbidden bindings and multi-asset assertions.
     if !is_update {
         let binding_plan = claim_refs.binding_plan(compound_ok);
-        match binding_plan.primary_count {
+        // 2.5 adds `c2pa.hash.segment` (append-only text) to the hard
+        // bindings counted for "exactly one". This verifier does not evaluate
+        // it, so a sole segment binding fails closed as unevaluated rather
+        // than reading as missing or valid. Under 2.4 it is an unknown label.
+        let segment_count = if spec25::applies(profile) {
+            claim_refs
+                .references
+                .iter()
+                .filter_map(|reference| reference.label)
+                .filter(|label| spec25::is_segment_hash_label(label))
+                .count()
+        } else {
+            0
+        };
+        match binding_plan.primary_count + segment_count {
             0 => results.push_failure(
                 CLAIM_HARD_BINDINGS_MISSING,
                 sig_url.to_string(),
                 "claim references no supported primary hard binding".into(),
             ),
-            1 => {}
+            1 if segment_count == 1 => results.push_failure(
+                spec25::ASSERTION_SEGMENT_HASH_UNEVALUATED,
+                format!(
+                    "self#jumbf=/c2pa/{}/c2pa.assertions/c2pa.hash.segment",
+                    manifest.label
+                ),
+                "c2pa.hash.segment (append-only text) hard bindings are not evaluated by this verifier; the content binding was not checked".into(),
+            ),
+            1 => {
+                // 2.5 Validate the Asset's Content: the standard manifest's
+                // hard binding must be in `created_assertions`; a binding
+                // gathered from elsewhere does not bind the content.
+                let gathered_only = binding_plan
+                    .primary()
+                    .is_some_and(|reference| reference.field == "gathered_assertions");
+                if spec25::applies(profile) && gathered_only {
+                    results.push_failure(
+                        CLAIM_HARD_BINDINGS_MISSING,
+                        sig_url.to_string(),
+                        "the hard binding is declared in gathered_assertions, not created_assertions"
+                            .into(),
+                    );
+                }
+            }
             _ => {
                 results.push_failure(
                     ASSERTION_MULTIPLE_HARD_BINDINGS,
@@ -4176,6 +4263,11 @@ fn claim_structure_first_fatal(
     verify_cawg_content_assertions(manifest, claim_refs, results);
 
     verify_ingredient_shapes(manifest, claim_refs, results);
+    if spec25::applies(profile) {
+        verify_ingredient_related_assertions(manifest, claim, claim_refs, profile, results);
+        spec25::verify_metadata_process_windows(&manifest.label, claim_refs, results);
+        spec25::verify_linked_resource_integrity(&manifest.label, claim_refs, results);
+    }
     verify_alternative_content(manifest, claim, claim_refs, results);
 
     verify_action_assertions(
@@ -4660,7 +4752,24 @@ fn verify_action_assertions(
         results.push_failure(code, sig_url.to_string(), explanation);
     };
 
-    for (label, assertion) in created.iter().chain(gathered.iter()) {
+    let v2_5 = spec25::applies(profile);
+    // 2.5 lets ingredient and related-assertion references resolve to a
+    // redacted assertion; the list spans the whole store.
+    let redactions = if v2_5 {
+        spec25::store_redactions(store.manifests)
+    } else {
+        std::collections::HashSet::new()
+    };
+    let created_field = if generation == ClaimGeneration::V1 {
+        "assertions"
+    } else {
+        "created_assertions"
+    };
+    for (actions_field, (label, assertion)) in created
+        .iter()
+        .map(|entry| (created_field, entry))
+        .chain(gathered.iter().map(|entry| ("gathered_assertions", entry)))
+    {
         let software_agent_count = match assertion.get("softwareAgents") {
             Some(Value::Array(values)) => values.len(),
             _ => 0,
@@ -4697,12 +4806,18 @@ fn verify_action_assertions(
             ) {
                 fail(results, ASSERTION_ACTION_MALFORMED, error);
             }
+            for error in spec25::action_time_errors(action, label.starts_with("c2pa.actions.v2"))
+                .into_iter()
+                .filter(|_| v2_5)
+            {
+                fail(results, ASSERTION_ACTION_MALFORMED, error);
+            }
 
             let parameters = action.get("parameters");
             // 1.x-era v1 claims predate the ingredient-reference rules, so they
             // are held to them only under strict conformance (c2pa-rs likewise
             // skips them unless `strict_v1_validation` is set).
-            let ingredient_rule = ActionIngredientRule::for_action(kind)
+            let ingredient_rule = ActionIngredientRule::for_action(kind, v2_5)
                 .filter(|_| generation == ClaimGeneration::V2 || !is_generous(profile));
             if let Some(rule) = ingredient_rule {
                 // `c2pa.actions.v2` names the field `ingredients`. `c2pa.actions`
@@ -4728,10 +4843,18 @@ fn verify_action_assertions(
                     ActionIngredientRule::Placed | ActionIngredientRule::Removed => {
                         !references.is_empty()
                     }
+                    // 2.5: optional, but when present one or more references.
+                    ActionIngredientRule::Deleted => field.is_none() || !references.is_empty(),
                     ActionIngredientRule::Derived => true,
                 };
+                let foreign = matches!(
+                    rule,
+                    ActionIngredientRule::Removed | ActionIngredientRule::Deleted
+                );
+                let mut redacted_references: Vec<String> = Vec::new();
+                let mut location_mismatches: Vec<String> = Vec::new();
                 let resolves = references.iter().all(|reference| {
-                    let relationship = if rule == ActionIngredientRule::Removed {
+                    let relationship = if foreign {
                         foreign_ingredient_relationship(
                             reference,
                             claim,
@@ -4741,7 +4864,7 @@ fn verify_action_assertions(
                             results,
                         )
                     } else {
-                        nested_assertion_reference_label(
+                        let target = nested_assertion_reference_label(
                             reference,
                             claim,
                             claim_refs,
@@ -4749,14 +4872,51 @@ fn verify_action_assertions(
                             profile,
                             results,
                         )
-                        .filter(|target| target.starts_with("c2pa.ingredient"))
-                        .and_then(|target| claim_refs.indexed(target))
-                        .and_then(|assertion| assertion.decoded.as_ref())
-                        .and_then(|ingredient| ingredient.get("relationship"))
-                        .and_then(Value::as_text)
-                        .map(str::to_string)
+                        .filter(|target| target.starts_with("c2pa.ingredient"));
+                        // 2.5: a resolved ingredient for `c2pa.opened` or
+                        // `c2pa.placed` in a v2 claim belongs in the same
+                        // claim field as this actions assertion.
+                        if let Some(target) = target.filter(|_| {
+                            v2_5 && generation == ClaimGeneration::V2
+                                && matches!(
+                                    rule,
+                                    ActionIngredientRule::Opened | ActionIngredientRule::Placed
+                                )
+                        }) {
+                            let ingredient_field = claim_refs
+                                .references
+                                .iter()
+                                .find(|candidate| candidate.label == Some(target))
+                                .map(|candidate| candidate.field);
+                            if ingredient_field.is_some_and(|field| field != actions_field) {
+                                location_mismatches.push(target.to_string());
+                            }
+                        }
+                        target
+                            .and_then(|target| claim_refs.indexed(target))
+                            .and_then(|assertion| assertion.decoded.as_ref())
+                            .and_then(|ingredient| ingredient.get("relationship"))
+                            .and_then(Value::as_text)
+                            .map(str::to_string)
                     };
-                    relationship.as_deref() == Some(rule.relationship())
+                    if relationship.as_deref() == Some(rule.relationship()) {
+                        return true;
+                    }
+                    // 2.5: "or to a redacted ingredient assertion in the
+                    // current manifest" (another manifest for removed and
+                    // deleted). 2.4 has no such alternative.
+                    match spec25::redacted_reference_target(reference, manifest_label, &redactions)
+                    {
+                        Some(target)
+                            if v2_5
+                                && target.same_manifest != foreign
+                                && target.label.starts_with("c2pa.ingredient") =>
+                        {
+                            redacted_references.push(target.url.to_string());
+                            true
+                        }
+                        _ => false,
+                    }
                 });
                 if !(count_ok && resolves) {
                     fail(
@@ -4765,6 +4925,22 @@ fn verify_action_assertions(
                         format!(
                             "{kind} does not resolve its {} ingredient",
                             rule.relationship()
+                        ),
+                    );
+                }
+                for url in redacted_references {
+                    results.push_informational(
+                        spec25::ASSERTION_REDACTED,
+                        url,
+                        format!("{kind} references a redacted ingredient assertion"),
+                    );
+                }
+                for target in location_mismatches {
+                    results.push_informational(
+                        spec25::ASSERTION_ACTION_INGREDIENT_LOCATION_MISMATCH,
+                        format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{target}"),
+                        format!(
+                            "{kind} ingredient '{target}' is not declared in {actions_field} with its actions assertion"
                         ),
                     );
                 }
@@ -4805,26 +4981,49 @@ fn verify_action_assertions(
             }
 
             if let Some(related) = parameters.and_then(|value| value.get("relatedAssertions")) {
+                let eligible =
+                    |target: &str| !target.starts_with("c2pa.actions") && !target.starts_with("c2pa.ingredient");
+                let mut redacted_related: Vec<String> = Vec::new();
                 let valid = matches!(related, Value::Array(values) if !values.is_empty()
                 && values.iter().all(|reference| {
-                    nested_assertion_reference_label(
+                    match nested_assertion_reference_label(
                         reference,
                         claim,
                         claim_refs,
                         manifest_label,
                         profile,
                         results,
-                    )
-                    .is_some_and(|target| {
-                        !target.starts_with("c2pa.actions")
-                            && !target.starts_with("c2pa.ingredient")
-                    })
+                    ) {
+                        Some(target) => eligible(target),
+                        // 2.5: the target "may or may not be redacted".
+                        None if v2_5 => match spec25::redacted_reference_target(
+                            reference,
+                            manifest_label,
+                            &redactions,
+                        ) {
+                            Some(target)
+                                if target.same_manifest && eligible(target.label.as_str()) =>
+                            {
+                                redacted_related.push(target.url.to_string());
+                                true
+                            }
+                            _ => false,
+                        },
+                        None => false,
+                    }
                 }));
                 if !valid {
                     fail(
                         results,
                         ASSERTION_ACTION_MALFORMED,
                         "relatedAssertions does not resolve eligible assertions".into(),
+                    );
+                }
+                for url in redacted_related {
+                    results.push_informational(
+                        spec25::ASSERTION_REDACTED,
+                        url,
+                        "relatedAssertions references a redacted assertion".into(),
                     );
                 }
             }
@@ -4889,7 +5088,30 @@ fn verify_action_assertions(
     // Update Manifests, permits an update to carry just `c2pa.edited.metadata`,
     // `c2pa.opened`, `c2pa.published` or `c2pa.redacted`. Whatever actions an
     // update does carry are still checked against that allowlist elsewhere.
-    if manifest_kind == ManifestKind::Standard && inception_assertions != 1 {
+    //
+    // 2.5 splits the absent case out: "Validate that at least one actions
+    // assertion is present in either `created_assertions` or
+    // `gathered_assertions`. If there is none, the manifest shall be rejected
+    // with ... `claim.actions.missing`." Presence is read from the claim's
+    // declarations, so an undecodable actions assertion is not "missing" (it
+    // already carries its decode failure).
+    let declares_actions = claim_refs.references.iter().any(|reference| {
+        matches!(reference.field, "created_assertions" | "gathered_assertions")
+            && reference
+                .label
+                .is_some_and(|label| label.starts_with("c2pa.actions"))
+    });
+    if manifest_kind == ManifestKind::Standard
+        && v2_5
+        && generation == ClaimGeneration::V2
+        && !declares_actions
+    {
+        fail(
+            results,
+            spec25::CLAIM_ACTIONS_MISSING,
+            "standard manifest declares no actions assertion".into(),
+        );
+    } else if manifest_kind == ManifestKind::Standard && inception_assertions != 1 {
         fail(
             results,
             ASSERTION_ACTION_MALFORMED,
@@ -4923,7 +5145,7 @@ fn verify_action_assertions(
 }
 
 /// The ingredient an action must (or may) reference, per the C2PA 2.4
-/// `c2pa.actions` validation rules.
+/// `c2pa.actions` validation rules and, for `c2pa.deleted`, the 2.5 rules.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActionIngredientRule {
     /// Exactly one parentOf ingredient in this manifest.
@@ -4932,16 +5154,22 @@ enum ActionIngredientRule {
     Placed,
     /// One or more componentOf ingredients in another manifest.
     Removed,
+    /// 2.5 `c2pa.deleted`: optional; when present, one or more componentOf
+    /// ingredients in another manifest.
+    Deleted,
     /// `c2pa.transcoded`/`c2pa.repackaged`: optional parentOf ingredients.
     Derived,
 }
 
 impl ActionIngredientRule {
-    fn for_action(kind: &str) -> Option<Self> {
+    /// The rule for `kind`. `v2_5` adds the `c2pa.deleted` rule, which 2.4
+    /// does not have.
+    fn for_action(kind: &str, v2_5: bool) -> Option<Self> {
         match kind {
             "c2pa.opened" => Some(Self::Opened),
             "c2pa.placed" => Some(Self::Placed),
             "c2pa.removed" => Some(Self::Removed),
+            "c2pa.deleted" if v2_5 => Some(Self::Deleted),
             "c2pa.transcoded" | "c2pa.repackaged" => Some(Self::Derived),
             _ => None,
         }
@@ -4950,7 +5178,7 @@ impl ActionIngredientRule {
     fn relationship(self) -> &'static str {
         match self {
             Self::Opened | Self::Derived => "parentOf",
-            Self::Placed | Self::Removed => "componentOf",
+            Self::Placed | Self::Removed | Self::Deleted => "componentOf",
         }
     }
 }
@@ -5075,6 +5303,82 @@ fn verify_ingredient_shapes(
                 ),
                 error,
             );
+        }
+    }
+}
+
+/// 2.5 Ingredient Assertion Validation, `relatedAssertions`: an ingredient may
+/// reference assertions about itself, but not alongside `activeManifest`, not
+/// as an empty list, and only assertions in the same manifest whose label ends
+/// with `.ingredient` and that are neither ingredient nor actions assertions.
+/// Each violation rejects the ingredient with `assertion.ingredient.malformed`.
+fn verify_ingredient_related_assertions(
+    manifest: &ParsedManifest<'_>,
+    claim: &Value,
+    claim_refs: &ClaimAssertionRefs<'_>,
+    profile: EngineProfile,
+    results: &mut ValidationResults,
+) {
+    for reference in &claim_refs.references {
+        let Some(label) = reference
+            .label
+            .filter(|label| label.starts_with("c2pa.ingredient"))
+        else {
+            continue;
+        };
+        let Some(ingredient) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+        else {
+            continue;
+        };
+        let Some(related) = ingredient.get("relatedAssertions") else {
+            continue;
+        };
+        let url = format!(
+            "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
+            manifest.label
+        );
+        let mut fail = |explanation: String| {
+            results.push_failure(ASSERTION_INGREDIENT_MALFORMED, url.clone(), explanation);
+        };
+        if ingredient.get("activeManifest").is_some() {
+            fail("ingredient carries both activeManifest and relatedAssertions".into());
+            continue;
+        }
+        let Value::Array(entries) = related else {
+            fail("ingredient relatedAssertions is not an array".into());
+            continue;
+        };
+        if entries.is_empty() {
+            fail("ingredient relatedAssertions is empty".into());
+            continue;
+        }
+        let mut errors = Vec::new();
+        for entry in entries {
+            let mut nested = ValidationResults::default();
+            match nested_assertion_reference_label(
+                entry,
+                claim,
+                claim_refs,
+                &manifest.label,
+                profile,
+                &mut nested,
+            ) {
+                Some(target) => {
+                    if let Some(error) = spec25::ingredient_related_target_error(target) {
+                        errors.push(error.to_string());
+                    }
+                }
+                None => errors.push(
+                    "ingredient relatedAssertions entry does not resolve to an assertion in this manifest"
+                        .to_string(),
+                ),
+            }
+            results.failure.append(&mut nested.failure);
+        }
+        for error in errors {
+            results.push_failure(ASSERTION_INGREDIENT_MALFORMED, url.clone(), error);
         }
     }
 }
@@ -5320,7 +5624,12 @@ fn verify_ingredient_references<'a>(
             // no `activeManifest` (or v1/v2 `c2pa_manifest`) link has no
             // provenance to validate, which is recorded informationally unless
             // the ingredient is only an input to this manifest.
-            if ingredient.get("relationship").and_then(Value::as_text) != Some("inputTo") {
+            // 2.5 removes this step from the recursive validation procedure
+            // (an ingredient's own `validationResults` are returned instead),
+            // so the code is recorded under the 2.4 policy only.
+            if !spec25::applies(profile)
+                && ingredient.get("relationship").and_then(Value::as_text) != Some("inputTo")
+            {
                 results.push_informational(
                     INGREDIENT_UNKNOWN_PROVENANCE,
                     format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{assertion_label}"),
@@ -6253,7 +6562,12 @@ fn verify_data_hash<'index, 'claim>(
         return Some(OperativeBinding::Primary(primary));
     }
 
-    let fallback = plan.multi_asset()?;
+    // 2.5 Validating a multi-asset hash: the fallback applies only when "the
+    // standard manifest contains a multi-asset hash assertion in
+    // `created_assertions`".
+    let fallback = plan
+        .multi_asset()
+        .filter(|reference| !spec25::applies(profile) || reference.field == "created_assertions")?;
     if added_failures.is_empty()
         || !added_failures
             .iter()
@@ -6391,7 +6705,32 @@ fn verify_primary_hard_binding(
     // assertion also carries a top-level `hash`, that signed value must match
     // before any merkle success can be emitted.
     let merkle_present = is_bmff && hash_data.get("merkle").is_some();
-    if is_bmff && bmff_has_additional_exclusions(&bmff_exclusions, merkle_present) {
+    // 2.5 Validating a BMFF-hash: "If the BMFF asset is fragmented and the
+    // `bmff-hash-map` contains both the `hash` and `merkle` fields, then the
+    // manifest shall be rejected with ... `assertion.bmffHash.malformed`." 2.4
+    // allows the pair and requires the top-level hash to match as well.
+    if spec25::applies(profile)
+        && merkle_present
+        && expected.is_some()
+        && (!fragments.is_empty() || bmff_has_top_level_moof(data))
+    {
+        results.push_failure(
+            ASSERTION_BMFF_HASH_MALFORMED,
+            url,
+            "fragmented BMFF hash assertion carries both hash and merkle".into(),
+        );
+        return;
+    }
+    // 2.5 drops `/ftyp` from the mandatory exclusions ("The 'ftyp' box should
+    // not be excluded"), so excluding it is an optional exclusion there.
+    let ftyp_exclusion_mandatory = !spec25::applies(profile);
+    if is_bmff
+        && bmff_has_additional_exclusions(
+            &bmff_exclusions,
+            merkle_present,
+            ftyp_exclusion_mandatory,
+        )
+    {
         results.push_informational(
             ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
             url.clone(),
@@ -6470,7 +6809,12 @@ fn verify_primary_hard_binding(
                 return;
             }
         };
-        let carrier = crate::c2pa_formats::compute_data_hash_exclusions(format, data).ok();
+        let carrier = crate::c2pa_formats::compute_data_hash_exclusions_with(
+            format,
+            data,
+            spec25::text_rules(profile),
+        )
+        .ok();
         // C2PA 2.4, Validating a data hash: an update manifest grows the store
         // the standard claim signed around, so the store exclusion takes the
         // store's current length and later exclusions shift by the difference.
@@ -6513,7 +6857,10 @@ fn verify_primary_hard_binding(
             }
         }
         if format == AssetFormat::TextUnstructured {
-            let wrappers = match crate::c2pa_formats::unstructured_text_wrapper_spans(data) {
+            let wrappers = match crate::c2pa_formats::unstructured_text_wrapper_spans(
+                data,
+                spec25::text_rules(profile),
+            ) {
                 Ok(wrappers) => wrappers,
                 Err(_) => {
                     results.push_failure(
@@ -9119,9 +9466,13 @@ fn verify_multi_asset(
         );
     }
 }
+/// Whether the BMFF exclusions go beyond the mandatory set: the C2PA `uuid`
+/// box, `/mfra`, `/mdat` under a Merkle binding, and `/ftyp` when
+/// `ftyp_mandatory` (C2PA 2.4; 2.5 says `ftyp` "should not be excluded").
 fn bmff_has_additional_exclusions(
     exclusions: &[crate::c2pa_formats::BmffExclusionMap],
     merkle_present: bool,
+    ftyp_mandatory: bool,
 ) -> bool {
     exclusions.iter().any(|exclusion| {
         let path = exclusion.xpath.as_str();
@@ -9131,13 +9482,19 @@ fn bmff_has_additional_exclusions(
                     .iter()
                     .any(|selector| path.contains(selector)));
         let mandatory = c2pa_uuid
-            || path == "/ftyp"
-            || path.starts_with("/ftyp[")
+            || (ftyp_mandatory && (path == "/ftyp" || path.starts_with("/ftyp[")))
             || path == "/mfra"
             || path.starts_with("/mfra[")
             || (merkle_present && (path == "/mdat" || path.starts_with("/mdat[")));
         !mandatory
     })
+}
+
+/// Whether `data` carries a top-level `moof` box, i.e. is a fragmented BMFF
+/// asset even when supplied as one file.
+fn bmff_has_top_level_moof(data: &[u8]) -> bool {
+    crate::c2pa_formats::bmff_box_ranges(data, &["/moof"])
+        .is_ok_and(|ranges| ranges.first().is_some_and(|spans| !spans.is_empty()))
 }
 
 /// Normalize every field of a BMFF v2/v3 exclusion map.
@@ -9870,6 +10227,16 @@ fn jumbf_failure_output(
         JumbfError::UnexpectedLabel { expected, .. } if *expected == "c2pa.signature" => (
             CLAIM_SIGNATURE_MISSING,
             "self#jumbf=/c2pa/c2pa.signature".to_string(),
+        ),
+        // A verifier work bound is not a defect in the store.
+        JumbfError::ResourceLimit(_) => (GENERAL_ERROR, "self#jumbf=/c2pa".to_string()),
+        // 2.5 Locating the Active Manifest: a store that "is readable but its
+        // contents cannot be interpreted as a valid C2PA Manifest Store - for
+        // example, due to a malformed JUMBF structure" is rejected with
+        // `manifest.inaccessible.malformed`, embedded or retrieved alike.
+        _ if spec25::applies(profile) => (
+            spec25::MANIFEST_INACCESSIBLE_MALFORMED,
+            "self#jumbf=/c2pa".to_string(),
         ),
         JumbfError::UnexpectedLabel { .. }
         | JumbfError::InvalidStructure(_)
@@ -10664,6 +11031,78 @@ mod tests {
             .results
             .has_failure("manifest.structuredText.malformedReference"));
         assert_eq!(output.validation_state, ValidationState::Invalid);
+    }
+
+    fn text_input<'a>(data: &'a [u8], mime: &'a str, profile: EngineProfile) -> VerifyInput<'a> {
+        VerifyInput {
+            data,
+            mime,
+            claim_signer_trust: None,
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: None,
+            profile,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        }
+    }
+
+    fn v2_5() -> EngineProfile {
+        EngineProfile {
+            version: SpecVersion::V2_5,
+            ..EngineProfile::GENEROUS
+        }
+    }
+
+    #[test]
+    fn same_text_carrier_defects_differ_between_2_4_and_2_5() {
+        let structured = b"-----BEGIN C2PA MANIFEST----- not-a-uri -----END C2PA MANIFEST-----";
+        let mut corrupted = c2pa_text::encode_wrapper(b"manifest");
+        corrupted.pop();
+        let corrupted = format!("signed text{corrupted}");
+        for (data, mime, legacy_code) in [
+            (
+                &structured[..],
+                "text/yaml",
+                "manifest.structuredText.malformedReference",
+            ),
+            (
+                corrupted.as_bytes(),
+                "text/plain",
+                "manifest.text.corruptedWrapper",
+            ),
+        ] {
+            let legacy = verify(&text_input(data, mime, EngineProfile::GENEROUS)).unwrap();
+            assert!(legacy.results.has_failure(legacy_code), "{legacy_code}");
+            assert_eq!(legacy.validation_state, ValidationState::Invalid);
+
+            // 2.5: locating a store has no status code; the asset simply
+            // carries no located manifest.
+            let proposed = verify(&text_input(data, mime, v2_5())).unwrap();
+            assert!(proposed.results.failure.is_empty(), "{mime}");
+            assert_eq!(proposed.validation_state, ValidationState::None);
+            assert_eq!(proposed.report_json["engine_profile"]["spec_version"], "2.5");
+        }
+    }
+
+    #[test]
+    fn malformed_store_code_differs_between_2_4_and_2_5() {
+        let error = JumbfError::InvalidStructure("no claim");
+        let legacy = jumbf_failure_output(&error, b"x", EngineProfile::GENEROUS);
+        assert!(legacy.results.has_failure(CLAIM_MALFORMED));
+        let proposed = jumbf_failure_output(&error, b"x", v2_5());
+        assert!(proposed
+            .results
+            .has_failure(spec25::MANIFEST_INACCESSIBLE_MALFORMED));
+        assert!(!proposed.results.has_failure(CLAIM_MALFORMED));
+        // A compressed-manifest defect keeps its registered code in both.
+        let compressed = JumbfError::CompressedManifestInvalid {
+            label: "urn:c2pa:x".into(),
+            reason: Box::new(JumbfError::DecompressionFailed),
+        };
+        assert!(jumbf_failure_output(&compressed, b"x", v2_5())
+            .results
+            .has_failure(MANIFEST_COMPRESSED_INVALID));
     }
 
     fn canonical_test_part_label(label: &str) -> String {
@@ -15896,9 +16335,17 @@ mod tests {
         assert!(!bmff_has_additional_exclusions(
             &[map("/uuid"), map("/ftyp"), map("/mfra")],
             false,
+            true,
         ));
-        assert!(bmff_has_additional_exclusions(&[map("/free")], false));
-        assert!(!bmff_has_additional_exclusions(&[map("/mdat")], true));
+        assert!(bmff_has_additional_exclusions(&[map("/free")], false, true));
+        assert!(!bmff_has_additional_exclusions(&[map("/mdat")], true, true));
+        // 2.5 no longer lists `/ftyp` as a mandatory exclusion.
+        assert!(bmff_has_additional_exclusions(&[map("/ftyp")], false, false));
+        assert!(!bmff_has_additional_exclusions(
+            &[map("/uuid"), map("/mfra")],
+            false,
+            false,
+        ));
     }
 
     #[test]

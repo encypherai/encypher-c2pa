@@ -5,8 +5,9 @@
 //!
 //! Three orthogonal axes describe how the engine operates:
 //!
-//! - [`SpecVersion`] — which C2PA spec revision (2.2, 2.4). Drives the emitted
-//!   `specVersion` string, the in-scope format set, and version-specific rules.
+//! - [`SpecVersion`] — which C2PA spec revision (2.2, 2.4, proposed 2.5).
+//!   Drives the emitted `specVersion` string, the in-scope format set, and
+//!   version-specific rules.
 //! - [`OperatingMode`] — restricted to the certified/conformance-evaluated
 //!   surface ([`OperatingMode::Conformance`]) vs the full engine capability
 //!   ([`OperatingMode::Regular`]).
@@ -25,9 +26,9 @@
 
 /// C2PA specification revision.
 ///
-/// Ordered by release: `V1_4 < V2_0 < V2_1 < V2_2 < V2_3 < V2_4`, so the
-/// verifier's version ladder can compare revisions directly. `V1_4` stands in
-/// for the whole claim-v1 generation (1.0–1.4): the 1.x revisions are not
+/// Ordered by release: `V1_4 < V2_0 < V2_1 < V2_2 < V2_3 < V2_4 < V2_5`, so
+/// the verifier's version ladder can compare revisions directly. `V1_4` stands
+/// in for the whole claim-v1 generation (1.0–1.4): the 1.x revisions are not
 /// distinguishable from a manifest's validator-observable structure, and 1.4
 /// is the terminal 1.x rule set.
 ///
@@ -35,7 +36,9 @@
 /// certified set) and [`SpecVersion::V2_4`] (the next application target);
 /// the other revisions exist for *validation* — classifying which spec
 /// revision an in-the-wild manifest conforms to — and have no entries in
-/// [`FORMAT_REGISTRY`].
+/// [`FORMAT_REGISTRY`]. [`SpecVersion::V2_5`] is the proposed 2.5 draft
+/// (specs-core `cd61a4d1`): it is selectable as an explicit validation policy
+/// only, carries no certified format scope, and is never a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum SpecVersion {
     /// C2PA 1.4 — the terminal claim-v1 revision (stands in for 1.0–1.4).
@@ -52,17 +55,20 @@ pub enum SpecVersion {
     V2_3,
     /// C2PA 2.4 — the next conformance application target (adds text + more).
     V2_4,
+    /// Proposed C2PA 2.5 (draft specs-core `cd61a4d1`). Explicit opt-in only.
+    V2_5,
 }
 
 impl SpecVersion {
     /// Every revision the engine can validate against, ascending.
-    pub const ALL: [SpecVersion; 6] = [
+    pub const ALL: [SpecVersion; 7] = [
         SpecVersion::V1_4,
         SpecVersion::V2_0,
         SpecVersion::V2_1,
         SpecVersion::V2_2,
         SpecVersion::V2_3,
         SpecVersion::V2_4,
+        SpecVersion::V2_5,
     ];
 
     /// The string emitted in `claim_generator_info.specVersion`.
@@ -74,6 +80,7 @@ impl SpecVersion {
             SpecVersion::V2_2 => "2.2",
             SpecVersion::V2_3 => "2.3",
             SpecVersion::V2_4 => "2.4",
+            SpecVersion::V2_5 => "2.5",
         }
     }
 
@@ -90,6 +97,7 @@ impl SpecVersion {
             "2.2" => Some(SpecVersion::V2_2),
             "2.3" => Some(SpecVersion::V2_3),
             "2.4" => Some(SpecVersion::V2_4),
+            "2.5" => Some(SpecVersion::V2_5),
             _ => None,
         }
     }
@@ -212,7 +220,7 @@ impl EngineProfile {
     ///
     /// - In [`OperatingMode::Conformance`], only MIME types registered for the
     ///   active [`SpecVersion`] are permitted. Validation-only revisions
-    ///   (1.4/2.0/2.1/2.3) have no certified scope, so conformance mode falls
+    ///   (1.4/2.0/2.1/2.3/2.5) have no certified scope, so conformance mode falls
     ///   back to the full known-format set for them — their strictness comes
     ///   from the target-spec-version conformance check in the verifier, not
     ///   from a format gate.
@@ -603,7 +611,7 @@ fn mime_known(canon_mime: &str) -> bool {
 }
 
 /// True when `version` defines a certified format scope (any registry row).
-/// The validation-only revisions (1.4/2.0/2.1/2.3) have none.
+/// The validation-only revisions (1.4/2.0/2.1/2.3/2.5) have none.
 fn version_has_scope(version: SpecVersion) -> bool {
     FORMAT_REGISTRY
         .iter()
@@ -783,6 +791,10 @@ mod tests {
     fn spec_version_round_trips() {
         assert_eq!(SpecVersion::from_str("2.2"), Some(SpecVersion::V2_2));
         assert_eq!(SpecVersion::from_str("2.4"), Some(SpecVersion::V2_4));
+        assert_eq!(SpecVersion::from_str("2.5"), Some(SpecVersion::V2_5));
+        assert_eq!(SpecVersion::V2_5.version_str(), "2.5");
+        assert!(SpecVersion::V2_4 < SpecVersion::V2_5);
+        assert!(mimes_for_version(SpecVersion::V2_5).is_empty());
         assert_eq!(SpecVersion::from_str("9.9"), None);
     }
 

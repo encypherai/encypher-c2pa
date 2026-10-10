@@ -86,6 +86,38 @@ pub fn verify_claim(
     claim_cbor: &[u8],
     cert_der: &[u8],
 ) -> Result<(), CryptoError> {
+    verify_claim_with(cose_sign1, claim_cbor, cert_der, ClaimAlgorithmList::V2_4)
+}
+
+/// Which revision's claim-signature algorithm list governs a verification.
+///
+/// C2PA 2.4 Cryptography, Signature Algorithms, lists ES256/384/512,
+/// PS256/384/512 and EdDSA (Ed25519). Proposed 2.5 adds the fully specified
+/// ECDSA identifiers ESP256 (`-9`), ESP384 (`-51`) and ESP512 (`-52`) from
+/// RFC 9864, each bound to one curve, and ML-DSA-44/65/87 (`-48`/`-49`/`-50`)
+/// from RFC 9964.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimAlgorithmList {
+    /// The 2.4 list (also the list every earlier revision's validator reads).
+    V2_4,
+    /// The proposed 2.5 list.
+    V2_5,
+}
+
+/// [`verify_claim`] under an explicit revision's algorithm list.
+///
+/// Under [`ClaimAlgorithmList::V2_5`] an ESP identifier verifies as the
+/// matching ECDSA algorithm and additionally requires the curve RFC 9864 binds
+/// to it. ML-DSA identifiers are allowed by 2.5 but this verifier has no
+/// ML-DSA implementation, so they fail closed with
+/// [`CryptoError::UnimplementedAlg`] rather than verifying or being silently
+/// accepted.
+pub fn verify_claim_with(
+    cose_sign1: &[u8],
+    claim_cbor: &[u8],
+    cert_der: &[u8],
+    list: ClaimAlgorithmList,
+) -> Result<(), CryptoError> {
     let decoded = decode(cose_sign1)?;
     let array = cose_array(&decoded)?;
 
@@ -109,11 +141,36 @@ pub fn verify_claim(
         _ => None,
     }
     .ok_or_else(|| CryptoError::Malformed("missing algorithm in protected header".into()))?;
-    let alg = CoseAlg::from_cose_id(alg_id).ok_or(CryptoError::UnsupportedAlg(alg_id))?;
+    let (alg, required_curve) = match (list, alg_id) {
+        (ClaimAlgorithmList::V2_5, COSE_ALG_ESP256) => (CoseAlg::Es256, Some(EcCurve::P256)),
+        (ClaimAlgorithmList::V2_5, COSE_ALG_ESP384) => (CoseAlg::Es384, Some(EcCurve::P384)),
+        (ClaimAlgorithmList::V2_5, COSE_ALG_ESP512) => (CoseAlg::Es512, Some(EcCurve::P521)),
+        (
+            ClaimAlgorithmList::V2_5,
+            COSE_ALG_ML_DSA_44 | COSE_ALG_ML_DSA_65 | COSE_ALG_ML_DSA_87,
+        ) => return Err(CryptoError::UnimplementedAlg(alg_id)),
+        _ => (
+            CoseAlg::from_cose_id(alg_id).ok_or(CryptoError::UnsupportedAlg(alg_id))?,
+            None,
+        ),
+    };
 
     let sig_input = sig_structure_bytes(protected_bytes, claim_cbor)?;
-    verify_signature(alg, &sig_input, signature, cert_der)
+    verify_signature_on_curve(alg, &sig_input, signature, cert_der, required_curve)
 }
+
+/// RFC 9864 fully specified ECDSA with SHA-256 on P-256.
+const COSE_ALG_ESP256: i128 = -9;
+/// RFC 9864 fully specified ECDSA with SHA-384 on P-384.
+const COSE_ALG_ESP384: i128 = -51;
+/// RFC 9864 fully specified ECDSA with SHA-512 on P-521.
+const COSE_ALG_ESP512: i128 = -52;
+/// RFC 9964 ML-DSA-44.
+const COSE_ALG_ML_DSA_44: i128 = -48;
+/// RFC 9964 ML-DSA-65.
+const COSE_ALG_ML_DSA_65: i128 = -49;
+/// RFC 9964 ML-DSA-87.
+const COSE_ALG_ML_DSA_87: i128 = -50;
 
 /// Return the protected COSE algorithm from a `COSE_Sign1_Tagged` value.
 pub fn extract_cose_alg(cose_sign1: &[u8]) -> Result<CoseAlg, CryptoError> {
@@ -232,11 +289,21 @@ fn rsa_public_key_from_spki(
     Ok(public_key)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EcCurve {
     P256,
     P384,
     P521,
+}
+
+impl EcCurve {
+    fn name(self) -> &'static str {
+        match self {
+            EcCurve::P256 => "P-256",
+            EcCurve::P384 => "P-384",
+            EcCurve::P521 => "P-521",
+        }
+    }
 }
 
 fn ec_curve_from_spki(spki_der: &[u8]) -> Result<EcCurve, CryptoError> {
@@ -276,6 +343,18 @@ pub(crate) fn verify_signature(
     signature: &[u8],
     cert_der: &[u8],
 ) -> Result<(), CryptoError> {
+    verify_signature_on_curve(alg, data, signature, cert_der, None)
+}
+
+/// [`verify_signature`], additionally requiring an ECDSA key on
+/// `required_curve` when one is given (the fully specified ESP identifiers).
+fn verify_signature_on_curve(
+    alg: CoseAlg,
+    data: &[u8],
+    signature: &[u8],
+    cert_der: &[u8],
+    required_curve: Option<EcCurve>,
+) -> Result<(), CryptoError> {
     use sha2::Digest as _;
     use signature::{hazmat::PrehashVerifier as _, Verifier as _};
 
@@ -292,7 +371,15 @@ pub(crate) fn verify_signature(
             CoseAlg::Es512 => sha2::Sha512::digest(data).to_vec(),
             _ => unreachable!(),
         };
-        return match ec_curve_from_spki(&spki)? {
+        let curve = ec_curve_from_spki(&spki)?;
+        if let Some(required) = required_curve.filter(|required| *required != curve) {
+            return Err(CryptoError::Verify(format!(
+                "fully specified ECDSA algorithm requires a {} key, found {}",
+                required.name(),
+                curve.name()
+            )));
+        }
+        return match curve {
             EcCurve::P256 => {
                 let verifying_key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki)
                     .map_err(key_err("P-256"))?;

@@ -98,6 +98,7 @@ def verify(
     cawg_ica_status_lists: Optional[Mapping[str, str]] = None,
     cawg_strict_encoding: bool = False,
     strict_conformance: bool = False,
+    spec_version: Optional[str] = None,
     validation_time: Optional[str] = None,
     telemetry: Optional[bool] = None,
     telemetry_endpoint: Optional[str] = None,
@@ -125,7 +126,12 @@ def verify(
     decompressed status bitstrings as base64. ``cawg_strict_encoding=True``
     refuses the CAWG field-order signer payload that c2pa-rs writes.
     ``strict_conformance=True`` applies the C2PA 2.4 Conformance Program
-    posture, including CAWG Identity 1.3 deterministic signer-payload encoding. On first interactive use,
+    posture, including CAWG Identity 1.3 deterministic signer-payload encoding.
+    ``spec_version`` selects the C2PA validation policy: ``None`` or ``"2.4"``
+    (the default, identical reports) or ``"2.5"`` for the proposed C2PA 2.5
+    draft, which reports ``profile: "c2pa-2.5"`` and cannot be combined with
+    ``strict_conformance``. Any other value raises ``ValueError`` with the
+    ``unsupported_spec_version`` code before the asset is read. On first interactive use,
     telemetry should be enabled and saves the answer. Passing
     ``telemetry=True`` or ``False`` attempts to save that preference; the
     explicit value still governs this verification if persistence fails.
@@ -177,6 +183,7 @@ def verify(
         else [],
         "cawg_strict_encoding": bool(cawg_strict_encoding),
         "strict_conformance": bool(strict_conformance),
+        "spec_version": spec_version,
         "validation_time": validation_time,
         "online": online,
         "online_allow_private_networks": bool(online_allow_private_networks),
@@ -253,6 +260,7 @@ def verify_stream(
     cawg_ica_status_lists: Optional[Mapping[str, str]] = None,
     cawg_strict_encoding: bool = False,
     strict_conformance: bool = False,
+    spec_version: Optional[str] = None,
     validation_time: Optional[str] = None,
     telemetry: Optional[bool] = None,
     telemetry_endpoint: Optional[str] = None,
@@ -278,7 +286,7 @@ def verify_stream(
     The returned report carries a top-level ``integrity``, the init manifest's
     report under ``stream``, per-segment reports under ``segments``, and the
     recomputed ``chain_valid`` for per-segment streams. Trust and telemetry
-    options behave exactly as in :func:`verify`.
+    options behave exactly as in :func:`verify`, and so does ``spec_version``.
     """
     options = {
         "trust_pem": trust_pem,
@@ -305,6 +313,7 @@ def verify_stream(
         else [],
         "cawg_strict_encoding": bool(cawg_strict_encoding),
         "strict_conformance": bool(strict_conformance),
+        "spec_version": spec_version,
         "validation_time": validation_time,
         "online": online,
         "online_allow_private_networks": bool(online_allow_private_networks),

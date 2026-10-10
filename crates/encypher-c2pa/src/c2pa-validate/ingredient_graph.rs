@@ -56,7 +56,7 @@ use super::{
 };
 use crate::c2pa_cbor::Value;
 use crate::c2pa_core::jumbf::ParsedManifest;
-use crate::c2pa_crypto::{extract_x5chain, verify_claim, CryptoError};
+use crate::c2pa_crypto::{extract_x5chain, verify_claim_with, CryptoError};
 
 /// Maximum ingredient edges followed away from the active manifest.
 const MAX_DEPTH: usize = 16;
@@ -378,7 +378,12 @@ fn validate_reached_manifest<'a>(
         );
         return;
     };
-    match verify_claim(cose, claim_cbor, &leaf) {
+    match verify_claim_with(
+        cose,
+        claim_cbor,
+        &leaf,
+        super::spec25::claim_algorithms(profile),
+    ) {
         Ok(()) => results.push_success(
             CLAIM_SIGNATURE_VALIDATED,
             sig_url,
@@ -388,6 +393,13 @@ fn validate_reached_manifest<'a>(
             ALGORITHM_UNSUPPORTED,
             sig_url,
             format!("ingredient manifest claim signature algorithm {id} is not on the C2PA allowed list"),
+        ),
+        Err(CryptoError::UnimplementedAlg(id)) => results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            sig_url,
+            format!(
+                "ingredient manifest claim signature algorithm {id} (ML-DSA) is allowed by C2PA 2.5 but not implemented by this verifier; the signature was not evaluated"
+            ),
         ),
         Err(error) => results.push_failure(
             CLAIM_SIGNATURE_MISMATCH,
