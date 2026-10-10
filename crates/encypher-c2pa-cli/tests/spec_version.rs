@@ -44,7 +44,10 @@ fn default_and_explicit_2_4_are_byte_identical() {
     );
     let value = report(&default);
     assert_eq!(value["profile"], "c2pa-2.4");
-    assert_eq!(value["manifest_report"]["engine_profile"]["spec_version"], "2.4");
+    assert_eq!(
+        value["manifest_report"]["engine_profile"]["spec_version"],
+        "2.4"
+    );
 }
 
 #[test]
@@ -52,7 +55,10 @@ fn spec_2_5_reaches_the_report() {
     let output = verify(&fixture("signed_test.jpg"), &["--spec", "2.5"]);
     let value = report(&output);
     assert_eq!(value["profile"], "c2pa-2.5");
-    assert_eq!(value["manifest_report"]["engine_profile"]["spec_version"], "2.5");
+    assert_eq!(
+        value["manifest_report"]["engine_profile"]["spec_version"],
+        "2.5"
+    );
     assert_eq!(
         value["manifest_report"]["engine_profile"]["compliance_level"],
         "core-spec"

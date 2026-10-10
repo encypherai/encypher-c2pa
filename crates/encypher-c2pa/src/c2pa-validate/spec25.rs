@@ -46,8 +46,7 @@ pub(super) const LINKED_RESOURCE_NOT_CREATED: &str = "assertion.linkedResourceIn
 /// Failure: a `c2pa.linked-resource-integrity` assertion is malformed.
 pub(super) const LINKED_RESOURCE_MALFORMED: &str = "assertion.linkedResourceIntegrity.malformed";
 /// Failure: a relative linked resource URI traverses with a `..` segment.
-pub(super) const LINKED_RESOURCE_INVALID_URI: &str =
-    "assertion.linkedResourceIntegrity.invalidURI";
+pub(super) const LINKED_RESOURCE_INVALID_URI: &str = "assertion.linkedResourceIntegrity.invalidURI";
 /// Informational: a linked resource was not retrieved.
 pub(super) const LINKED_RESOURCE_SKIPPED: &str = "assertion.linkedResourceIntegrity.skipped";
 /// Failure extension: the sole hard binding is a 2.5 `c2pa.hash.segment`
@@ -87,20 +86,65 @@ pub(super) fn is_segment_hash_label(label: &str) -> bool {
     base_assertion_label(label) == "c2pa.hash.segment"
 }
 
+/// A claim-generator instant, ordered exactly.
+///
+/// RFC 3339 places no limit on fractional-second digits, but `OffsetDateTime`
+/// keeps nanoseconds, so two instants that differ only past the ninth digit
+/// would compare equal and a reversed range could pass. The whole-second
+/// instant (offset applied) is compared first and the fraction second, as its
+/// decimal digits with trailing zeros removed, which orders lexicographically
+/// exactly as the decimal values do.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GeneratorTime {
+    unix_seconds: i64,
+    fraction: Vec<u8>,
+}
+
+/// Parse RFC 3339 text into a [`GeneratorTime`] without losing precision.
+fn parse_rfc3339_exact(text: &str) -> Option<GeneratorTime> {
+    let time_start = text.find(['T', 't'])?;
+    let (whole_seconds, fraction) = match text[time_start..].find('.') {
+        Some(relative) => {
+            let dot = time_start + relative;
+            let digits = text[dot + 1..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            if digits == 0 {
+                return None;
+            }
+            let fraction = text[dot + 1..dot + 1 + digits]
+                .trim_end_matches('0')
+                .as_bytes()
+                .to_vec();
+            (
+                format!("{}{}", &text[..dot], &text[dot + 1 + digits..]),
+                fraction,
+            )
+        }
+        None => (text.to_string(), Vec::new()),
+    };
+    let instant = OffsetDateTime::parse(&whole_seconds, &Rfc3339).ok()?;
+    Some(GeneratorTime {
+        unix_seconds: instant.unix_timestamp(),
+        fraction,
+    })
+}
+
 /// Parse a claim-generator time (Specifications of time in assertions).
 ///
 /// The value is a `tdate` (CBOR tag 0 over RFC 3339 text; untagged text is
 /// read too, because generators commonly omit the tag) or a map whose `value`
 /// is one and whose optional `timeStampType` is `absolute` or the bound kind
 /// this field allows (`lowerBound` for a start, `upperBound` for an end).
-fn parse_generator_time(value: &Value, upper: bool) -> Option<OffsetDateTime> {
-    let parse_tdate = |value: &Value| -> Option<OffsetDateTime> {
+fn parse_generator_time(value: &Value, upper: bool) -> Option<GeneratorTime> {
+    let parse_tdate = |value: &Value| -> Option<GeneratorTime> {
         let text = match value {
             Value::Tag(0, inner) => inner.as_text()?,
             Value::Text(text) => text.as_str(),
             _ => return None,
         };
-        OffsetDateTime::parse(text, &Rfc3339).ok()
+        parse_rfc3339_exact(text)
     };
     match value {
         Value::Map(_) => {
@@ -286,7 +330,9 @@ pub(super) fn verify_linked_resource_integrity(
                 results.push_failure(
                     ALGORITHM_UNSUPPORTED,
                     url.clone(),
-                    format!("linked resource integrity alg '{alg}' is not on the C2PA allowed list"),
+                    format!(
+                        "linked resource integrity alg '{alg}' is not on the C2PA allowed list"
+                    ),
                 );
             }
             for entry in entries {
@@ -418,8 +464,9 @@ pub(super) fn ingredient_related_target_error(target: &str) -> Option<&'static s
     ) {
         return Some("relatedAssertions references an ingredient or actions assertion");
     }
-    (!base.ends_with(".ingredient"))
-        .then_some("relatedAssertions references an assertion whose label does not end with .ingredient")
+    (!base.ends_with(".ingredient")).then_some(
+        "relatedAssertions references an assertion whose label does not end with .ingredient",
+    )
 }
 
 #[cfg(test)]
@@ -433,8 +480,11 @@ mod tests {
 
     fn action(pairs: Vec<(&str, Value)>) -> Value {
         map_from_pairs(
-            std::iter::once(("action".to_string(), Value::Text("c2pa.edited".into())))
-                .chain(pairs.into_iter().map(|(key, value)| (key.to_string(), value))),
+            std::iter::once(("action".to_string(), Value::Text("c2pa.edited".into()))).chain(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value)),
+            ),
         )
     }
 
@@ -492,6 +542,26 @@ mod tests {
         assert!(ingredient_related_target_error("c2pa.thumbnail.ingredient.jpeg").is_some());
         assert!(ingredient_related_target_error("c2pa.thumbnail.ingredient").is_none());
         assert!(ingredient_related_target_error("com.example.ingredient__1").is_none());
+    }
+
+    #[test]
+    fn generator_times_order_past_nanosecond_precision() {
+        // Equal to nine digits; the start is later at the tenth.
+        let reversed = action(vec![
+            ("whenStart", tdate("2026-05-01T00:00:00.0000000002Z")),
+            ("whenEnd", tdate("2026-05-01T00:00:00.0000000001Z")),
+        ]);
+        assert_eq!(action_time_errors(&reversed, true).len(), 1);
+        let equal = action(vec![
+            ("whenStart", tdate("2026-05-01T00:00:00.50Z")),
+            ("whenEnd", tdate("2026-05-01T02:00:00.5+02:00")),
+        ]);
+        assert!(action_time_errors(&equal, true).is_empty());
+        assert!(
+            parse_rfc3339_exact("2026-05-01T00:00:00.45Z")
+                < parse_rfc3339_exact("2026-05-01T00:00:00.5Z")
+        );
+        assert_eq!(parse_rfc3339_exact("2026-05-01T00:00:00.Z"), None);
     }
 
     #[test]

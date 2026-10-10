@@ -319,6 +319,8 @@ By default the verifier applies the C2PA 2.4 validation rules. A few rules that 
 
 Set `strict_conformance` (`--strict-conformance`) to apply the C2PA Conformance Program as well. Strict mode turns the program's additional requirements into failures, such as a trusted timestamp and usable revocation information, and requires CAWG Identity 1.3 deterministic encoding of identity signatures. It also adds the report's Content Credentials JSON (`content_credentials`), the form conformance rubrics evaluate.
 
+Set `spec_version` (`--spec`) to `"2.5"` to validate under the proposed C2PA 2.5 draft instead. The default, and `"2.4"`, keep the 2.4 rules and produce identical reports. The 2.5 policy is a regular validation policy, not a certified conformance profile, so it cannot be combined with `strict_conformance`; any other value fails with `unsupported_spec_version` before the asset is read. Reports name the policy in `profile` (`c2pa-2.4` or `c2pa-2.5`). The policy is chosen by the caller, never by what a manifest declares. See [docs/FORMATS.md](docs/FORMATS.md) for the format-level differences.
+
 Where the two postures differ, the default report says so with an informational status. For example, an identity signature over the CAWG 1.1 field order, which c2pa-rs still writes, verifies by default with `com.encypher.cawg.legacyProfile`. To refuse that encoding without taking on the rest of strict mode, set `cawg_strict_encoding` (`--cawg-strict-encoding`).
 
 ## Failure telemetry (opt-in)

@@ -587,6 +587,7 @@ pub fn detached_manifest_evidence_with_options(
         crate::c2pa_formats::TextLocatorRules::V2_4
     };
     let mime = canonicalize_mime(mime_type);
+    require_embedded_mime(&mime, profile)?;
     let format = crate::c2pa_formats::AssetFormat::from_mime(&mime)
         .ok_or_else(|| Error::UnsupportedMime(mime.clone()))?;
     if !crate::c2pa_formats::supports_hash_mode(&mime) {
@@ -672,6 +673,7 @@ fn detached_pass(
     mime: &str,
     options: &VerifyOptions,
 ) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
     if manifest_store.is_empty() {
         return Err(Error::Verification("manifest store is empty".into()));
     }
@@ -680,7 +682,6 @@ fn detached_pass(
             "manifest store exceeds the {MAX_MANIFEST_STORE_BYTES} byte limit"
         )));
     }
-    let resolved = ResolvedOptions::resolve(options)?;
     let input = resolved.input(asset, mime);
     let mut output = crate::c2pa_validate::verify_detached_safe(
         manifest_store,
@@ -845,8 +846,7 @@ impl ResolvedOptions {
     pub(crate) fn resolve(options: &VerifyOptions) -> Result<Self, Error> {
         // The policy selector is resolved first, so an unknown value fails
         // before any trust material is parsed or asset read.
-        let profile =
-            resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
+        let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
         let use_defaults = !options.no_default_trust;
         let validation_time = parse_validation_time(options.validation_time.as_deref())?;
         let custom_claim_trust = options.trust_pem.is_some() || options.allowed_list_pem.is_some();
@@ -1032,6 +1032,16 @@ pub(crate) fn resolve_mime(mime_type: &str) -> Result<String, Error> {
     Ok(mime)
 }
 
+fn require_embedded_mime(mime: &str, profile: EngineProfile) -> Result<(), Error> {
+    // The draft's generic XML comment armor contains "--", forbidden inside
+    // XML comments (upstream issue 2590). Dedicated SVG/TTML carriers and
+    // separately supplied manifest stores are not this embedding method.
+    if profile.version >= SpecVersion::V2_5 && matches!(mime, "application/xml" | "text/xml") {
+        return Err(Error::UnsupportedMime(mime.to_owned()));
+    }
+    Ok(())
+}
+
 pub(crate) fn map_validate_error(error: crate::c2pa_validate::ValidateError) -> Error {
     match error {
         crate::c2pa_validate::ValidateError::UnsupportedMime(value) => {
@@ -1093,6 +1103,7 @@ fn verify_with_options_inner(
     resolved: &ResolvedOptions,
 ) -> Result<(VerificationReport, PassCapture), Error> {
     let mime = resolve_mime(mime_type)?;
+    require_embedded_mime(&mime, resolved.profile)?;
     let (mut report, needs, capture) =
         embedded_pass_resolved(data, fragments, &mime, options, resolved)?;
     let (mut network, evidence) = online::gather(options, &needs);

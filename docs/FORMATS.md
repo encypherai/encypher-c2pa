@@ -53,6 +53,18 @@ Format-specific rules the verifier applies:
 - A collection hash requires every listed member; unlisted files are allowed. For ZIP packages the central-directory hash still detects files added after signing.
 - Under `strict_conformance`, carrier placement is also checked: the GIF block before the first image descriptor, the TIFF entry in the last main IFD, the SVG element under the root `metadata` element, and the BMFF store box after `ftyp` and before `moov` and `mdat`.
 
+### C2PA 2.5 policy (`spec_version: "2.5"`)
+
+The proposed 2.5 policy adds no carriers. Generic XML-comment embedding (`application/xml`, `text/xml`) is explicitly unsupported under 2.5: its armor contains `--`, which XML forbids inside comments ([upstream issue 2590](https://github.com/c2pa-org/specs-core/issues/2590)). Separately supplied manifest stores remain readable for XML; dedicated SVG carriage is unaffected. Append-only text, WARC, MIDI, TTML, ONNX, SafeTensors, Parquet, BlockFact, and the WebVTT/RSS/Atom-specific structured-text examples remain unsupported, and a `c2pa.hash.segment` binding fails closed with `com.encypher.assertion.segmentHash.unevaluated`. What changes for the other supported formats:
+
+- Unstructured text: any trailing padding byte is admitted and the whole variation-selector run is the wrapper's byte range. A candidate that does not decode is ignored, and zero or several valid wrappers locate no manifest instead of reporting `manifest.text.*`.
+- Detached text: hash the supplied asset's exact bytes. Embedded-wrapper exclusions and NFC normalization do not apply to a separately supplied manifest store.
+- Structured text: one `BEGIN`/`END` pair, reference trimmed of space, tab, CR and LF only, and only a valid `data:application/c2pa;base64,` reference embeds a store. Anything else locates no manifest instead of reporting `manifest.structuredText.*`.
+- HTML: only elements inside `head` count; more than one there locates no manifest.
+- Placement checked in the regular 2.5 posture: the PNG `caBX` chunk before the first `IDAT`, the BMFF manifest box after `ftyp` and before the first `mdat`/`moov` or adjacent to `moov` (an `update` box last), and the TIFF entry in the first or last IFD. A violation reports `general.error`.
+- BMFF: excluding `ftyp` becomes an optional exclusion (`assertion.bmffHash.additionalExclusionsPresent`), and a fragmented hash carrying both `hash` and `merkle` is `assertion.bmffHash.malformed`.
+- An unreadable manifest store reports `manifest.inaccessible.malformed`.
+
 ## Test fixtures
 
 `tests/fixtures/signed_test.jpg` and `signed_test.mp4` exercise the public report contract, together with `signed_bigtiff_le_single_page.tif` (C2PA 2.4 A.3.6, the entry inside the single main IFD) and `signed_bigtiff_be_multi_page.tif` (2.2 A.3.5, a big-endian multi-page asset with a dedicated last IFD). The deeper engine suite covers format extraction, claim parsing, signature algorithms, data hash, BMFF hash, boxes hash, collection hash, multipart bindings, ingredients, trust, OCSP, and malformed input boundaries.

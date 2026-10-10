@@ -1030,25 +1030,34 @@ fn verify_with_fragments_mode_and_expected_seeks(
         return Ok(out);
     }
 
-    if input.profile.mode == OperatingMode::Conformance {
-        match crate::c2pa_formats::carrier_placement_error(format, input.data) {
-            Ok(Some(detail)) => {
-                let mut out = container_failure_output(GENERAL_ERROR, detail, input.profile);
-                if out_of_scope {
-                    note_out_of_scope(&mut out, input.mime, input.profile);
-                }
-                return Ok(out);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let mut out =
-                    container_failure_output(GENERAL_ERROR, &error.to_string(), input.profile);
-                if out_of_scope {
-                    note_out_of_scope(&mut out, input.mime, input.profile);
-                }
-                return Ok(out);
-            }
+    // Placement: the 2.4 rules are a conformance-mode observation. The 2.5
+    // policy applies the placement rules 2.5 makes normative or changes (PNG
+    // `caBX` before `IDAT`, the 2.5 BMFF positions, the TIFF first-or-last
+    // IFD locator) in its own regular posture; a container the placement
+    // reader cannot parse is left to the extractor, which reports it.
+    let placement = if spec25::applies(input.profile) {
+        match crate::c2pa_formats::carrier_placement_error_v2_5(format, input.data) {
+            Ok(Some(detail)) => Some(Ok(detail)),
+            Ok(None) | Err(_) => None,
         }
+    } else if input.profile.mode == OperatingMode::Conformance {
+        match crate::c2pa_formats::carrier_placement_error(format, input.data) {
+            Ok(Some(detail)) => Some(Ok(detail)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error.to_string())),
+        }
+    } else {
+        None
+    };
+    if let Some(placement) = placement {
+        let mut out = match placement {
+            Ok(detail) => container_failure_output(GENERAL_ERROR, detail, input.profile),
+            Err(error) => container_failure_output(GENERAL_ERROR, &error, input.profile),
+        };
+        if out_of_scope {
+            note_out_of_scope(&mut out, input.mime, input.profile);
+        }
+        return Ok(out);
     }
 
     let store_bytes = match crate::c2pa_formats::extract_manifest_with(
@@ -1585,18 +1594,22 @@ pub(crate) fn verify_detached_with_cawg_options<'a>(
         mime: content_mime,
         ..*input
     };
-    let mut out = verify_manifest(
+    let mut out = verify_manifest_bound(
         manifest,
         StoreContext {
             manifests: &store.manifests,
             manifest_hashes: &manifest_hashes,
         },
         &content_input,
-        format,
+        ContentBinding::Asset {
+            format,
+            prehashed_digest: None,
+            detached: spec25::applies(input.profile),
+        },
         &[],
-        None,
         cawg_inputs,
         &mut report_decode_nodes,
+        None,
     );
     append_store_manifests(
         &mut out.report_json,
@@ -2556,6 +2569,7 @@ fn verify_manifest<'a>(
         ContentBinding::Asset {
             format,
             prehashed_digest,
+            detached: false,
         },
         fragments,
         cawg_inputs,
@@ -2572,6 +2586,7 @@ enum ContentBinding<'d> {
     Asset {
         format: AssetFormat,
         prehashed_digest: Option<&'d [u8]>,
+        detached: bool,
     },
     /// The caller has verified the binding with its own engine. No host
     /// format exists here; `host_less` says whether the store is a
@@ -2581,6 +2596,10 @@ enum ContentBinding<'d> {
 }
 
 impl<'d> ContentBinding<'d> {
+    fn detached(self) -> bool {
+        matches!(self, Self::Asset { detached: true, .. })
+    }
+
     fn format(self) -> Option<AssetFormat> {
         match self {
             Self::Asset { format, .. } => Some(format),
@@ -2937,9 +2956,8 @@ fn verify_manifest_bound<'a>(
         });
 
     // Cryptographic verification of the claim signature against the leaf.
-    let sig_verification = leaf.map(|d| {
-        verify_claim_with(cose, claim_cbor, d, spec25::claim_algorithms(input.profile))
-    });
+    let sig_verification = leaf
+        .map(|d| verify_claim_with(cose, claim_cbor, d, spec25::claim_algorithms(input.profile)));
     let sig_ok = matches!(sig_verification, Some(Ok(())));
 
     let generous = is_generous(input.profile);
@@ -3120,9 +3138,8 @@ fn verify_manifest_bound<'a>(
                 manifest,
                 store,
                 input.data,
-                binding.format(),
+                binding,
                 fragments,
-                binding.prehashed_digest(),
                 input.profile,
                 &mut results,
             );
@@ -3136,7 +3153,11 @@ fn verify_manifest_bound<'a>(
                 input.data,
                 format,
                 fragments,
-                update_manifest::StoreRendition::AsSigned,
+                if binding.detached() {
+                    update_manifest::StoreRendition::Detached
+                } else {
+                    update_manifest::StoreRendition::AsSigned
+                },
                 &label,
                 input.profile,
                 &mut results,
@@ -4036,6 +4057,25 @@ fn claim_structure_first_fatal(
                                 "update chain does not reach a standard manifest with a hard binding"
                                     .into(),
                             ),
+                            // 2.5 Validate the Asset's Content: "If no
+                            // standard manifest is found, or the standard
+                            // manifest has no hard binding in
+                            // `created_assertions`" - the update chain's
+                            // inherited binding is held to the same rule.
+                            1 if spec25::applies(profile)
+                                && parent_refs
+                                    .binding_plan(false)
+                                    .primary()
+                                    .is_some_and(|reference| {
+                                        reference.field == "gathered_assertions"
+                                    }) =>
+                            {
+                                results.push_failure(
+                                    CLAIM_HARD_BINDINGS_MISSING,
+                                    sig_url.to_string(),
+                                    "the update chain's standard manifest declares its hard binding in gathered_assertions, not created_assertions".into(),
+                                );
+                            }
                             1 => {}
                             _ => {
                                 results.push_failure(
@@ -4981,8 +5021,9 @@ fn verify_action_assertions(
             }
 
             if let Some(related) = parameters.and_then(|value| value.get("relatedAssertions")) {
-                let eligible =
-                    |target: &str| !target.starts_with("c2pa.actions") && !target.starts_with("c2pa.ingredient");
+                let eligible = |target: &str| {
+                    !target.starts_with("c2pa.actions") && !target.starts_with("c2pa.ingredient")
+                };
                 let mut redacted_related: Vec<String> = Vec::new();
                 let valid = matches!(related, Value::Array(values) if !values.is_empty()
                 && values.iter().all(|reference| {
@@ -5096,10 +5137,12 @@ fn verify_action_assertions(
     // declarations, so an undecodable actions assertion is not "missing" (it
     // already carries its decode failure).
     let declares_actions = claim_refs.references.iter().any(|reference| {
-        matches!(reference.field, "created_assertions" | "gathered_assertions")
-            && reference
-                .label
-                .is_some_and(|label| label.starts_with("c2pa.actions"))
+        matches!(
+            reference.field,
+            "created_assertions" | "gathered_assertions"
+        ) && reference
+            .label
+            .is_some_and(|label| label.starts_with("c2pa.actions"))
     });
     if manifest_kind == ManifestKind::Standard
         && v2_5
@@ -6303,9 +6346,8 @@ fn verify_update_hard_binding(
     active: &ParsedManifest<'_>,
     store: StoreContext<'_>,
     data: &[u8],
-    format: Option<AssetFormat>,
+    binding: ContentBinding<'_>,
     fragments: &[&[u8]],
-    prehashed_digest: Option<&[u8]>,
     profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
@@ -6371,10 +6413,10 @@ fn verify_update_hard_binding(
         profile,
         results,
     );
-    if let Some(digest) = prehashed_digest {
+    if let Some(digest) = binding.prehashed_digest() {
         let _ =
             verify_prehashed_hard_binding(&claim, &claim_refs, digest, &standard.label, results);
-    } else if let Some(format) = format {
+    } else if let Some(format) = binding.format() {
         // The active manifest is an update, so the store the standard claim
         // signed its exclusions against has since grown (C2PA 2.4, Validating
         // a data hash).
@@ -6384,7 +6426,11 @@ fn verify_update_hard_binding(
             data,
             format,
             fragments,
-            update_manifest::StoreRendition::WithUpdates,
+            if binding.detached() {
+                update_manifest::StoreRendition::Detached
+            } else {
+                update_manifest::StoreRendition::WithUpdates
+            },
             &standard.label,
             profile,
             results,
@@ -6809,17 +6855,22 @@ fn verify_primary_hard_binding(
                 return;
             }
         };
-        let carrier = crate::c2pa_formats::compute_data_hash_exclusions_with(
-            format,
-            data,
-            spec25::text_rules(profile),
-        )
-        .ok();
+        let carrier = if rendition == update_manifest::StoreRendition::Detached {
+            None
+        } else {
+            crate::c2pa_formats::compute_data_hash_exclusions_with(
+                format,
+                data,
+                spec25::text_rules(profile),
+            )
+            .ok()
+        };
         // C2PA 2.4, Validating a data hash: an update manifest grows the store
         // the standard claim signed around, so the store exclusion takes the
         // store's current length and later exclusions shift by the difference.
         let exclusions = match rendition {
-            update_manifest::StoreRendition::AsSigned => exclusions,
+            update_manifest::StoreRendition::AsSigned
+            | update_manifest::StoreRendition::Detached => exclusions,
             update_manifest::StoreRendition::WithUpdates => {
                 let adjusted = carrier.as_deref().and_then(|carrier| {
                     update_manifest::adjust_exclusions_for_updates(&exclusions, carrier, data.len())
@@ -6856,7 +6907,9 @@ fn verify_primary_hard_binding(
                 }
             }
         }
-        if format == AssetFormat::TextUnstructured {
+        if format == AssetFormat::TextUnstructured
+            && rendition != update_manifest::StoreRendition::Detached
+        {
             let wrappers = match crate::c2pa_formats::unstructured_text_wrapper_spans(
                 data,
                 spec25::text_rules(profile),
@@ -10160,7 +10213,7 @@ fn no_manifest_output(explanation: &str, profile: EngineProfile, present: bool) 
         "validation_state": state.as_str(),
         "provenance_verdict": provenance_verdict_json(&results, present, profile),
     });
-    VerifyOutput {
+    let mut output = VerifyOutput {
         validation_state: state,
         network_needs: Vec::new(),
         results,
@@ -10169,6 +10222,19 @@ fn no_manifest_output(explanation: &str, profile: EngineProfile, present: bool) 
         version_verdict: None,
         manifest_store: None,
         hard_binding_label: None,
+    };
+    stamp_selected_policy(&mut output, profile);
+    output
+}
+
+/// Record the caller-selected policy on an output that never reached a
+/// manifest. The 2.4 policy's no-manifest and container-failure reports have
+/// never carried `engine_profile`, and keeping them byte-stable is a contract,
+/// so only an explicitly selected newer policy is stamped here: a 2.5 report
+/// must say which rules decided that no manifest was located.
+fn stamp_selected_policy(output: &mut VerifyOutput, profile: EngineProfile) {
+    if spec25::applies(profile) {
+        stamp_profile(output, profile);
     }
 }
 fn failure_only_output(
@@ -10267,7 +10333,7 @@ fn container_failure_output(code: &str, explanation: &str, profile: EngineProfil
         "validation_state": state.as_str(),
         "provenance_verdict": provenance_verdict_json(&results, true, profile),
     });
-    VerifyOutput {
+    let mut output = VerifyOutput {
         validation_state: state,
         network_needs: Vec::new(),
         results,
@@ -10276,7 +10342,9 @@ fn container_failure_output(code: &str, explanation: &str, profile: EngineProfil
         version_verdict: None,
         manifest_store: None,
         hard_binding_label: None,
-    }
+    };
+    stamp_selected_policy(&mut output, profile);
+    output
 }
 
 /// Serialize a slice of status codes for the reader report.
@@ -11081,7 +11149,10 @@ mod tests {
             let proposed = verify(&text_input(data, mime, v2_5())).unwrap();
             assert!(proposed.results.failure.is_empty(), "{mime}");
             assert_eq!(proposed.validation_state, ValidationState::None);
-            assert_eq!(proposed.report_json["engine_profile"]["spec_version"], "2.5");
+            assert_eq!(
+                proposed.report_json["engine_profile"]["spec_version"],
+                "2.5"
+            );
         }
     }
 
@@ -11710,6 +11781,8 @@ mod tests {
         data: &[u8],
         expected: Vec<u8>,
         exclusions: &[(usize, usize)],
+        rendition: update_manifest::StoreRendition,
+        profile: EngineProfile,
     ) -> ValidationResults {
         let exclusions = Value::Array(
             exclusions
@@ -11750,9 +11823,9 @@ mod tests {
             data,
             AssetFormat::TextUnstructured,
             &[],
-            update_manifest::StoreRendition::AsSigned,
+            rendition,
             "urn:test",
-            EngineProfile::GENEROUS,
+            profile,
             &mut results,
         );
         results
@@ -11768,6 +11841,8 @@ mod tests {
             asset.as_bytes(),
             expected,
             &[(carrier_nfd.len(), wrapper.len())],
+            update_manifest::StoreRendition::AsSigned,
+            EngineProfile::GENEROUS,
         );
 
         assert!(results.has_success(ASSERTION_DATA_HASH_MATCH));
@@ -11779,7 +11854,13 @@ mod tests {
         let carrier = "signed text";
         let wrapper = c2pa_text::encode_wrapper(b"manifest");
         let asset = format!("{carrier}{wrapper}");
-        let results = run_text_data_hash(asset.as_bytes(), sha(carrier.as_bytes()), &[(0, 1)]);
+        let results = run_text_data_hash(
+            asset.as_bytes(),
+            sha(carrier.as_bytes()),
+            &[(0, 1)],
+            update_manifest::StoreRendition::AsSigned,
+            EngineProfile::GENEROUS,
+        );
 
         assert!(results.has_failure(ASSERTION_DATA_HASH_MALFORMED));
         assert!(!results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
@@ -11795,10 +11876,36 @@ mod tests {
             asset.as_bytes(),
             sha(b"signed text"),
             &[("signed".len(), first.len()), (second_start, second.len())],
+            update_manifest::StoreRendition::AsSigned,
+            EngineProfile::GENEROUS,
         );
 
         assert!(results.has_failure("manifest.text.multipleWrappers"));
         assert!(!results.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    #[test]
+    fn detached_text_hashes_exact_asset_bytes_without_an_embedded_wrapper() {
+        let nfd = "Cafe\u{301}".as_bytes();
+        let profile = EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular);
+        let intact = run_text_data_hash(
+            nfd,
+            sha(nfd),
+            &[],
+            update_manifest::StoreRendition::Detached,
+            profile,
+        );
+        assert!(intact.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(!intact.has_failure(ASSERTION_DATA_HASH_MALFORMED));
+        let changed = run_text_data_hash(
+            nfd,
+            sha("Caf\u{e9}".as_bytes()),
+            &[],
+            update_manifest::StoreRendition::Detached,
+            profile,
+        );
+        assert!(changed.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert!(!changed.has_success(ASSERTION_DATA_HASH_MATCH));
     }
 
     #[test]
@@ -16340,7 +16447,11 @@ mod tests {
         assert!(bmff_has_additional_exclusions(&[map("/free")], false, true));
         assert!(!bmff_has_additional_exclusions(&[map("/mdat")], true, true));
         // 2.5 no longer lists `/ftyp` as a mandatory exclusion.
-        assert!(bmff_has_additional_exclusions(&[map("/ftyp")], false, false));
+        assert!(bmff_has_additional_exclusions(
+            &[map("/ftyp")],
+            false,
+            false
+        ));
         assert!(!bmff_has_additional_exclusions(
             &[map("/uuid"), map("/mfra")],
             false,

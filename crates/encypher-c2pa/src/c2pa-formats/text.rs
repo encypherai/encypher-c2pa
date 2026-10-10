@@ -241,12 +241,17 @@ pub(crate) fn unstructured_wrapper_spans(
 /// The whitespace 2.5 trims from a structured-text manifest reference.
 const STRUCTURED_REFERENCE_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 
-/// The 2.5 structured-text manifest block: its byte span and the decoded
-/// store when the reference is a well-formed inline `data:` URI.
+struct StructuredTextCarrier<'a> {
+    span: (usize, usize),
+    reference: &'a str,
+}
+
+/// Locate the 2.5 structured-text block without decoding the store when the
+/// caller needs only its exclusion span.
 ///
 /// Locating the C2PA Manifest Store, Special Considerations for Structured
 /// Text: exactly one `BEGIN`/`END` pair, END after BEGIN; otherwise no block.
-fn structured_block_v2_5(text: &str) -> Option<((usize, usize), Option<Vec<u8>>)> {
+fn structured_block_v2_5(text: &str) -> Option<StructuredTextCarrier<'_>> {
     let begin_delimiter = c2pa_text::structured::BEGIN_DELIMITER;
     let end_delimiter = c2pa_text::structured::END_DELIMITER;
     if text.matches(begin_delimiter).count() != 1 || text.matches(end_delimiter).count() != 1 {
@@ -259,16 +264,7 @@ fn structured_block_v2_5(text: &str) -> Option<((usize, usize), Option<Vec<u8>>)
     }
     let span = structured_block_span(text)?;
     let reference = text[begin..end].trim_matches(STRUCTURED_REFERENCE_WHITESPACE.as_slice());
-    // Only `data:application/c2pa;base64,<data>` embeds a store. A remote URI
-    // is optional to retrieve and this reader does not, so it locates no
-    // manifest, as does a `data:` URI with another media type or encoding, or
-    // an invalid Base64 payload.
-    let manifest = reference
-        .strip_prefix(c2pa_text::structured::DATA_URI_PREFIX)
-        .filter(|payload| !payload.is_empty())
-        .and_then(crate::c2pa_formats::util::base64_decode)
-        .filter(|bytes| !bytes.is_empty());
-    Some((span, manifest))
+    Some(StructuredTextCarrier { span, reference })
 }
 
 /// The 2.5 HTML manifest carrier: the single C2PA element inside `head`.
@@ -298,7 +294,10 @@ fn find_start_tag(text: &str, name: &str, from: usize) -> Option<usize> {
     loop {
         let index = find_ascii_ci(text, name, cursor)?;
         let next = text.as_bytes().get(index + name.len()).copied();
-        if matches!(next, Some(b'>' | b'/') | Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')) {
+        if matches!(
+            next,
+            Some(b'>' | b'/') | Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+        ) {
             return Some(index);
         }
         cursor = index + name.len();
@@ -316,8 +315,7 @@ fn html_head_carrier_v2_5(text: &str) -> Option<HtmlHeadCarrier> {
     let mut links = 0usize;
 
     let mut cursor = head_body_start;
-    while let Some(open) = find_start_tag(text, "<script", cursor).filter(|i| *i < head_body_end)
-    {
+    while let Some(open) = find_start_tag(text, "<script", cursor).filter(|i| *i < head_body_end) {
         let tag_end = open + text[open..].find('>')?;
         let tag = &text[open..=tag_end];
         cursor = tag_end + 1;
@@ -425,7 +423,16 @@ pub(crate) fn extract(
             }
         }
         (TextMethod::Structured, TextLocatorRules::V2_5) => {
-            Ok(structured_block_v2_5(text).and_then(|(_, manifest)| manifest))
+            // Only a non-empty inline C2PA data URI locates a store.
+            Ok(structured_block_v2_5(text)
+                .and_then(|block| {
+                    block
+                        .reference
+                        .strip_prefix(c2pa_text::structured::DATA_URI_PREFIX)
+                })
+                .filter(|payload| !payload.is_empty())
+                .and_then(crate::c2pa_formats::util::base64_decode)
+                .filter(|bytes| !bytes.is_empty()))
         }
         (TextMethod::Html, TextLocatorRules::V2_4) => match c2pa_text::html::extract_html(text) {
             Ok(Some(ext)) => Ok(ext.manifest),
@@ -543,7 +550,7 @@ pub(crate) fn exclusions(
             .map(|wrapper| (wrapper.start, wrapper.length)),
         (TextMethod::Structured, TextLocatorRules::V2_4) => structured_block_span(text),
         (TextMethod::Structured, TextLocatorRules::V2_5) => {
-            structured_block_v2_5(text).map(|(span, _)| span)
+            structured_block_v2_5(text).map(|block| block.span)
         }
         (TextMethod::Html, TextLocatorRules::V2_4) => {
             locate_span(text, "<script type=\"application/c2pa\"", "</script>")
@@ -840,7 +847,12 @@ mod tests {
         // Existing 0xFF padding stays admitted under 2.5.
         let legacy = format!("post{}", with_padding(&wrapper, &[0xff, 0xff, 0xff]));
         assert_eq!(
-            extract(TextMethod::Unstructured, legacy.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Unstructured,
+                legacy.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             Some(store.clone())
         );
         let legacy_v25 =
@@ -856,16 +868,30 @@ mod tests {
         let second = c2pa_text::encode_wrapper(&[4, 5, 6]);
         let text = format!("{first} text {second}");
         assert_eq!(
-            extract(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            extract(
+                TextMethod::Unstructured,
+                text.as_bytes(),
+                TextLocatorRules::V2_4
+            )
+            .unwrap(),
             Some(vec![1, 2, 3])
         );
         assert_eq!(
-            extract(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Unstructured,
+                text.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             None
         );
-        assert!(exclusions(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_5)
-            .unwrap()
-            .is_empty());
+        assert!(exclusions(
+            TextMethod::Unstructured,
+            text.as_bytes(),
+            TextLocatorRules::V2_5
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -875,7 +901,12 @@ mod tests {
         let valid = c2pa_text::encode_wrapper(&[7, 7]);
         let text = format!("{truncated} body {valid}");
         assert_eq!(
-            extract(TextMethod::Unstructured, text.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Unstructured,
+                text.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             Some(vec![7, 7])
         );
         assert_eq!(
@@ -904,11 +935,21 @@ mod tests {
         // the four characters 2.5 trims, so the 2.5 reference is not a data URI.
         let nbsp = format!("x\n# {BEGIN}\u{a0}data:application/c2pa;base64,AQID {END}\n");
         assert_eq!(
-            extract(TextMethod::Structured, nbsp.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            extract(
+                TextMethod::Structured,
+                nbsp.as_bytes(),
+                TextLocatorRules::V2_4
+            )
+            .unwrap(),
             Some(vec![1, 2, 3])
         );
         assert_eq!(
-            extract(TextMethod::Structured, nbsp.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Structured,
+                nbsp.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             None
         );
         let wrong_type = format!("# {BEGIN} data:text/plain;base64,AQID {END}\n");
@@ -916,13 +957,22 @@ mod tests {
         let doubled = format!("{inline}{inline}");
         for text in [wrong_type, bad_base64, doubled] {
             assert_eq!(
-                extract(TextMethod::Structured, text.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+                extract(
+                    TextMethod::Structured,
+                    text.as_bytes(),
+                    TextLocatorRules::V2_5
+                )
+                .unwrap(),
                 None
             );
             assert!(
-                exclusions(TextMethod::Structured, text.as_bytes(), TextLocatorRules::V2_5)
-                    .unwrap()
-                    .is_empty()
+                exclusions(
+                    TextMethod::Structured,
+                    text.as_bytes(),
+                    TextLocatorRules::V2_5
+                )
+                .unwrap()
+                .is_empty()
                     || text.matches(BEGIN).count() == 1
             );
         }
@@ -933,27 +983,51 @@ mod tests {
         let body_only = "<html><head><title>t</title></head><body>\
             <script type=\"application/c2pa\">AQID</script></body></html>";
         assert_eq!(
-            extract(TextMethod::Html, body_only.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            extract(
+                TextMethod::Html,
+                body_only.as_bytes(),
+                TextLocatorRules::V2_4
+            )
+            .unwrap(),
             Some(vec![1, 2, 3])
         );
         assert_eq!(
-            extract(TextMethod::Html, body_only.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Html,
+                body_only.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             None
         );
 
         let head_and_body = "<html><HEAD>\n<script type=\"application/c2pa\"> AQID\n</script>\
             </head><body><script type=\"application/c2pa\">BAUG</script></body></html>";
         assert_eq!(
-            extract(TextMethod::Html, head_and_body.as_bytes(), TextLocatorRules::V2_4).unwrap(),
+            extract(
+                TextMethod::Html,
+                head_and_body.as_bytes(),
+                TextLocatorRules::V2_4
+            )
+            .unwrap(),
             None,
             "2.4 counts the body element and finds two"
         );
         assert_eq!(
-            extract(TextMethod::Html, head_and_body.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Html,
+                head_and_body.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             Some(vec![1, 2, 3])
         );
-        let span =
-            exclusions(TextMethod::Html, head_and_body.as_bytes(), TextLocatorRules::V2_5).unwrap();
+        let span = exclusions(
+            TextMethod::Html,
+            head_and_body.as_bytes(),
+            TextLocatorRules::V2_5,
+        )
+        .unwrap();
         assert_eq!(span.len(), 1);
         let excluded = &head_and_body[span[0].start..span[0].start + span[0].length];
         assert!(excluded.starts_with("<script") && excluded.ends_with("</script>"));
@@ -962,12 +1036,22 @@ mod tests {
         let two_in_head = "<html><head><script type=\"application/c2pa\">AQID</script>\
             <link rel=\"c2pa-manifest\" href=\"https://x/m.c2pa\"></head></html>";
         assert_eq!(
-            extract(TextMethod::Html, two_in_head.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Html,
+                two_in_head.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             None
         );
         let header_not_head = "<header><script type=\"application/c2pa\">AQID</script></header>";
         assert_eq!(
-            extract(TextMethod::Html, header_not_head.as_bytes(), TextLocatorRules::V2_5).unwrap(),
+            extract(
+                TextMethod::Html,
+                header_not_head.as_bytes(),
+                TextLocatorRules::V2_5
+            )
+            .unwrap(),
             None
         );
     }

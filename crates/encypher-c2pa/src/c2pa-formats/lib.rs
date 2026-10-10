@@ -548,6 +548,23 @@ pub(crate) fn carrier_placement_error(
     }
 }
 
+/// Placement rules that are new or changed in C2PA 2.5 and that a validator
+/// can observe: PNG `caBX` before `IDAT` (a "shall" in 2.5, a recommendation
+/// in 2.4), the 2.5 BMFF manifest-box positions (adjacent to `moov` allowed),
+/// and the 2.5 TIFF locator (first or last IFD). Rules unchanged from 2.4 keep
+/// their 2.4 scope in [`carrier_placement_error`].
+pub(crate) fn carrier_placement_error_v2_5(
+    format: AssetFormat,
+    data: &[u8],
+) -> Result<Option<&'static str>, FormatError> {
+    match format {
+        AssetFormat::Png => png::placement_error_v2_5(data),
+        AssetFormat::Tiff => tiff::placement_error_v2_5(data),
+        AssetFormat::Bmff => bmff::placement_error_v2_5(data),
+        _ => Ok(None),
+    }
+}
+
 /// Remove zero-filled capacity reserved after a complete top-level JUMBF box.
 ///
 /// ZIP entries, SFNT tables, ID3 `GEOB` frames (MP3 and FLAC), and the legacy
@@ -617,9 +634,7 @@ pub(crate) fn extract_manifest_with(
         AssetFormat::Ogg => ogg::extract(data),
         AssetFormat::Font => font::extract(data),
         AssetFormat::Jxl => jxl::extract(data),
-        AssetFormat::TextUnstructured => {
-            text::extract(text::TextMethod::Unstructured, data, rules)
-        }
+        AssetFormat::TextUnstructured => text::extract(text::TextMethod::Unstructured, data, rules),
         AssetFormat::TextStructured { .. } => {
             text::extract(text::TextMethod::Structured, data, rules)
         }
@@ -783,11 +798,9 @@ pub(crate) fn compute_data_hash_exclusions_with(
             asset_with_placeholder,
             rules,
         ),
-        AssetFormat::TextStructured { .. } => text::exclusions(
-            text::TextMethod::Structured,
-            asset_with_placeholder,
-            rules,
-        ),
+        AssetFormat::TextStructured { .. } => {
+            text::exclusions(text::TextMethod::Structured, asset_with_placeholder, rules)
+        }
         AssetFormat::TextHtml => {
             text::exclusions(text::TextMethod::Html, asset_with_placeholder, rules)
         }

@@ -395,9 +395,7 @@ fn is_actions_v2_label(label: &str) -> bool {
 
 /// Whether `label` names an actions assertion of either version.
 fn is_actions_label(label: &str) -> bool {
-    is_actions_v2_label(label)
-        || label == "c2pa.actions"
-        || label.starts_with("c2pa.actions__")
+    is_actions_v2_label(label) || label == "c2pa.actions" || label.starts_with("c2pa.actions__")
 }
 
 /// Creation rules that first apply in proposed 2.5 and are visible in the
@@ -427,9 +425,9 @@ fn actions_creation_findings(manifest: &ParsedManifest) -> (Vec<String>, Vec<Str
             ));
         }
         let removed = matches!(assertion.get("actions"), Some(Value::Array(actions))
-            if actions.iter().any(|action| {
-                action.get("action").and_then(Value::as_text) == Some("c2pa.removed")
-            }));
+        if actions.iter().any(|action| {
+            action.get("action").and_then(Value::as_text) == Some("c2pa.removed")
+        }));
         if removed {
             deprecations.push(format!(
                 "actions assertion '{label}' writes c2pa.removed, deprecated as of 2.5"
