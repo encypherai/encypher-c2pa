@@ -17,7 +17,7 @@ use encypher_c2pa::{
     telemetry_preference, verify_ertmp_with_options, verify_file, verify_fragmented_with_options,
     verify_manifest_store_only, verify_stream_with_options, verify_with_caller_verified_binding,
     verify_with_manifest_store, verify_with_options, CallerBindingEvidence, CallerBindingVerdict,
-    CawgStoreHost, CawgTrustConfiguration, Error, ErtmpInput, ManifestBindingTarget,
+    CawgStoreHost, CawgTrustConfiguration, Error, ErtmpInput, GraphInputs, ManifestBindingTarget,
     OnlinePreference, SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation,
     StreamMethod, TelemetryOptions, TrustListSource, VerifyOptions,
 };
@@ -722,6 +722,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 },
                 &evidence,
                 &options,
+                GraphInputs::default(),
             )?;
             if json {
                 println!("{}", report.to_pretty_json()?);

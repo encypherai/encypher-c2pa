@@ -10,8 +10,9 @@ use encypher_c2pa::{
     set_telemetry_enabled, telemetry_preference, verify_ertmp_with_options,
     verify_fragmented_with_options, verify_manifest_store_only, verify_stream_with_options,
     verify_with_caller_verified_binding, verify_with_manifest_store, verify_with_options,
-    CallerBindingEvidence, CallerBindingVerdict, CawgStoreHost, ErtmpInput, ManifestBindingTarget,
-    SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation, StreamMethod, VerifyOptions,
+    CallerBindingEvidence, CallerBindingVerdict, CawgStoreHost, ErtmpInput, GraphInputs,
+    ManifestBindingTarget, SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation,
+    StreamMethod, VerifyOptions,
 };
 use serde_json::json;
 
@@ -377,6 +378,7 @@ pub unsafe extern "C" fn encypher_c2pa_verify_with_caller_binding(
             },
             &evidence,
             &options,
+            GraphInputs::default(),
         ) {
             Ok(report) => json!({ "ok": true, "report": report }).to_string(),
             Err(error) => error_json(error.code(), &error.to_string()),

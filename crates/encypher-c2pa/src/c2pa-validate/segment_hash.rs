@@ -12,9 +12,10 @@
 //! that line references must carry a segment hash that is itself well formed,
 //! correctly placed and matching, back to the first checkpoint.
 //!
-//! An external predecessor store is read only from caller-supplied evidence
-//! (`external_data`, keyed by URI); the kernel never fetches. When it is
-//! absent, `manifest.inaccessible` is recorded without rejecting the active
+//! An external predecessor store is read only from caller-supplied evidence or
+//! the network-free resource provider; the kernel never fetches. Provider
+//! bodies are borrowed through the verification pass's URI cache. When a store
+//! is absent, `manifest.inaccessible` is recorded without rejecting the active
 //! checkpoint, and every earlier segment is reported unverified, exactly as
 //! the clause directs.
 //!
@@ -33,7 +34,7 @@ use serde_json::json;
 
 use super::{
     base_assertion_label, hash_bytes, is_allowed_hash_algorithm, network_needs,
-    resolved_hash_algorithm, NetworkNeed, OnlineEvidence, ValidationResults, ALGORITHM_UNSUPPORTED,
+    resolved_hash_algorithm, NetworkNeed, ValidationResults, ALGORITHM_UNSUPPORTED,
     MANIFEST_INACCESSIBLE,
 };
 
@@ -243,6 +244,7 @@ fn check_start(segment: &SegmentHash, url: &str, results: &mut ValidationResults
 struct PredecessorCheckpoint {
     manifest_label: String,
     assertion_label: String,
+    manifest_bytes: usize,
     segment: Result<SegmentHash, ParseError>,
 }
 
@@ -273,8 +275,40 @@ fn predecessor_checkpoint(store: &[u8]) -> Result<PredecessorCheckpoint, &'stati
     Ok(PredecessorCheckpoint {
         manifest_label: manifest.label.clone(),
         assertion_label: assertion_label.clone(),
+        manifest_bytes: manifest.manifest_jumbf.len(),
         segment,
     })
+}
+
+/// Locate the predecessor store named by one claim-declared segment binding.
+/// This parses only the schema and sentinel needed for discovery; it performs
+/// no digest, signature, or trust validation.
+pub(super) fn locate_predecessor_reference(
+    claim_refs: &super::ClaimAssertionRefs<'_>,
+    claim: &Value,
+    data: &[u8],
+    flavor: AppendOnlyFlavor,
+) -> Result<Option<CheckpointReference>, ()> {
+    let mut declared = claim_refs.references.iter().filter_map(|reference| {
+        let label = reference.label?;
+        (base_assertion_label(label) == "c2pa.hash.segment").then_some(label)
+    });
+    let label = declared.next().ok_or(())?;
+    if declared.next().is_some() {
+        return Err(());
+    }
+    let assertion = claim_refs
+        .indexed(label)
+        .and_then(|assertion| assertion.decoded.as_ref())
+        .ok_or(())?;
+    let segment = parse(assertion, claim).map_err(|_| ())?;
+    let Some(predecessor) = segment.predecessor else {
+        return Ok(None);
+    };
+    let sentinel = sentinel_at(data, predecessor.start, Some(flavor))
+        .filter(|sentinel| sentinel.length == predecessor.length)
+        .ok_or(())?;
+    Ok(Some(sentinel.reference))
 }
 
 /// The schema defect of a segment hash assertion, checked without the file:
@@ -317,7 +351,8 @@ pub(super) fn verify(
     active_sentinel: Option<usize>,
     binding_compromised: bool,
     url: &str,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut super::refs::ResourceCache<'_>,
+    budget: &mut super::ingredient_graph::Budget,
     results: &mut ValidationResults,
 ) {
     let Some(assertion) = assertion else {
@@ -366,7 +401,7 @@ pub(super) fn verify(
             format!("segment [{}, {}) hash valid", segment.start, segment.end),
         );
     }
-    verify_chain(segment, data, flavor, url, evidence, results);
+    verify_chain(segment, data, flavor, url, resources, budget, results);
 }
 
 /// Walk the predecessor chain from the active checkpoint to the first.
@@ -375,13 +410,14 @@ fn verify_chain(
     data: &[u8],
     flavor: Option<AppendOnlyFlavor>,
     active_url: &str,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut super::refs::ResourceCache<'_>,
+    budget: &mut super::ingredient_graph::Budget,
     results: &mut ValidationResults,
 ) {
     let mut current = active;
     let mut current_url = active_url.to_string();
     let mut decoded_bytes = 0usize;
-    for _ in 0..MAX_CHECKPOINT_CHAIN {
+    for depth in 1..=MAX_CHECKPOINT_CHAIN {
         let Some(predecessor) = current.predecessor.clone() else {
             return;
         };
@@ -407,13 +443,33 @@ fn verify_chain(
             );
             return;
         };
+        if !budget.resource_edge(depth) {
+            results.push_informational(
+                MANIFEST_INACCESSIBLE,
+                current_url,
+                "earlier checkpoint stores exceed the graph limits; earlier history is unverified"
+                    .into(),
+            );
+            return;
+        }
         let store: &[u8] = match &line.reference {
             CheckpointReference::Inline(store) => store,
-            CheckpointReference::External(uri) => {
-                match evidence.external_data.and_then(|data| data.get(uri)) {
-                    Some(store) => store,
-                    None => {
-                        results.push_informational_with_details(
+            CheckpointReference::External(uri) => match resources.resolve(uri) {
+                super::refs::ResolvedResource::Retrieved { bytes, .. } => bytes,
+                super::refs::ResolvedResource::Unavailable => {
+                    results.push_informational_with_details(
+                            MANIFEST_INACCESSIBLE,
+                            uri.clone(),
+                            "an earlier checkpoint's external manifest store could not be retrieved; that segment and every earlier one are unverified".into(),
+                            json!({
+                                "checkpoint_sentinel_start": predecessor.start,
+                                "history": "unverified",
+                            }),
+                        );
+                    return;
+                }
+                super::refs::ResolvedResource::NotAttempted => {
+                    results.push_informational_with_details(
                             MANIFEST_INACCESSIBLE,
                             uri.clone(),
                             "an earlier checkpoint's manifest store is external and was not supplied; that segment and every earlier one are unverified".into(),
@@ -422,17 +478,16 @@ fn verify_chain(
                                 "history": "unverified",
                             }),
                         );
-                        network_needs::push_unique(
-                            &mut results.network_needs,
-                            NetworkNeed::ExternalData {
-                                uri: uri.clone(),
-                                assertion_label: "c2pa.hash.segment".to_string(),
-                            },
-                        );
-                        return;
-                    }
+                    network_needs::push_unique(
+                        &mut results.network_needs,
+                        NetworkNeed::ExternalData {
+                            uri: uri.clone(),
+                            assertion_label: "c2pa.hash.segment".to_string(),
+                        },
+                    );
+                    return;
                 }
-            }
+            },
         };
         decoded_bytes = decoded_bytes.saturating_add(store.len());
         if decoded_bytes > MAX_CHAIN_STORE_BYTES || store.len() > crate::MAX_MANIFEST_STORE_BYTES {
@@ -451,6 +506,15 @@ fn verify_chain(
                 return;
             }
         };
+        if !budget.resource_bytes(checkpoint.manifest_bytes) {
+            results.push_informational(
+                MANIFEST_INACCESSIBLE,
+                current_url,
+                "earlier checkpoint stores exceed the graph limits; earlier history is unverified"
+                    .into(),
+            );
+            return;
+        }
         let url = format!(
             "self#jumbf=/c2pa/{}/c2pa.assertions/{}",
             checkpoint.manifest_label, checkpoint.assertion_label
@@ -517,6 +581,8 @@ fn verify_chain(
 
 #[cfg(test)]
 mod tests {
+    use super::super::ingredient_graph::GraphLimits;
+    use super::super::OnlineEvidence;
     use super::*;
     use crate::c2pa_core::jumbf::{assertion_box, build_manifest, build_manifest_store};
     use sha2::{Digest, Sha256};
@@ -570,7 +636,19 @@ mod tests {
     }
 
     fn run(assertion: &Value, data: &[u8], evidence: OnlineEvidence<'_>) -> ValidationResults {
+        run_with_resources(assertion, data, evidence, None, GraphLimits::default())
+    }
+
+    fn run_with_resources(
+        assertion: &Value,
+        data: &[u8],
+        evidence: OnlineEvidence<'_>,
+        provider: Option<&dyn super::super::refs::ExternalResources>,
+        limits: GraphLimits,
+    ) -> ValidationResults {
         let mut results = ValidationResults::default();
+        let mut resources = super::super::refs::ResourceCache::with_evidence(provider, evidence);
+        let mut budget = super::super::ingredient_graph::Budget::new(limits);
         verify(
             Some(assertion),
             &Value::Map(Vec::new()),
@@ -579,9 +657,11 @@ mod tests {
             None,
             false,
             "self#jumbf=/c2pa/urn:active/c2pa.assertions/c2pa.hash.segment",
-            evidence,
+            &mut resources,
+            &mut budget,
             &mut results,
         );
+        budget.report("urn:active", &mut results);
         results
     }
 
@@ -714,6 +794,93 @@ mod tests {
             .filter(|status| status.code == ASSERTION_SEGMENT_HASH_MATCH)
             .count();
         assert_eq!(matches, 2, "active and predecessor both verified");
+    }
+
+    fn two_external_checkpoints() -> (Vec<u8>, Value, Vec<u8>) {
+        let mut data = b"alpha\n".to_vec();
+        let first_line = line("https://e.example/chk1.c2pa");
+        data.extend_from_slice(first_line.as_bytes());
+        let first_assertion = segment_map(&data, 0, 6, Some(first_line.len()), None);
+        let assertion = assertion_box(
+            "c2pa.hash.segment",
+            &crate::c2pa_cbor::encode(
+                &first_assertion,
+                crate::c2pa_cbor::Profile::CanonicalForHashedSubstructures,
+            )
+            .unwrap(),
+            None,
+        );
+        let manifest = build_manifest("urn:c2pa:first", &[assertion], &[0xa0], &[0xd2, 0x84]);
+        let store = build_manifest_store(&[manifest]);
+        let second_start = data.len();
+        data.extend_from_slice(b"bravo\n");
+        let second_end = data.len();
+        let second_line = line("https://e.example/chk2.c2pa");
+        data.extend_from_slice(second_line.as_bytes());
+        let active = segment_map(
+            &data,
+            second_start,
+            second_end,
+            Some(second_line.len()),
+            Some((6, first_line.len())),
+        );
+        (data, active, store)
+    }
+
+    #[test]
+    fn injected_resource_verifies_external_predecessor_with_graph_limits() {
+        struct Provider<'a> {
+            store: &'a [u8],
+            calls: std::cell::Cell<usize>,
+        }
+
+        impl super::super::refs::ExternalResources for Provider<'_> {
+            fn resolve(&self, url: &str) -> super::super::refs::ExternalResource<'_> {
+                assert_eq!(url, "https://e.example/chk1.c2pa");
+                self.calls.set(self.calls.get() + 1);
+                super::super::refs::ExternalResource::Retrieved {
+                    bytes: self.store,
+                    media_type: Some("application/c2pa"),
+                }
+            }
+        }
+
+        let (data, active, store) = two_external_checkpoints();
+        let provider = Provider {
+            store: &store,
+            calls: std::cell::Cell::new(0),
+        };
+        let results = run_with_resources(
+            &active,
+            &data,
+            OnlineEvidence::default(),
+            Some(&provider),
+            GraphLimits::default(),
+        );
+        assert!(results.failure.is_empty(), "{results:?}");
+        assert_eq!(
+            results
+                .success
+                .iter()
+                .filter(|status| status.code == ASSERTION_SEGMENT_HASH_MATCH)
+                .count(),
+            2
+        );
+        assert_eq!(provider.calls.get(), 1);
+
+        let limited = run_with_resources(
+            &active,
+            &data,
+            OnlineEvidence::default(),
+            Some(&provider),
+            GraphLimits::lowered(32, 0, usize::MAX, usize::MAX),
+        );
+        assert!(limited.has_informational(super::super::ingredient_graph::GRAPH_LIMIT_EXCEEDED));
+        assert_eq!(
+            provider.calls.get(),
+            1,
+            "node limit is enforced before provider resolution"
+        );
     }
 
     #[test]

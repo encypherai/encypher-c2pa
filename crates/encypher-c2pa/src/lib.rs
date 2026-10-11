@@ -64,6 +64,10 @@ mod c2pa_trust;
 #[path = "c2pa-validate/lib.rs"]
 #[allow(dead_code, unused_imports, reason = "production kernel mirror")]
 mod c2pa_validate;
+pub use c2pa_validate::external_discovery::{
+    locate_external_resources, locate_external_resources_with_manifest_store, ExternalResourceKind,
+    ExternalResourcePlan, ExternalResourceRequest, ExternalResourceStopReason, GraphLimitKind,
+};
 pub use c2pa_validate::ingredient_graph::{GraphInputs, GraphLimits};
 pub use c2pa_validate::refs::{ExternalResource, ExternalResources};
 mod config_dir;
@@ -760,6 +764,28 @@ pub fn verify_with_manifest_store(
     result
 }
 
+/// [`verify_with_manifest_store`] with caller-controlled external resource
+/// resolution and lowered graph ceilings. The manifest store and external
+/// resources are supplied by the caller; this function performs no network
+/// I/O and completes the graph and CAWG checks in one verification pass.
+pub fn verify_with_manifest_store_and_graph_inputs(
+    asset: &[u8],
+    manifest_store: &[u8],
+    mime_type: &str,
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<VerificationReport, Error> {
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let result = (|| {
+        let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
+        let mime = resolve_detached_mime(mime_type, profile)?;
+        detached_pass(asset, manifest_store, &mime, options, graph_inputs)
+            .map(|(report, _, _)| report)
+    })();
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    result
+}
+
 fn verify_with_manifest_store_inner(
     asset: &[u8],
     manifest_store: &[u8],
@@ -768,7 +794,13 @@ fn verify_with_manifest_store_inner(
 ) -> Result<VerificationReport, Error> {
     let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
     let mime = resolve_detached_mime(mime_type, profile)?;
-    let (mut report, needs, _) = detached_pass(asset, manifest_store, &mime, options)?;
+    let (mut report, needs, _) = detached_pass(
+        asset,
+        manifest_store,
+        &mime,
+        options,
+        GraphInputs::default(),
+    )?;
     let (network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
@@ -777,7 +809,8 @@ fn verify_with_manifest_store_inner(
     // The store the caller supplied is the one that binds this asset. Pass 2
     // re-reads it with the fetched evidence; it never swaps in another store.
     let next = online::apply_evidence(options, &evidence);
-    let (mut report, _, _) = detached_pass(asset, manifest_store, &mime, &next)?;
+    let (mut report, _, _) =
+        detached_pass(asset, manifest_store, &mime, &next, GraphInputs::default())?;
     report.network = network;
     Ok(report)
 }
@@ -789,6 +822,7 @@ fn detached_pass(
     manifest_store: &[u8],
     mime: &str,
     options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     let resolved = ResolvedOptions::resolve(options)?;
     if manifest_store.is_empty() {
@@ -812,6 +846,7 @@ fn detached_pass(
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),
         options.cawg_ica_status_lists.as_ref(),
+        graph_inputs,
     )
     .map_err(map_validate_error)?;
     let needs = online::network_needs(&output);
@@ -840,6 +875,17 @@ pub fn verify_manifest_store_only(
     manifest_store: &[u8],
     options: &VerifyOptions,
 ) -> Result<StoreOnlyValidation, Error> {
+    verify_manifest_store_only_with_graph_inputs(manifest_store, options, GraphInputs::default())
+}
+
+/// [`verify_manifest_store_only`] with caller-controlled external resource
+/// resolution and lowered graph ceilings. Content remains deliberately
+/// unevaluated, so a valid result stays unbound.
+pub fn verify_manifest_store_only_with_graph_inputs(
+    manifest_store: &[u8],
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<StoreOnlyValidation, Error> {
     if options.online == Some(true) {
         return Err(Error::Verification(
             "online must not be Some(true): store-only validation never fetches".into(),
@@ -863,6 +909,7 @@ pub fn verify_manifest_store_only(
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),
         options.cawg_ica_status_lists.as_ref(),
+        graph_inputs,
     );
     let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::c2pa_validate::verify_store_binding(
@@ -918,7 +965,7 @@ pub fn verify_with_graph_inputs(
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let result = (|| {
         let resolved = ResolvedOptions::resolve(options)?;
-        embedded_graph_pass(data, mime_type, options, &resolved, graph_inputs)
+        embedded_graph_pass(data, None, mime_type, options, &resolved, graph_inputs)
     })();
     enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
     result
@@ -1033,6 +1080,37 @@ pub fn verify_fragmented_with_options(
     {
         verify_with_options_inner(init_segment, Some(fragments), &mime, options, &resolved)
             .map(|(report, _)| report)
+    } else {
+        Err(Error::UnsupportedMime(mime))
+    };
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    result
+}
+
+/// [`verify_fragmented_with_options`] with caller-controlled external resource
+/// resolution and lowered graph ceilings. The fragments, graph walk, and CAWG
+/// identity checks run in one verification pass without network I/O.
+pub fn verify_fragmented_with_graph_inputs(
+    init_segment: &[u8],
+    fragments: &[&[u8]],
+    mime_type: &str,
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<VerificationReport, Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let mime = canonicalize_mime(mime_type);
+    let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
+        == Some(crate::c2pa_formats::AssetFormat::Bmff)
+    {
+        embedded_graph_pass(
+            init_segment,
+            Some(fragments),
+            &mime,
+            options,
+            &resolved,
+            graph_inputs,
+        )
     } else {
         Err(Error::UnsupportedMime(mime))
     };
@@ -1427,7 +1505,7 @@ fn verify_with_options_inner(
         // The asset said where its manifest store lives and the store was
         // fetched. Pass 2 verifies the asset against it exactly as it would
         // against a sidecar handed in by the caller, hard binding and all.
-        (Some(store), None) => detached_pass(data, store, &mime, &next),
+        (Some(store), None) => detached_pass(data, store, &mime, &next, GraphInputs::default()),
         _ => embedded_pass(data, fragments, &mime, &next),
     };
     match second {
@@ -1478,6 +1556,7 @@ fn embedded_pass_resolved(
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),
             options.cawg_ica_status_lists.as_ref(),
+            GraphInputs::default(),
         ),
         None => verify_safe(
             &input,
@@ -1502,6 +1581,7 @@ fn embedded_pass_resolved(
 
 fn embedded_graph_pass(
     data: &[u8],
+    fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
     resolved: &ResolvedOptions,
@@ -1510,17 +1590,32 @@ fn embedded_graph_pass(
     let mime = resolve_mime(mime_type, resolved.profile)?;
     require_embedded_mime(&mime, resolved.profile)?;
     let input = resolved.input(data, &mime);
-    let output = verify_graph_safe(
-        &input,
-        resolved.cawg_trust(),
-        resolved.cawg_allowed_certs(),
-        resolved.cawg_document_signing_require_anchor,
-        options.cawg_did_documents.as_ref(),
-        options.cawg_ica_trusted_issuers.as_deref(),
-        options.cawg_ica_trust_anchors.as_deref(),
-        options.cawg_ica_status_lists.as_ref(),
-        graph_inputs,
-    )
+    let output = match fragments {
+        Some(fragments) => verify_fragmented_safe(
+            &input,
+            fragments,
+            &options.expected_seek_positions,
+            resolved.cawg_trust(),
+            resolved.cawg_allowed_certs(),
+            resolved.cawg_document_signing_require_anchor,
+            options.cawg_did_documents.as_ref(),
+            options.cawg_ica_trusted_issuers.as_deref(),
+            options.cawg_ica_trust_anchors.as_deref(),
+            options.cawg_ica_status_lists.as_ref(),
+            graph_inputs,
+        ),
+        None => verify_graph_safe(
+            &input,
+            resolved.cawg_trust(),
+            resolved.cawg_allowed_certs(),
+            resolved.cawg_document_signing_require_anchor,
+            options.cawg_did_documents.as_ref(),
+            options.cawg_ica_trusted_issuers.as_deref(),
+            options.cawg_ica_trust_anchors.as_deref(),
+            options.cawg_ica_status_lists.as_ref(),
+            graph_inputs,
+        ),
+    }
     .map_err(map_validate_error)?;
     Ok(report_from_output(output, mime, resolved))
 }
@@ -2118,9 +2213,11 @@ fn trust_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_file,
-        verify_fragmented, verify_with_options, CawgTrustConfiguration, CawgTrustProfile, Error,
-        VerifyOptions,
+        detached_manifest_evidence, mime_from_path, read_bounded_file, supported_mime_types,
+        verify, verify_file, verify_fragmented, verify_fragmented_with_graph_inputs,
+        verify_manifest_store_only_with_graph_inputs, verify_with_manifest_store_and_graph_inputs,
+        verify_with_options, CawgTrustConfiguration, CawgTrustProfile, Error, GraphInputs,
+        GraphLimits, VerificationReport, VerifyOptions,
     };
     use std::{io::Cursor, path::Path};
 
@@ -2253,6 +2350,72 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::UnsupportedMime(mime) if mime == "image/jpeg"));
+    }
+
+    #[test]
+    fn detached_fragmented_and_store_only_routes_honor_one_graph_budget() {
+        let limited = || GraphInputs {
+            external: None,
+            limits: GraphLimits::lowered(32, 0, 16_384, 64 * 1024 * 1024),
+        };
+        let has_node_limit = |report: &VerificationReport| {
+            report
+                .validation_results
+                .informational
+                .iter()
+                .any(|status| {
+                    status.code == "com.encypher.resource.graphLimitExceeded"
+                        && status
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("limit"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("nodes")
+                })
+        };
+
+        let jpeg = include_bytes!("../../../tests/fixtures/signed_test.jpg");
+        let store = detached_manifest_evidence(jpeg, "image/jpeg")
+            .expect("extract detached evidence")
+            .expect("signed JPEG manifest")
+            .manifest_store;
+        let detached = verify_with_manifest_store_and_graph_inputs(
+            jpeg,
+            &store,
+            "image/jpeg",
+            &VerifyOptions::default(),
+            limited(),
+        )
+        .expect("detached graph verification");
+        assert!(
+            has_node_limit(&detached),
+            "{:?}",
+            detached.validation_results
+        );
+
+        let store_only = verify_manifest_store_only_with_graph_inputs(
+            &store,
+            &VerifyOptions::default(),
+            limited(),
+        )
+        .expect("store-only graph verification");
+        assert_eq!(store_only.report.hard_binding, "not_evaluated");
+        assert!(has_node_limit(&store_only.report));
+
+        let mp4 = include_bytes!("../../../tests/fixtures/signed_test.mp4");
+        let fragmented = verify_fragmented_with_graph_inputs(
+            mp4,
+            &[],
+            "video/mp4",
+            &VerifyOptions::default(),
+            limited(),
+        )
+        .expect("fragmented graph verification");
+        assert!(
+            has_node_limit(&fragmented),
+            "{:?}",
+            fragmented.validation_results
+        );
     }
 
     #[test]

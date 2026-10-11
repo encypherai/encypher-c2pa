@@ -39,13 +39,13 @@ use crate::c2pa_validate::{
     binding_target as kernel_binding_target, verify_detached_safe,
     verify_fragmented_with_cawg_options_and_expected_seeks_safe,
     verify_identity_with_caller_verified_binding, verify_store_binding,
-    verify_with_cawg_options_safe, BindingTarget, CallerBinding, CawgTrustInputs, StoreBinding,
-    VerifyOutput,
+    verify_with_cawg_options_and_graph_inputs_safe, BindingTarget, CallerBinding, CawgTrustInputs,
+    StoreBinding, VerifyOutput,
 };
 use crate::{
     copy_status, finish_store_only_validation, map_validate_error, parse_validation_time,
     report_from_output, require_embedded_mime, resolve_detached_mime, resolve_mime,
-    resolve_profile, Error, ManifestDigest, ResolvedOptions, StoreOnlyValidation,
+    resolve_profile, Error, GraphInputs, ManifestDigest, ResolvedOptions, StoreOnlyValidation,
     ValidationResults, VerificationReport, VerifyOptions, MAX_MANIFEST_STORE_BYTES,
 };
 
@@ -232,7 +232,7 @@ impl CawgEvaluator {
             )));
         }
         let input = self.resolved.input(&[], "");
-        let cawg_inputs = self.cawg_inputs();
+        let cawg_inputs = self.cawg_inputs(GraphInputs::default());
         let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             verify_identity_with_caller_verified_binding(
                 manifest_store,
@@ -281,8 +281,8 @@ impl CawgEvaluator {
         }
     }
 
-    /// The CAWG trust and evidence inputs this evaluator was built with.
-    fn cawg_inputs(&self) -> CawgTrustInputs<'_> {
+    /// The CAWG trust, evidence, and graph inputs for one verification.
+    fn cawg_inputs<'a>(&'a self, graph_inputs: GraphInputs<'a>) -> CawgTrustInputs<'a> {
         CawgTrustInputs::new(
             self.resolved.cawg_trust(),
             self.resolved.cawg_allowed_certs(),
@@ -291,6 +291,7 @@ impl CawgEvaluator {
             self.ica_trusted_issuers.as_deref(),
             self.ica_trust_anchors.as_deref(),
             self.ica_status_lists.as_ref(),
+            graph_inputs,
         )
     }
 
@@ -404,6 +405,7 @@ pub fn verify_manifest_store_only_with_cawg(
     manifest_store: &[u8],
     options: &VerifyOptions,
     evaluator: &CawgEvaluator,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<StoreOnlyValidation, Error> {
     check_store_size(manifest_store)?;
     let resolved = evaluator.pass_options(options)?;
@@ -413,7 +415,7 @@ pub fn verify_manifest_store_only_with_cawg(
             manifest_store,
             StoreBinding::StoreOnly,
             &input,
-            evaluator.cawg_inputs(),
+            evaluator.cawg_inputs(graph_inputs),
         )
     })?;
     Ok(finish_store_only_validation(
@@ -636,6 +638,7 @@ pub fn verify_with_caller_verified_binding(
     host: CawgStoreHost,
     evidence: &CallerBindingEvidence,
     options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
     if options.online == Some(true) {
         return Err(Error::Verification(
@@ -651,6 +654,7 @@ pub fn verify_with_caller_verified_binding(
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),
         options.cawg_ica_status_lists.as_ref(),
+        graph_inputs,
     );
     verify_caller_binding(
         manifest_store,
@@ -673,6 +677,7 @@ pub fn verify_with_caller_verified_binding_and_cawg(
     evidence: &CallerBindingEvidence,
     options: &VerifyOptions,
     evaluator: &CawgEvaluator,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
     let resolved = evaluator.pass_options(options)?;
     verify_caller_binding(
@@ -681,7 +686,7 @@ pub fn verify_with_caller_verified_binding_and_cawg(
         host,
         evidence,
         &resolved,
-        evaluator.cawg_inputs(),
+        evaluator.cawg_inputs(graph_inputs),
     )
 }
 
@@ -693,13 +698,14 @@ pub fn verify_with_cawg(
     mime_type: &str,
     options: &VerifyOptions,
     evaluator: &CawgEvaluator,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
     let resolved = evaluator.pass_options(options)?;
     let mime = resolve_mime(mime_type, resolved.profile)?;
     require_embedded_mime(&mime, resolved.profile)?;
     let input = resolved.input(data, &mime);
     let output = contained(|| {
-        verify_with_cawg_options_safe(
+        verify_with_cawg_options_and_graph_inputs_safe(
             &input,
             evaluator.resolved.cawg_trust(),
             evaluator.resolved.cawg_allowed_certs(),
@@ -708,6 +714,7 @@ pub fn verify_with_cawg(
             evaluator.ica_trusted_issuers.as_deref(),
             evaluator.ica_trust_anchors.as_deref(),
             evaluator.ica_status_lists.as_ref(),
+            graph_inputs,
         )
     })?;
     Ok(report_from_output(output, mime, &resolved))
@@ -723,6 +730,7 @@ pub fn verify_with_manifest_store_and_cawg(
     mime_type: &str,
     options: &VerifyOptions,
     evaluator: &CawgEvaluator,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
     let resolved = evaluator.pass_options(options)?;
     let mime = resolve_detached_mime(mime_type, resolved.profile)?;
@@ -741,6 +749,7 @@ pub fn verify_with_manifest_store_and_cawg(
             evaluator.ica_trusted_issuers.as_deref(),
             evaluator.ica_trust_anchors.as_deref(),
             evaluator.ica_status_lists.as_ref(),
+            graph_inputs,
         )
     })?;
     Ok(report_from_output(output, mime, &resolved))
@@ -755,6 +764,7 @@ pub fn verify_fragmented_with_cawg(
     mime_type: &str,
     options: &VerifyOptions,
     evaluator: &CawgEvaluator,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
     let resolved = evaluator.pass_options(options)?;
     let mime = resolve_mime(mime_type, resolved.profile)?;
@@ -774,6 +784,7 @@ pub fn verify_fragmented_with_cawg(
             evaluator.ica_trusted_issuers.as_deref(),
             evaluator.ica_trust_anchors.as_deref(),
             evaluator.ica_status_lists.as_ref(),
+            graph_inputs,
         )
     })?;
     Ok(report_from_output(output, mime, &resolved))

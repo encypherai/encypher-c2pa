@@ -616,6 +616,16 @@ pub(crate) struct RemoteManifestRef {
     pub source: &'static str,
 }
 
+/// Format-owned result of locating an asset's remote active manifest.
+pub(crate) enum RemoteManifestLocation {
+    /// No remote active manifest is declared.
+    Absent,
+    /// The authoritative append-only checkpoint is malformed.
+    Malformed,
+    /// The authoritative active manifest is external.
+    Remote(RemoteManifestRef),
+}
+
 /// Read a documented remote-manifest declaration from `data`.
 ///
 /// C2PA 2.4 Validation, By Reference, lists the locations a validator should
@@ -629,33 +639,52 @@ pub(crate) fn remote_manifest_uri(
     format: AssetFormat,
     data: &[u8],
 ) -> Result<Option<RemoteManifestRef>, FormatError> {
-    // An append-only file's active checkpoint names its store by URI.
+    Ok(match locate_remote_manifest(format, data)? {
+        RemoteManifestLocation::Remote(remote) => Some(remote),
+        RemoteManifestLocation::Absent | RemoteManifestLocation::Malformed => None,
+    })
+}
+
+/// Locate a remote active manifest without flattening a malformed terminal
+/// append-only checkpoint into ordinary absence.
+pub(crate) fn locate_remote_manifest(
+    format: AssetFormat,
+    data: &[u8],
+) -> Result<RemoteManifestLocation, FormatError> {
+    // An append-only file's terminal checkpoint is authoritative. An inline or
+    // malformed terminal checkpoint never falls back to an older external one.
     if let AssetFormat::AppendOnlyText { flavor } = format {
         return Ok(match append_text::locate_active(data, flavor) {
             append_text::Located::Active(append_text::Sentinel {
                 reference: append_text::SentinelReference::External(uri),
                 ..
-            }) => Some(RemoteManifestRef {
+            }) => RemoteManifestLocation::Remote(RemoteManifestRef {
                 uri,
                 source: "append_only_text.checkpoint",
             }),
-            _ => None,
+            append_text::Located::Malformed => RemoteManifestLocation::Malformed,
+            append_text::Located::Active(_) | append_text::Located::None => {
+                RemoteManifestLocation::Absent
+            }
         });
     }
     if format == AssetFormat::Font {
-        if let Some(uri) = font::remote_manifest_uri(data)? {
-            return Ok(Some(RemoteManifestRef {
+        return Ok(match font::remote_manifest_uri(data)? {
+            Some(uri) => RemoteManifestLocation::Remote(RemoteManifestRef {
                 uri: uri.to_string(),
                 source: "font.C2PA.activeManifestUri",
-            }));
-        }
-        return Ok(None);
+            }),
+            None => RemoteManifestLocation::Absent,
+        });
     }
     Ok(
-        xmp::provenance_uri(format, data).map(|uri| RemoteManifestRef {
+        match xmp::provenance_uri(format, data).map(|uri| RemoteManifestRef {
             uri,
             source: "xmp.dcterms:provenance",
-        }),
+        }) {
+            Some(remote) => RemoteManifestLocation::Remote(remote),
+            None => RemoteManifestLocation::Absent,
+        },
     )
 }
 

@@ -60,15 +60,15 @@ use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_crypto::{extract_x5chain, verify_claim_with, CryptoError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Resource ceilings for one ingredient and hashed-reference walk.
+/// Resource ceilings for one verification graph.
 pub struct GraphLimits {
-    /// Maximum ingredient edges followed from the active manifest.
+    /// Maximum graph edges followed from the active manifest.
     pub max_depth: usize,
-    /// Maximum distinct manifests visited.
+    /// Maximum distinct manifests visited, including append-history stores.
     pub max_nodes: usize,
-    /// Maximum hashed references examined across all visited manifests.
+    /// Maximum references examined across the pass.
     pub max_references: usize,
-    /// Maximum cumulative JUMBF bytes of visited manifests.
+    /// Maximum cumulative JUMBF bytes of visited manifests and predecessor stores.
     pub max_bytes: usize,
 }
 
@@ -106,9 +106,9 @@ impl Default for GraphLimits {
 #[derive(Default, Clone, Copy)]
 /// Caller-supplied resource provider and ceilings for graph validation.
 pub struct GraphInputs<'a> {
-    /// Network-free source of external-reference bytes already held by the caller.
+    /// Network-free source of external bytes already held by the caller.
     pub external: Option<&'a dyn super::refs::ExternalResources>,
-    /// Resource ceilings for the walk.
+    /// Resource ceilings shared by the complete verification pass.
     pub limits: GraphLimits,
 }
 
@@ -139,6 +139,7 @@ pub(super) struct Budget {
     references: usize,
     bytes: usize,
     exhausted: [Option<usize>; 4],
+    reported: [bool; 4],
 }
 
 impl Budget {
@@ -154,6 +155,7 @@ impl Budget {
             references: 0,
             bytes: 0,
             exhausted: [None; 4],
+            reported: [false; 4],
         }
     }
 
@@ -213,11 +215,26 @@ impl Budget {
         true
     }
 
-    pub(super) fn report(&self, active_label: &str, results: &mut ValidationResults) {
+    pub(super) fn resource_edge(&mut self, depth: usize) -> bool {
+        let references = self.references(1);
+        let depth = self.depth(depth);
+        let nodes = self.node();
+        references && depth && nodes
+    }
+
+    pub(super) fn resource_bytes(&mut self, bytes: usize) -> bool {
+        self.bytes(bytes)
+    }
+
+    pub(super) fn report(&mut self, active_label: &str, results: &mut ValidationResults) {
         for ceiling in Ceiling::ALL {
+            if self.reported[ceiling as usize] {
+                continue;
+            }
             let Some(observed) = self.exhausted[ceiling as usize] else {
                 continue;
             };
+            self.reported[ceiling as usize] = true;
             let limit = match ceiling {
                 Ceiling::Depth => self.limits.max_depth,
                 Ceiling::Nodes => self.limits.max_nodes,
@@ -240,7 +257,7 @@ impl Budget {
                 code: GRAPH_LIMIT_EXCEEDED.into(),
                 url: format!("self#jumbf=/c2pa/{active_label}"),
                 explanation: format!(
-                    "ingredient graph {name} ceiling reached ({limit}); traversal stopped. \
+                    "verification graph {name} ceiling reached ({limit}); traversal stopped. \
                      This is a resource outcome and does not affect manifest validity."
                 ),
                 details: Some(json!({ "limit": name, "ceiling": limit, "observed": observed })),
@@ -249,7 +266,7 @@ impl Budget {
     }
 }
 
-/// Informational: a ceiling stopped the ingredient walk. Entity-namespaced
+/// Informational: a ceiling stopped the verification graph. Entity-namespaced
 /// because it is a resource outcome, not a C2PA validation outcome.
 pub(super) const GRAPH_LIMIT_EXCEEDED: &str = "com.encypher.resource.graphLimitExceeded";
 
@@ -509,7 +526,7 @@ fn record_missing_claim(manifest: &ParsedManifest<'_>, results: &mut ValidationR
 
 /// A time-stamp manifest carries a time-stamp assertion and ingredient
 /// assertions, and nothing else.
-fn is_time_stamp_manifest(claim_refs: &ClaimAssertionRefs<'_>) -> bool {
+pub(super) fn is_time_stamp_manifest(claim_refs: &ClaimAssertionRefs<'_>) -> bool {
     let mut timestamps = false;
     for label in &claim_refs.declaration_labels {
         let base = label.split("__").next().unwrap_or(label);
@@ -767,6 +784,7 @@ fn collect_recorded(codes: Option<&Value>, into: &mut Vec<(&'static str, StatusC
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use sha2::{Digest, Sha256};
@@ -786,6 +804,7 @@ mod tests {
     };
     use crate::c2pa_core::EngineProfile;
     use crate::c2pa_formats::AssetFormat;
+    use crate::{ExternalResource, ExternalResources, GraphInputs, GraphLimits, VerifyOptions};
     use serde_json::Value as Json;
 
     const INGREDIENT: &str = "urn:c2pa:00000000-0000-4000-8000-000000000001";
@@ -1486,5 +1505,140 @@ mod tests {
             .failure
             .iter()
             .any(|status| status.code.starts_with("com.encypher.ingredient.")));
+    }
+
+    #[test]
+    fn store_only_graph_inputs_share_provider_and_budget_without_binding_content() {
+        const URL: &str = "https://example.test/icon.png";
+        const ICON: &[u8] = b"caller-held icon bytes";
+
+        let external_icon = || {
+            vmap(vec![
+                ("url", Value::Text(URL.into())),
+                ("alg", Value::Text("sha256".into())),
+                ("hash", Value::Bytes(Sha256::digest(ICON).to_vec())),
+                ("dc:format", Value::Text("image/png".into())),
+            ])
+        };
+        let actions = Assertion::new(
+            "c2pa.actions.v2",
+            &vmap(vec![
+                (
+                    "actions",
+                    Value::Array(vec![vmap(vec![
+                        ("action", Value::Text("c2pa.created".into())),
+                        (
+                            "digitalSourceType",
+                            Value::Text(
+                                "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture"
+                                    .into(),
+                            ),
+                        ),
+                    ])]),
+                ),
+                (
+                    "softwareAgents",
+                    Value::Array(vec![
+                        vmap(vec![
+                            ("name", Value::Text("agent one".into())),
+                            ("icon", external_icon()),
+                        ]),
+                        vmap(vec![
+                            ("name", Value::Text("agent two".into())),
+                            ("icon", external_icon()),
+                        ]),
+                    ]),
+                ),
+            ]),
+        );
+        let binding = Assertion::new("c2pa.hash.data", &data_hash());
+        let signer = Signer::conformant();
+        let (manifest, _) = manifest_box(
+            &signer,
+            ACTIVE,
+            &[binding.clone(), actions.clone()],
+            vec![binding.reference(), actions.reference()],
+        );
+        let store = build_manifest_store(&[manifest]);
+        let options = VerifyOptions {
+            no_default_trust: true,
+            validation_time: Some("2026-06-01T00:00:00Z".into()),
+            ..VerifyOptions::default()
+        };
+
+        struct Provider {
+            calls: Cell<usize>,
+        }
+
+        impl ExternalResources for Provider {
+            fn resolve(&self, url: &str) -> ExternalResource<'_> {
+                assert_eq!(url, URL);
+                self.calls.set(self.calls.get() + 1);
+                ExternalResource::Retrieved {
+                    bytes: ICON,
+                    media_type: Some("image/png"),
+                }
+            }
+        }
+
+        let provider = Provider {
+            calls: Cell::new(0),
+        };
+        let validation = crate::verify_manifest_store_only_with_graph_inputs(
+            &store,
+            &options,
+            GraphInputs {
+                external: Some(&provider),
+                limits: GraphLimits::default(),
+            },
+        )
+        .expect("store-only graph validation");
+        assert_eq!(provider.calls.get(), 1, "one URI is resolved once");
+        assert_eq!(validation.report.hard_binding, "not_evaluated");
+        assert_eq!(validation.report.integrity, "unbound");
+        assert_eq!(
+            validation
+                .report
+                .validation_results
+                .success
+                .iter()
+                .filter(|status| {
+                    status.code == "assertion.hashedURI.match" && status.url == URL
+                })
+                .count(),
+            2
+        );
+
+        let limited_provider = Provider {
+            calls: Cell::new(0),
+        };
+        let limited = crate::verify_manifest_store_only_with_graph_inputs(
+            &store,
+            &options,
+            GraphInputs {
+                external: Some(&limited_provider),
+                limits: GraphLimits::lowered(32, 1_024, 1, 64 * 1024 * 1024),
+            },
+        )
+        .expect("budget-limited store-only graph validation");
+        assert_eq!(limited.report.hard_binding, "not_evaluated");
+        assert!(
+            limited
+                .report
+                .validation_results
+                .informational
+                .iter()
+                .any(|status| {
+                    status.code == "com.encypher.resource.graphLimitExceeded"
+                        && status
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("limit"))
+                            .and_then(Json::as_str)
+                            == Some("references")
+                }),
+            "{:?}",
+            limited.report.validation_results.informational
+        );
     }
 }

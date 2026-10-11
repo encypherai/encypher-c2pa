@@ -11,9 +11,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use encypher_c2pa::{
-    detached_manifest_evidence, verify_with_manifest_store, verify_with_options, CawgEvaluation,
-    CawgEvaluator, CawgProfile, CawgStoreHost, Error, TelemetryOptions, VerificationReport,
-    VerifyOptions,
+    binding_target, detached_manifest_evidence, verify_with_caller_verified_binding_and_cawg,
+    verify_with_cawg, verify_with_manifest_store, verify_with_options, CallerBindingEvidence,
+    CallerBindingVerdict, CawgEvaluation, CawgEvaluator, CawgProfile, CawgStoreHost, Error,
+    GraphInputs, GraphLimits, TelemetryOptions, VerificationReport, VerifyOptions,
 };
 
 fn vector(path: &str) -> Vec<u8> {
@@ -293,6 +294,55 @@ fn the_document_signing_anchor_requirement_follows_the_option() {
             );
         }
     }
+}
+
+#[test]
+fn caller_built_cawg_and_binding_share_the_supplied_graph_budget() {
+    let asset = vector(ES256_JPEG);
+    let store = store_of(&asset, "image/jpeg");
+    let evaluator = CawgEvaluator::new(&es256_options(), &generous()).expect("evaluator");
+    let options = offline(VerifyOptions {
+        allowed_list_pem: Some(text("generated/identity-1.2/trust/claim-allowed.pem")),
+        validation_time: Some("2026-08-06T00:00:00Z".into()),
+        ..VerifyOptions::default()
+    });
+    let graph_inputs = || GraphInputs {
+        external: None,
+        limits: GraphLimits::lowered(32, 0, 16_384, 64 * 1024 * 1024),
+    };
+    let has = |report: &VerificationReport, code: &str| {
+        report
+            .validation_results
+            .success
+            .iter()
+            .chain(&report.validation_results.informational)
+            .chain(&report.validation_results.failure)
+            .any(|status| status.code == code)
+    };
+
+    let embedded = verify_with_cawg(&asset, "image/jpeg", &options, &evaluator, graph_inputs())
+        .expect("embedded CAWG graph verification");
+    assert!(has(&embedded, "com.encypher.resource.graphLimitExceeded"));
+    assert!(has(&embedded, "cawg.identity.trusted"));
+
+    let target = binding_target(&store, CawgStoreHost::Asset, &VerifyOptions::default())
+        .expect("binding target")
+        .expect("unique binding");
+    let evidence = CallerBindingEvidence::new(target, CallerBindingVerdict::Match, "test engine")
+        .expect("caller evidence");
+    let caller = verify_with_caller_verified_binding_and_cawg(
+        &store,
+        "image/jpeg",
+        CawgStoreHost::Asset,
+        &evidence,
+        &options,
+        &evaluator,
+        graph_inputs(),
+    )
+    .expect("caller-binding CAWG graph verification");
+    assert!(has(&caller, "com.encypher.resource.graphLimitExceeded"));
+    assert!(has(&caller, "com.encypher.hardBinding.callerVerified"));
+    assert!(has(&caller, "cawg.identity.trusted"));
 }
 
 #[test]

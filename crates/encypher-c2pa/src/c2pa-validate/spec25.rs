@@ -307,8 +307,11 @@ pub(super) fn verify_linked_resource_integrity(
     manifest_label: &str,
     claim_refs: &ClaimAssertionRefs<'_>,
     evidence: OnlineEvidence<'_>,
+    resources: &mut super::refs::ResourceCache<'_>,
+    reference_budget: usize,
     results: &mut ValidationResults,
-) {
+) -> super::refs::ReferenceWalk {
+    let mut examined = 0usize;
     for reference in &claim_refs.references {
         let Some(label) = reference
             .label
@@ -330,7 +333,7 @@ pub(super) fn verify_linked_resource_integrity(
         else {
             continue;
         };
-        let Some(resources) = assertion.get("resources").and_then(Value::as_map) else {
+        let Some(resource_map) = assertion.get("resources").and_then(Value::as_map) else {
             results.push_failure(
                 LINKED_RESOURCE_MALFORMED,
                 assertion_url,
@@ -338,8 +341,8 @@ pub(super) fn verify_linked_resource_integrity(
             );
             continue;
         };
-        let external_field = unique_map_field(resources, "externalResources");
-        let relative_field = unique_map_field(resources, "relativeResources");
+        let external_field = unique_map_field(resource_map, "externalResources");
+        let relative_field = unique_map_field(resource_map, "relativeResources");
         let external = match external_field {
             Some(Value::Array(entries)) => Some(entries.as_slice()),
             _ => None,
@@ -348,7 +351,7 @@ pub(super) fn verify_linked_resource_integrity(
             Some(Value::Array(entries)) => Some(entries.as_slice()),
             _ => None,
         };
-        let shared_alg = unique_map_field(resources, "alg").and_then(Value::as_text);
+        let shared_alg = unique_map_field(resource_map, "alg").and_then(Value::as_text);
 
         let external_valid = external.is_some_and(|entries| !entries.is_empty());
         let relative_valid =
@@ -365,6 +368,13 @@ pub(super) fn verify_linked_resource_integrity(
 
         if let Some(entries) = external.filter(|entries| !entries.is_empty()) {
             for entry in entries {
+                if examined >= reference_budget {
+                    return super::refs::ReferenceWalk {
+                        examined,
+                        truncated: true,
+                    };
+                }
+                examined += 1;
                 let resource_url = entry.get("url").and_then(Value::as_text);
                 let alg = entry.get("alg").and_then(Value::as_text);
                 let expected = entry.get("hash").and_then(Value::as_bytes);
@@ -405,6 +415,7 @@ pub(super) fn verify_linked_resource_integrity(
                     &assertion_url,
                     true,
                     evidence,
+                    resources,
                     results,
                 );
             }
@@ -423,6 +434,13 @@ pub(super) fn verify_linked_resource_integrity(
                 continue;
             }
             for entry in entries {
+                if examined >= reference_budget {
+                    return super::refs::ReferenceWalk {
+                        examined,
+                        truncated: true,
+                    };
+                }
+                examined += 1;
                 let resource_url = entry.get("uri").and_then(Value::as_text);
                 let expected = entry.get("hash").and_then(Value::as_bytes);
                 let Some(resource_url) = resource_url else {
@@ -462,11 +480,96 @@ pub(super) fn verify_linked_resource_integrity(
                     &assertion_url,
                     false,
                     evidence,
+                    resources,
                     results,
                 );
             }
         }
     }
+    super::refs::ReferenceWalk {
+        examined,
+        truncated: false,
+    }
+}
+
+/// Locate well-formed absolute LRI resources without retrieving or validating
+/// them. Relative resources still count toward the shared reference budget.
+pub(super) fn locate_linked_resources(
+    claim_refs: &ClaimAssertionRefs<'_>,
+    reference_budget: usize,
+) -> (Vec<String>, super::refs::ReferenceWalk) {
+    let mut urls = Vec::new();
+    let mut examined = 0usize;
+    for reference in &claim_refs.references {
+        let Some(label) = reference
+            .label
+            .filter(|label| base_assertion_label(label) == "c2pa.linked-resource-integrity")
+        else {
+            continue;
+        };
+        let Some(assertion) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+        else {
+            continue;
+        };
+        let Some(resources) = assertion.get("resources").and_then(Value::as_map) else {
+            continue;
+        };
+        let external = match unique_map_field(resources, "externalResources") {
+            Some(Value::Array(entries)) if !entries.is_empty() => Some(entries.as_slice()),
+            _ => None,
+        };
+        let relative = match unique_map_field(resources, "relativeResources") {
+            Some(Value::Array(entries)) if !entries.is_empty() => Some(entries.as_slice()),
+            _ => None,
+        };
+        if let Some(entries) = external {
+            for entry in entries {
+                if examined >= reference_budget {
+                    return (
+                        urls,
+                        super::refs::ReferenceWalk {
+                            examined,
+                            truncated: true,
+                        },
+                    );
+                }
+                examined += 1;
+                let url = entry.get("url").and_then(Value::as_text);
+                let alg = entry.get("alg").and_then(Value::as_text);
+                let hash = entry.get("hash").and_then(Value::as_bytes);
+                if let (Some(url), Some(alg), Some(_)) = (url, alg, hash) {
+                    if is_allowed_hash_algorithm(alg)
+                        && (url.starts_with("https://") || url.starts_with("http://"))
+                    {
+                        urls.push(url.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(entries) = relative {
+            for _ in entries {
+                if examined >= reference_budget {
+                    return (
+                        urls,
+                        super::refs::ReferenceWalk {
+                            examined,
+                            truncated: true,
+                        },
+                    );
+                }
+                examined += 1;
+            }
+        }
+    }
+    (
+        urls,
+        super::refs::ReferenceWalk {
+            examined,
+            truncated: false,
+        },
+    )
 }
 
 fn unique_map_field<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
@@ -488,29 +591,34 @@ fn terminal_linked_resource(
     assertion_url: &str,
     network_resolvable: bool,
     evidence: OnlineEvidence<'_>,
+    resources: &mut super::refs::ResourceCache<'_>,
     results: &mut ValidationResults,
 ) {
     let details = || serde_json::json!({ "resourceUrl": resource_url });
     let supplied = evidence
         .external_data
         .and_then(|resources| resources.get(resource_url))
-        .map(Vec::as_slice);
-    let Some(bytes) = supplied else {
-        if evidence.external_is_unreachable(resource_url) {
-            results.push_informational_with_details(
-                LINKED_RESOURCE_INACCESSIBLE,
-                assertion_url.to_string(),
-                "linked resource retrieval produced no usable body".into(),
-                details(),
-            );
-        } else {
-            results.push_informational_with_details(
-                LINKED_RESOURCE_SKIPPED,
-                assertion_url.to_string(),
-                "linked resource was not retrieved".into(),
-                details(),
-            );
-            if network_resolvable {
+        .map(|bytes| (bytes.as_slice(), evidence.external_media_type(resource_url)));
+    let (bytes, media_type) = match supplied {
+        Some(content) => content,
+        None if network_resolvable => match resources.resolve(resource_url) {
+            super::refs::ResolvedResource::Retrieved { bytes, media_type } => (bytes, media_type),
+            super::refs::ResolvedResource::Unavailable => {
+                results.push_informational_with_details(
+                    LINKED_RESOURCE_INACCESSIBLE,
+                    assertion_url.to_string(),
+                    "linked resource retrieval produced no usable body".into(),
+                    details(),
+                );
+                return;
+            }
+            super::refs::ResolvedResource::NotAttempted => {
+                results.push_informational_with_details(
+                    LINKED_RESOURCE_SKIPPED,
+                    assertion_url.to_string(),
+                    "linked resource was not retrieved".into(),
+                    details(),
+                );
                 push_unique(
                     &mut results.network_needs,
                     NetworkNeed::ExternalData {
@@ -518,9 +626,27 @@ fn terminal_linked_resource(
                         assertion_label: assertion_label.to_string(),
                     },
                 );
+                return;
             }
+        },
+        None => {
+            if evidence.external_is_unreachable(resource_url) {
+                results.push_informational_with_details(
+                    LINKED_RESOURCE_INACCESSIBLE,
+                    assertion_url.to_string(),
+                    "linked resource retrieval produced no usable body".into(),
+                    details(),
+                );
+            } else {
+                results.push_informational_with_details(
+                    LINKED_RESOURCE_SKIPPED,
+                    assertion_url.to_string(),
+                    "linked resource was not retrieved".into(),
+                    details(),
+                );
+            }
+            return;
         }
-        return;
     };
 
     if let Some(size) = entry.get("size").and_then(|value| match value {
@@ -538,7 +664,7 @@ fn terminal_linked_resource(
         }
     }
     if let Some(expected_format) = entry.get("dc:format").and_then(Value::as_text) {
-        let observed = evidence.external_media_type(resource_url);
+        let observed = media_type;
         if observed.is_none_or(|observed| {
             crate::c2pa_core::spec::canonicalize_mime(observed)
                 != crate::c2pa_core::spec::canonicalize_mime(expected_format)
@@ -797,5 +923,69 @@ mod tests {
         assert_eq!(text_rules(v24), TextLocatorRules::V2_4);
         assert_eq!(text_rules(v25), TextLocatorRules::V2_5);
         assert!(!applies(EngineProfile::GENEROUS));
+    }
+
+    #[test]
+    fn linked_resources_use_one_borrowed_provider_result_per_uri() {
+        use std::cell::Cell;
+
+        const URL: &str = "https://example.test/resource";
+        const BODY: &[u8] = b"linked resource";
+
+        struct Provider {
+            calls: Cell<usize>,
+        }
+
+        impl super::super::refs::ExternalResources for Provider {
+            fn resolve(&self, url: &str) -> super::super::refs::ExternalResource<'_> {
+                assert_eq!(url, URL);
+                self.calls.set(self.calls.get() + 1);
+                super::super::refs::ExternalResource::Retrieved {
+                    bytes: BODY,
+                    media_type: Some("text/plain"),
+                }
+            }
+        }
+
+        let entry = map_from_pairs([
+            ("url".to_string(), Value::Text(URL.into())),
+            ("alg".to_string(), Value::Text("sha256".into())),
+            (
+                "hash".to_string(),
+                Value::Bytes(hash_bytes("sha256", BODY).expect("digest")),
+            ),
+            ("dc:format".to_string(), Value::Text("text/plain".into())),
+        ]);
+        let provider = Provider {
+            calls: Cell::new(0),
+        };
+        let mut resources = super::super::refs::ResourceCache::with_evidence(
+            Some(&provider),
+            OnlineEvidence::default(),
+        );
+        let mut results = ValidationResults::default();
+        for _ in 0..2 {
+            terminal_linked_resource(
+                URL,
+                "sha256",
+                entry.get("hash").and_then(Value::as_bytes).unwrap(),
+                &entry,
+                "c2pa.linked-resource-integrity",
+                "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.linked-resource-integrity",
+                true,
+                OnlineEvidence::default(),
+                &mut resources,
+                &mut results,
+            );
+        }
+        assert_eq!(provider.calls.get(), 1);
+        assert_eq!(
+            results
+                .success
+                .iter()
+                .filter(|status| status.code == LINKED_RESOURCE_MATCH)
+                .count(),
+            2
+        );
     }
 }

@@ -7,9 +7,9 @@ use encypher_c2pa::{
     set_telemetry_enabled, supported_mime_types, telemetry_preference, verify_ertmp_with_options,
     verify_fragmented_with_options, verify_manifest_store_only, verify_stream_with_options,
     verify_with_caller_verified_binding, verify_with_manifest_store, verify_with_options,
-    CallerBindingEvidence, CallerBindingVerdict, CawgStoreHost, ErtmpInput, ManifestBindingTarget,
-    SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation, StreamMethod, VerifyOptions,
-    SUPPORTED_EXTENSIONS,
+    CallerBindingEvidence, CallerBindingVerdict, CawgStoreHost, ErtmpInput, GraphInputs,
+    ManifestBindingTarget, SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation,
+    StreamMethod, VerifyOptions, SUPPORTED_EXTENSIONS,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -128,6 +128,7 @@ fn verify_caller_binding_bytes(
             },
             &evidence,
             &options,
+            GraphInputs::default(),
         )
         .and_then(|report| report.to_json())
         .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))

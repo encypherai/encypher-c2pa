@@ -70,6 +70,7 @@ pub(crate) use cawg_ica::{
 };
 mod cert;
 mod crjson;
+pub(crate) mod external_discovery;
 pub(crate) mod ingredient_graph;
 pub(crate) mod live_video;
 mod network_needs;
@@ -685,6 +686,7 @@ impl<'a> CawgTrustInputs<'a> {
         ica_trusted_issuers: Option<&'a [String]>,
         ica_trust_anchors: Option<&'a [String]>,
         ica_status_lists: Option<&'a std::collections::HashMap<String, String>>,
+        graph_inputs: ingredient_graph::GraphInputs<'a>,
     ) -> Self {
         Self {
             trust,
@@ -694,7 +696,7 @@ impl<'a> CawgTrustInputs<'a> {
             ica_trusted_issuers,
             ica_trust_anchors,
             ica_status_lists,
-            graph_inputs: ingredient_graph::GraphInputs::default(),
+            graph_inputs,
         }
     }
 }
@@ -1589,7 +1591,7 @@ pub fn verify_fragmented_with_cawg_options_safe(
 }
 
 /// Panic-containment wrapper for fragmented verification with explicit seek
-/// boundaries and the full CAWG option set.
+/// boundaries, the full CAWG option set, and caller-supplied graph inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_fragmented_with_cawg_options_and_expected_seeks_safe(
     input: &VerifyInput,
@@ -1602,6 +1604,7 @@ pub fn verify_fragmented_with_cawg_options_and_expected_seeks_safe(
     cawg_ica_trusted_issuers: Option<&[String]>,
     cawg_ica_trust_anchors: Option<&[String]>,
     cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
+    graph_inputs: ingredient_graph::GraphInputs<'_>,
 ) -> Result<VerifyOutput, ValidateError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         verify_with_fragments_and_expected_seeks(
@@ -1616,7 +1619,7 @@ pub fn verify_fragmented_with_cawg_options_and_expected_seeks_safe(
                 ica_trusted_issuers: cawg_ica_trusted_issuers,
                 ica_trust_anchors: cawg_ica_trust_anchors,
                 ica_status_lists: cawg_ica_status_lists,
-                graph_inputs: ingredient_graph::GraphInputs::default(),
+                graph_inputs,
             },
         )
     })) {
@@ -1767,6 +1770,7 @@ pub fn verify_detached_safe<'a>(
     cawg_ica_trusted_issuers: Option<&[String]>,
     cawg_ica_trust_anchors: Option<&[String]>,
     cawg_ica_status_lists: Option<&std::collections::HashMap<String, String>>,
+    graph_inputs: ingredient_graph::GraphInputs<'_>,
 ) -> Result<VerifyOutput, ValidateError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         verify_detached_with_cawg_options(
@@ -1782,7 +1786,7 @@ pub fn verify_detached_safe<'a>(
                 ica_trusted_issuers: cawg_ica_trusted_issuers,
                 ica_trust_anchors: cawg_ica_trust_anchors,
                 ica_status_lists: cawg_ica_status_lists,
-                graph_inputs: ingredient_graph::GraphInputs::default(),
+                graph_inputs,
             },
         )
     })) {
@@ -3151,7 +3155,8 @@ fn verify_manifest_bound<'a>(
     );
     let mut structure_ok = first_fatal.is_none();
     let mut graph_budget = ingredient_graph::Budget::new(cawg_inputs.graph_inputs.limits);
-    let mut graph_resources = refs::ResourceCache::new(cawg_inputs.graph_inputs.external);
+    let mut graph_resources =
+        refs::ResourceCache::with_evidence(cawg_inputs.graph_inputs.external, input.evidence);
     // Runs alongside the structural gate rather than inside it: the external
     // data checks are the only ones that consult caller-supplied network
     // evidence, which the structural gate has no business knowing about.
@@ -3161,16 +3166,22 @@ fn verify_manifest_bound<'a>(
         manifest.kind(),
         &manifest.label,
         input.profile,
-        input.evidence,
+        &mut graph_resources,
+        &mut graph_budget,
         &mut results,
     );
     if spec25::applies(input.profile) {
-        spec25::verify_linked_resource_integrity(
+        let walked = spec25::verify_linked_resource_integrity(
             &manifest.label,
             &claim_refs,
             input.evidence,
+            &mut graph_resources,
+            graph_budget.references_left(),
             &mut results,
         );
+        if !graph_budget.references(walked.examined) || walked.truncated {
+            graph_budget.exhaust_references();
+        }
     }
     // C2PA 2.4 Validation, Validation of References: every schema-declared
     // `hashed_uri` FIELD of a standard assertion is resolved and digested, not
@@ -3547,7 +3558,8 @@ fn verify_manifest_bound<'a>(
                     format,
                     binding.detached(),
                     &label,
-                    input.evidence,
+                    &mut graph_resources,
+                    &mut graph_budget,
                     &mut results,
                 );
             } else {
@@ -3660,9 +3672,7 @@ fn verify_manifest_bound<'a>(
             }
         }
     }
-    if !sig_usable {
-        graph_budget.report(&label, &mut results);
-    }
+    graph_budget.report(&label, &mut results);
 
     // Step 7a: evaluate OCSP evidence before trust so a revoked leaf or CA
     // certificate cannot be reported trusted. Embedded staples first (the
@@ -4862,13 +4872,12 @@ fn base_assertion_label(label: &str) -> &str {
 /// C2PA 2.4 Validation, Specific Assertion Validation: `c2pa.cloud-data` and
 /// `c2pa.external-reference`.
 ///
-/// Both assertions point at data stored somewhere else. Everything the spec
-/// makes checkable without going to get that data - the required fields, the
-/// shape of the `location` map, and the assertion types the spec forbids
-/// storing remotely - is checked here and rejects the claim exactly as the
-/// spec says. Everything that would need the bytes - the retrieved size, the
-/// `Content-Type`, the hash, the retrieved JUMBF box's label - is not checked,
-/// because this verifier does not fetch on its own.
+/// Both assertions point at data stored somewhere else. The required fields,
+/// the shape of the `location` map, and the assertion types the spec forbids
+/// storing remotely are checked whether or not bytes are available. Remote
+/// content is never fetched by this verifier: it is considered only when the
+/// caller supplies it as online evidence or through the network-free resource
+/// provider.
 ///
 /// The distinction is the spec's own, not a shortcut: C2PA 2.4 Validation,
 /// External Data Validation, General, says those references "are not retrieved
@@ -4878,11 +4887,12 @@ fn base_assertion_label(label: &str) -> &str {
 /// with the registered `assertion.inaccessible` code and its URI, and that code
 /// is carved out of the integrity verdict in both postures.
 ///
-/// When a caller supplies the bytes in [`OnlineEvidence::external_data`], the
-/// procedure in External Data Validation, Validation of External References,
-/// runs for real: the content is hashed against the assertion's own `alg` and
-/// `hash`, producing `assertion.accessible` plus `assertion.hashedURI.match`,
-/// or `assertion.hashedURI.mismatch`.
+/// When a caller supplies the bytes in [`OnlineEvidence::external_data`] or
+/// `GraphInputs::external`, the procedure in External Data Validation,
+/// Validation of External References, runs for real: the content is hashed
+/// against the assertion's own `alg` and `hash`, producing
+/// `assertion.accessible` plus `assertion.hashedURI.match`, or
+/// `assertion.hashedURI.mismatch`.
 #[allow(clippy::too_many_arguments)] // one assertion pass; grouping obscures inputs
 fn verify_external_data_assertions(
     claim_refs: &ClaimAssertionRefs<'_>,
@@ -4890,7 +4900,8 @@ fn verify_external_data_assertions(
     manifest_kind: ManifestKind,
     manifest_label: &str,
     profile: EngineProfile,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut refs::ResourceCache<'_>,
+    budget: &mut ingredient_graph::Budget,
     results: &mut ValidationResults,
 ) {
     for reference in &claim_refs.references {
@@ -4901,6 +4912,9 @@ fn verify_external_data_assertions(
         if kind != "c2pa.cloud-data" && kind != "c2pa.external-reference" {
             continue;
         }
+        if !budget.references(1) {
+            break;
+        }
         let Some(assertion) = claim_refs
             .indexed(label)
             .and_then(|indexed| indexed.decoded.as_ref())
@@ -4909,7 +4923,14 @@ fn verify_external_data_assertions(
         };
         let url = format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{label}");
         if kind == "c2pa.cloud-data" {
-            verify_cloud_data_assertion(assertion, manifest_kind, &url, profile, evidence, results);
+            verify_cloud_data_assertion(
+                assertion,
+                manifest_kind,
+                &url,
+                profile,
+                resources,
+                results,
+            );
         } else {
             verify_external_reference_assertion(
                 assertion,
@@ -4917,7 +4938,7 @@ fn verify_external_data_assertions(
                 generation,
                 &url,
                 profile,
-                evidence,
+                resources,
                 results,
             );
         }
@@ -4929,7 +4950,7 @@ fn verify_cloud_data_assertion(
     manifest_kind: ManifestKind,
     url: &str,
     profile: EngineProfile,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut refs::ResourceCache<'_>,
     results: &mut ValidationResults,
 ) {
     let malformed = |results: &mut ValidationResults, detail: &str| {
@@ -5005,7 +5026,7 @@ fn verify_cloud_data_assertion(
             }
         }
     }
-    resolve_external_assertion(referenced, location, uri, url, evidence, results);
+    resolve_external_assertion(referenced, location, uri, url, resources, results);
 }
 
 fn verify_external_reference_assertion(
@@ -5014,7 +5035,7 @@ fn verify_external_reference_assertion(
     generation: ClaimGeneration,
     url: &str,
     profile: EngineProfile,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut refs::ResourceCache<'_>,
     results: &mut ValidationResults,
 ) {
     let malformed = |results: &mut ValidationResults, detail: &str| {
@@ -5066,16 +5087,31 @@ fn verify_external_reference_assertion(
     }
     match referenced {
         Some(referenced) => {
-            resolve_external_assertion(referenced, location, uri, url, evidence, results)
+            resolve_external_assertion(referenced, location, uri, url, resources, results)
         }
         // No `label` means the reference points at arbitrary data, not at an
-        // assertion, so the registered assertion code does not describe it.
-        None => results.push_informational_with_details(
-            EXTERNAL_REFERENCE_NOT_RETRIEVED,
-            url.to_string(),
-            "externally referenced data was not retrieved".into(),
-            json!({ "uri": uri, "retrieval": "not_attempted" }),
-        ),
+        // assertion, so there is no digest procedure or registered accessible
+        // status to emit. Resolve it through the same evidence/provider path
+        // so an injected provider covers every external-reference assertion.
+        None => match resources.resolve(uri) {
+            refs::ResolvedResource::Retrieved { .. } => {}
+            refs::ResolvedResource::Unavailable => {
+                results.push_informational_with_details(
+                    EXTERNAL_REFERENCE_NOT_RETRIEVED,
+                    url.to_string(),
+                    "externally referenced data retrieval produced no usable body".into(),
+                    json!({ "uri": uri, "retrieval": "unavailable" }),
+                );
+            }
+            refs::ResolvedResource::NotAttempted => {
+                results.push_informational_with_details(
+                    EXTERNAL_REFERENCE_NOT_RETRIEVED,
+                    url.to_string(),
+                    "externally referenced data was not retrieved".into(),
+                    json!({ "uri": uri, "retrieval": "not_attempted" }),
+                );
+            }
+        },
     }
 }
 
@@ -5098,32 +5134,46 @@ fn resolve_external_assertion(
     location: &Value,
     uri: &str,
     url: &str,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut refs::ResourceCache<'_>,
     results: &mut ValidationResults,
 ) {
-    let Some(content) = evidence
-        .external_data
-        .and_then(|supplied| supplied.get(uri))
-    else {
-        results.push_failure_with_details(
-            ASSERTION_INACCESSIBLE,
-            url.to_string(),
-            format!("remotely stored assertion {referenced} was not retrieved"),
-            json!({
-                "assertion_label": referenced,
-                "uri": uri,
-                "retrieval": "not_attempted",
-                "external_data": true,
-            }),
-        );
-        network_needs::push_unique(
-            &mut results.network_needs,
-            NetworkNeed::ExternalData {
-                uri: uri.to_string(),
-                assertion_label: referenced.to_string(),
-            },
-        );
-        return;
+    let content = match resources.resolve(uri) {
+        refs::ResolvedResource::Retrieved { bytes, .. } => bytes,
+        refs::ResolvedResource::Unavailable => {
+            results.push_failure_with_details(
+                ASSERTION_INACCESSIBLE,
+                url.to_string(),
+                format!("remotely stored assertion {referenced} could not be retrieved"),
+                json!({
+                    "assertion_label": referenced,
+                    "uri": uri,
+                    "retrieval": "unavailable",
+                    "external_data": true,
+                }),
+            );
+            return;
+        }
+        refs::ResolvedResource::NotAttempted => {
+            results.push_failure_with_details(
+                ASSERTION_INACCESSIBLE,
+                url.to_string(),
+                format!("remotely stored assertion {referenced} was not retrieved"),
+                json!({
+                    "assertion_label": referenced,
+                    "uri": uri,
+                    "retrieval": "not_attempted",
+                    "external_data": true,
+                }),
+            );
+            network_needs::push_unique(
+                &mut results.network_needs,
+                NetworkNeed::ExternalData {
+                    uri: uri.to_string(),
+                    assertion_label: referenced.to_string(),
+                },
+            );
+            return;
+        }
     };
 
     results.push_success_with_details(
@@ -6888,7 +6938,8 @@ fn verify_segment_binding(
     format: AssetFormat,
     detached: bool,
     label: &str,
-    evidence: OnlineEvidence<'_>,
+    resources: &mut refs::ResourceCache<'_>,
+    budget: &mut ingredient_graph::Budget,
     results: &mut ValidationResults,
 ) {
     let Some(assertion_label) = reference.label else {
@@ -6920,7 +6971,8 @@ fn verify_segment_binding(
         active_sentinel,
         binding_compromised,
         &url,
-        evidence,
+        resources,
+        budget,
         results,
     );
 }
@@ -11153,6 +11205,7 @@ mod tests {
     //! (`c2pa.hash.multi-asset`) coverage, and tampered-assertion suppression
     //! of `dataHash.match`. Synthetic CBOR assertions isolate each rule from
     //! the on-disk interoperability corpus.
+    use super::ingredient_graph::GraphLimits;
     use super::*;
     use crate::c2pa_cbor::{encode, Profile};
     use crate::c2pa_core::jumbf::{
@@ -17802,6 +17855,29 @@ mod tests {
         profile: EngineProfile,
         evidence: OnlineEvidence<'_>,
     ) -> ValidationResults {
+        run_external_data_with_sources(
+            label,
+            assertion,
+            field,
+            generation,
+            manifest_kind,
+            profile,
+            evidence,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_external_data_with_sources(
+        label: &str,
+        assertion: &Value,
+        field: &'static str,
+        generation: ClaimGeneration,
+        manifest_kind: ManifestKind,
+        profile: EngineProfile,
+        evidence: OnlineEvidence<'_>,
+        provider: Option<&dyn refs::ExternalResources>,
+    ) -> ValidationResults {
         let payload = enc(assertion);
         let manifest = ParsedManifest {
             label: "urn:c2pa:00000000-0000-4000-8000-0000000000ed".into(),
@@ -17819,13 +17895,16 @@ mod tests {
         )]);
         let refs = ClaimAssertionRefs::build(&manifest, &claim, generation);
         let mut results = ValidationResults::default();
+        let mut resources = refs::ResourceCache::with_evidence(provider, evidence);
+        let mut budget = ingredient_graph::Budget::new(GraphLimits::default());
         verify_external_data_assertions(
             &refs,
             generation,
             manifest_kind,
             &manifest.label,
             profile,
-            evidence,
+            &mut resources,
+            &mut budget,
             &mut results,
         );
         results
@@ -17937,6 +18016,97 @@ mod tests {
             compute_state(&mismatch, EngineProfile::CONFORMANCE_V2_2),
             ValidationState::Valid,
             "external data must never reject a claim"
+        );
+    }
+
+    #[test]
+    fn injected_resources_cover_cloud_and_external_reference_data() {
+        struct Provider<'a> {
+            content: &'a [u8],
+            calls: std::cell::Cell<usize>,
+        }
+
+        impl refs::ExternalResources for Provider<'_> {
+            fn resolve(&self, url: &str) -> refs::ExternalResource<'_> {
+                assert_eq!(url, "https://store.test/a");
+                self.calls.set(self.calls.get() + 1);
+                refs::ExternalResource::Retrieved {
+                    bytes: self.content,
+                    media_type: Some("application/cbor"),
+                }
+            }
+        }
+
+        let content = b"provider-held external content";
+        let provider = Provider {
+            content,
+            calls: std::cell::Cell::new(0),
+        };
+        let assertion = vmap(vec![
+            ("label", Value::Text("c2pa.metadata".into())),
+            ("size", Value::Integer(content.len() as i128)),
+            (
+                "location",
+                vmap(vec![
+                    ("url", Value::Text("https://store.test/a".into())),
+                    ("alg", Value::Text("sha256".into())),
+                    ("hash", Value::Bytes(Sha256::digest(content).to_vec())),
+                ]),
+            ),
+        ]);
+        let cloud = run_external_data_with_sources(
+            "c2pa.cloud-data",
+            &assertion,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+            OnlineEvidence::default(),
+            Some(&provider),
+        );
+        assert!(cloud.has_success(ASSERTION_ACCESSIBLE));
+        assert!(cloud.has_success(ASSERTION_HASHED_URI_MATCH));
+
+        let arbitrary = vmap(vec![(
+            "location",
+            vmap(vec![("url", Value::Text("https://store.test/a".into()))]),
+        )]);
+        let external = run_external_data_with_sources(
+            "c2pa.external-reference",
+            &arbitrary,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+            OnlineEvidence::default(),
+            Some(&provider),
+        );
+        assert!(!external
+            .informational
+            .iter()
+            .any(|status| status.code == EXTERNAL_REFERENCE_NOT_RETRIEVED));
+        assert_eq!(provider.calls.get(), 2);
+
+        let unreachable = ["https://store.test/a".to_string()];
+        let unavailable = run_external_data_with_sources(
+            "c2pa.cloud-data",
+            &assertion,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+            OnlineEvidence {
+                external_data_unreachable: Some(&unreachable),
+                ..OnlineEvidence::default()
+            },
+            Some(&provider),
+        );
+        assert!(unavailable.has_failure(ASSERTION_INACCESSIBLE));
+        assert!(unavailable.network_needs.is_empty());
+        assert_eq!(
+            provider.calls.get(),
+            2,
+            "explicit evidence outcome takes precedence over provider"
         );
     }
 
