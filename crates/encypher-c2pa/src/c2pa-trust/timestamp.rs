@@ -774,6 +774,29 @@ mod tests {
         OffsetDateTime::from_unix_timestamp(1_785_839_000).unwrap()
     }
 
+    fn add_profile_fixture_aki(cert: &mut Certificate) {
+        let aki = x509_cert::ext::pkix::AuthorityKeyIdentifier {
+            key_identifier: Some(OctetString::new([0x01]).expect("key identifier")),
+            ..Default::default()
+        };
+        let extensions = cert
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .expect("extensions");
+        if extensions
+            .iter()
+            .any(|extension| extension.extn_id == ObjectIdentifier::new_unwrap("2.5.29.35"))
+        {
+            return;
+        }
+        extensions.push(x509_cert::ext::Extension {
+            extn_id: ObjectIdentifier::new_unwrap("2.5.29.35"),
+            critical: false,
+            extn_value: OctetString::new(aki.to_der().expect("AKI DER")).expect("AKI extension"),
+        });
+    }
+
     #[test]
     fn verifies_cms_imprint_eku_chain_and_generation_time() {
         let result = verify_timestamp_token(&token(), PAYLOAD, &trust(), verification_time());
@@ -853,6 +876,9 @@ mod tests {
         let mut signer = signer_certificate(&parts.signed_data, signer_info)
             .expect("certificate")
             .clone();
+        // This profile-only fixture changes signed fields without re-signing.
+        // A valid AKI keeps it from claiming the self-signed exemption.
+        add_profile_fixture_aki(&mut signer);
         let dsa = x509_cert::spki::AlgorithmIdentifierOwned {
             oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.2"),
             parameters: None,

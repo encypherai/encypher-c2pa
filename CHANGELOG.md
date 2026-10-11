@@ -25,6 +25,7 @@ All notable changes to this project are recorded here.
 
 - Failure telemetry reports the profile of the policy that produced the report (`c2pa-2.4` or `c2pa-2.5`).
 - Live session-key delivery and `emsg` signatures now use the claim-algorithm list selected by `VerifyOptions::spec_version`. The compatibility helpers retain their C2PA 2.4 defaults.
+- Exact `"2.5"` certificate paths apply RFC 5280 policy mappings and inhibition through bounded RFC 9618 policy levels, including self-issued key rollover. Processing stops at the selected trust anchor: its encoded validity, path-length, name and policy constraints do not replace configured trust authority. C2PA certificate-profile admission still applies to anchors, including duplicate-extension rejection and a verified self-signed exemption when AKI is absent. Policy qualifiers use their RFC DER shapes, including all four `DisplayText` encodings and overlong `explicitText`. The 2.2 and 2.4 trust paths remain unchanged.
 
 ## 1.7.0 - 2026-10-01
 

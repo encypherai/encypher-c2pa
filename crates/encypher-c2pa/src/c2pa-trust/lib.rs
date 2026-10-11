@@ -878,17 +878,19 @@ fn extend_path(
         return PathOutcome::NoPath;
     };
     if let Some(&index) = search.anchor_indices.get(&fingerprint_hex(&current_der)) {
-        let outcome = evaluate_path(path, search.at, search.rules);
+        let outcome = evaluate_path(path, search.at, search.rules, search.profile);
         if outcome == PathOutcome::Trusted {
             *anchor = Some(index);
         }
         return outcome;
     }
     if path.len() >= MAX_CHAIN_DEPTH
-        || current.tbs_certificate.subject == current.tbs_certificate.issuer
+        || (search.profile != CertificateProfile::V2_5
+            && current.tbs_certificate.subject == current.tbs_certificate.issuer)
     {
-        // A self-signed certificate that is not an anchor terminates the path
-        // without reaching one.
+        // Exact 2.5 may continue through a self-issued rollover certificate
+        // when a distinct previous-key issuer actually verifies it. Older
+        // profiles retain their established self-issued termination behavior.
         return PathOutcome::NoPath;
     }
 
@@ -922,16 +924,22 @@ fn extend_path(
     best
 }
 
-/// Check a complete path, end entity first and anchor last.
+/// Check a complete path, end entity first and selected anchor last.
 fn evaluate_path(
     path: &[Certificate],
     at: OffsetDateTime,
     rules: profile::ProfileRules,
+    certificate_profile: CertificateProfile,
 ) -> PathOutcome {
     if let Some(reason) = profile::path_violation(path, rules) {
         return PathOutcome::Rejected(reason);
     }
-    if path.iter().any(|cert| !valid_at(cert, at)) {
+    let validity_path = if certificate_profile == CertificateProfile::V2_5 {
+        &path[..path.len().saturating_sub(1)]
+    } else {
+        path
+    };
+    if validity_path.iter().any(|cert| !valid_at(cert, at)) {
         return PathOutcome::OutsideValidity;
     }
     PathOutcome::Trusted

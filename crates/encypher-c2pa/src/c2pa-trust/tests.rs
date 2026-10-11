@@ -12,6 +12,9 @@ use rcgen::{
 use time::macros::datetime;
 use x509_cert::ext::pkix::ExtendedKeyUsage as X509Eku;
 
+const TEST_OID_AUTHORITY_KEY_IDENTIFIER: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("2.5.29.35");
+
 /// Build a self-signed certificate, returning `(der, pem)`.
 fn make_cert(configure: impl FnOnce(&mut CertificateParams)) -> (Vec<u8>, String) {
     let key = KeyPair::generate().expect("keypair");
@@ -499,6 +502,30 @@ fn leaf_with_algorithms(
     algorithm: x509_cert::spki::AlgorithmIdentifierOwned,
 ) -> Vec<u8> {
     let mut leaf = Certificate::from_der(&leaf_with_ekus(&[OID_C2PA_CLAIM_SIGNING])).expect("leaf");
+    // These profile-only fixtures replace signed algorithm and key fields
+    // without re-signing. A valid AKI prevents a false self-signed exemption.
+    let aki = x509_cert::ext::pkix::AuthorityKeyIdentifier {
+        key_identifier: Some(
+            der::asn1::OctetString::new([0x01]).expect("synthetic key identifier"),
+        ),
+        ..Default::default()
+    };
+    let extensions = leaf
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("leaf extensions");
+    if !extensions
+        .iter()
+        .any(|extension| extension.extn_id == TEST_OID_AUTHORITY_KEY_IDENTIFIER)
+    {
+        extensions.push(x509_cert::ext::Extension {
+            extn_id: TEST_OID_AUTHORITY_KEY_IDENTIFIER,
+            critical: false,
+            extn_value: der::asn1::OctetString::new(aki.to_der().expect("AKI DER"))
+                .expect("AKI extension"),
+        });
+    }
     leaf.tbs_certificate.subject_public_key_info = spki;
     leaf.tbs_certificate.signature = algorithm.clone();
     leaf.signature_algorithm = algorithm;
