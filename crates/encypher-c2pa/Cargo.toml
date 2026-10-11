@@ -53,9 +53,17 @@ signature = { workspace = true }
 rand_core = { workspace = true }
 cms = { workspace = true }
 x509-tsp = { workspace = true }
+# ML-DSA verification (FIPS 204; RFC 9964 COSE, RFC 9881 X.509). Pure Rust
+# and no_std-capable, so it builds for wasm32; `alloc` keeps the large key
+# and matrix values off the stack. No `getrandom`/`pkcs8`: this crate only
+# verifies, and parses SPKI with the existing `spki` stack.
+ml-dsa = { workspace = true, features = ["alloc"] }
 unicode-normalization = "0.1"
 miniz_oxide = "0.8"
 brotli = { version = "8", default-features = false, features = ["std"] }
+# Zstandard decoding for WARC records (`std` reader, `hash` frame checksums);
+# pure Rust, MSRV 1.87.
+ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
 ureq = { workspace = true, optional = true }
 url = "2.5"
 

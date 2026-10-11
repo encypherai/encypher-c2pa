@@ -71,6 +71,22 @@ impl SpecVersion {
         SpecVersion::V2_5,
     ];
 
+    /// Revisions exposed as caller-selected public verification policies.
+    ///
+    /// Operation-specific APIs may support a strict subset, but no public
+    /// surface may accept a revision absent here.
+    pub const PUBLIC_POLICIES: [SpecVersion; 3] =
+        [SpecVersion::V2_2, SpecVersion::V2_4, SpecVersion::V2_5];
+
+    /// Stable string-valued public policy capabilities, in ascending order.
+    pub const PUBLIC_POLICY_STRINGS: [&'static str; 3] = ["2.2", "2.4", "2.5"];
+
+    /// Parse a caller-selected public verification policy.
+    pub fn public_policy_from_str(s: &str) -> Option<Self> {
+        let version = Self::from_str(s)?;
+        Self::PUBLIC_POLICIES.contains(&version).then_some(version)
+    }
+
     /// The string emitted in `claim_generator_info.specVersion`.
     pub fn version_str(self) -> &'static str {
         match self {
@@ -268,6 +284,19 @@ pub fn canonicalize_mime(mime: &str) -> String {
         "application/svg+xml" => "image/svg+xml".to_string(),
         "text/javascript" => "application/javascript".to_string(),
         "text/yaml" | "application/x-yaml" => "application/yaml".to_string(),
+        // C2PA 2.5 carriers. MIDI, ONNX, SafeTensors and JSON Lines have no
+        // IANA-registered media type; the canonical spellings below are this
+        // engine's documented, non-normative choices (see
+        // [`V2_5_READER_MIMES`]), and the common informal spellings fold into
+        // them.
+        "audio/x-midi" | "audio/mid" => "audio/midi".to_string(),
+        "application/x-onnx" => "application/onnx".to_string(),
+        "application/x-safetensors" => "application/safetensors".to_string(),
+        "application/x-ndjson"
+        | "application/ndjson"
+        | "application/jsonlines"
+        | "application/x-jsonlines" => "application/jsonl".to_string(),
+        "application/x-parquet" => "application/vnd.apache.parquet".to_string(),
         other => other.to_string(),
     }
 }
@@ -627,6 +656,57 @@ pub fn mimes_for_version(version: SpecVersion) -> Vec<&'static str> {
         .filter(|e| e.versions.contains(&version))
         .map(|e| e.mime)
         .collect()
+}
+
+/// Media types the explicitly selected C2PA 2.5 validation policy reads in
+/// addition to the C2PA 2.4 registry. This is reader capability, not a
+/// certified or signable scope: no 2.5 conformance program exists, and
+/// [`mimes_for_version`] stays empty for 2.5.
+///
+/// Registered types come from the 2.5 embedding index. `audio/midi`,
+/// `application/onnx`, `application/safetensors` and `application/jsonl` are
+/// non-normative spellings for formats the index lists without a registered
+/// type ("—"); [`canonicalize_mime`] folds common informal spellings into
+/// them. The textual `application/*` types are formats with a comment syntax
+/// that the structured-text applicability clause covers by example.
+pub const V2_5_READER_MIMES: &[&str] = &[
+    "application/warc",
+    "application/ttml+xml",
+    "application/vnd.apache.parquet",
+    "image/vnd.blockfact.facti",
+    "audio/vnd.blockfact.facta",
+    "video/vnd.blockfact.factv",
+    "audio/midi",
+    "application/onnx",
+    "application/safetensors",
+    "application/jsonl",
+    "text/vtt",
+    "application/sql",
+    "application/x-sh",
+    "application/postscript",
+    "application/x-tex",
+    "application/x-latex",
+];
+
+/// Whether a validation policy for `version` reads assets of `mime` (already
+/// canonicalized) with an embedded-manifest reader.
+///
+/// The explicit 2.2 policy uses its registered format set. Other established
+/// policies through 2.4 retain the 2.4 reader set. Exactly 2.5 adds
+/// [`V2_5_READER_MIMES`], every other `text/*` type and every XML-derived
+/// `+xml` type. A future enum variant must register its own behavior rather
+/// than silently inheriting 2.5.
+pub fn reader_permits(canon_mime: &str, version: SpecVersion) -> bool {
+    if version == SpecVersion::V2_2 {
+        return mime_in_version(canon_mime, SpecVersion::V2_2);
+    }
+    if mime_in_version(canon_mime, SpecVersion::V2_4) {
+        return true;
+    }
+    version == SpecVersion::V2_5
+        && (V2_5_READER_MIMES.contains(&canon_mime)
+            || canon_mime.starts_with("text/")
+            || canon_mime.ends_with("+xml"))
 }
 
 /// The certified C2PA 2.2 MIME set, as the *accepted* input forms (aliases

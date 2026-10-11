@@ -14,22 +14,34 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Union
 
 from ._native import (
+    binding_target_bytes as _binding_target_bytes,
     extensions_json as _extensions_json,
     formats_json,
     get_telemetry_preference,
     set_telemetry_preference,
+    resolve_soft_binding_bytes as _resolve_soft_binding_bytes,
+    request_soft_binding_receipt_verification_json as _request_soft_binding_receipt_verification_json,
     validate_options as _validate_options,
     verify_bytes,
     verify_detached_bytes,
+    verify_manifest_store_only_bytes as _verify_manifest_store_only_bytes,
+    verify_caller_binding_bytes as _verify_caller_binding_bytes,
+    verify_ertmp_events,
     verify_fragmented_bytes,
     verify_stream_bytes,
 )
 
 __all__ = [
+    "binding_target",
     "configure_telemetry",
     "supported_mime_types",
+    "resolve_soft_binding",
+    "request_soft_binding_receipt_verification",
     "telemetry_enabled",
     "verify",
+    "verify_ertmp",
+    "verify_manifest_store_only",
+    "verify_with_caller_verified_binding",
     "verify_stream",
 ]
 __version__ = "1.7.0"
@@ -84,7 +96,9 @@ def verify(
     manifest_store: Optional[Asset] = None,
     expected_seek_positions: Optional[Sequence[int]] = None,
     trust_pem: Optional[str] = None,
+    claim_trust_sources: Optional[Sequence[Mapping[str, Any]]] = None,
     tsa_trust_pem: Optional[str] = None,
+    tsa_trust_sources: Optional[Sequence[Mapping[str, Any]]] = None,
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
@@ -125,12 +139,13 @@ def verify(
     ICA trust configuration; and ``cawg_ica_status_lists`` supplies offline
     decompressed status bitstrings as base64. ``cawg_strict_encoding=True``
     refuses the CAWG field-order signer payload that c2pa-rs writes.
-    ``strict_conformance=True`` applies the C2PA 2.4 Conformance Program
-    posture, including CAWG Identity 1.3 deterministic signer-payload encoding.
-    ``spec_version`` selects the C2PA validation policy: ``None`` or ``"2.4"``
-    (the default, identical reports) or ``"2.5"`` for the proposed C2PA 2.5
-    draft, which reports ``profile: "c2pa-2.5"`` and cannot be combined with
-    ``strict_conformance``. Any other value raises ``ValueError`` with the
+    ``strict_conformance=True`` applies the published Conformance Program
+    posture under the 2.2 and 2.4 policies. Under ``spec_version="2.5"`` it
+    applies strict technical validation with the core-spec compliance bar and
+    makes no certified or Conformance Program claim. ``spec_version`` selects
+    the C2PA validation policy: ``"2.2"``, ``None`` or ``"2.4"`` (the default,
+    with identical reports), or ``"2.5"`` for the proposed draft, which reports
+    ``profile: "c2pa-2.5"``. Any other value raises ``ValueError`` with the
     ``unsupported_spec_version`` code before the asset is read. On first interactive use,
     telemetry should be enabled and saves the answer. Passing
     ``telemetry=True`` or ``False`` attempts to save that preference; the
@@ -158,7 +173,13 @@ def verify(
     """
     options = {
         "trust_pem": trust_pem,
+        "claim_trust_sources": [dict(entry) for entry in claim_trust_sources]
+        if claim_trust_sources
+        else None,
         "tsa_trust_pem": tsa_trust_pem,
+        "tsa_trust_sources": [dict(entry) for entry in tsa_trust_sources]
+        if tsa_trust_sources
+        else None,
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,
@@ -238,6 +259,188 @@ def verify(
         report = verify_fragmented_bytes(data, fragment_data, mime_type, options_json)
     return json.loads(report)
 
+def verify_manifest_store_only(
+    manifest_store: Asset,
+    *,
+    options: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    """Validate a manifest store without claiming any asset-content match."""
+    options_json = json.dumps(dict(options or {}))
+    _validate_options(options_json)
+    if isinstance(manifest_store, (str, Path)):
+        store = _read_path(Path(manifest_store))
+    elif isinstance(manifest_store, (bytes, bytearray, memoryview)):
+        store = manifest_store
+    else:
+        raise TypeError("manifest_store must be bytes or a filesystem path")
+    return json.loads(_verify_manifest_store_only_bytes(store, options_json))
+
+def binding_target(
+    manifest_store: Asset,
+    *,
+    hostless: bool = False,
+    options: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
+    """Derive the exact hard-binding target a trusted caller must compare."""
+    options_json = json.dumps(dict(options or {}))
+    _validate_options(options_json)
+    if isinstance(manifest_store, (str, Path)):
+        store = _read_path(Path(manifest_store))
+    elif isinstance(manifest_store, (bytes, bytearray, memoryview)):
+        store = manifest_store
+    else:
+        raise TypeError("manifest_store must be bytes or a filesystem path")
+    return json.loads(_binding_target_bytes(store, hostless, options_json))
+
+
+def verify_with_caller_verified_binding(
+    manifest_store: Asset,
+    content_mime: str,
+    target: Mapping[str, Any],
+    *,
+    matched: bool,
+    engine: str,
+    explanation: Optional[str] = None,
+    hostless: bool = False,
+    options: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    """Validate a store using an exact content comparison made by the caller."""
+    options_json = json.dumps(dict(options or {}))
+    _validate_options(options_json)
+    if matched and explanation is not None:
+        raise ValueError("explanation is only valid for a mismatch")
+    if not matched and not explanation:
+        raise ValueError("a mismatch requires explanation")
+    verdict: Any = "Match" if matched else {"Mismatch": {"explanation": explanation}}
+    target_json = json.dumps(dict(target))
+    verdict_json = json.dumps(verdict)
+    if isinstance(manifest_store, (str, Path)):
+        store = _read_path(Path(manifest_store))
+    elif isinstance(manifest_store, (bytes, bytearray, memoryview)):
+        store = manifest_store
+    else:
+        raise TypeError("manifest_store must be bytes or a filesystem path")
+    return json.loads(
+        _verify_caller_binding_bytes(
+            store,
+            content_mime,
+            hostless,
+            target_json,
+            verdict_json,
+            engine,
+            options_json,
+        )
+    )
+
+
+def verify_ertmp(
+    input_events: Mapping[str, Any],
+    *,
+    options: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    """Verify caller-parsed Enhanced RTMP events in exact transmission order.
+
+    ``input_events`` carries bilateral ``capsEx``, ``object_encoding`` and an
+    ordered ``events`` array. Aggregate timestamps must already be normalized,
+    and Multitrack events must contain only the selected track packet. The
+    verifier never guesses an undefined audio Metadata packet number.
+    """
+    resolved_options = dict(options or {})
+    resolved_options.setdefault("spec_version", "2.5")
+    options_json = json.dumps(resolved_options)
+    _validate_options(options_json)
+    return json.loads(verify_ertmp_events(json.dumps(dict(input_events)), options_json))
+
+
+def resolve_soft_binding(
+    asset: Asset,
+    mime_type: Optional[str],
+    service_root: str,
+    query: Mapping[str, Any],
+    *,
+    allowed_origins: Sequence[str],
+    options: Optional[Mapping[str, Any]] = None,
+    allow_private_networks: bool = False,
+    max_results: int = 10,
+    fetch_status: bool = False,
+    fetch_receipts: bool = False,
+) -> Mapping[str, Any]:
+    """Recover and verify manifests through a soft-binding resolution service.
+
+    ``query`` selects one tagged route: ``binding_get``, ``binding_post``,
+    ``content``, or ``reference``. Content and reference disclosure require
+    their matching explicit consent value. Every discovery, federation, and
+    repository origin must appear exactly in ``allowed_origins``. Redirects
+    are refused. The service's advertised version never selects local policy.
+    """
+    if not allowed_origins:
+        raise ValueError("allowed_origins must contain at least one exact origin")
+    verify_options = dict(options or {})
+    verify_options_json = json.dumps(verify_options)
+    _validate_options(verify_options_json)
+    resolver_options = {
+        "allowed_origins": list(allowed_origins),
+        "allow_private_networks": bool(allow_private_networks),
+        "max_results": int(max_results),
+        "fetch_status": bool(fetch_status),
+        "fetch_receipts": bool(fetch_receipts),
+    }
+    query_json = json.dumps(dict(query))
+    resolver_options_json = json.dumps(resolver_options)
+    if isinstance(asset, (str, Path)):
+        path = Path(asset)
+        data = _read_path(path)
+        if mime_type is None:
+            mime_type = _infer_mime_type(path)
+    elif isinstance(asset, (bytes, bytearray, memoryview)):
+        data = asset
+    else:
+        raise TypeError("asset must be bytes or a filesystem path")
+    if not mime_type:
+        raise ValueError("mime_type is required when it cannot be inferred from a path")
+    return json.loads(
+        _resolve_soft_binding_bytes(
+            data,
+            mime_type,
+            service_root,
+            query_json,
+            verify_options_json,
+            resolver_options_json,
+        )
+    )
+
+def request_soft_binding_receipt_verification(
+    service_root: str,
+    manifest_id: str,
+    receipt: Mapping[str, Any],
+    *,
+    allowed_origins: Sequence[str],
+    options: Optional[Mapping[str, Any]] = None,
+    allow_private_networks: bool = False,
+) -> Mapping[str, Any]:
+    """Return a repository's report about a supplied receipt.
+
+    ``server_reported_verified`` is operational evidence. It is not a local
+    cryptographic receipt verdict.
+    """
+    if not allowed_origins:
+        raise ValueError("allowed_origins must contain at least one exact origin")
+    resolver_options = {
+        "allowed_origins": list(allowed_origins),
+        "allow_private_networks": bool(allow_private_networks),
+    }
+    verify_options = dict(options or {})
+    _validate_options(json.dumps(verify_options))
+    return json.loads(
+        _request_soft_binding_receipt_verification_json(
+            service_root,
+            manifest_id,
+            json.dumps(dict(receipt)),
+            json.dumps(verify_options),
+            json.dumps(resolver_options),
+        )
+    )
+
 
 def verify_stream(
     init_segment: Asset,
@@ -248,7 +451,9 @@ def verify_stream(
     method: str = "verifiable-segment-info",
     expected_seek_positions: Optional[Sequence[int]] = None,
     trust_pem: Optional[str] = None,
+    claim_trust_sources: Optional[Sequence[Mapping[str, Any]]] = None,
     tsa_trust_pem: Optional[str] = None,
+    tsa_trust_sources: Optional[Sequence[Mapping[str, Any]]] = None,
     allowed_list_pem: Optional[str] = None,
     cawg_trust_pem: Optional[str] = None,
     cawg_allowed_certs_pem: Optional[str] = None,
@@ -290,7 +495,13 @@ def verify_stream(
     """
     options = {
         "trust_pem": trust_pem,
+        "claim_trust_sources": [dict(entry) for entry in claim_trust_sources]
+        if claim_trust_sources
+        else None,
         "tsa_trust_pem": tsa_trust_pem,
+        "tsa_trust_sources": [dict(entry) for entry in tsa_trust_sources]
+        if tsa_trust_sources
+        else None,
         "allowed_list_pem": allowed_list_pem,
         "cawg_trust_pem": cawg_trust_pem,
         "cawg_allowed_certs_pem": cawg_allowed_certs_pem,

@@ -13,12 +13,16 @@
 //! only.
 //!
 //! Supported readers cover JPEG, PNG, BMFF, FLAC, RIFF, GIF, SVG, JXL, ZIP,
-//! ID3, TIFF/DNG, Font/SFNT, PDF, Ogg, and C2PA text wrappers.
+//! ID3, TIFF/DNG, Font/SFNT, PDF, Ogg, and C2PA text wrappers, plus the
+//! carriers C2PA 2.5 adds: Standard MIDI Files, TTML, ONNX, SafeTensors,
+//! Parquet, BlockFact, WARC, and append-only text checkpoints.
 
 #![forbid(unsafe_code)]
 
 use thiserror::Error;
 
+mod append_text;
+mod blockfact;
 mod bmff;
 mod flac;
 mod font;
@@ -26,19 +30,37 @@ mod gif;
 mod id3;
 mod jpeg;
 mod jxl;
+mod midi;
 mod ogg;
+mod onnx;
+mod parquet;
 mod pdf;
 mod png;
 mod riff;
+mod safetensors;
 mod svg;
 mod text;
 pub(crate) mod text_standard;
 mod tiff;
+mod ttml;
 pub(crate) mod util;
+mod warc;
 pub(crate) mod xmp;
 mod zip;
+pub(crate) use append_text::AppendOnlyFlavor;
+pub(crate) use append_text::{
+    declares_checkpoints, locate_active as locate_active_checkpoint,
+    sentinel_at as checkpoint_sentinel_at, Located as CheckpointLocated,
+    Sentinel as CheckpointSentinel, SentinelReference as CheckpointReference,
+};
 pub(crate) use pdf::{
-    manifest_store_sections as pdf_manifest_store_sections, PdfManifestStoreSection,
+    manifest_store_sections as pdf_manifest_store_sections,
+    manifest_store_sections_v2_5 as pdf_manifest_store_sections_v2_5,
+    object_manifest_stores as pdf_object_manifest_stores, PdfManifestStoreSection,
+    PdfObjectManifestStore,
+};
+pub(crate) use warc::{
+    verify_collection as warc_verify_collection, WarcArchive, WarcCollectionFailure,
 };
 
 /// A C2PA-carrying asset container format.
@@ -61,9 +83,9 @@ pub enum AssetFormat {
     Tiff,
     /// GIF: JUMBF in an Application Extension block.
     Gif,
-    /// SVG: JUMBF base64-encoded in an XML processing instruction.
+    /// SVG: JUMBF base64-encoded in a `c2pa:manifest` metadata element.
     Svg,
-    /// PDF: embedded file stream. Not yet implemented.
+    /// PDF: embedded file stream referenced from the catalog `AF` array.
     Pdf,
     /// ZIP/OPC family (EPUB, OOXML, OpenDocument, OpenXPS): JUMBF in entry
     /// `META-INF/content_credential.c2pa`.
@@ -100,6 +122,37 @@ pub enum AssetFormat {
     /// version. `extract` returns the bytes verbatim; `embed` and data-hash
     /// exclusions are not applicable.
     C2paStore,
+    /// Standard MIDI File (C2PA 2.5): JUMBF in a Sequencer-Specific Meta
+    /// Event (`FF 7F 00 43 32`) before End of Track in the designated track.
+    Midi,
+    /// Standalone TTML (C2PA 2.5): Base64 JUMBF in
+    /// `/tt:tt/tt:head/tt:metadata/c2pa:manifest`.
+    Ttml,
+    /// ONNX (C2PA 2.5): Base64 JUMBF as the `c2pa:manifest` value in
+    /// `ModelProto.metadata_props`.
+    Onnx,
+    /// SafeTensors (C2PA 2.5): Base64 JUMBF as `__metadata__.c2pa:manifest`
+    /// in the JSON header.
+    SafeTensors,
+    /// Apache Parquet (C2PA 2.5): Base64 JUMBF as the `c2pa:manifest`
+    /// `KeyValue` in the footer's `key_value_metadata`.
+    Parquet,
+    /// BlockFact `.facti`/`.facta`/`.factv` (C2PA 2.5): JUMBF as the data of
+    /// the `C2PA` extension block.
+    BlockFact,
+    /// WARC 1.1 (C2PA 2.5): JUMBF as the block of the last
+    /// `c2pa-provenance` record; bound by a collection data hash.
+    Warc,
+    /// Append-only plain text or JSON Lines (C2PA 2.5): checkpoint sentinel
+    /// lines; bound by `c2pa.hash.segment`.
+    AppendOnlyText {
+        /// The sentinel-line grammar.
+        flavor: AppendOnlyFlavor,
+    },
+    /// Bytes with no standardized embedding. Only a separately supplied
+    /// (external) manifest store can bind them; [`AssetFormat::from_mime`]
+    /// never returns it.
+    Opaque,
 }
 
 /// C2PA user-type UUID for the unique BMFF manifest carrier.
@@ -243,10 +296,63 @@ impl AssetFormat {
             },
             // EXPERIMENTAL: host-less compound manifest store (PR #2058).
             "application/c2pa" => Self::C2paStore,
+            // ---- Carriers C2PA 2.5 adds. The registry decides which policy
+            // may read them; routing is policy-independent. ----
+            "audio/midi" => Self::Midi,
+            "application/ttml+xml" => Self::Ttml,
+            // ONNX and SafeTensors have no registered media type; these are
+            // the documented non-normative spellings (`c2pa_core::spec`).
+            "application/onnx" => Self::Onnx,
+            "application/safetensors" => Self::SafeTensors,
+            "application/vnd.apache.parquet" => Self::Parquet,
+            "image/vnd.blockfact.facti"
+            | "audio/vnd.blockfact.facta"
+            | "video/vnd.blockfact.factv" => Self::BlockFact,
+            "application/warc" => Self::Warc,
+            // JSON Lines has no registered media type either; a JSONL stream
+            // is only ever an append-only checkpoint carrier.
+            "application/jsonl" => Self::AppendOnlyText {
+                flavor: AppendOnlyFlavor::JsonLines,
+            },
+            // WebVTT: the structured-text block is a `NOTE` comment block
+            // after the `WEBVTT` header (2.5 Structured Text examples).
+            "text/vtt" => Self::TextStructured {
+                comment_prefix: "NOTE",
+                comment_suffix: "",
+            },
+            // Textual application types with a comment convention, which the
+            // 2.5 structured-text applicability clause names by example.
+            "application/sql" => Self::TextStructured {
+                comment_prefix: "--",
+                comment_suffix: "",
+            },
+            "application/x-sh" => Self::TextStructured {
+                comment_prefix: "#",
+                comment_suffix: "",
+            },
+            "application/postscript" | "application/x-tex" | "application/x-latex" => {
+                Self::TextStructured {
+                    comment_prefix: "%",
+                    comment_suffix: "",
+                }
+            }
             other => match c2pa_text::structured::comment_syntax(other) {
                 Some((comment_prefix, comment_suffix)) => Self::TextStructured {
                     comment_prefix,
                     comment_suffix,
+                },
+                // Every other `text/*` type (source code, INI, AsciiDoc, ...)
+                // and every XML-derived `+xml` type without its own carrier
+                // falls under the structured-text applicability clause. The
+                // locator finds the armour delimiters without knowing the host
+                // comment syntax, so the delimiters here are informational.
+                None if other.starts_with("text/") => Self::TextStructured {
+                    comment_prefix: "",
+                    comment_suffix: "",
+                },
+                None if other.ends_with("+xml") => Self::TextStructured {
+                    comment_prefix: "<!--",
+                    comment_suffix: "-->",
                 },
                 None => return None,
             },
@@ -518,6 +624,19 @@ pub(crate) fn remote_manifest_uri(
     format: AssetFormat,
     data: &[u8],
 ) -> Result<Option<RemoteManifestRef>, FormatError> {
+    // An append-only file's active checkpoint names its store by URI.
+    if let AssetFormat::AppendOnlyText { flavor } = format {
+        return Ok(match append_text::locate_active(data, flavor) {
+            append_text::Located::Active(append_text::Sentinel {
+                reference: append_text::SentinelReference::External(uri),
+                ..
+            }) => Some(RemoteManifestRef {
+                uri,
+                source: "append_only_text.checkpoint",
+            }),
+            _ => None,
+        });
+    }
     if format == AssetFormat::Font {
         if let Some(uri) = font::remote_manifest_uri(data)? {
             return Ok(Some(RemoteManifestRef {
@@ -560,6 +679,7 @@ pub(crate) fn carrier_placement_error_v2_5(
     match format {
         AssetFormat::Png => png::placement_error_v2_5(data),
         AssetFormat::Tiff => tiff::placement_error_v2_5(data),
+        AssetFormat::Warc => warc::placement_error(data),
         AssetFormat::Bmff => bmff::placement_error_v2_5(data),
         _ => Ok(None),
     }
@@ -627,6 +747,7 @@ pub(crate) fn extract_manifest_with(
         AssetFormat::Tiff => tiff::extract(data),
         AssetFormat::Gif => gif::extract(data),
         AssetFormat::Svg => svg::extract(data),
+        AssetFormat::Pdf if rules == TextLocatorRules::V2_5 => pdf::extract_v2_5(data),
         AssetFormat::Pdf => pdf::extract(data),
         AssetFormat::Zip => zip::extract(data),
         AssetFormat::Id3 => id3::extract(data),
@@ -648,6 +769,16 @@ pub(crate) fn extract_manifest_with(
                 Ok(Some(data.to_vec()))
             }
         }
+        AssetFormat::Midi => midi::extract(data),
+        AssetFormat::Ttml => ttml::extract(data),
+        AssetFormat::Onnx => onnx::extract(data),
+        AssetFormat::SafeTensors => safetensors::extract(data),
+        AssetFormat::Parquet => parquet::extract(data),
+        AssetFormat::BlockFact => blockfact::extract(data),
+        AssetFormat::Warc => warc::extract(data),
+        AssetFormat::AppendOnlyText { flavor } => append_text::extract(data, flavor),
+        // No standardized embedding: only an external store binds these bytes.
+        AssetFormat::Opaque => Ok(None),
     }?;
     if let Some(store) = &manifest {
         ensure_manifest_store_size(format, store.len())?;
@@ -696,7 +827,16 @@ pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, Form
         | AssetFormat::TextUnstructured
         | AssetFormat::TextStructured { .. }
         | AssetFormat::TextHtml
-        | AssetFormat::C2paStore => Ok(asset.to_vec()),
+        | AssetFormat::C2paStore
+        | AssetFormat::Midi
+        | AssetFormat::Ttml
+        | AssetFormat::Onnx
+        | AssetFormat::SafeTensors
+        | AssetFormat::Parquet
+        | AssetFormat::BlockFact
+        | AssetFormat::Warc
+        | AssetFormat::AppendOnlyText { .. }
+        | AssetFormat::Opaque => Ok(asset.to_vec()),
     }
 }
 
@@ -754,8 +894,18 @@ pub fn embed_manifest(
             comment_suffix,
         } => text::embed_structured(asset, manifest_store, comment_prefix, comment_suffix),
         AssetFormat::TextHtml => text::embed(text::TextMethod::Html, asset, manifest_store),
-        // A host-less manifest store has no container to embed into.
-        AssetFormat::C2paStore => Err(FormatError::NotImplemented(AssetFormat::C2paStore)),
+        // A host-less manifest store has no container to embed into, and the
+        // 2.5 carriers' fixtures are built by their own modules' test helpers.
+        other @ (AssetFormat::C2paStore
+        | AssetFormat::Midi
+        | AssetFormat::Ttml
+        | AssetFormat::Onnx
+        | AssetFormat::SafeTensors
+        | AssetFormat::Parquet
+        | AssetFormat::BlockFact
+        | AssetFormat::Warc
+        | AssetFormat::AppendOnlyText { .. }
+        | AssetFormat::Opaque) => Err(FormatError::NotImplemented(other)),
     }
 }
 
@@ -807,6 +957,9 @@ pub(crate) fn compute_data_hash_exclusions_with(
         AssetFormat::Tiff => tiff::exclusions(asset_with_placeholder),
         AssetFormat::Gif => gif::exclusions(asset_with_placeholder),
         AssetFormat::Svg => svg::exclusions(asset_with_placeholder),
+        AssetFormat::Pdf if rules == TextLocatorRules::V2_5 => {
+            pdf::exclusions_v2_5(asset_with_placeholder)
+        }
         AssetFormat::Pdf => pdf::exclusions(asset_with_placeholder),
         AssetFormat::Zip => zip::exclusions(asset_with_placeholder),
         AssetFormat::Id3 => id3::exclusions(asset_with_placeholder),
@@ -814,6 +967,17 @@ pub(crate) fn compute_data_hash_exclusions_with(
         AssetFormat::Jxl => jxl::exclusions(asset_with_placeholder),
         // No host bytes: a compound store has no data-hash binding.
         AssetFormat::C2paStore => Ok(Vec::new()),
+        AssetFormat::Midi => midi::exclusions(asset_with_placeholder),
+        AssetFormat::Ttml => ttml::exclusions(asset_with_placeholder),
+        AssetFormat::Onnx => onnx::exclusions(asset_with_placeholder),
+        AssetFormat::SafeTensors => safetensors::exclusions(asset_with_placeholder),
+        AssetFormat::Parquet => parquet::exclusions(asset_with_placeholder),
+        AssetFormat::BlockFact => blockfact::exclusions(asset_with_placeholder),
+        AssetFormat::Warc => warc::exclusions(asset_with_placeholder),
+        AssetFormat::AppendOnlyText { flavor } => {
+            append_text::exclusions(asset_with_placeholder, flavor)
+        }
+        AssetFormat::Opaque => Ok(Vec::new()),
     }
 }
 

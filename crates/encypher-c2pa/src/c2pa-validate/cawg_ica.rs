@@ -9,7 +9,7 @@ use crate::c2pa_cbor::{decode, encode, Profile, Value};
 use crate::c2pa_crypto::{
     extract_claim_tsa_tokens, extract_tsa_tokens, timestamp_input, ClaimTimestampVersion, CoseAlg,
 };
-use crate::c2pa_trust::TrustList;
+use crate::c2pa_trust::{CertificateProfile, TrustList};
 use serde_json::{json, Value as Json};
 use sha2::Digest as _;
 use signature::{hazmat::PrehashVerifier as _, Verifier as _};
@@ -51,7 +51,7 @@ const MAX_DID_TRUST_DEPTH: usize = 16;
 /// Validate one ICA identity assertion. Every resolver and trust input is
 /// caller-supplied; this function never performs network I/O.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn verify_ica_assertion(
+pub(super) fn verify_ica_assertion_with(
     signer_payload: &Value,
     signature: &[u8],
     url: &str,
@@ -62,6 +62,7 @@ pub(super) fn verify_ica_assertion(
     trusted_issuers: Option<&[String]>,
     trust_anchors: Option<&[String]>,
     status_lists: Option<&HashMap<String, String>>,
+    certificate_profile: CertificateProfile,
     results: &mut ValidationResults,
 ) {
     let Some(cose) = CoseSign1::parse(signature) else {
@@ -180,7 +181,13 @@ pub(super) fn verify_ica_assertion(
         }
     }
 
-    let identity_time = match ica_timestamp(&cose, signature, tsa_trust, validation_time) {
+    let identity_time = match ica_timestamp(
+        &cose,
+        signature,
+        tsa_trust,
+        validation_time,
+        certificate_profile,
+    ) {
         IcaTimestamp::Absent => None,
         IcaTimestamp::Valid(at) => {
             results.push_success(
@@ -373,6 +380,37 @@ pub(super) fn verify_ica_assertion(
             }),
         );
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn verify_ica_assertion(
+    signer_payload: &Value,
+    signature: &[u8],
+    url: &str,
+    validation_time: OffsetDateTime,
+    manifest_time: Option<OffsetDateTime>,
+    tsa_trust: Option<&TrustList>,
+    did_documents: Option<&HashMap<String, Json>>,
+    trusted_issuers: Option<&[String]>,
+    trust_anchors: Option<&[String]>,
+    status_lists: Option<&HashMap<String, String>>,
+    results: &mut ValidationResults,
+) {
+    verify_ica_assertion_with(
+        signer_payload,
+        signature,
+        url,
+        validation_time,
+        manifest_time,
+        tsa_trust,
+        did_documents,
+        trusted_issuers,
+        trust_anchors,
+        status_lists,
+        CertificateProfile::V2_4,
+        results,
+    )
 }
 
 struct CoseSign1 {
@@ -1203,6 +1241,7 @@ fn ica_timestamp(
     signature: &[u8],
     tsa_trust: Option<&TrustList>,
     verification_time: OffsetDateTime,
+    certificate_profile: CertificateProfile,
 ) -> IcaTimestamp {
     if !cose.has_unprotected("sigTst2") {
         return IcaTimestamp::Absent;
@@ -1215,8 +1254,13 @@ fn ica_timestamp(
         return IcaTimestamp::Invalid;
     };
 
-    let result =
-        crate::c2pa_trust::verify_timestamp_token(token, &payload, trust, verification_time);
+    let result = crate::c2pa_trust::verify_timestamp_token_with(
+        token,
+        &payload,
+        trust,
+        verification_time,
+        certificate_profile,
+    );
     match (result.verified, result.time) {
         (true, Some(at)) => IcaTimestamp::Valid(at),
         _ => IcaTimestamp::Invalid,

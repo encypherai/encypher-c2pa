@@ -25,7 +25,10 @@ use x509_cert::{
 };
 use x509_tsp::{TimeStampResp, TstInfo};
 
-use super::{common_name, validate_chain, AnchorPurpose, TrustList, OID_KP_TIME_STAMPING};
+use super::{
+    common_name, validate_chain_with, AnchorPurpose, CertificateProfile, TrustList, TrustSource,
+    OID_KP_TIME_STAMPING,
+};
 
 const OID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 const OID_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
@@ -70,6 +73,11 @@ pub struct TimestampResult {
     pub time: Option<OffsetDateTime>,
     /// Common Name of the verified TSA signer certificate, when present.
     pub tsa_common_name: Option<String>,
+    /// Trust lists containing the anchor that accepted the TSA signer chain.
+    ///
+    /// Empty unless `verified` is true. Duplicate metadata is removed in trust
+    /// configuration order.
+    pub trust_sources: Vec<TrustSource>,
     /// Stable failure reason. `None` when `verified` is true.
     pub error: Option<&'static str>,
 }
@@ -80,15 +88,21 @@ impl TimestampResult {
             verified: false,
             time: None,
             tsa_common_name: None,
+            trust_sources: Vec::new(),
             error: Some(error),
         }
     }
 
-    fn success(time: OffsetDateTime, tsa_common_name: Option<String>) -> Self {
+    fn success(
+        time: OffsetDateTime,
+        tsa_common_name: Option<String>,
+        trust_sources: Vec<TrustSource>,
+    ) -> Self {
         Self {
             verified: true,
             time: Some(time),
             tsa_common_name,
+            trust_sources,
             error: None,
         }
     }
@@ -238,8 +252,35 @@ pub fn verify_timestamp_token(
     tsa_trust: &TrustList,
     verification_time: OffsetDateTime,
 ) -> TimestampResult {
-    verify_timestamp_token_inner(token_der, timestamp_input, tsa_trust, verification_time)
-        .unwrap_or_else(TimestampResult::failure)
+    verify_timestamp_token_with(
+        token_der,
+        timestamp_input,
+        tsa_trust,
+        verification_time,
+        CertificateProfile::V2_4,
+    )
+}
+
+/// [`verify_timestamp_token`] under an explicit certificate profile.
+///
+/// The 2.5 profile verifies RSASSA-PSS and ML-DSA certificate chains and
+/// accepts ML-DSA-44/65/87 CMS SignerInfos with a matching TSA key. The
+/// claim-credential algorithm allow list is not applied to the TSA leaf.
+pub fn verify_timestamp_token_with(
+    token_der: &[u8],
+    timestamp_input: &[u8],
+    tsa_trust: &TrustList,
+    verification_time: OffsetDateTime,
+    profile: CertificateProfile,
+) -> TimestampResult {
+    verify_timestamp_token_inner(
+        token_der,
+        timestamp_input,
+        tsa_trust,
+        verification_time,
+        profile,
+    )
+    .unwrap_or_else(TimestampResult::failure)
 }
 
 /// Validate a timestamp token's structure, imprint, CMS signature, and TSA
@@ -254,6 +295,7 @@ pub fn inspect_timestamp_token(
         timestamp_input,
         &TrustList::default(),
         verification_time,
+        CertificateProfile::V2_4,
     ) {
         Err("no_tsa_anchors") => Ok(()),
         Err(error) => Err(error),
@@ -266,6 +308,7 @@ fn verify_timestamp_token_inner(
     timestamp_input: &[u8],
     tsa_trust: &TrustList,
     verification_time: OffsetDateTime,
+    profile: CertificateProfile,
 ) -> Result<TimestampResult, &'static str> {
     let TokenParts {
         signed_data,
@@ -327,13 +370,19 @@ fn verify_timestamp_token_inner(
     let signed_attrs_der = signed_attrs
         .to_der()
         .map_err(|_| "timestamp_signed_attrs_invalid")?;
-    if !verify_signer_signature(signer_cert, signer_info, signer_hash, &signed_attrs_der) {
+    if !verify_signer_signature_with(
+        signer_cert,
+        signer_info,
+        signer_hash,
+        &signed_attrs_der,
+        profile,
+    ) {
         return Err("timestamp_signature_invalid");
     }
     if !has_strict_timestamping_eku(signer_cert) {
         return Err("timestamp_eku_invalid");
     }
-    if !tsa_leaf_profile_acceptable(signer_cert) {
+    if !tsa_leaf_profile_acceptable(signer_cert, profile) {
         return Err("timestamp_tsa_leaf_profile_invalid");
     }
 
@@ -355,12 +404,13 @@ fn verify_timestamp_token_inner(
     if tsa_trust.anchors.is_empty() {
         return Err("no_tsa_anchors");
     }
-    let chain = validate_chain(
+    let chain = validate_chain_with(
         &signer_der,
         &included_der,
         tsa_trust,
         AnchorPurpose::TimeStamping,
         Some(generated_at),
+        profile,
     );
     if !chain.chain_validity_ok {
         return Err("timestamp_tsa_outside_validity");
@@ -369,9 +419,15 @@ fn verify_timestamp_token_inner(
         return Err("timestamp_tsa_untrusted");
     }
 
+    let trust_sources = chain
+        .matching_anchor_sources(tsa_trust)
+        .into_iter()
+        .cloned()
+        .collect();
     Ok(TimestampResult::success(
         generated_at,
         common_name(signer_cert),
+        trust_sources,
     ))
 }
 
@@ -433,10 +489,69 @@ fn has_strict_timestamping_eku(cert: &Certificate) -> bool {
 
 /// The C2PA end-entity certificate profile as it applies to a TSA signing
 /// certificate. The time-stamping EKU itself is checked by
-/// [`has_strict_timestamping_eku`]; this covers the rest of the profile, which
-/// the spec applies to every certificate regardless of purpose.
-fn tsa_leaf_profile_acceptable(cert: &Certificate) -> bool {
-    super::profile::profile_violation(cert, super::profile::CertRole::EndEntity).is_none()
+/// [`has_strict_timestamping_eku`]; this covers the structural requirements
+/// that apply to every certificate. C2PA 2.5 expressly excludes TSA
+/// certificates from the claim-credential algorithm and key allow lists.
+fn tsa_leaf_profile_acceptable(cert: &Certificate, profile: CertificateProfile) -> bool {
+    super::profile::profile_violation_with(
+        cert,
+        super::profile::CertRole::EndEntity,
+        super::profile::ProfileRules::exempt_end_entity(profile),
+    )
+    .is_none()
+}
+
+fn verify_signer_signature_with(
+    cert: &Certificate,
+    signer_info: &SignerInfo,
+    digest_hash: HashAlgorithm,
+    signed_attrs_der: &[u8],
+    profile: CertificateProfile,
+) -> bool {
+    let signature_oid = signer_info.signature_algorithm.oid;
+    if profile == CertificateProfile::V2_5
+        && (is_ml_dsa(signature_oid) || signature_oid == OID_RSASSA_PSS)
+    {
+        if signature_oid == OID_RSASSA_PSS
+            && !pss_digest_algorithm_matches(signer_info, digest_hash)
+        {
+            return false;
+        }
+        let (Ok(key), Ok(algorithm)) = (
+            cert.tbs_certificate.subject_public_key_info.to_der(),
+            signer_info.signature_algorithm.to_der(),
+        ) else {
+            return false;
+        };
+        return crate::c2pa_crypto::verify_x509_signature(
+            &key,
+            &algorithm,
+            signed_attrs_der,
+            signer_info.signature.as_bytes(),
+        )
+        .is_ok();
+    }
+    verify_signer_signature(cert, signer_info, digest_hash, signed_attrs_der)
+}
+
+fn pss_digest_algorithm_matches(signer_info: &SignerInfo, digest_hash: HashAlgorithm) -> bool {
+    let Some(parameters) = signer_info.signature_algorithm.parameters.as_ref() else {
+        return false;
+    };
+    let Ok(parameters_der) = parameters.to_der() else {
+        return false;
+    };
+    rsa::pkcs1::RsaPssParams::try_from(parameters_der.as_slice())
+        .ok()
+        .and_then(|parameters| HashAlgorithm::from_oid(parameters.hash.oid))
+        == Some(digest_hash)
+}
+
+fn is_ml_dsa(oid: ObjectIdentifier) -> bool {
+    const ID_ML_DSA_44: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17");
+    const ID_ML_DSA_65: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.18");
+    const ID_ML_DSA_87: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
+    matches!(oid, ID_ML_DSA_44 | ID_ML_DSA_65 | ID_ML_DSA_87)
 }
 
 fn verify_signer_signature(
@@ -649,6 +764,10 @@ mod tests {
             include_str!("tests/fixtures/rfc3161_root.pem"),
         )
         .unwrap()
+        .with_source(
+            TrustSource::new("https://c2pa.org/trustlist-tsa", "c2pa.tsaTrustList")
+                .with_identifier("7"),
+        )
     }
 
     fn verification_time() -> OffsetDateTime {
@@ -667,6 +786,13 @@ mod tests {
             "fixture genTime must be returned as the trusted validation instant"
         );
         assert_eq!(result.tsa_common_name.as_deref(), Some("CAWG Fixture TSA"));
+        assert_eq!(
+            result.trust_sources,
+            vec![
+                TrustSource::new("https://c2pa.org/trustlist-tsa", "c2pa.tsaTrustList")
+                    .with_identifier("7")
+            ]
+        );
     }
 
     #[test]
@@ -713,5 +839,44 @@ mod tests {
 
         assert!(!result.verified);
         assert_eq!(result.error, Some("timestamp_time_in_future"));
+    }
+    #[test]
+    fn v2_5_tsa_profile_exempts_claim_algorithm_list_but_not_structure() {
+        let parts = parse_token_parts(&token()).expect("timestamp");
+        let signer_info = parts
+            .signed_data
+            .signer_infos
+            .0
+            .iter()
+            .next()
+            .expect("signer");
+        let mut signer = signer_certificate(&parts.signed_data, signer_info)
+            .expect("certificate")
+            .clone();
+        let dsa = x509_cert::spki::AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.2"),
+            parameters: None,
+        };
+        signer.signature_algorithm = dsa.clone();
+        signer.tbs_certificate.signature = dsa;
+        assert!(tsa_leaf_profile_acceptable(
+            &signer,
+            CertificateProfile::V2_5,
+        ));
+        assert!(!tsa_leaf_profile_acceptable(
+            &signer,
+            CertificateProfile::V2_4,
+        ));
+
+        signer
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .expect("extensions")
+            .retain(|extension| extension.extn_id != OID_EXT_KEY_USAGE);
+        assert!(!tsa_leaf_profile_acceptable(
+            &signer,
+            CertificateProfile::V2_5,
+        ));
     }
 }

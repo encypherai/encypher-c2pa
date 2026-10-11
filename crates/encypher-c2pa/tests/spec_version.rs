@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use encypher_c2pa::{
-    detached_manifest_evidence, detached_manifest_evidence_with_options, verify_with_options,
-    Error, VerifyOptions, C2PA_PROFILE, C2PA_PROFILE_2_5,
+    detached_manifest_evidence, detached_manifest_evidence_with_options, supported_mime_types_for,
+    verify_with_options, Error, VerifyOptions, C2PA_PROFILE, C2PA_PROFILE_2_2, C2PA_PROFILE_2_5,
 };
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -48,6 +48,36 @@ fn none_and_explicit_2_4_produce_identical_reports() {
 }
 
 #[test]
+fn explicit_2_2_uses_its_own_policy_and_format_set() {
+    let asset = fixture("signed_test.jpg");
+    let report = verify_with_options(&asset, "image/jpeg", &options(Some("2.2"))).unwrap();
+    assert_eq!(report.profile, C2PA_PROFILE_2_2);
+    assert_eq!(
+        report.manifest_report["engine_profile"]["spec_version"],
+        "2.2"
+    );
+
+    let error = verify_with_options(b"plain", "text/csv", &options(Some("2.2")))
+        .expect_err("text/csv entered the registered format set after 2.2");
+    assert_eq!(error.code(), "unsupported_mime");
+    let accepted = verify_with_options(b"plain", "text/csv", &options(Some("2.4"))).unwrap();
+    assert!(!accepted.present);
+}
+
+#[test]
+fn mime_capabilities_follow_the_selected_policy() {
+    let v22 = supported_mime_types_for(Some("2.2")).unwrap();
+    let v24 = supported_mime_types_for(Some("2.4")).unwrap();
+    let v25 = supported_mime_types_for(Some("2.5")).unwrap();
+    assert!(v22.contains(&"image/jpeg"));
+    assert!(!v22.contains(&"text/csv"));
+    assert!(v24.contains(&"text/csv"));
+    assert!(v25.contains(&"image/jpeg"));
+    assert!(v25.contains(&"application/warc"));
+    assert!(supported_mime_types_for(Some("2.6")).is_err());
+}
+
+#[test]
 fn explicit_2_5_reaches_kernel_and_report() {
     let asset = fixture("signed_test.jpg");
     let report = verify_with_options(&asset, "image/jpeg", &options(Some("2.5"))).unwrap();
@@ -64,7 +94,7 @@ fn explicit_2_5_reaches_kernel_and_report() {
 
 #[test]
 fn unknown_and_unsupported_selections_fail_closed() {
-    for (spec, strict) in [("2.6", false), ("2.4.0", false), ("", false), ("2.5", true)] {
+    for (spec, strict) in [("2.6", false), ("2.4.0", false), ("", false)] {
         let mut options = options(Some(spec));
         options.strict_conformance = strict;
         let error = options.validate().expect_err("selection must be refused");

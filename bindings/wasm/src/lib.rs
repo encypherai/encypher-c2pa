@@ -3,11 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use encypher_c2pa::{
     local_evidence_with_options, supported_mime_types, validation_failure_telemetry,
-    verify_fragmented_with_options, verify_stream_with_options, verify_with_manifest_store,
-    verify_with_options, Error, NetworkReport, NetworkRequest, StreamEncapsulation, StreamMethod,
+    verify_ertmp_with_options, verify_fragmented_with_options, verify_stream_with_options,
+    verify_with_manifest_store, verify_with_options, Error, ErtmpInput, NetworkReport,
+    NetworkRequest, SoftBindingHttpMethod, SoftBindingQuery, SoftBindingReceiptVerificationSession,
+    SoftBindingResolverOptions, SoftBindingResolverSession, StreamEncapsulation, StreamMethod,
     VerificationReport, VerifyOptions,
 };
 use serde::Serialize;
@@ -102,6 +105,51 @@ export async function fetchOnlineNeeds(needed) {
   }
   return result;
 }
+export function softBindingHost(url) {
+  return new URL(url).hostname;
+}
+export async function fetchSoftBinding(url, method, contentType, accept, body, maxBytes) {
+  const headers = { accept };
+  if (contentType !== null) headers["content-type"] = contentType;
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body === null ? undefined : body,
+    credentials: "omit",
+    redirect: "error",
+    mode: "cors",
+  });
+  if (!response.ok) throw new Error("soft-binding request failed");
+  const length = Number(response.headers.get("content-length"));
+  if (Number.isFinite(length) && length > maxBytes) {
+    throw new Error("soft-binding response exceeds limit");
+  }
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) throw new Error("soft-binding response exceeds limit");
+    return { finalUrl: response.url, bytes };
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error("soft-binding response exceeds limit");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { finalUrl: response.url, bytes };
+}
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = postValidationFailure)]
@@ -114,6 +162,251 @@ extern "C" {
     fn resolve_telemetry_preference() -> bool;
     #[wasm_bindgen(js_name = fetchOnlineNeeds)]
     fn fetch_online_needs(needed: JsValue) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = softBindingHost)]
+    fn soft_binding_host(url: &str) -> String;
+    #[wasm_bindgen(js_name = fetchSoftBinding)]
+    fn fetch_soft_binding(
+        url: &str,
+        method: &str,
+        content_type: JsValue,
+        accept: &str,
+        body: JsValue,
+        max_bytes: usize,
+    ) -> js_sys::Promise;
+}
+
+struct BrowserSoftBindingRequest {
+    method: &'static str,
+    url: String,
+    content_type: Option<String>,
+    accept: &'static str,
+    body: Option<Vec<u8>>,
+    max_bytes: usize,
+}
+
+async fn browser_soft_binding_fetch(
+    request: BrowserSoftBindingRequest,
+    allow_private_networks: bool,
+) -> Result<(String, Vec<u8>), JsValue> {
+    require_browser_destination(&request.url, allow_private_networks)?;
+    let content_type = request
+        .content_type
+        .as_deref()
+        .map(JsValue::from_str)
+        .unwrap_or(JsValue::NULL);
+    let body = request
+        .body
+        .as_deref()
+        .map(|bytes| js_sys::Uint8Array::from(bytes).into())
+        .unwrap_or(JsValue::NULL);
+    let response = JsFuture::from(fetch_soft_binding(
+        &request.url,
+        request.method,
+        content_type,
+        request.accept,
+        body,
+        request.max_bytes,
+    ))
+    .await
+    .map_err(|_| {
+        js_error(
+            "verification_error",
+            "soft-binding network request failed".to_string(),
+        )
+    })?;
+    let final_url = js_sys::Reflect::get(&response, &"finalUrl".into())?
+        .as_string()
+        .ok_or_else(|| {
+            js_error(
+                "serialization_error",
+                "soft-binding transport returned no final URL".to_string(),
+            )
+        })?;
+    let bytes =
+        js_sys::Uint8Array::new(&js_sys::Reflect::get(&response, &"bytes".into())?).to_vec();
+    Ok((final_url, bytes))
+}
+
+fn copy_soft_binding_request(
+    request: encypher_c2pa::SoftBindingFetchRequest<'_>,
+) -> BrowserSoftBindingRequest {
+    BrowserSoftBindingRequest {
+        method: match request.method {
+            SoftBindingHttpMethod::Get => "GET",
+            SoftBindingHttpMethod::Post => "POST",
+        },
+        url: request.url.to_owned(),
+        content_type: request.content_type.map(str::to_owned),
+        accept: request.accept,
+        body: request.body.map(<[u8]>::to_vec),
+        max_bytes: request.max_response_bytes,
+    }
+}
+
+fn require_browser_destination(url: &str, allow_private_networks: bool) -> Result<(), JsValue> {
+    if allow_private_networks {
+        return Ok(());
+    }
+    if !url.starts_with("https://") {
+        return Err(js_error(
+            "verification_error",
+            "soft-binding browser requests require HTTPS".to_string(),
+        ));
+    }
+    let host = soft_binding_host(url);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&host);
+    let address: IpAddr = host.parse().map_err(|_| {
+        js_error(
+            "verification_error",
+            "soft-binding browser requests to DNS hosts require allow_private_networks=true"
+                .to_string(),
+        )
+    })?;
+    if public_literal_ip(address) {
+        Ok(())
+    } else {
+        Err(js_error(
+            "verification_error",
+            "soft-binding destination is blocked by network policy".to_string(),
+        ))
+    }
+}
+
+fn public_literal_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => public_ipv4(address),
+        IpAddr::V6(address) => public_ipv6(address),
+    }
+}
+
+fn public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_broadcast()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_documentation()
+        || a == 0
+        || a >= 240
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 198 && matches!(b, 18 | 19)))
+}
+
+fn public_ipv6(address: Ipv6Addr) -> bool {
+    let octets = address.octets();
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return public_ipv4(mapped);
+    }
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || (octets[0] & 0xfe) == 0xfc
+        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0xc0)
+        || (octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8)
+        || (octets[..8] == [0x01, 0x00, 0, 0, 0, 0, 0, 0]))
+}
+
+/// Resolve soft bindings with Fetch while keeping protocol state in Rust.
+#[wasm_bindgen(js_name = resolveSoftBinding)]
+pub async fn resolve_soft_binding_js(
+    asset: Vec<u8>,
+    mime_type: String,
+    service_root: String,
+    query: JsValue,
+    options: Option<JsValue>,
+    resolver_options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let query: SoftBindingQuery = serde_wasm_bindgen::from_value(query)
+        .map_err(|error| js_error("invalid_soft_binding_query", error.to_string()))?;
+    let mut verify_options: VerifyOptions = match options {
+        None => VerifyOptions::default(),
+        Some(value) if value.is_null() || value.is_undefined() => VerifyOptions::default(),
+        Some(value) => serde_wasm_bindgen::from_value(value)
+            .map_err(|error| js_error("invalid_options", error.to_string()))?,
+    };
+    if verify_options.validation_time.is_none() {
+        verify_options.validation_time = js_sys::Date::new_0().to_iso_string().as_string();
+    }
+    let resolver_options: SoftBindingResolverOptions =
+        serde_wasm_bindgen::from_value(resolver_options).map_err(|error| {
+            js_error("invalid_soft_binding_resolver_options", error.to_string())
+        })?;
+    let mut session = SoftBindingResolverSession::new(
+        &asset,
+        &mime_type,
+        &service_root,
+        &query,
+        &verify_options,
+        &resolver_options,
+    )
+    .map_err(|error| js_error(error.code(), error.to_string()))?;
+    while let Some(request) = session.next_request() {
+        let request = copy_soft_binding_request(request);
+        let (final_url, bytes) =
+            browser_soft_binding_fetch(request, resolver_options.allow_private_networks).await?;
+        session
+            .accept_response(&final_url, bytes)
+            .map_err(|error| js_error(error.code(), error.to_string()))?;
+    }
+    session
+        .finish()
+        .map_err(|error| js_error(error.code(), error.to_string()))?
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| js_error("serialization_error", error.to_string()))
+}
+
+/// Submit a receipt for a repository-reported verification result.
+#[wasm_bindgen(js_name = requestSoftBindingReceiptVerification)]
+pub async fn request_soft_binding_receipt_verification_js(
+    service_root: String,
+    manifest_id: String,
+    receipt: JsValue,
+    options: Option<JsValue>,
+    resolver_options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let receipt: serde_json::Value = serde_wasm_bindgen::from_value(receipt)
+        .map_err(|error| js_error("invalid_soft_binding_receipt", error.to_string()))?;
+    let mut verify_options: VerifyOptions = match options {
+        None => VerifyOptions::default(),
+        Some(value) if value.is_null() || value.is_undefined() => VerifyOptions::default(),
+        Some(value) => serde_wasm_bindgen::from_value(value)
+            .map_err(|error| js_error("invalid_options", error.to_string()))?,
+    };
+    if verify_options.validation_time.is_none() {
+        verify_options.validation_time = js_sys::Date::new_0().to_iso_string().as_string();
+    }
+    let resolver_options: SoftBindingResolverOptions =
+        serde_wasm_bindgen::from_value(resolver_options).map_err(|error| {
+            js_error("invalid_soft_binding_resolver_options", error.to_string())
+        })?;
+    let mut session = SoftBindingReceiptVerificationSession::new(
+        &service_root,
+        &manifest_id,
+        receipt,
+        &verify_options,
+        &resolver_options,
+    )
+    .map_err(|error| js_error(error.code(), error.to_string()))?;
+    while let Some(request) = session.next_request() {
+        let request = copy_soft_binding_request(request);
+        let (final_url, bytes) =
+            browser_soft_binding_fetch(request, resolver_options.allow_private_networks).await?;
+        session
+            .accept_response(&final_url, bytes)
+            .map_err(|error| js_error(error.code(), error.to_string()))?;
+    }
+    session
+        .finish()
+        .map_err(|error| js_error(error.code(), error.to_string()))?
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| js_error("serialization_error", error.to_string()))
 }
 
 #[wasm_bindgen(js_name = verify)]
@@ -157,6 +450,10 @@ export interface LocalEvidence {
     algorithm: string | null;
     status: "match" | "mismatch" | "unknown";
   };
+  /** Label of the store's active manifest, or null without a readable store. */
+  active_manifest_label: string | null;
+  /** Every manifest of the store with its expanded-domain SHA-256 (hex). */
+  store_manifests: { label: string; sha256: string }[];
 }
 "#;
 
@@ -457,6 +754,37 @@ pub fn verify_stream_js(
         &options,
     )
     .map_err(|error| js_error(error.code(), error.to_string()))?;
+    report
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| js_error("serialization_error", error.to_string()))
+}
+
+/// Verify caller-parsed Enhanced RTMP events in exact transmission order.
+///
+/// The input carries bilateral capsEx, objectEncoding and the ordered events.
+/// Aggregate timestamps must already be normalized and Multitrack events must
+/// contain only the selected packet.
+#[wasm_bindgen(js_name = verifyErtmp)]
+pub fn verify_ertmp_js(input: JsValue, options: Option<JsValue>) -> Result<JsValue, JsValue> {
+    let input: ErtmpInput = serde_wasm_bindgen::from_value(input)
+        .map_err(|error| js_error("invalid_ertmp_input", error.to_string()))?;
+    let mut options = match options {
+        None => VerifyOptions {
+            spec_version: Some("2.5".into()),
+            ..VerifyOptions::default()
+        },
+        Some(value) if value.is_null() || value.is_undefined() => VerifyOptions {
+            spec_version: Some("2.5".into()),
+            ..VerifyOptions::default()
+        },
+        Some(value) => serde_wasm_bindgen::from_value(value)
+            .map_err(|error| js_error("invalid_options", error.to_string()))?,
+    };
+    if options.validation_time.is_none() {
+        options.validation_time = js_sys::Date::new_0().to_iso_string().as_string();
+    }
+    let report = verify_ertmp_with_options(&input, &options)
+        .map_err(|error| js_error(error.code(), error.to_string()))?;
     report
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| js_error("serialization_error", error.to_string()))

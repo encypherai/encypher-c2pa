@@ -10,7 +10,9 @@
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::c2pa_cbor::{decode, encode, Profile, Value};
-use crate::c2pa_crypto::{cose_key_id, protected_iat, verify_with_cose_key};
+use crate::c2pa_crypto::{
+    cose_key_id, protected_iat, verify_with_cose_key_with, ClaimAlgorithmList,
+};
 use crate::c2pa_formats::StreamMethod;
 
 use super::ValidationResults;
@@ -92,6 +94,28 @@ pub fn validate_session_keys(
     results: &mut ValidationResults,
     url: &str,
 ) -> Vec<ValidatedSessionKey> {
+    validate_session_keys_with(
+        applicability,
+        assertion_cbor,
+        signer_chain_der,
+        ClaimAlgorithmList::V2_4,
+        results,
+        url,
+    )
+}
+
+/// [`validate_session_keys`] under an explicit claim-signature algorithm list.
+///
+/// Session keys follow the claim-signing algorithm list of the caller-selected
+/// C2PA revision. The default helper remains byte-for-byte 2.4 behavior.
+pub fn validate_session_keys_with(
+    applicability: LiveVideoApplicability,
+    assertion_cbor: &[u8],
+    signer_chain_der: &[Vec<u8>],
+    algorithms: ClaimAlgorithmList,
+    results: &mut ValidationResults,
+    url: &str,
+) -> Vec<ValidatedSessionKey> {
     if applicability.method != StreamMethod::VerifiableSegmentInfo {
         return Vec::new();
     }
@@ -144,7 +168,7 @@ pub fn validate_session_keys(
     let mut validated = Vec::with_capacity(keys.len());
     let mut any_invalid = false;
     for entry in keys {
-        match validate_session_key(entry, signer_leaf, signer_chain_der) {
+        match validate_session_key(entry, signer_leaf, signer_chain_der, algorithms) {
             Ok(key)
                 if !validated
                     .iter()
@@ -170,6 +194,7 @@ fn validate_session_key(
     entry: &Value,
     signer_leaf: &[u8],
     signer_chain_der: &[Vec<u8>],
+    algorithms: ClaimAlgorithmList,
 ) -> Result<ValidatedSessionKey, ()> {
     let map = entry.as_map().ok_or(())?;
     if map.len() != 5 {
@@ -194,7 +219,7 @@ fn validate_session_key(
     let key_id = cose_key_id(&cose_key).map_err(|_| ())?;
     let binding =
         encode(signer_binding, Profile::CanonicalForHashedSubstructures).map_err(|_| ())?;
-    let verified = verify_with_cose_key(&binding, &cose_key).map_err(|_| ())?;
+    let verified = verify_with_cose_key_with(&binding, &cose_key, algorithms).map_err(|_| ())?;
     if verified.payload != signer_leaf {
         return Err(());
     }
@@ -400,6 +425,33 @@ pub fn validate_emsg_segment(
     results: &mut ValidationResults,
     url: &str,
 ) -> Option<VerifiedSegmentInfo> {
+    validate_emsg_segment_with(
+        applicability,
+        segment,
+        expected_sequence_number,
+        expected_manifest_id,
+        session_keys,
+        validation_time,
+        ClaimAlgorithmList::V2_4,
+        results,
+        url,
+    )
+}
+
+/// [`validate_emsg_segment`] with the algorithm list selected by the caller's
+/// C2PA revision. The default helper retains the C2PA 2.4 list.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_emsg_segment_with(
+    applicability: LiveVideoApplicability,
+    segment: &[u8],
+    expected_sequence_number: Option<u64>,
+    expected_manifest_id: &str,
+    session_keys: &[ValidatedSessionKey],
+    validation_time: OffsetDateTime,
+    algorithms: ClaimAlgorithmList,
+    results: &mut ValidationResults,
+    url: &str,
+) -> Option<VerifiedSegmentInfo> {
     if applicability.method != StreamMethod::VerifiableSegmentInfo {
         return None;
     }
@@ -440,6 +492,7 @@ pub fn validate_emsg_segment(
             expected_manifest_id,
             session_keys,
             validation_time,
+            algorithms,
         )?;
         if expected_sequence_number.is_none_or(|expected| candidate.sequence_number == expected) {
             verified = Some(candidate);
@@ -495,9 +548,10 @@ fn authenticate_segment_info(
     expected_manifest_id: &str,
     session_keys: &[ValidatedSessionKey],
     validation_time: OffsetDateTime,
+    algorithms: ClaimAlgorithmList,
 ) -> Option<VerifiedSegmentInfo> {
     for key in session_keys {
-        let Ok(verified) = verify_with_cose_key(message, &key.cose_key) else {
+        let Ok(verified) = verify_with_cose_key_with(message, &key.cose_key, algorithms) else {
             continue;
         };
         if verified.key_id.as_deref() != Some(key.key_id.as_slice()) {

@@ -51,28 +51,29 @@ fn default_and_explicit_2_4_are_byte_identical() {
 }
 
 #[test]
-fn spec_2_5_reaches_the_report() {
-    let output = verify(&fixture("signed_test.jpg"), &["--spec", "2.5"]);
-    let value = report(&output);
-    assert_eq!(value["profile"], "c2pa-2.5");
-    assert_eq!(
-        value["manifest_report"]["engine_profile"]["spec_version"],
-        "2.5"
-    );
-    assert_eq!(
-        value["manifest_report"]["engine_profile"]["compliance_level"],
-        "core-spec"
-    );
+fn spec_2_5_regular_and_strict_reach_the_report() {
+    for extra in [
+        &["--spec", "2.5"][..],
+        &["--spec", "2.5", "--strict-conformance"][..],
+    ] {
+        let output = verify(&fixture("signed_test.jpg"), extra);
+        let value = report(&output);
+        assert_eq!(value["profile"], "c2pa-2.5", "{extra:?}");
+        assert_eq!(
+            value["manifest_report"]["engine_profile"]["spec_version"], "2.5",
+            "{extra:?}"
+        );
+        assert_eq!(
+            value["manifest_report"]["engine_profile"]["compliance_level"], "core-spec",
+            "{extra:?}"
+        );
+    }
 }
 
 #[test]
 fn unknown_or_unsupported_selection_fails_before_asset_io() {
     let missing = fixture("does-not-exist.jpg");
-    for extra in [
-        &["--spec", "2.6"][..],
-        &["--spec", "2.4.0"][..],
-        &["--spec", "2.5", "--strict-conformance"][..],
-    ] {
+    for extra in [&["--spec", "2.6"][..], &["--spec", "2.4.0"][..]] {
         let output = verify(&missing, extra);
         assert!(!output.status.success(), "{extra:?} must fail");
         let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");

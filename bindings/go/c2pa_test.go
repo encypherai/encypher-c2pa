@@ -353,20 +353,31 @@ func TestSpecVersionSelectsThePolicyAndRejectsUnknownValues(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		spec    string
+		strict  bool
 		profile string
-	}{{"", "c2pa-2.4"}, {"2.4", "c2pa-2.4"}, {"2.5", "c2pa-2.5"}} {
-		report, err := Verify(asset, "image/jpeg", &Options{SpecVersion: tc.spec, ValidationTime: "2026-01-01T00:00:00Z"})
+	}{
+		{"", false, "c2pa-2.4"},
+		{"2.4", false, "c2pa-2.4"},
+		{"2.5", false, "c2pa-2.5"},
+		{"2.5", true, "c2pa-2.5"},
+	} {
+		report, err := Verify(asset, "image/jpeg", &Options{
+			SpecVersion:       tc.spec,
+			StrictConformance: tc.strict,
+			ValidationTime:    "2026-01-01T00:00:00Z",
+		})
 		if err != nil {
-			t.Fatalf("spec %q: %v", tc.spec, err)
+			t.Fatalf("spec %q strict=%v: %v", tc.spec, tc.strict, err)
 		}
 		if report.Profile != tc.profile {
-			t.Fatalf("spec %q reported profile %q, want %q", tc.spec, report.Profile, tc.profile)
+			t.Fatalf("spec %q strict=%v reported profile %q, want %q", tc.spec, tc.strict, report.Profile, tc.profile)
 		}
 	}
 	missing := filepath.Join(t.TempDir(), "missing.jpg")
 	for _, options := range []*Options{
 		{SpecVersion: "2.6"},
-		{SpecVersion: "2.5", StrictConformance: true},
+		{SpecVersion: "9.9"},
+		{SpecVersion: "2.5.0"},
 	} {
 		_, err := VerifyFile(missing, "image/jpeg", options)
 		if err == nil || !strings.Contains(err.Error(), "unsupported_spec_version") {

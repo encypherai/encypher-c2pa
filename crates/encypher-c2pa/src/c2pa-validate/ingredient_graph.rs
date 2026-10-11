@@ -36,12 +36,13 @@
 //!
 //! ## Ceilings
 //!
-//! A manifest store is attacker-supplied. The walk is bounded on depth and on
-//! the number of manifests validated, and it never re-enters a manifest it has
-//! already reached, so a cycle terminates. Exhausting a ceiling stops the walk
-//! and records `com.encypher.ingredient.graphLimitExceeded` as informational:
-//! running out of budget says nothing about authenticity and must never be
-//! confusable with a hash or signature failure.
+//! A manifest store is attacker-supplied. One shared budget bounds depth,
+//! distinct manifests, hashed-URI references, and cumulative manifest bytes.
+//! The walk never re-enters a manifest it has already reached, so a cycle
+//! terminates. Exhausting a ceiling stops the walk and records
+//! `com.encypher.resource.graphLimitExceeded` as informational: running out of
+//! budget says nothing about authenticity and cannot become a validation
+//! failure.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -58,14 +59,199 @@ use crate::c2pa_cbor::Value;
 use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_crypto::{extract_x5chain, verify_claim_with, CryptoError};
 
-/// Maximum ingredient edges followed away from the active manifest.
-const MAX_DEPTH: usize = 16;
-/// Maximum manifests validated in one walk, the active manifest included.
-const MAX_MANIFESTS: usize = 64;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resource ceilings for one ingredient and hashed-reference walk.
+pub struct GraphLimits {
+    /// Maximum ingredient edges followed from the active manifest.
+    pub max_depth: usize,
+    /// Maximum distinct manifests visited.
+    pub max_nodes: usize,
+    /// Maximum hashed references examined across all visited manifests.
+    pub max_references: usize,
+    /// Maximum cumulative JUMBF bytes of visited manifests.
+    pub max_bytes: usize,
+}
+
+impl GraphLimits {
+    /// Engine ceilings used when the caller supplies no lower limits.
+    pub const DEFAULT: Self = Self {
+        max_depth: 32,
+        max_nodes: 1_024,
+        max_references: 16_384,
+        max_bytes: 64 * 1024 * 1024,
+    };
+
+    /// Construct caller-requested limits, clamped so no engine ceiling rises.
+    pub fn lowered(
+        max_depth: usize,
+        max_nodes: usize,
+        max_references: usize,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            max_depth: max_depth.min(Self::DEFAULT.max_depth),
+            max_nodes: max_nodes.min(Self::DEFAULT.max_nodes),
+            max_references: max_references.min(Self::DEFAULT.max_references),
+            max_bytes: max_bytes.min(Self::DEFAULT.max_bytes),
+        }
+    }
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+/// Caller-supplied resource provider and ceilings for graph validation.
+pub struct GraphInputs<'a> {
+    /// Network-free source of external-reference bytes already held by the caller.
+    pub external: Option<&'a dyn super::refs::ExternalResources>,
+    /// Resource ceilings for the walk.
+    pub limits: GraphLimits,
+}
+
+#[derive(Clone, Copy)]
+enum Ceiling {
+    Depth = 0,
+    Nodes = 1,
+    References = 2,
+    Bytes = 3,
+}
+
+impl Ceiling {
+    const ALL: [Self; 4] = [Self::Depth, Self::Nodes, Self::References, Self::Bytes];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Depth => "depth",
+            Self::Nodes => "nodes",
+            Self::References => "references",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+pub(super) struct Budget {
+    limits: GraphLimits,
+    nodes: usize,
+    references: usize,
+    bytes: usize,
+    exhausted: [Option<usize>; 4],
+}
+
+impl Budget {
+    pub(super) fn new(limits: GraphLimits) -> Self {
+        Self {
+            limits: GraphLimits::lowered(
+                limits.max_depth,
+                limits.max_nodes,
+                limits.max_references,
+                limits.max_bytes,
+            ),
+            nodes: 0,
+            references: 0,
+            bytes: 0,
+            exhausted: [None; 4],
+        }
+    }
+
+    fn note(&mut self, ceiling: Ceiling, observed: usize) {
+        let slot = &mut self.exhausted[ceiling as usize];
+        if slot.is_none() {
+            *slot = Some(observed);
+        }
+    }
+
+    fn node(&mut self) -> bool {
+        if self.nodes >= self.limits.max_nodes {
+            self.note(Ceiling::Nodes, self.nodes.saturating_add(1));
+            return false;
+        }
+        self.nodes += 1;
+        true
+    }
+
+    fn bytes(&mut self, bytes: usize) -> bool {
+        let total = self.bytes.saturating_add(bytes);
+        if total > self.limits.max_bytes {
+            self.note(Ceiling::Bytes, total);
+            return false;
+        }
+        self.bytes = total;
+        true
+    }
+
+    pub(super) fn references_left(&self) -> usize {
+        self.limits.max_references.saturating_sub(self.references)
+    }
+
+    pub(super) fn references(&mut self, count: usize) -> bool {
+        let total = self.references.saturating_add(count);
+        if total > self.limits.max_references {
+            self.note(Ceiling::References, total);
+            self.references = self.limits.max_references;
+            return false;
+        }
+        self.references = total;
+        true
+    }
+
+    pub(super) fn exhaust_references(&mut self) {
+        self.note(
+            Ceiling::References,
+            self.limits.max_references.saturating_add(1),
+        );
+    }
+
+    fn depth(&mut self, depth: usize) -> bool {
+        if depth > self.limits.max_depth {
+            self.note(Ceiling::Depth, depth);
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn report(&self, active_label: &str, results: &mut ValidationResults) {
+        for ceiling in Ceiling::ALL {
+            let Some(observed) = self.exhausted[ceiling as usize] else {
+                continue;
+            };
+            let limit = match ceiling {
+                Ceiling::Depth => self.limits.max_depth,
+                Ceiling::Nodes => self.limits.max_nodes,
+                Ceiling::References => self.limits.max_references,
+                Ceiling::Bytes => self.limits.max_bytes,
+            };
+            let name = ceiling.as_str();
+            if results.informational.iter().any(|status| {
+                status.code == GRAPH_LIMIT_EXCEEDED
+                    && status
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("limit"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(name)
+            }) {
+                continue;
+            }
+            results.informational.push(StatusCode {
+                code: GRAPH_LIMIT_EXCEEDED.into(),
+                url: format!("self#jumbf=/c2pa/{active_label}"),
+                explanation: format!(
+                    "ingredient graph {name} ceiling reached ({limit}); traversal stopped. \
+                     This is a resource outcome and does not affect manifest validity."
+                ),
+                details: Some(json!({ "limit": name, "ceiling": limit, "observed": observed })),
+            });
+        }
+    }
+}
 
 /// Informational: a ceiling stopped the ingredient walk. Entity-namespaced
 /// because it is a resource outcome, not a C2PA validation outcome.
-pub(super) const GRAPH_LIMIT_EXCEEDED: &str = "com.encypher.ingredient.graphLimitExceeded";
+pub(super) const GRAPH_LIMIT_EXCEEDED: &str = "com.encypher.resource.graphLimitExceeded";
 
 /// One `validation_results.ingredientDeltas` entry.
 pub(super) struct IngredientDelta {
@@ -113,6 +299,8 @@ pub(super) fn build<'a>(
     active_label: &str,
     store: StoreContext<'a>,
     profile: EngineProfile,
+    budget: &mut Budget,
+    resources: &mut super::refs::ResourceCache<'_>,
 ) -> IngredientGraph {
     let mut graph = IngredientGraph {
         active: ValidationResults::default(),
@@ -142,16 +330,16 @@ pub(super) fn build<'a>(
         .collect();
     let mut reached: Vec<bool> = vec![false; store.manifests.len()];
     let mut pending: Vec<(usize, Edge)> = Vec::new();
-    let mut cache = IngredientManifestDigestCache::new(store);
+    let mut cache = IngredientManifestDigestCache::new(store, profile);
     let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
-    let mut visited = 0usize;
-    let mut limits: HashSet<&'static str> = HashSet::new();
 
     queue.push_back((active, 0));
     reached[active] = true;
-    while let Some((index, depth)) = queue.pop_front() {
-        visited += 1;
+    'walk: while let Some((index, depth)) = queue.pop_front() {
         let manifest = &store.manifests[index];
+        if !budget.node() || !budget.bytes(manifest.manifest_jumbf.len()) {
+            break;
+        }
         let is_active = index == active;
         let Some(claim) = claims[index].as_ref() else {
             if !is_active {
@@ -176,14 +364,38 @@ pub(super) fn build<'a>(
                 profile,
                 &mut results[index],
             );
+            let walked = super::refs::verify_assertion_references(
+                super::refs::AssertionReferenceContext {
+                    claim,
+                    claim_refs: &claim_refs,
+                    generation,
+                    profile,
+                    manifest_label: &manifest.label,
+                    manifests: store.manifests,
+                    budget: budget.references_left(),
+                },
+                resources,
+                &mut results[index],
+            );
+            if !budget.references(walked.examined) {
+                break;
+            }
+            if walked.truncated {
+                budget.exhaust_references();
+                break;
+            }
         }
-        for edge in edges(
+        let graph_edges = edges(
             manifest,
             &claim_refs,
             generation,
             profile,
             &mut results[index],
-        ) {
+        );
+        if !budget.references(graph_edges.len()) {
+            break;
+        }
+        for edge in graph_edges {
             let Some(target) = index_of.get(edge.target.as_str()).copied() else {
                 // The link named a manifest the store does not carry;
                 // `verify_ingredient_references` already reported it.
@@ -196,34 +408,14 @@ pub(super) fn build<'a>(
                 // manifest is validated once and the walk does not re-enter it.
                 continue;
             }
-            if depth + 1 > MAX_DEPTH {
-                limits.insert("depth");
-                continue;
-            }
-            if visited + queue.len() >= MAX_MANIFESTS {
-                limits.insert("manifests");
-                continue;
+            if !budget.depth(depth + 1) {
+                break 'walk;
             }
             reached[target] = true;
             queue.push_back((target, depth + 1));
         }
     }
-    for limit in limits {
-        let ceiling = if limit == "depth" {
-            MAX_DEPTH
-        } else {
-            MAX_MANIFESTS
-        };
-        graph.active.informational.push(StatusCode {
-            code: GRAPH_LIMIT_EXCEEDED.into(),
-            url: format!("self#jumbf=/c2pa/{active_label}"),
-            explanation: format!(
-                "ingredient graph {limit} ceiling reached ({ceiling}); traversal stopped there. \
-                 This is a resource outcome and does not affect manifest validity."
-            ),
-            details: Some(json!({ "limit": limit, "ceiling": ceiling })),
-        });
-    }
+    budget.report(active_label, &mut graph.active);
 
     // Deltas last: both sides of every edge are computed by now.
     for (target, edge) in pending {
@@ -393,13 +585,6 @@ fn validate_reached_manifest<'a>(
             ALGORITHM_UNSUPPORTED,
             sig_url,
             format!("ingredient manifest claim signature algorithm {id} is not on the C2PA allowed list"),
-        ),
-        Err(CryptoError::UnimplementedAlg(id)) => results.push_failure(
-            ALGORITHM_UNSUPPORTED,
-            sig_url,
-            format!(
-                "ingredient manifest claim signature algorithm {id} (ML-DSA) is allowed by C2PA 2.5 but not implemented by this verifier; the signature was not evaluated"
-            ),
         ),
         Err(error) => results.push_failure(
             CLAIM_SIGNATURE_MISMATCH,
@@ -1100,6 +1285,8 @@ mod tests {
                 report: &out.report_json,
                 validation_time: NOW,
                 profile: EngineProfile::GENEROUS,
+                trust_list_sources: &[],
+                compressed_manifests: Vec::new(),
             },
         );
 
@@ -1250,7 +1437,7 @@ mod tests {
     #[test]
     fn a_chain_deeper_than_the_ceiling_stops_and_reports_the_limit() {
         let signer = Signer::conformant();
-        let depth = super::MAX_DEPTH + 2;
+        let depth = super::GraphLimits::DEFAULT.max_depth + 2;
         let mut boxes: Vec<Vec<u8>> = Vec::with_capacity(depth);
         let mut previous: Option<(String, Vec<u8>, Vec<u8>)> = None;
         for index in 0..depth {
@@ -1284,7 +1471,7 @@ mod tests {
             .results
             .informational
             .iter()
-            .find(|status| status.code == "com.encypher.ingredient.graphLimitExceeded")
+            .find(|status| status.code == "com.encypher.resource.graphLimitExceeded")
             .expect("graph ceiling reported");
         assert_eq!(
             limit

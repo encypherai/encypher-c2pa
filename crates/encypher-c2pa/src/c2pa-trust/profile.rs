@@ -35,8 +35,8 @@ use x509_cert::Certificate;
 
 use super::{
     allows_digital_signature, certificate_eku_oids, has_key_cert_sign, is_ca_certificate,
-    path_len_constraint, OID_ANY_EKU, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EKU, OID_EXT_KEY_USAGE,
-    OID_KP_OCSP_SIGNING, OID_KP_TIME_STAMPING,
+    path_len_constraint, AnchorPurpose, CertificateProfile, OID_ANY_EKU, OID_EXT_BASIC_CONSTRAINTS,
+    OID_EXT_EKU, OID_EXT_KEY_USAGE, OID_KP_OCSP_SIGNING, OID_KP_TIME_STAMPING,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,10 @@ const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.10
 const OID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
 const OID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
 
+const OID_ML_DSA_44: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17");
+const OID_ML_DSA_65: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.18");
+const OID_ML_DSA_87: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
+
 /// Minimum RSA modulus length the profile accepts, in bits.
 const MIN_RSA_MODULUS_BITS: u32 = 2048;
 
@@ -109,23 +113,81 @@ pub(crate) enum CertRole {
     Intermediate,
 }
 
+/// Which revision's profile applies, and whether the end entity is a signing
+/// credential the algorithm requirements bind.
+///
+/// The 2.4 profile applies the signature-algorithm and public-key allow lists
+/// to every path certificate. The 2.5 profile adds RSASSA-PSS with the full
+/// RFC 4055 salt range and ML-DSA-44/65/87, and scopes those requirements to
+/// claim-signing certificates: "The requirements do not apply to TSA, OCSP or
+/// CA certificates in certificate chains" (Trust Model, Certificate Profiles,
+/// General Requirements). CAWG credentials import the C2PA claim-signing
+/// profile, so they are bound as well.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ProfileRules {
+    profile: CertificateProfile,
+    signing_credential: bool,
+}
+
+impl ProfileRules {
+    /// The established 2.4 rules.
+    pub(crate) const V2_4: Self = Self {
+        profile: CertificateProfile::V2_4,
+        signing_credential: true,
+    };
+
+    /// Rules for an end entity validated for `purpose` under `profile`.
+    pub(crate) fn for_purpose(profile: CertificateProfile, purpose: AnchorPurpose) -> Self {
+        Self {
+            profile,
+            signing_credential: purpose != AnchorPurpose::TimeStamping,
+        }
+    }
+
+    /// Rules for a TSA or OCSP responder end entity under `profile`.
+    pub(crate) fn exempt_end_entity(profile: CertificateProfile) -> Self {
+        Self {
+            profile,
+            signing_credential: false,
+        }
+    }
+
+    fn algorithm_violation(self, cert: &Certificate, role: CertRole) -> Option<&'static str> {
+        match self.profile {
+            CertificateProfile::V2_2 | CertificateProfile::V2_4 => {
+                signature_algorithm_violation(cert).or_else(|| public_key_violation(cert))
+            }
+            CertificateProfile::V2_5 if role == CertRole::EndEntity && self.signing_credential => {
+                signature_algorithm_violation_v2_5(cert).or_else(|| public_key_violation_v2_5(cert))
+            }
+            CertificateProfile::V2_5 => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Single-certificate profile
 // ---------------------------------------------------------------------------
+
+/// [`profile_violation_with`] under [`ProfileRules::V2_4`].
+pub(crate) fn profile_violation(cert: &Certificate, role: CertRole) -> Option<&'static str> {
+    profile_violation_with(cert, role, ProfileRules::V2_4)
+}
 
 /// Check one certificate against the C2PA certificate profile.
 ///
 /// Returns `Some(reason)` when the certificate is unacceptable. The EKU
 /// *purpose* rules that differ per application (which claim-signing OIDs are
 /// accepted) stay with the caller; what lives here is what the profile demands
-/// of every certificate regardless of purpose.
-pub(crate) fn profile_violation(cert: &Certificate, role: CertRole) -> Option<&'static str> {
-    // "All certificates shall fulfill the following requirements": signature
-    // algorithm allow list and public-key constraints.
-    if let Some(reason) = signature_algorithm_violation(cert) {
-        return Some(reason);
-    }
-    if let Some(reason) = public_key_violation(cert) {
+/// of every certificate regardless of purpose, plus the algorithm
+/// requirements `rules` selects.
+pub(crate) fn profile_violation_with(
+    cert: &Certificate,
+    role: CertRole,
+    rules: ProfileRules,
+) -> Option<&'static str> {
+    // Signature algorithm allow list and public-key constraints.
+    if let Some(reason) = rules.algorithm_violation(cert, role) {
         return Some(reason);
     }
 
@@ -316,17 +378,96 @@ fn public_key_violation(cert: &Certificate) -> Option<&'static str> {
     Some("certificate public key algorithm is outside the C2PA allow list")
 }
 
+/// The 2.5 `signatureAlgorithm` allow list for a claim-signing certificate:
+/// the 2.4 algorithms plus ML-DSA-44/65/87 with absent parameters, and
+/// RSASSA-PSS whose parameters carry a present SHA-256/384/512 hash and MGF1
+/// over the same hash. The salt length may be any RFC 4055 value.
+fn signature_algorithm_violation_v2_5(cert: &Certificate) -> Option<&'static str> {
+    let alg = &cert.signature_algorithm;
+    match alg.oid {
+        OID_ECDSA_SHA256 | OID_ECDSA_SHA384 | OID_ECDSA_SHA512 | OID_RSA_SHA256
+        | OID_RSA_SHA384 | OID_RSA_SHA512 | OID_ED25519 => None,
+        OID_ML_DSA_44 | OID_ML_DSA_65 | OID_ML_DSA_87 => alg
+            .parameters
+            .is_some()
+            .then_some("ML-DSA certificate signature algorithm carries parameters"),
+        OID_RSASSA_PSS => {
+            let Some(parameters) = alg.parameters.as_ref() else {
+                return Some("RSASSA-PSS certificate signature has no parameters");
+            };
+            pss_parameters_violation(parameters)
+        }
+        _ => Some("certificate signature algorithm is outside the C2PA allow list"),
+    }
+}
+
+/// RFC 4055 `RSASSA-PSS-params` read with a full-range salt length.
+fn pss_parameters_violation(parameters: &der::Any) -> Option<&'static str> {
+    use der::{Reader as _, TagMode, TagNumber};
+
+    let parsed = parameters.sequence(|reader| {
+        let hash: Option<spki::AlgorithmIdentifierRef<'_>> =
+            reader.context_specific(TagNumber::N0, TagMode::Explicit)?;
+        let mask: Option<spki::AlgorithmIdentifier<spki::AlgorithmIdentifierRef<'_>>> =
+            reader.context_specific(TagNumber::N1, TagMode::Explicit)?;
+        let _salt: Option<u32> = reader.context_specific(TagNumber::N2, TagMode::Explicit)?;
+        let _trailer: Option<u32> = reader.context_specific(TagNumber::N3, TagMode::Explicit)?;
+        Ok((
+            hash.map(|hash| hash.oid),
+            mask.map(|mask| (mask.oid, mask.parameters.map(|inner| inner.oid))),
+        ))
+    });
+    let Ok((hash, mask)) = parsed else {
+        return Some("RSASSA-PSS certificate signature parameters are malformed");
+    };
+    let Some(hash) = hash else {
+        return Some("RSASSA-PSS hashAlgorithm is absent");
+    };
+    if !matches!(hash, OID_SHA256 | OID_SHA384 | OID_SHA512) {
+        return Some("RSASSA-PSS hashAlgorithm is not SHA-256, SHA-384 or SHA-512");
+    }
+    match mask {
+        None => Some("RSASSA-PSS maskGenAlgorithm is absent"),
+        Some((mgf, _)) if mgf != OID_MGF1 => Some("RSASSA-PSS maskGenAlgorithm is not MGF1"),
+        Some((_, None)) => Some("RSASSA-PSS maskGenAlgorithm has no hash parameter"),
+        Some((_, Some(mask_hash))) if mask_hash != hash => {
+            Some("RSASSA-PSS MGF1 hash does not match hashAlgorithm")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The 2.5 `subjectPublicKeyInfo` constraints for a claim-signing
+/// certificate: the 2.4 rules plus an ML-DSA key with absent parameters and
+/// the RFC 9881 encoding of its parameter set.
+fn public_key_violation_v2_5(cert: &Certificate) -> Option<&'static str> {
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    if matches!(
+        spki.algorithm.oid,
+        OID_ML_DSA_44 | OID_ML_DSA_65 | OID_ML_DSA_87
+    ) {
+        let Ok(der) = spki.to_der() else {
+            return Some("ML-DSA public key is malformed");
+        };
+        return crate::c2pa_crypto::ml_dsa_spki_alg(&der)
+            .is_err()
+            .then_some("ML-DSA public key is not an RFC 9881 encoding of its parameter set");
+    }
+    public_key_violation(cert)
+}
+
 // ---------------------------------------------------------------------------
 // Path constraints
 // ---------------------------------------------------------------------------
 
 /// Check a complete candidate path, ordered end entity first and trust anchor
-/// last, against the RFC 5280 section 6 constraints.
+/// last, against the certificate profile `rules` select and the RFC 5280
+/// section 6 constraints.
 ///
 /// `path[0]` is the certificate under validation; `path[path.len() - 1]` is the
 /// anchor. A single-element path (the anchor is itself the credential) has no
 /// constraints to apply.
-pub(crate) fn path_violation(path: &[Certificate]) -> Option<&'static str> {
+pub(crate) fn path_violation(path: &[Certificate], rules: ProfileRules) -> Option<&'static str> {
     for (index, cert) in path.iter().enumerate() {
         // The anchor is a trusted name and key, not a path certificate.
         if index + 1 == path.len() {
@@ -337,7 +478,7 @@ pub(crate) fn path_violation(path: &[Certificate]) -> Option<&'static str> {
         } else {
             CertRole::Intermediate
         };
-        if let Some(reason) = profile_violation(cert, role) {
+        if let Some(reason) = profile_violation_with(cert, role, rules) {
             return Some(reason);
         }
     }

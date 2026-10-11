@@ -73,6 +73,12 @@ pub fn alg_name(alg: CoseAlg) -> &'static str {
         CoseAlg::Ps384 => "Ps384",
         CoseAlg::Ps512 => "Ps512",
         CoseAlg::EdDsa => "Ed25519",
+        CoseAlg::Esp256 => "Esp256",
+        CoseAlg::Esp384 => "Esp384",
+        CoseAlg::Esp512 => "Esp512",
+        CoseAlg::MlDsa44 => "MlDsa44",
+        CoseAlg::MlDsa65 => "MlDsa65",
+        CoseAlg::MlDsa87 => "MlDsa87",
     }
 }
 

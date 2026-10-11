@@ -13,6 +13,7 @@ use spki::DecodePublicKey;
 
 use crate::c2pa_crypto::alg::CoseAlg;
 use crate::c2pa_crypto::error::CryptoError;
+use crate::c2pa_crypto::mldsa::{ml_dsa_public_key_from_spki, verify_ml_dsa};
 
 /// CBOR tag for a `COSE_Sign1_Tagged` structure (RFC 9052).
 const COSE_SIGN1_TAG: u64 = 18;
@@ -91,27 +92,47 @@ pub fn verify_claim(
 
 /// Which revision's claim-signature algorithm list governs a verification.
 ///
-/// C2PA 2.4 Cryptography, Signature Algorithms, lists ES256/384/512,
-/// PS256/384/512 and EdDSA (Ed25519). Proposed 2.5 adds the fully specified
-/// ECDSA identifiers ESP256 (`-9`), ESP384 (`-51`) and ESP512 (`-52`) from
-/// RFC 9864, each bound to one curve, and ML-DSA-44/65/87 (`-48`/`-49`/`-50`)
-/// from RFC 9964.
+/// C2PA 2.2 and 2.4 list ES256/384/512, PS256/384/512 and EdDSA
+/// (Ed25519). C2PA 2.5 adds the fully specified ECDSA identifiers ESP256
+/// (`-9`), ESP384 (`-51`) and ESP512 (`-52`) from RFC 9864, each bound to one
+/// curve, and ML-DSA-44/65/87 (`-48`/`-49`/`-50`) from RFC 9964.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimAlgorithmList {
-    /// The 2.4 list (also the list every earlier revision's validator reads).
+    /// The C2PA 2.2 list.
+    V2_2,
+    /// The C2PA 2.4 list.
     V2_4,
-    /// The proposed 2.5 list.
+    /// The C2PA 2.5 list.
     V2_5,
+}
+
+impl ClaimAlgorithmList {
+    /// Whether `alg` is on this revision's allowed list. Both deprecated
+    /// lists are empty, so allowed is the whole of what a validator accepts.
+    pub fn permits(self, alg: CoseAlg) -> bool {
+        match self {
+            ClaimAlgorithmList::V2_2 | ClaimAlgorithmList::V2_4 => !alg.introduced_in_c2pa_2_5(),
+            ClaimAlgorithmList::V2_5 => true,
+        }
+    }
+
+    /// The listed algorithm for a protected-header `alg` value, or
+    /// [`CryptoError::UnsupportedAlg`] when the value is unknown or not on
+    /// this list.
+    pub fn algorithm(self, alg_id: i128) -> Result<CoseAlg, CryptoError> {
+        CoseAlg::from_cose_id(alg_id)
+            .filter(|alg| self.permits(*alg))
+            .ok_or(CryptoError::UnsupportedAlg(alg_id))
+    }
 }
 
 /// [`verify_claim`] under an explicit revision's algorithm list.
 ///
-/// Under [`ClaimAlgorithmList::V2_5`] an ESP identifier verifies as the
-/// matching ECDSA algorithm and additionally requires the curve RFC 9864 binds
-/// to it. ML-DSA identifiers are allowed by 2.5 but this verifier has no
-/// ML-DSA implementation, so they fail closed with
-/// [`CryptoError::UnimplementedAlg`] rather than verifying or being silently
-/// accepted.
+/// An algorithm outside `list` is [`CryptoError::UnsupportedAlg`] and is
+/// never evaluated. Under [`ClaimAlgorithmList::V2_5`] an ESP identifier
+/// requires the curve RFC 9864 binds to it and a fixed-width `r || s`
+/// signature, and an ML-DSA identifier requires a certificate key of the same
+/// parameter set (C2PA 2.5 Cryptography, Signature Algorithms).
 pub fn verify_claim_with(
     cose_sign1: &[u8],
     claim_cbor: &[u8],
@@ -131,63 +152,36 @@ pub fn verify_claim_with(
         .as_bytes()
         .ok_or_else(|| CryptoError::Malformed("signature is not a byte string".into()))?;
 
-    // Algorithm lives in the protected header map.
-    let protected = decode(protected_bytes)?;
-    let alg_id = match &protected {
-        Value::Map(m) => map_get_int(m, COSE_HDR_ALG).and_then(|v| match v {
-            Value::Integer(n) => Some(*n),
-            _ => None,
-        }),
-        _ => None,
-    }
-    .ok_or_else(|| CryptoError::Malformed("missing algorithm in protected header".into()))?;
-    let (alg, required_curve) = match (list, alg_id) {
-        (ClaimAlgorithmList::V2_5, COSE_ALG_ESP256) => (CoseAlg::Es256, Some(EcCurve::P256)),
-        (ClaimAlgorithmList::V2_5, COSE_ALG_ESP384) => (CoseAlg::Es384, Some(EcCurve::P384)),
-        (ClaimAlgorithmList::V2_5, COSE_ALG_ESP512) => (CoseAlg::Es512, Some(EcCurve::P521)),
-        (
-            ClaimAlgorithmList::V2_5,
-            COSE_ALG_ML_DSA_44 | COSE_ALG_ML_DSA_65 | COSE_ALG_ML_DSA_87,
-        ) => return Err(CryptoError::UnimplementedAlg(alg_id)),
-        _ => (
-            CoseAlg::from_cose_id(alg_id).ok_or(CryptoError::UnsupportedAlg(alg_id))?,
-            None,
-        ),
-    };
-
+    let alg = list.algorithm(protected_alg_id(protected_bytes)?)?;
     let sig_input = sig_structure_bytes(protected_bytes, claim_cbor)?;
-    verify_signature_on_curve(alg, &sig_input, signature, cert_der, required_curve)
+    verify_signature(alg, &sig_input, signature, cert_der)
 }
 
-/// RFC 9864 fully specified ECDSA with SHA-256 on P-256.
-const COSE_ALG_ESP256: i128 = -9;
-/// RFC 9864 fully specified ECDSA with SHA-384 on P-384.
-const COSE_ALG_ESP384: i128 = -51;
-/// RFC 9864 fully specified ECDSA with SHA-512 on P-521.
-const COSE_ALG_ESP512: i128 = -52;
-/// RFC 9964 ML-DSA-44.
-const COSE_ALG_ML_DSA_44: i128 = -48;
-/// RFC 9964 ML-DSA-65.
-const COSE_ALG_ML_DSA_65: i128 = -49;
-/// RFC 9964 ML-DSA-87.
-const COSE_ALG_ML_DSA_87: i128 = -50;
-
-/// Return the protected COSE algorithm from a `COSE_Sign1_Tagged` value.
-pub fn extract_cose_alg(cose_sign1: &[u8]) -> Result<CoseAlg, CryptoError> {
-    let decoded = decode(cose_sign1)?;
-    let array = cose_array(&decoded)?;
-    let protected_bytes = array[0]
-        .as_bytes()
-        .ok_or_else(|| CryptoError::Malformed("protected header is not a byte string".into()))?;
+/// The integer `alg` (label 1) of a serialized protected header map.
+fn protected_alg_id(protected_bytes: &[u8]) -> Result<i128, CryptoError> {
     let protected = decode(protected_bytes)?;
-    let alg_id = match &protected {
+    match &protected {
         Value::Map(entries) => map_get_int(entries, COSE_HDR_ALG).and_then(|value| match value {
             Value::Integer(id) => Some(*id),
             _ => None,
         }),
         _ => None,
     }
-    .ok_or_else(|| CryptoError::Malformed("missing algorithm in protected header".into()))?;
+    .ok_or_else(|| CryptoError::Malformed("missing algorithm in protected header".into()))
+}
+
+/// Return the protected COSE algorithm from a `COSE_Sign1_Tagged` value.
+///
+/// This names any algorithm this crate knows, for reporting. Whether the
+/// algorithm is acceptable is decided by [`ClaimAlgorithmList`] at
+/// verification time.
+pub fn extract_cose_alg(cose_sign1: &[u8]) -> Result<CoseAlg, CryptoError> {
+    let decoded = decode(cose_sign1)?;
+    let array = cose_array(&decoded)?;
+    let protected_bytes = array[0]
+        .as_bytes()
+        .ok_or_else(|| CryptoError::Malformed("protected header is not a byte string".into()))?;
+    let alg_id = protected_alg_id(protected_bytes)?;
     CoseAlg::from_cose_id(alg_id).ok_or(CryptoError::UnsupportedAlg(alg_id))
 }
 
@@ -337,26 +331,20 @@ fn ec_curve_from_spki(spki_der: &[u8]) -> Result<EcCurve, CryptoError> {
 }
 
 /// Verify `signature` over `data` against the public key in `cert_der`.
+///
+/// The key must be correct for `alg` (C2PA 2.5 Cryptography, Signature
+/// Algorithms): ESP identifiers require their RFC 9864 curve and a
+/// fixed-width `r || s` value, PS identifiers an RSA key of at least 2048
+/// bits, EdDSA an Ed25519 key and ML-DSA a key of the same parameter set.
+/// The ES identifiers keep their established acceptance of any permitted
+/// NIST curve and of DER-encoded legacy signatures.
 pub(crate) fn verify_signature(
     alg: CoseAlg,
     data: &[u8],
     signature: &[u8],
     cert_der: &[u8],
 ) -> Result<(), CryptoError> {
-    verify_signature_on_curve(alg, data, signature, cert_der, None)
-}
-
-/// [`verify_signature`], additionally requiring an ECDSA key on
-/// `required_curve` when one is given (the fully specified ESP identifiers).
-fn verify_signature_on_curve(
-    alg: CoseAlg,
-    data: &[u8],
-    signature: &[u8],
-    cert_der: &[u8],
-    required_curve: Option<EcCurve>,
-) -> Result<(), CryptoError> {
-    use sha2::Digest as _;
-    use signature::{hazmat::PrehashVerifier as _, Verifier as _};
+    use signature::Verifier as _;
 
     let spki = leaf_spki_der(cert_der)?;
     let bad = |e: signature::Error| CryptoError::Verify(e.to_string());
@@ -364,61 +352,13 @@ fn verify_signature_on_curve(
         move |e: spki::Error| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
     };
 
-    if matches!(alg, CoseAlg::Es256 | CoseAlg::Es384 | CoseAlg::Es512) {
-        let digest = match alg {
-            CoseAlg::Es256 => sha2::Sha256::digest(data).to_vec(),
-            CoseAlg::Es384 => sha2::Sha384::digest(data).to_vec(),
-            CoseAlg::Es512 => sha2::Sha512::digest(data).to_vec(),
-            _ => unreachable!(),
-        };
-        let curve = ec_curve_from_spki(&spki)?;
-        if let Some(required) = required_curve.filter(|required| *required != curve) {
-            return Err(CryptoError::Verify(format!(
-                "fully specified ECDSA algorithm requires a {} key, found {}",
-                required.name(),
-                curve.name()
-            )));
-        }
-        return match curve {
-            EcCurve::P256 => {
-                let verifying_key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki)
-                    .map_err(key_err("P-256"))?;
-                let signature = p256::ecdsa::Signature::from_slice(signature)
-                    .or_else(|_| p256::ecdsa::Signature::from_der(signature))
-                    .map_err(bad)?;
-                verifying_key
-                    .verify_prehash(&digest, &signature)
-                    .map_err(bad)
-            }
-            EcCurve::P384 => {
-                let verifying_key = p384::ecdsa::VerifyingKey::from_public_key_der(&spki)
-                    .map_err(key_err("P-384"))?;
-                let signature = p384::ecdsa::Signature::from_slice(signature)
-                    .or_else(|_| p384::ecdsa::Signature::from_der(signature))
-                    .map_err(bad)?;
-                verifying_key
-                    .verify_prehash(&digest, &signature)
-                    .map_err(bad)
-            }
-            EcCurve::P521 => {
-                use p521::elliptic_curve::sec1::ToEncodedPoint;
-                let public_key =
-                    p521::PublicKey::from_public_key_der(&spki).map_err(key_err("P-521"))?;
-                let verifying_key = p521::ecdsa::VerifyingKey::from_encoded_point(
-                    &public_key.to_encoded_point(false),
-                )
-                .map_err(bad)?;
-                let signature = p521::ecdsa::Signature::from_slice(signature)
-                    .or_else(|_| p521::ecdsa::Signature::from_der(signature))
-                    .map_err(bad)?;
-                verifying_key
-                    .verify_prehash(&digest, &signature)
-                    .map_err(bad)
-            }
-        };
-    }
-
     match alg {
+        CoseAlg::Es256 | CoseAlg::Es384 | CoseAlg::Es512 => {
+            verify_ecdsa(alg, data, signature, &spki, None)
+        }
+        CoseAlg::Esp256 => verify_ecdsa(alg, data, signature, &spki, Some(EcCurve::P256)),
+        CoseAlg::Esp384 => verify_ecdsa(alg, data, signature, &spki, Some(EcCurve::P384)),
+        CoseAlg::Esp512 => verify_ecdsa(alg, data, signature, &spki, Some(EcCurve::P521)),
         CoseAlg::Ps256 => {
             let public_key = rsa_public_key_from_spki(&spki, alg)?;
             let verifying_key = rsa::pss::VerifyingKey::<sha2::Sha256>::new(public_key);
@@ -443,7 +383,120 @@ fn verify_signature_on_curve(
             let signature = ed25519_dalek::Signature::from_slice(signature).map_err(bad)?;
             verifying_key.verify(data, &signature).map_err(bad)
         }
-        CoseAlg::Es256 | CoseAlg::Es384 | CoseAlg::Es512 => unreachable!(),
+        CoseAlg::MlDsa44 | CoseAlg::MlDsa65 | CoseAlg::MlDsa87 => {
+            let (key_alg, public_key) = ml_dsa_public_key_from_spki(&spki)?;
+            if key_alg != alg {
+                return Err(CryptoError::Verify(format!(
+                    "{} requires an {} key, found {}",
+                    alg.iana_name(),
+                    alg.iana_name(),
+                    key_alg.iana_name()
+                )));
+            }
+            verify_ml_dsa(alg, public_key, data, signature)
+        }
+    }
+}
+
+/// ECDSA over the leaf's NIST curve with the digest `alg` names.
+///
+/// `required_curve` is the RFC 9864 curve of an ESP identifier. Fully
+/// specified identifiers accept only the COSE fixed-width `r || s` encoding;
+/// the ES identifiers also accept the DER form legacy assets carry.
+fn verify_ecdsa(
+    alg: CoseAlg,
+    data: &[u8],
+    signature: &[u8],
+    spki: &[u8],
+    required_curve: Option<EcCurve>,
+) -> Result<(), CryptoError> {
+    use sha2::Digest as _;
+    use signature::hazmat::PrehashVerifier as _;
+
+    let bad = |e: signature::Error| CryptoError::Verify(e.to_string());
+    let key_err = |what: &'static str| {
+        move |e: spki::Error| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
+    };
+    let mut digest = [0_u8; 64];
+    let digest_len = match alg {
+        CoseAlg::Es256 | CoseAlg::Esp256 => {
+            digest[..32].copy_from_slice(&sha2::Sha256::digest(data));
+            32
+        }
+        CoseAlg::Es384 | CoseAlg::Esp384 => {
+            digest[..48].copy_from_slice(&sha2::Sha384::digest(data));
+            48
+        }
+        CoseAlg::Es512 | CoseAlg::Esp512 => {
+            digest.copy_from_slice(&sha2::Sha512::digest(data));
+            64
+        }
+        _ => return Err(CryptoError::UnsupportedAlg(alg.cose_id())),
+    };
+    let digest = &digest[..digest_len];
+    let curve = ec_curve_from_spki(spki)?;
+    if let Some(required) = required_curve.filter(|required| *required != curve) {
+        return Err(CryptoError::Verify(format!(
+            "{} requires a {} key, found {}",
+            alg.iana_name(),
+            required.name(),
+            curve.name()
+        )));
+    }
+    let legacy_der = required_curve.is_none();
+    match curve {
+        EcCurve::P256 => {
+            let verifying_key =
+                p256::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(key_err("P-256"))?;
+            let signature = p256::ecdsa::Signature::from_slice(signature)
+                .or_else(|e| {
+                    if legacy_der {
+                        p256::ecdsa::Signature::from_der(signature)
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(bad)?;
+            verifying_key
+                .verify_prehash(digest, &signature)
+                .map_err(bad)
+        }
+        EcCurve::P384 => {
+            let verifying_key =
+                p384::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(key_err("P-384"))?;
+            let signature = p384::ecdsa::Signature::from_slice(signature)
+                .or_else(|e| {
+                    if legacy_der {
+                        p384::ecdsa::Signature::from_der(signature)
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(bad)?;
+            verifying_key
+                .verify_prehash(digest, &signature)
+                .map_err(bad)
+        }
+        EcCurve::P521 => {
+            use p521::elliptic_curve::sec1::ToEncodedPoint;
+            let public_key =
+                p521::PublicKey::from_public_key_der(spki).map_err(key_err("P-521"))?;
+            let verifying_key =
+                p521::ecdsa::VerifyingKey::from_encoded_point(&public_key.to_encoded_point(false))
+                    .map_err(bad)?;
+            let signature = p521::ecdsa::Signature::from_slice(signature)
+                .or_else(|e| {
+                    if legacy_der {
+                        p521::ecdsa::Signature::from_der(signature)
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(bad)?;
+            verifying_key
+                .verify_prehash(digest, &signature)
+                .map_err(bad)
+        }
     }
 }
 
@@ -725,6 +778,17 @@ pub fn visit_ocsp_staples(
 mod tests {
     use super::*;
 
+    #[test]
+    fn c2pa_2_2_and_2_4_have_the_same_claim_algorithm_policy() {
+        for algorithm in CoseAlg::ALL {
+            assert_eq!(
+                ClaimAlgorithmList::V2_2.permits(algorithm),
+                ClaimAlgorithmList::V2_4.permits(algorithm),
+                "{algorithm:?}"
+            );
+        }
+    }
+
     fn cose_with_headers(
         protected: Vec<(Value, Value)>,
         unprotected: Vec<(Value, Value)>,
@@ -957,5 +1021,377 @@ mod tests {
                 "a COSE_Sign1 payload that is not nil must be rejected"
             );
         }
+    }
+
+    /// A real certificate carrying `spki`, issued by a fixed P-256 test CA.
+    /// Claim verification reads only the leaf key; the issuer signature is
+    /// genuine so the certificate is also usable by chain-level tests.
+    fn certificate_for(spki: spki::SubjectPublicKeyInfoOwned) -> Vec<u8> {
+        use p256::ecdsa::{signature::Signer as _, DerSignature, SigningKey};
+        use std::str::FromStr as _;
+        use x509_cert::certificate::{Certificate, TbsCertificate, Version};
+        use x509_cert::time::{Time, Validity};
+
+        let at = |seconds: u64| {
+            Time::UtcTime(
+                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(seconds))
+                    .expect("UTC time"),
+            )
+        };
+        let algorithm = spki::AlgorithmIdentifierOwned {
+            oid: spki::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+            parameters: None,
+        };
+        let tbs_certificate = TbsCertificate {
+            version: Version::V3,
+            serial_number: x509_cert::serial_number::SerialNumber::new(&[0x25]).expect("serial"),
+            signature: algorithm.clone(),
+            issuer: x509_cert::name::Name::from_str("CN=C2PA 2.5 Test CA,O=Encypher Test")
+                .expect("issuer"),
+            validity: Validity {
+                not_before: at(1_700_000_000),
+                not_after: at(2_000_000_000),
+            },
+            subject: x509_cert::name::Name::from_str("CN=C2PA 2.5 Test Signer,O=Encypher Test")
+                .expect("subject"),
+            subject_public_key_info: spki,
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: None,
+        };
+        let issuer = SigningKey::from_slice(&[0x25; 32]).expect("CA key");
+        let signature: DerSignature = issuer.sign(&tbs_certificate.to_der().expect("TBS"));
+        Certificate {
+            tbs_certificate,
+            signature_algorithm: algorithm,
+            signature: der::asn1::BitString::from_bytes(signature.as_bytes()).expect("bits"),
+        }
+        .to_der()
+        .expect("certificate")
+    }
+
+    fn certificate_for_spki_der(spki_der: &[u8]) -> Vec<u8> {
+        certificate_for(spki::SubjectPublicKeyInfoOwned::from_der(spki_der).expect("SPKI"))
+    }
+
+    /// A detached `COSE_Sign1_Tagged` over `claim` with protected `{1: alg}`.
+    fn detached_cose(alg_id: i128, claim: &[u8], sign: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+        let protected = encode(
+            &Value::Map(vec![(Value::Integer(COSE_HDR_ALG), Value::Integer(alg_id))]),
+            PROFILE,
+        )
+        .expect("encode protected");
+        let signature = sign(&sig_structure_bytes(&protected, claim).expect("sig structure"));
+        encode(
+            &Value::Tag(
+                COSE_SIGN1_TAG,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(Vec::new()),
+                    Value::Null,
+                    Value::Bytes(signature),
+                ])),
+            ),
+            PROFILE,
+        )
+        .expect("encode cose")
+    }
+
+    struct EcSigner {
+        p256: p256::ecdsa::SigningKey,
+        p384: p384::ecdsa::SigningKey,
+        p521: p521::ecdsa::SigningKey,
+    }
+
+    impl EcSigner {
+        fn new() -> Self {
+            let mut rng = rand_core::OsRng;
+            Self {
+                p256: p256::ecdsa::SigningKey::random(&mut rng),
+                p384: p384::ecdsa::SigningKey::random(&mut rng),
+                p521: p521::ecdsa::SigningKey::random(&mut rng),
+            }
+        }
+
+        fn leaf(&self, curve: EcCurve) -> Vec<u8> {
+            use p256::pkcs8::EncodePublicKey as _;
+            let spki = match curve {
+                EcCurve::P256 => self.p256.verifying_key().to_public_key_der(),
+                EcCurve::P384 => self.p384.verifying_key().to_public_key_der(),
+                EcCurve::P521 => p521::PublicKey::from_sec1_bytes(
+                    p521::ecdsa::VerifyingKey::from(&self.p521)
+                        .to_encoded_point(false)
+                        .as_bytes(),
+                )
+                .expect("P-521 point")
+                .to_public_key_der(),
+            }
+            .expect("SPKI");
+            certificate_for_spki_der(spki.as_bytes())
+        }
+
+        /// Fixed-width `r || s`, the COSE encoding (RFC 9053 section 2.1).
+        fn raw(&self, curve: EcCurve, data: &[u8]) -> Vec<u8> {
+            use signature::Signer as _;
+            match curve {
+                EcCurve::P256 => {
+                    let signature: p256::ecdsa::Signature = self.p256.sign(data);
+                    signature.to_bytes().to_vec()
+                }
+                EcCurve::P384 => {
+                    let signature: p384::ecdsa::Signature = self.p384.sign(data);
+                    signature.to_bytes().to_vec()
+                }
+                EcCurve::P521 => {
+                    let signature: p521::ecdsa::Signature = self.p521.sign(data);
+                    signature.to_bytes().to_vec()
+                }
+            }
+        }
+    }
+
+    /// `(ESP id, its RFC 9864 curve, the ES twin with the same digest, digest bits)`.
+    const ESP: [(i128, EcCurve, i128, u16); 3] = [
+        (-9, EcCurve::P256, -7, 256),
+        (-51, EcCurve::P384, -35, 384),
+        (-52, EcCurve::P521, -36, 512),
+    ];
+
+    #[test]
+    fn esp_signatures_verify_on_their_bound_curve_only_under_the_2_5_list() {
+        let signer = EcSigner::new();
+        let claim = b"esp claim bytes".to_vec();
+        for (alg_id, curve, _, _) in ESP {
+            let leaf = signer.leaf(curve);
+            let cose = detached_cose(alg_id, &claim, |data| signer.raw(curve, data));
+            verify_claim_with(&cose, &claim, &leaf, ClaimAlgorithmList::V2_5)
+                .unwrap_or_else(|e| panic!("ESP {alg_id} on its own curve must verify: {e}"));
+            assert!(matches!(
+                verify_claim(&cose, &claim, &leaf),
+                Err(CryptoError::UnsupportedAlg(id)) if id == alg_id
+            ));
+
+            let mut tampered = claim.clone();
+            tampered[0] ^= 0x01;
+            assert!(verify_claim_with(&cose, &tampered, &leaf, ClaimAlgorithmList::V2_5).is_err());
+        }
+    }
+
+    #[test]
+    fn esp_refuses_a_key_on_any_other_curve_even_with_a_valid_signature() {
+        let signer = EcSigner::new();
+        let claim = b"esp pairing".to_vec();
+        for (alg_id, bound, es_twin, bits) in ESP {
+            for (_, other, _, _) in ESP {
+                // A 256-bit digest is shorter than half of P-521's field, which
+                // RustCrypto ECDSA refuses (bits2field); C2PA lets validators
+                // reject non-matching pairings, so that one has no ES baseline.
+                if other == bound || (bits == 256 && other == EcCurve::P521) {
+                    continue;
+                }
+                // Both signatures are genuinely valid ECDSA by `other`'s key
+                // over the same digest. The ES identifier accepts that
+                // pairing; only the RFC 9864 binding makes the ESP one wrong.
+                let leaf = signer.leaf(other);
+                let sign = |data: &[u8]| prehash_sign(&signer, other, sha2_digest(bits, data));
+                let es_cose = detached_cose(es_twin, &claim, sign);
+                verify_claim_with(&es_cose, &claim, &leaf, ClaimAlgorithmList::V2_5)
+                    .expect("the ES twin keeps its cross-curve acceptance");
+                let esp_cose = detached_cose(alg_id, &claim, sign);
+                assert!(matches!(
+                    verify_claim_with(&esp_cose, &claim, &leaf, ClaimAlgorithmList::V2_5),
+                    Err(CryptoError::Verify(_))
+                ));
+            }
+        }
+    }
+
+    fn sha2_digest(bits: u16, data: &[u8]) -> Vec<u8> {
+        use sha2::Digest as _;
+        match bits {
+            256 => sha2::Sha256::digest(data).to_vec(),
+            384 => sha2::Sha384::digest(data).to_vec(),
+            _ => sha2::Sha512::digest(data).to_vec(),
+        }
+    }
+
+    fn prehash_sign(signer: &EcSigner, curve: EcCurve, digest: Vec<u8>) -> Vec<u8> {
+        use signature::hazmat::PrehashSigner as _;
+        match curve {
+            EcCurve::P256 => {
+                let signature: p256::ecdsa::Signature =
+                    signer.p256.sign_prehash(&digest).expect("P-256 prehash");
+                signature.to_bytes().to_vec()
+            }
+            EcCurve::P384 => {
+                let signature: p384::ecdsa::Signature =
+                    signer.p384.sign_prehash(&digest).expect("P-384 prehash");
+                signature.to_bytes().to_vec()
+            }
+            EcCurve::P521 => {
+                let signature: p521::ecdsa::Signature =
+                    signer.p521.sign_prehash(&digest).expect("P-521 prehash");
+                signature.to_bytes().to_vec()
+            }
+        }
+    }
+
+    #[test]
+    fn esp_accepts_only_the_fixed_width_cose_signature_encoding() {
+        let signer = EcSigner::new();
+        let claim = b"esp encoding".to_vec();
+        let leaf = signer.leaf(EcCurve::P256);
+        let der_signed = |alg_id| {
+            detached_cose(alg_id, &claim, |data| {
+                use signature::Signer as _;
+                let signature: p256::ecdsa::Signature = signer.p256.sign(data);
+                signature.to_der().as_bytes().to_vec()
+            })
+        };
+        // ES256 keeps accepting the DER form legacy assets carry.
+        verify_claim_with(&der_signed(-7), &claim, &leaf, ClaimAlgorithmList::V2_5)
+            .expect("legacy ES256 DER signature");
+        assert!(matches!(
+            verify_claim_with(&der_signed(-9), &claim, &leaf, ClaimAlgorithmList::V2_5),
+            Err(CryptoError::Verify(_))
+        ));
+    }
+
+    struct Rfc9964Claim {
+        alg_id: i128,
+        public_key: &'static [u8],
+        sign1: &'static [u8],
+        to_be_signed: &'static [u8],
+    }
+
+    /// RFC 9964 Appendix A.2: COSE_Sign1 values signed by an independent
+    /// ML-DSA implementation. Re-expressed in C2PA detached form, the RFC
+    /// payload becomes the claim and the Sig_structure is unchanged.
+    const RFC9964: [Rfc9964Claim; 3] = [
+        Rfc9964Claim {
+            alg_id: -48,
+            public_key: include_bytes!("fixtures/ml_dsa_44_rfc9964.pub"),
+            sign1: include_bytes!("fixtures/ml_dsa_44_rfc9964.sign1"),
+            to_be_signed: include_bytes!("fixtures/ml_dsa_44_rfc9964.tbs"),
+        },
+        Rfc9964Claim {
+            alg_id: -49,
+            public_key: include_bytes!("fixtures/ml_dsa_65_rfc9964.pub"),
+            sign1: include_bytes!("fixtures/ml_dsa_65_rfc9964.sign1"),
+            to_be_signed: include_bytes!("fixtures/ml_dsa_65_rfc9964.tbs"),
+        },
+        Rfc9964Claim {
+            alg_id: -50,
+            public_key: include_bytes!("fixtures/ml_dsa_87_rfc9964.pub"),
+            sign1: include_bytes!("fixtures/ml_dsa_87_rfc9964.sign1"),
+            to_be_signed: include_bytes!("fixtures/ml_dsa_87_rfc9964.tbs"),
+        },
+    ];
+
+    const RFC9881_CERTIFICATES: [&[u8]; 3] = [
+        include_bytes!("fixtures/ml_dsa_44_rfc9881_cert.der"),
+        include_bytes!("fixtures/ml_dsa_65_rfc9881_cert.der"),
+        include_bytes!("fixtures/ml_dsa_87_rfc9881_cert.der"),
+    ];
+
+    /// `(detached C2PA COSE, claim bytes, leaf certificate)` for an RFC vector.
+    fn rfc9964_claim(vector: &Rfc9964Claim) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let decoded = decode(vector.sign1).expect("RFC COSE_Sign1");
+        let items = cose_array(&decoded).expect("RFC COSE_Sign1 array");
+        let protected = items[0].as_bytes().expect("protected").to_vec();
+        let payload = items[2]
+            .as_bytes()
+            .expect("RFC example carries its payload")
+            .to_vec();
+        let signature = items[3].as_bytes().expect("signature").to_vec();
+        assert_eq!(
+            sig_structure_bytes(&protected, &payload).expect("sig structure"),
+            vector.to_be_signed,
+            "our Sig_structure encoding must equal the RFC's ToBeSigned bytes"
+        );
+        let cose = encode(
+            &Value::Tag(
+                COSE_SIGN1_TAG,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(Vec::new()),
+                    Value::Null,
+                    Value::Bytes(signature),
+                ])),
+            ),
+            PROFILE,
+        )
+        .expect("detached cose");
+        let oid = match vector.alg_id {
+            -48 => "2.16.840.1.101.3.4.3.17",
+            -49 => "2.16.840.1.101.3.4.3.18",
+            _ => "2.16.840.1.101.3.4.3.19",
+        };
+        let leaf = certificate_for(spki::SubjectPublicKeyInfoOwned {
+            algorithm: spki::AlgorithmIdentifierOwned {
+                oid: spki::ObjectIdentifier::new_unwrap(oid),
+                parameters: None,
+            },
+            subject_public_key: der::asn1::BitString::from_bytes(vector.public_key)
+                .expect("bit string"),
+        });
+        (cose, payload, leaf)
+    }
+
+    #[test]
+    fn rfc9964_ml_dsa_claims_verify_only_under_the_2_5_list() {
+        for vector in &RFC9964 {
+            let (cose, claim, leaf) = rfc9964_claim(vector);
+            verify_claim_with(&cose, &claim, &leaf, ClaimAlgorithmList::V2_5)
+                .unwrap_or_else(|e| panic!("RFC 9964 {} must verify: {e}", vector.alg_id));
+            assert!(matches!(
+                verify_claim(&cose, &claim, &leaf),
+                Err(CryptoError::UnsupportedAlg(id)) if id == vector.alg_id
+            ));
+            assert_eq!(
+                extract_cose_alg(&cose).expect("known algorithm").cose_id(),
+                vector.alg_id
+            );
+
+            let mut tampered = claim.clone();
+            tampered[0] ^= 0x01;
+            assert!(matches!(
+                verify_claim_with(&cose, &tampered, &leaf, ClaimAlgorithmList::V2_5),
+                Err(CryptoError::Verify(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ml_dsa_refuses_a_certificate_key_of_another_parameter_set_or_owner() {
+        for (index, vector) in RFC9964.iter().enumerate() {
+            let (cose, claim, _) = rfc9964_claim(vector);
+            for (other, certificate) in RFC9881_CERTIFICATES.iter().enumerate() {
+                // Same parameter set, different key: a signature mismatch.
+                // Different parameter set: refused before any verification.
+                let result =
+                    verify_claim_with(&cose, &claim, certificate, ClaimAlgorithmList::V2_5);
+                assert!(
+                    matches!(result, Err(CryptoError::Verify(_))),
+                    "vector {index} against RFC 9881 certificate {other}: {result:?}"
+                );
+            }
+            let ec_leaf = EcSigner::new().leaf(EcCurve::P256);
+            assert!(matches!(
+                verify_claim_with(&cose, &claim, &ec_leaf, ClaimAlgorithmList::V2_5),
+                Err(CryptoError::CertParse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_classical_algorithm_id_never_verifies_with_an_ml_dsa_key() {
+        let (_, claim, ml_dsa_leaf) = rfc9964_claim(&RFC9964[0]);
+        let signer = EcSigner::new();
+        let cose = detached_cose(-7, &claim, |data| signer.raw(EcCurve::P256, data));
+        assert!(matches!(
+            verify_claim_with(&cose, &claim, &ml_dsa_leaf, ClaimAlgorithmList::V2_5),
+            Err(CryptoError::CertParse(_))
+        ));
     }
 }

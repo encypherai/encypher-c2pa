@@ -19,12 +19,14 @@ use std::collections::HashSet;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
-    base_assertion_label, is_allowed_hash_algorithm, ClaimAssertionRefs, EngineProfile,
-    SpecVersion, ValidationResults, Value, ALGORITHM_UNSUPPORTED,
+    base_assertion_label, hash_bytes, is_allowed_hash_algorithm,
+    network_needs::{push_unique, NetworkNeed},
+    ClaimAssertionRefs, EngineProfile, OnlineEvidence, SpecVersion, ValidationResults, Value,
+    ALGORITHM_UNSUPPORTED,
 };
 use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_crypto::ClaimAlgorithmList;
-use crate::c2pa_formats::TextLocatorRules;
+use crate::c2pa_formats::{AppendOnlyFlavor, AssetFormat, TextLocatorRules};
 
 /// Failure: a standard manifest carries no actions assertion (2.5 Validate the
 /// Assertions, Standard Manifest Assertions).
@@ -49,25 +51,32 @@ pub(super) const LINKED_RESOURCE_MALFORMED: &str = "assertion.linkedResourceInte
 pub(super) const LINKED_RESOURCE_INVALID_URI: &str = "assertion.linkedResourceIntegrity.invalidURI";
 /// Informational: a linked resource was not retrieved.
 pub(super) const LINKED_RESOURCE_SKIPPED: &str = "assertion.linkedResourceIntegrity.skipped";
-/// Failure extension: the sole hard binding is a 2.5 `c2pa.hash.segment`
-/// (append-only text), which this verifier does not evaluate. No registered
-/// code says "unevaluated binding", and a manifest whose content binding was
-/// never checked must not read as valid, so the verifier fails closed under
-/// this extension code, as it does for an unevaluable general box hash.
-pub(super) const ASSERTION_SEGMENT_HASH_UNEVALUATED: &str =
-    "com.encypher.assertion.segmentHash.unevaluated";
+/// Success: every applicable linked-resource check matched.
+pub(super) const LINKED_RESOURCE_MATCH: &str = "assertion.linkedResourceIntegrity.match";
+/// Informational: retrieval was attempted but no usable body was obtained.
+pub(super) const LINKED_RESOURCE_INACCESSIBLE: &str =
+    "assertion.linkedResourceIntegrity.inaccessible";
+/// Informational: retrieved size differs from the assertion.
+pub(super) const LINKED_RESOURCE_SIZE_MISMATCH: &str =
+    "assertion.linkedResourceIntegrity.sizeMismatch";
+/// Informational: retrieved media type differs from the assertion.
+pub(super) const LINKED_RESOURCE_FORMAT_MISMATCH: &str =
+    "assertion.linkedResourceIntegrity.formatMismatch";
+/// Informational: retrieved bytes differ from the assertion digest.
+pub(super) const LINKED_RESOURCE_HASH_MISMATCH: &str =
+    "assertion.linkedResourceIntegrity.hashMismatch";
 
 /// Whether the caller selected the proposed 2.5 validation policy.
 pub(super) fn applies(profile: EngineProfile) -> bool {
-    profile.version >= SpecVersion::V2_5
+    profile.version == SpecVersion::V2_5
 }
 
 /// The claim-signature algorithm list the selected policy applies.
 pub(super) fn claim_algorithms(profile: EngineProfile) -> ClaimAlgorithmList {
-    if applies(profile) {
-        ClaimAlgorithmList::V2_5
-    } else {
-        ClaimAlgorithmList::V2_4
+    match profile.version {
+        SpecVersion::V2_2 => ClaimAlgorithmList::V2_2,
+        SpecVersion::V2_5 => ClaimAlgorithmList::V2_5,
+        _ => ClaimAlgorithmList::V2_4,
     }
 }
 
@@ -84,6 +93,32 @@ pub(super) fn text_rules(profile: EngineProfile) -> TextLocatorRules {
 /// text hard binding), counting multi-instance spellings.
 pub(super) fn is_segment_hash_label(label: &str) -> bool {
     base_assertion_label(label) == "c2pa.hash.segment"
+}
+
+/// The carrier the selected policy reads an asset with.
+///
+/// 2.5 distinguishes the two `text/plain` methods by their delimiters alone
+/// (Embedding manifests into append-only text files, Applicability): a plain
+/// text file carrying complete `-----BEGIN C2PA CHECKPOINT-----` lines is an
+/// append-only file, not unstructured text. The 2.4 policy keeps reading
+/// every `text/plain` asset as unstructured text.
+pub(super) fn select_format(
+    format: AssetFormat,
+    mime: &str,
+    data: &[u8],
+    profile: EngineProfile,
+) -> AssetFormat {
+    if applies(profile)
+        && format == AssetFormat::TextUnstructured
+        && crate::c2pa_core::spec::canonicalize_mime(mime) == "text/plain"
+        && crate::c2pa_formats::declares_checkpoints(data, AppendOnlyFlavor::PlainText)
+    {
+        AssetFormat::AppendOnlyText {
+            flavor: AppendOnlyFlavor::PlainText,
+        }
+    } else {
+        format
+    }
 }
 
 /// A claim-generator instant, ordered exactly.
@@ -176,15 +211,24 @@ pub(super) fn action_time_errors(action: &Value, actions_v2: bool) -> Vec<String
     if action.get("when").is_some() && (start.is_some() || end.is_some()) {
         errors.push("action combines when with whenStart or whenEnd".into());
     }
-    if let (Some(start), Some(end)) = (start, end) {
-        match (
+    match (start, end) {
+        (Some(start), Some(end)) => match (
             parse_generator_time(start, false),
             parse_generator_time(end, true),
         ) {
             (Some(start), Some(end)) if start <= end => {}
             (Some(_), Some(_)) => errors.push("action whenStart is later than whenEnd".into()),
             _ => errors.push("action whenStart or whenEnd is not a valid generator time".into()),
+        },
+        // A bound may stand alone; it must still be a valid generator time
+        // of the kind its field allows (`lowerBound` start, `upperBound` end).
+        (Some(start), None) if parse_generator_time(start, false).is_none() => {
+            errors.push("action whenStart is not a valid generator time".into())
         }
+        (None, Some(end)) if parse_generator_time(end, true).is_none() => {
+            errors.push("action whenEnd is not a valid generator time".into())
+        }
+        _ => {}
     }
     errors
 }
@@ -255,15 +299,14 @@ fn percent_decode(uri: &str) -> Option<String> {
 
 /// 2.5 `c2pa.linked-resource-integrity` validation.
 ///
-/// Structure, placement, the shared `alg`, and relative-URI traversal are
-/// checked and fail the claim as the clause directs. Every well-formed entry
-/// then receives exactly one terminal code. This verifier does not retrieve
-/// linked resources, so that code is always
-/// `assertion.linkedResourceIntegrity.skipped`, carrying the entry's URI as
-/// `details.resourceUrl`; per the clause it never rejects the claim.
+/// Retrieval remains optional. Caller-supplied or consent-gated online evidence
+/// is checked when present; otherwise each well-formed entry gets the required
+/// non-rejecting `skipped` terminal result and an absolute external URL records
+/// a network need.
 pub(super) fn verify_linked_resource_integrity(
     manifest_label: &str,
     claim_refs: &ClaimAssertionRefs<'_>,
+    evidence: OnlineEvidence<'_>,
     results: &mut ValidationResults,
 ) {
     for reference in &claim_refs.references {
@@ -273,11 +316,11 @@ pub(super) fn verify_linked_resource_integrity(
         else {
             continue;
         };
-        let url = format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{label}");
+        let assertion_url = format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{label}");
         if reference.field != "created_assertions" {
             results.push_failure(
                 LINKED_RESOURCE_NOT_CREATED,
-                url.clone(),
+                assertion_url.clone(),
                 "linked resource integrity assertion is not in created_assertions".into(),
             );
         }
@@ -285,93 +328,246 @@ pub(super) fn verify_linked_resource_integrity(
             .indexed(label)
             .and_then(|assertion| assertion.decoded.as_ref())
         else {
-            // Undecodable payloads already carry assertion.cbor.invalid.
             continue;
         };
-        let resources = assertion.get("resources");
-        let external = match resources.and_then(|value| value.get("externalResources")) {
-            Some(Value::Array(entries)) if !entries.is_empty() => Some(entries),
-            _ => None,
-        };
-        let relative = match resources.and_then(|value| value.get("relativeResources")) {
-            Some(Value::Array(entries)) if !entries.is_empty() => Some(entries),
-            _ => None,
-        };
-        let shared_alg = resources
-            .and_then(|value| value.get("alg"))
-            .and_then(Value::as_text);
-        let relative_shape = relative.is_some() && shared_alg.is_some();
-        if !matches!(resources, Some(Value::Map(_))) || (external.is_none() && !relative_shape) {
+        let Some(resources) = assertion.get("resources").and_then(Value::as_map) else {
             results.push_failure(
                 LINKED_RESOURCE_MALFORMED,
-                url,
-                "resources is not an object with non-empty externalResources, or non-empty relativeResources with alg".into(),
+                assertion_url,
+                "resources is not an object".into(),
             );
             continue;
+        };
+        let external_field = unique_map_field(resources, "externalResources");
+        let relative_field = unique_map_field(resources, "relativeResources");
+        let external = match external_field {
+            Some(Value::Array(entries)) => Some(entries.as_slice()),
+            _ => None,
+        };
+        let relative = match relative_field {
+            Some(Value::Array(entries)) => Some(entries.as_slice()),
+            _ => None,
+        };
+        let shared_alg = unique_map_field(resources, "alg").and_then(Value::as_text);
+
+        let external_valid = external.is_some_and(|entries| !entries.is_empty());
+        let relative_valid =
+            relative.is_some_and(|entries| !entries.is_empty()) && shared_alg.is_some();
+        let malformed_external = external_field.is_some() && !external_valid;
+        let malformed_relative = relative_field.is_some() && !relative_valid;
+        if (!external_valid && !relative_valid) || malformed_external || malformed_relative {
+            results.push_failure(
+                LINKED_RESOURCE_MALFORMED,
+                assertion_url.clone(),
+                "resources must contain non-empty externalResources, or non-empty relativeResources with alg; any present list must have that shape".into(),
+            );
         }
-        let mut skipped: Vec<String> = Vec::new();
-        for entry in external.into_iter().flatten() {
-            let entry_url = entry.get("url").and_then(Value::as_text);
-            let complete = entry_url.is_some()
-                && entry.get("alg").and_then(Value::as_text).is_some()
-                && entry.get("hash").and_then(Value::as_bytes).is_some();
-            match entry_url.filter(|_| complete) {
-                Some(entry_url) => skipped.push(entry_url.to_string()),
-                None => results.push_failure(
-                    LINKED_RESOURCE_MALFORMED,
-                    url.clone(),
-                    "externalResources entry lacks url, alg, or hash".into(),
-                ),
+
+        if let Some(entries) = external.filter(|entries| !entries.is_empty()) {
+            for entry in entries {
+                let resource_url = entry.get("url").and_then(Value::as_text);
+                let alg = entry.get("alg").and_then(Value::as_text);
+                let expected = entry.get("hash").and_then(Value::as_bytes);
+                let Some(resource_url) = resource_url else {
+                    results.push_failure(
+                        LINKED_RESOURCE_MALFORMED,
+                        assertion_url.clone(),
+                        "externalResources entry lacks url".into(),
+                    );
+                    continue;
+                };
+                if alg.is_none() || expected.is_none() {
+                    results.push_failure_with_details(
+                        LINKED_RESOURCE_MALFORMED,
+                        assertion_url.clone(),
+                        "externalResources entry lacks alg or hash".into(),
+                        serde_json::json!({ "resourceUrl": resource_url }),
+                    );
+                    continue;
+                }
+                if !is_allowed_hash_algorithm(alg.unwrap_or_default()) {
+                    results.push_failure(
+                        ALGORITHM_UNSUPPORTED,
+                        assertion_url.clone(),
+                        format!(
+                            "linked resource integrity alg {:?} is not on the C2PA allowed list",
+                            alg.unwrap_or_default()
+                        ),
+                    );
+                    continue;
+                }
+                terminal_linked_resource(
+                    resource_url,
+                    alg.unwrap_or_default(),
+                    expected.unwrap_or_default(),
+                    entry,
+                    label,
+                    &assertion_url,
+                    true,
+                    evidence,
+                    results,
+                );
             }
         }
-        if let Some(entries) = relative.filter(|_| relative_shape) {
+
+        if let Some(entries) = relative.filter(|entries| !entries.is_empty()) {
             let alg = shared_alg.unwrap_or_default();
             if !is_allowed_hash_algorithm(alg) {
                 results.push_failure(
                     ALGORITHM_UNSUPPORTED,
-                    url.clone(),
+                    assertion_url.clone(),
                     format!(
                         "linked resource integrity alg '{alg}' is not on the C2PA allowed list"
                     ),
                 );
+                continue;
             }
             for entry in entries {
-                let uri = entry.get("uri").and_then(Value::as_text);
-                let (Some(uri), Some(_)) = (uri, entry.get("hash").and_then(Value::as_bytes))
-                else {
+                let resource_url = entry.get("uri").and_then(Value::as_text);
+                let expected = entry.get("hash").and_then(Value::as_bytes);
+                let Some(resource_url) = resource_url else {
                     results.push_failure(
                         LINKED_RESOURCE_MALFORMED,
-                        url.clone(),
-                        "relativeResources entry lacks uri or hash".into(),
+                        assertion_url.clone(),
+                        "relativeResources entry lacks uri".into(),
                     );
                     continue;
                 };
-                let traverses = percent_decode(uri)
+                if expected.is_none() {
+                    results.push_failure_with_details(
+                        LINKED_RESOURCE_MALFORMED,
+                        assertion_url.clone(),
+                        "relativeResources entry lacks hash".into(),
+                        serde_json::json!({ "resourceUrl": resource_url }),
+                    );
+                    continue;
+                }
+                let traverses = percent_decode(resource_url)
                     .is_none_or(|decoded| decoded.split('/').any(|segment| segment == ".."));
                 if traverses {
                     results.push_failure_with_details(
                         LINKED_RESOURCE_INVALID_URI,
-                        url.clone(),
+                        assertion_url.clone(),
                         "relative linked resource URI contains a '..' path segment or an invalid escape".into(),
-                        serde_json::json!({ "resourceUrl": uri }),
+                        serde_json::json!({ "resourceUrl": resource_url }),
                     );
                     continue;
                 }
-                skipped.push(uri.to_string());
+                terminal_linked_resource(
+                    resource_url,
+                    alg,
+                    expected.unwrap_or_default(),
+                    entry,
+                    label,
+                    &assertion_url,
+                    false,
+                    evidence,
+                    results,
+                );
             }
-        }
-        for resource in skipped {
-            results.push_informational_with_details(
-                LINKED_RESOURCE_SKIPPED,
-                url.clone(),
-                "linked resource was not retrieved; this verifier does not fetch linked resources"
-                    .into(),
-                serde_json::json!({ "resourceUrl": resource }),
-            );
         }
     }
 }
 
+fn unique_map_field<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
+    let mut values = map
+        .iter()
+        .filter(|(key, _)| key.as_text() == Some(name))
+        .map(|(_, value)| value);
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_linked_resource(
+    resource_url: &str,
+    alg: &str,
+    expected_hash: &[u8],
+    entry: &Value,
+    assertion_label: &str,
+    assertion_url: &str,
+    network_resolvable: bool,
+    evidence: OnlineEvidence<'_>,
+    results: &mut ValidationResults,
+) {
+    let details = || serde_json::json!({ "resourceUrl": resource_url });
+    let supplied = evidence
+        .external_data
+        .and_then(|resources| resources.get(resource_url))
+        .map(Vec::as_slice);
+    let Some(bytes) = supplied else {
+        if evidence.external_is_unreachable(resource_url) {
+            results.push_informational_with_details(
+                LINKED_RESOURCE_INACCESSIBLE,
+                assertion_url.to_string(),
+                "linked resource retrieval produced no usable body".into(),
+                details(),
+            );
+        } else {
+            results.push_informational_with_details(
+                LINKED_RESOURCE_SKIPPED,
+                assertion_url.to_string(),
+                "linked resource was not retrieved".into(),
+                details(),
+            );
+            if network_resolvable {
+                push_unique(
+                    &mut results.network_needs,
+                    NetworkNeed::ExternalData {
+                        uri: resource_url.to_string(),
+                        assertion_label: assertion_label.to_string(),
+                    },
+                );
+            }
+        }
+        return;
+    };
+
+    if let Some(size) = entry.get("size").and_then(|value| match value {
+        Value::Integer(size) if *size >= 0 => usize::try_from(*size).ok(),
+        _ => None,
+    }) {
+        if size != bytes.len() {
+            results.push_informational_with_details(
+                LINKED_RESOURCE_SIZE_MISMATCH,
+                assertion_url.to_string(),
+                "retrieved linked resource size differs from the assertion".into(),
+                details(),
+            );
+            return;
+        }
+    }
+    if let Some(expected_format) = entry.get("dc:format").and_then(Value::as_text) {
+        let observed = evidence.external_media_type(resource_url);
+        if observed.is_none_or(|observed| {
+            crate::c2pa_core::spec::canonicalize_mime(observed)
+                != crate::c2pa_core::spec::canonicalize_mime(expected_format)
+        }) {
+            results.push_informational_with_details(
+                LINKED_RESOURCE_FORMAT_MISMATCH,
+                assertion_url.to_string(),
+                "retrieved linked resource media type differs from the assertion".into(),
+                details(),
+            );
+            return;
+        }
+    }
+    if hash_bytes(alg, bytes).as_deref() != Some(expected_hash) {
+        results.push_informational_with_details(
+            LINKED_RESOURCE_HASH_MISMATCH,
+            assertion_url.to_string(),
+            "retrieved linked resource hash differs from the assertion".into(),
+            details(),
+        );
+        return;
+    }
+    results.push_success_with_details(
+        LINKED_RESOURCE_MATCH,
+        assertion_url.to_string(),
+        "linked resource integrity matched".into(),
+        details(),
+    );
+}
 /// Every assertion named in any claim's `redacted_assertions` across the
 /// store, as `(manifest label, assertion label)` (2.5 Preparing the list of
 /// redacted assertions: the list spans the asset's whole lineage).
@@ -533,6 +729,23 @@ mod tests {
             ("whenEnd", tdate("2026-05-02T00:00:00Z")),
         ]);
         assert_eq!(action_time_errors(&wrong_bound, true).len(), 1);
+
+        // A lone bound is still checked for syntax and bound kind.
+        let lone_ok = action(vec![("whenStart", tdate("2026-05-01T00:00:00Z"))]);
+        assert!(action_time_errors(&lone_ok, true).is_empty());
+        let lone_bad_start = action(vec![("whenStart", tdate("yesterday"))]);
+        assert_eq!(action_time_errors(&lone_bad_start, true).len(), 1);
+        let lone_wrong_end = action(vec![(
+            "whenEnd",
+            map_from_pairs([
+                ("value".to_string(), tdate("2026-05-02T00:00:00Z")),
+                (
+                    "timeStampType".to_string(),
+                    Value::Text("lowerBound".into()),
+                ),
+            ]),
+        )]);
+        assert_eq!(action_time_errors(&lone_wrong_end, true).len(), 1);
     }
 
     #[test]
@@ -575,8 +788,10 @@ mod tests {
     fn gates_follow_the_selected_policy_only() {
         use crate::c2pa_core::OperatingMode;
         let v24 = EngineProfile::new(SpecVersion::V2_4, OperatingMode::Regular);
+        let v22 = EngineProfile::new(SpecVersion::V2_2, OperatingMode::Regular);
         let v25 = EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular);
         assert!(!applies(v24) && applies(v25));
+        assert_eq!(claim_algorithms(v22), ClaimAlgorithmList::V2_2);
         assert_eq!(claim_algorithms(v24), ClaimAlgorithmList::V2_4);
         assert_eq!(claim_algorithms(v25), ClaimAlgorithmList::V2_5);
         assert_eq!(text_rules(v24), TextLocatorRules::V2_4);

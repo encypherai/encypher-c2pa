@@ -868,3 +868,71 @@ fn ip_and_rfc822_name_constraint_matching() {
         &GeneralName::UniformResourceIdentifier(ia5("news.example"))
     ));
 }
+
+#[test]
+fn v2_5_claim_algorithm_rules_exempt_ca_tsa_and_ocsp_certificates_only() {
+    let dsa = x509_cert::spki::AlgorithmIdentifierOwned {
+        oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.2"),
+        parameters: None,
+    };
+
+    let mut claim_leaf = conformant().leaf;
+    claim_leaf.signature_algorithm = dsa.clone();
+    claim_leaf.tbs_certificate.signature = dsa.clone();
+    let claim_rules =
+        ProfileRules::for_purpose(CertificateProfile::V2_5, AnchorPurpose::ClaimSigning);
+    assert_eq!(
+        profile_violation_with(&claim_leaf, CertRole::EndEntity, claim_rules),
+        Some("certificate signature algorithm is outside the C2PA allow list")
+    );
+
+    let exempt_rules = ProfileRules::exempt_end_entity(CertificateProfile::V2_5);
+    assert_eq!(
+        profile_violation_with(&claim_leaf, CertRole::EndEntity, exempt_rules),
+        None,
+        "TSA and OCSP leaves are exempt only from the claim algorithm/key list"
+    );
+
+    let mut ca = conformant().root;
+    ca.signature_algorithm = dsa.clone();
+    ca.tbs_certificate.signature = dsa;
+    assert_eq!(
+        profile_violation_with(&ca, CertRole::Intermediate, claim_rules),
+        None,
+        "CA certificates are not claim-signing credentials"
+    );
+}
+
+#[test]
+fn v2_5_algorithm_exemptions_keep_structural_profile_checks() {
+    let mut tsa_or_ocsp = conformant().leaf;
+    tsa_or_ocsp
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("extensions")
+        .retain(|extension| extension.extn_id != OID_EXT_KEY_USAGE);
+    assert_eq!(
+        profile_violation_with(
+            &tsa_or_ocsp,
+            CertRole::EndEntity,
+            ProfileRules::exempt_end_entity(CertificateProfile::V2_5),
+        ),
+        Some("certificate has no Key Usage extension")
+    );
+
+    let mut ca = conformant().root;
+    ca.tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("extensions")
+        .retain(|extension| extension.extn_id != OID_EXT_KEY_USAGE);
+    assert_eq!(
+        profile_violation_with(
+            &ca,
+            CertRole::Intermediate,
+            ProfileRules::for_purpose(CertificateProfile::V2_5, AnchorPurpose::ClaimSigning),
+        ),
+        Some("certificate has no Key Usage extension")
+    );
+}

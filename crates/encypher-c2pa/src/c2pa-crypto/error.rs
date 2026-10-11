@@ -8,15 +8,15 @@ use crate::c2pa_cbor::{DecodeError, EncodeError};
 /// Errors produced while verifying COSE_Sign1 structures.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
-    /// The COSE `alg` header value does not map to a supported algorithm.
+    /// The COSE `alg` header value is unknown, or is not on the claim
+    /// signature list of the C2PA revision being applied.
     #[error("unsupported COSE algorithm id: {0}")]
     UnsupportedAlg(i128),
 
-    /// The COSE `alg` header names an algorithm the selected C2PA revision
-    /// allows but this verifier does not implement (ML-DSA under 2.5). The
-    /// signature is not evaluated, so it can never verify.
-    #[error("COSE algorithm id {0} is allowed by the selected C2PA revision but not implemented by this verifier")]
-    UnimplementedAlg(i128),
+    /// An X.509 AlgorithmIdentifier names a signature algorithm this crate
+    /// does not verify (certificates, OCSP responses, CMS SignerInfos).
+    #[error("unsupported X.509 signature algorithm: {0}")]
+    UnsupportedSignatureAlgorithm(String),
 
     /// CBOR encoding failed while building a COSE structure.
     #[error("CBOR encode failed: {0}")]

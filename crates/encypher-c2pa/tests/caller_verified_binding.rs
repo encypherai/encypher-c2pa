@@ -125,7 +125,7 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
 
     let CawgEvaluation::Evaluated {
         manifest_label,
-        store_manifest_sha256,
+        store_manifests,
         ..
     } = evaluation
     else {
@@ -135,9 +135,9 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
         Some(manifest_label.as_str()),
         full.manifest_report["active_manifest"].as_str()
     );
-    assert!(store_manifest_sha256
+    assert!(store_manifests
         .iter()
-        .any(|(label, _)| *label == manifest_label));
+        .any(|manifest| manifest.label == manifest_label));
 }
 
 /// Statuses the pipeline records outside the identity step (here the
@@ -297,19 +297,23 @@ fn the_document_signing_anchor_requirement_follows_the_option() {
 
 #[test]
 fn unknown_spec_versions_are_rejected() {
-    for version in ["1.3", "2.6", "2.5.0", ""] {
+    for version in ["2.6", "9.9", "2.5.0", ""] {
         let error = CawgProfile::new(version, false, false).expect_err(version);
         assert!(
             matches!(&error, Error::Verification(message) if message.contains("spec_version")),
             "{version}: {error}"
         );
     }
-    for version in ["1.4", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5"] {
+    for version in [
+        "1.0", "1.1", "1.2", "1.3", "1.4", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5",
+    ] {
         CawgProfile::new(version, false, false).unwrap_or_else(|e| panic!("{version}: {e}"));
     }
-    // The proposed 2.5 policy has no conformance profile.
-    for (mode, program) in [(true, false), (false, true), (true, true)] {
-        assert!(CawgProfile::new("2.5", mode, program).is_err());
+    // The proposed 2.5 policy permits strict technical validation under the
+    // core-spec bar, but has no published Conformance Program profile.
+    CawgProfile::new("2.5", true, false).expect("strict 2.5 core profile");
+    for mode in [false, true] {
+        assert!(CawgProfile::new("2.5", mode, true).is_err());
     }
     // The evaluator takes its revision from the profile, never from options.
     let options = VerifyOptions {

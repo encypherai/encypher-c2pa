@@ -1,15 +1,12 @@
 // Copyright 2026 Encypher Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-//! ZIP (EPUB/DOCX/ODT/OXPS): JUMBF in entry `META-INF/content_credential.c2pa`.
+//! ZIP/ZIP64 verifier for C2PA collection bindings.
 //!
-//! The manifest store is a *stored* (uncompressed) ZIP entry whose name is
-//! `META-INF/content_credential.c2pa`. Extraction locates that entry through the
-//! central directory; embedding appends a new stored entry and rebuilds the
-//! central directory and end-of-central-directory record.
-//!
-//! Only standard (non-ZIP64) archives are supported; ZIP64 archives return
-//! [`FormatError::UnsupportedVariant`].
+//! The manifest store is the stored, unencrypted entry
+//! `META-INF/content_credential.c2pa`. Reader geometry supports ZIP32 and
+//! single-disk ZIP64, including ZIP64 extended-information fields and 64-bit
+//! data descriptors. The public crate has no production writer.
 
 use std::collections::HashMap;
 
@@ -21,7 +18,11 @@ const ENTRY_NAME: &[u8] = b"META-INF/content_credential.c2pa";
 const SIG_LOCAL: u32 = 0x0403_4b50;
 const SIG_CENTRAL: u32 = 0x0201_4b50;
 const SIG_EOCD: u32 = 0x0605_4b50;
+const SIG_ZIP64_EOCD: u32 = 0x0606_4b50;
+const SIG_ZIP64_LOCATOR: u32 = 0x0706_4b50;
+const SIG_DESCRIPTOR: u32 = 0x0807_4b50;
 const METHOD_STORED: u16 = 0;
+const MAX_ZIP_ENTRIES: usize = 1 << 20;
 
 #[cfg(test)]
 thread_local! {
@@ -33,11 +34,25 @@ fn le16(data: &[u8], off: usize) -> Option<u16> {
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
+fn le64(data: &[u8], off: usize) -> Option<u64> {
+    data.get(off..off + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+}
+
 struct Eocd {
-    total_entries: u16,
-    cd_size: u32,
-    cd_offset: u32,
+    total_entries: usize,
+    cd_size: usize,
+    cd_offset: usize,
+    /// First byte after the central directory (ZIP64 EOCD or classic EOCD).
+    directory_end: usize,
     eocd_offset: usize,
+}
+
+fn usize64(value: u64, detail: &'static str) -> Result<usize, FormatError> {
+    usize::try_from(value).map_err(|_| FormatError::UnsupportedVariant {
+        format: FMT,
+        detail,
+    })
 }
 
 fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
@@ -51,7 +66,10 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
     let mut pos = data.len() - 22;
     loop {
         if le_u32(data, pos) == Some(SIG_EOCD) {
-            let total_entries = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
+            let disk = le16(data, pos + 4).ok_or(FormatError::Truncated(FMT))?;
+            let cd_disk = le16(data, pos + 6).ok_or(FormatError::Truncated(FMT))?;
+            let entries_disk = le16(data, pos + 8).ok_or(FormatError::Truncated(FMT))?;
+            let entries = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
             let cd_size = le_u32(data, pos + 12).ok_or(FormatError::Truncated(FMT))?;
             let cd_offset = le_u32(data, pos + 16).ok_or(FormatError::Truncated(FMT))?;
             let comment_len = le16(data, pos + 20).ok_or(FormatError::Truncated(FMT))? as usize;
@@ -65,16 +83,95 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
                 pos -= 1;
                 continue;
             }
-            if cd_offset == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF || total_entries == 0xFFFF {
-                return Err(FormatError::UnsupportedVariant {
-                    format: FMT,
-                    detail: "ZIP64 archive",
+            let has_zip64_locator = pos
+                .checked_sub(20)
+                .is_some_and(|at| le_u32(data, at) == Some(SIG_ZIP64_LOCATOR));
+            let zip64 = has_zip64_locator
+                || entries == u16::MAX
+                || entries_disk == u16::MAX
+                || cd_size == u32::MAX
+                || cd_offset == u32::MAX;
+            if !zip64 {
+                if disk != 0 || cd_disk != 0 || entries_disk != entries {
+                    return Err(FormatError::UnsupportedVariant {
+                        format: FMT,
+                        detail: "multi-disk ZIP archive",
+                    });
+                }
+                return Ok(Eocd {
+                    total_entries: entries as usize,
+                    cd_size: cd_size as usize,
+                    cd_offset: cd_offset as usize,
+                    directory_end: pos,
+                    eocd_offset: pos,
                 });
             }
+            let locator = pos.checked_sub(20).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "ZIP64 EOCD locator is missing",
+            })?;
+            if le_u32(data, locator) != Some(SIG_ZIP64_LOCATOR)
+                || le_u32(data, locator + 4) != Some(0)
+                || le_u32(data, locator + 16) != Some(1)
+            {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "multi-disk or malformed ZIP64 archive",
+                });
+            }
+            let zip64_offset = usize64(
+                le64(data, locator + 8).ok_or(FormatError::Truncated(FMT))?,
+                "ZIP64 EOCD offset exceeds address space",
+            )?;
+            if le_u32(data, zip64_offset) != Some(SIG_ZIP64_EOCD) {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "ZIP64 EOCD record is missing",
+                });
+            }
+            let record_size = usize64(
+                le64(data, zip64_offset + 4).ok_or(FormatError::Truncated(FMT))?,
+                "ZIP64 EOCD record is too large",
+            )?;
+            if record_size < 44
+                || zip64_offset.checked_add(12 + record_size) != Some(locator)
+                || le_u32(data, zip64_offset + 16) != Some(0)
+                || le_u32(data, zip64_offset + 20) != Some(0)
+            {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "malformed ZIP64 EOCD record",
+                });
+            }
+            let entries_disk64 =
+                le64(data, zip64_offset + 24).ok_or(FormatError::Truncated(FMT))?;
+            let entries64 = le64(data, zip64_offset + 32).ok_or(FormatError::Truncated(FMT))?;
+            if entries_disk64 != entries64 {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "multi-disk ZIP64 archive",
+                });
+            }
+            let total_entries = usize64(entries64, "ZIP64 entry count exceeds address space")?;
+            if total_entries > MAX_ZIP_ENTRIES {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "ZIP archive has too many entries",
+                });
+            }
+            let cd_size = usize64(
+                le64(data, zip64_offset + 40).ok_or(FormatError::Truncated(FMT))?,
+                "ZIP64 central directory is too large",
+            )?;
+            let cd_offset = usize64(
+                le64(data, zip64_offset + 48).ok_or(FormatError::Truncated(FMT))?,
+                "ZIP64 central directory offset exceeds address space",
+            )?;
             return Ok(Eocd {
                 total_entries,
                 cd_size,
                 cd_offset,
+                directory_end: zip64_offset,
                 eocd_offset: pos,
             });
         }
@@ -89,10 +186,10 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
 }
 
 fn central_directory_bounds(data: &[u8], eocd: &Eocd) -> Result<(usize, usize), FormatError> {
-    let start = eocd.cd_offset as usize;
+    let start = eocd.cd_offset;
     let end = start
-        .checked_add(eocd.cd_size as usize)
-        .filter(|&end| end == eocd.eocd_offset && end <= data.len())
+        .checked_add(eocd.cd_size)
+        .filter(|&end| end == eocd.directory_end && end <= data.len())
         .ok_or(FormatError::InvalidStructure {
             format: FMT,
             detail: "central directory bounds do not match EOCD",
@@ -104,6 +201,11 @@ fn central_directory_bounds(data: &[u8], eocd: &Eocd) -> Result<(usize, usize), 
 pub struct ZipMember<'a> {
     raw_name: &'a [u8],
     method: u16,
+    flags: u16,
+    crc: u32,
+    comp_size: u64,
+    uncomp_size: u64,
+    zip64_sizes: bool,
     data_span: (usize, usize),
     hash_span: (usize, usize),
     local_span: (usize, usize),
@@ -150,15 +252,24 @@ impl<'a> ZipIndex<'a> {
 fn local_data_span(
     data: &[u8],
     eocd: &Eocd,
-    method_size_offset: (u16, u32, u32),
+    method_size_offset: (u16, u16, u64, u64),
     expected_name: &[u8],
 ) -> Result<(usize, usize), FormatError> {
-    let (_, comp_size, local_offset) = method_size_offset;
-    let lh = local_offset as usize;
+    let (method, flags, comp_size, local_offset) = method_size_offset;
+    let lh = usize64(
+        local_offset,
+        "ZIP64 local-header offset exceeds address space",
+    )?;
     if le_u32(data, lh) != Some(SIG_LOCAL) {
         return Err(FormatError::InvalidStructure {
             format: FMT,
             detail: "bad local file header signature",
+        });
+    }
+    if le16(data, lh + 6) != Some(flags) || le16(data, lh + 8) != Some(method) {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "ZIP local and central flags or compression method disagree",
         });
     }
     let name_len = le16(data, lh + 26).ok_or(FormatError::Truncated(FMT))? as usize;
@@ -181,17 +292,104 @@ fn local_data_span(
         .checked_add(extra_len)
         .filter(|&offset| offset <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
+    let comp_size = usize64(comp_size, "ZIP64 member is too large")?;
     let data_end = data_start
-        .checked_add(comp_size as usize)
-        .filter(|&offset| offset <= eocd.cd_offset as usize)
+        .checked_add(comp_size)
+        .filter(|&offset| offset <= eocd.cd_offset)
         .ok_or(FormatError::Truncated(FMT))?;
     Ok((data_start, data_end))
+}
+
+fn zip64_central_values(
+    extra: &[u8],
+    uncomp32: u32,
+    comp32: u32,
+    offset32: u32,
+    disk32: u16,
+) -> Result<(u64, u64, u64, bool), FormatError> {
+    let needs =
+        uncomp32 == u32::MAX || comp32 == u32::MAX || offset32 == u32::MAX || disk32 == u16::MAX;
+    if !needs {
+        if disk32 != 0 {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "multi-disk ZIP archive",
+            });
+        }
+        return Ok((
+            u64::from(uncomp32),
+            u64::from(comp32),
+            u64::from(offset32),
+            false,
+        ));
+    }
+    let mut cursor = 0usize;
+    let mut zip64 = None;
+    while cursor < extra.len() {
+        let id = le16(extra, cursor).ok_or(FormatError::Truncated(FMT))?;
+        let size = le16(extra, cursor + 2).ok_or(FormatError::Truncated(FMT))? as usize;
+        let start = cursor + 4;
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= extra.len())
+            .ok_or(FormatError::Truncated(FMT))?;
+        if id == 0x0001 {
+            if zip64.is_some() {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "duplicate ZIP64 extended information field",
+                });
+            }
+            zip64 = Some(&extra[start..end]);
+        }
+        cursor = end;
+    }
+    let field = zip64.ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "ZIP64 extended information field is missing",
+    })?;
+    let mut at = 0usize;
+    let mut next_u64 = || {
+        let value = le64(field, at).ok_or(FormatError::Truncated(FMT))?;
+        at += 8;
+        Ok::<u64, FormatError>(value)
+    };
+    let uncomp = if uncomp32 == u32::MAX {
+        next_u64()?
+    } else {
+        u64::from(uncomp32)
+    };
+    let comp = if comp32 == u32::MAX {
+        next_u64()?
+    } else {
+        u64::from(comp32)
+    };
+    let offset = if offset32 == u32::MAX {
+        next_u64()?
+    } else {
+        u64::from(offset32)
+    };
+    if disk32 == u16::MAX {
+        let disk = le_u32(field, at).ok_or(FormatError::Truncated(FMT))?;
+        if disk != 0 {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "multi-disk ZIP64 archive",
+            });
+        }
+    }
+    Ok((
+        uncomp,
+        comp,
+        offset,
+        uncomp32 == u32::MAX || comp32 == u32::MAX,
+    ))
 }
 
 fn local_offset_order(members: &[ZipMember<'_>]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..members.len()).collect();
     let mut scratch = vec![0usize; members.len()];
-    for shift in [0, 8, 16, 24] {
+    for shift in (0..usize::BITS).step_by(8) {
         let mut counts = [0usize; 256];
         for &index in &order {
             counts[(members[index].hash_span.0 >> shift) & 0xff] += 1;
@@ -212,10 +410,46 @@ fn local_offset_order(members: &[ZipMember<'_>]) -> Vec<usize> {
     order
 }
 
+fn data_descriptor_end(
+    data: &[u8],
+    member: &ZipMember<'_>,
+    limit: usize,
+) -> Result<usize, FormatError> {
+    if member.flags & 8 == 0 {
+        return Ok(member.data_span.1);
+    }
+    let start = member.data_span.1;
+    let matches = |at: usize| -> bool {
+        if member.zip64_sizes {
+            at.checked_add(20).is_some_and(|end| end <= limit)
+                && le_u32(data, at) == Some(member.crc)
+                && le64(data, at + 4) == Some(member.comp_size)
+                && le64(data, at + 12) == Some(member.uncomp_size)
+        } else {
+            at.checked_add(12).is_some_and(|end| end <= limit)
+                && le_u32(data, at) == Some(member.crc)
+                && le_u32(data, at + 4) == u32::try_from(member.comp_size).ok()
+                && le_u32(data, at + 8) == u32::try_from(member.uncomp_size).ok()
+        }
+    };
+    let signed = start
+        .checked_add(4)
+        .filter(|at| le_u32(data, start) == Some(SIG_DESCRIPTOR) && matches(*at));
+    let payload = signed.or_else(|| matches(start).then_some(start)).ok_or(
+        FormatError::InvalidStructure {
+            format: FMT,
+            detail: "ZIP data descriptor is missing or disagrees with central directory",
+        },
+    )?;
+    payload
+        .checked_add(if member.zip64_sizes { 20 } else { 12 })
+        .ok_or(FormatError::Truncated(FMT))
+}
+
 fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, FormatError> {
     let (mut pos, cd_end) = central_directory_bounds(data, eocd)?;
-    let mut members = Vec::with_capacity(eocd.total_entries as usize);
-    let mut by_name = HashMap::with_capacity(eocd.total_entries as usize);
+    let mut members = Vec::with_capacity(eocd.total_entries);
+    let mut by_name = HashMap::with_capacity(eocd.total_entries);
     let mut central_hash_parts = Vec::with_capacity(3);
     let mut part_start = pos;
 
@@ -228,20 +462,27 @@ fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, Form
                 detail: "bad central directory signature",
             });
         }
+        let flags = le16(data, pos + 8).ok_or(FormatError::Truncated(FMT))?;
         let method = le16(data, pos + 10).ok_or(FormatError::Truncated(FMT))?;
-        let comp_size = le_u32(data, pos + 20).ok_or(FormatError::Truncated(FMT))?;
+        let crc = le_u32(data, pos + 16).ok_or(FormatError::Truncated(FMT))?;
+        let comp32 = le_u32(data, pos + 20).ok_or(FormatError::Truncated(FMT))?;
+        let uncomp32 = le_u32(data, pos + 24).ok_or(FormatError::Truncated(FMT))?;
         let name_len = le16(data, pos + 28).ok_or(FormatError::Truncated(FMT))? as usize;
         let extra_len = le16(data, pos + 30).ok_or(FormatError::Truncated(FMT))? as usize;
         let comment_len = le16(data, pos + 32).ok_or(FormatError::Truncated(FMT))? as usize;
-        let local_offset = le_u32(data, pos + 42).ok_or(FormatError::Truncated(FMT))?;
+        let disk = le16(data, pos + 34).ok_or(FormatError::Truncated(FMT))?;
+        let offset32 = le_u32(data, pos + 42).ok_or(FormatError::Truncated(FMT))?;
         let name_start = pos + 46;
         let name_end = name_start
             .checked_add(name_len)
             .filter(|&end| end <= cd_end)
             .ok_or(FormatError::Truncated(FMT))?;
-        let entry_end = name_end
+        let extra_end = name_end
             .checked_add(extra_len)
-            .and_then(|end| end.checked_add(comment_len))
+            .filter(|&end| end <= cd_end)
+            .ok_or(FormatError::Truncated(FMT))?;
+        let entry_end = extra_end
+            .checked_add(comment_len)
             .filter(|&end| end <= cd_end)
             .ok_or(FormatError::Truncated(FMT))?;
         let raw_name = &data[name_start..name_end];
@@ -251,8 +492,19 @@ fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, Form
                 detail: "duplicate ZIP entry name",
             });
         }
-        let data_span = local_data_span(data, eocd, (method, comp_size, local_offset), raw_name)?;
-        let hash_span = (local_offset as usize, data_span.1);
+        let (uncomp_size, comp_size, local_offset, zip64_sizes) =
+            zip64_central_values(&data[name_end..extra_end], uncomp32, comp32, offset32, disk)?;
+        let data_span = local_data_span(
+            data,
+            eocd,
+            (method, flags, comp_size, local_offset),
+            raw_name,
+        )?;
+        let local_offset = usize64(
+            local_offset,
+            "ZIP64 local-header offset exceeds address space",
+        )?;
+        let hash_span = (local_offset, data_span.1);
         if raw_name == ENTRY_NAME {
             central_hash_parts.push(&data[part_start..pos + 16]);
             part_start = pos + 20;
@@ -261,6 +513,11 @@ fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, Form
         members.push(ZipMember {
             raw_name,
             method,
+            flags,
+            crc,
+            comp_size,
+            uncomp_size,
+            zip64_sizes,
             data_span,
             hash_span,
             local_span: hash_span,
@@ -279,16 +536,18 @@ fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, Form
 
     let order = local_offset_order(&members);
     for (position, &index) in order.iter().enumerate() {
-        let end = order
+        let limit = order
             .get(position + 1)
-            .map_or(eocd.cd_offset as usize, |&next| members[next].hash_span.0);
-        if members[index].hash_span.1 > end {
+            .map_or(eocd.cd_offset, |&next| members[next].hash_span.0);
+        let hash_end = data_descriptor_end(data, &members[index], limit)?;
+        if hash_end > limit {
             return Err(FormatError::InvalidStructure {
                 format: FMT,
                 detail: "overlapping ZIP local entries",
             });
         }
-        members[index].local_span.1 = end;
+        members[index].hash_span.1 = hash_end;
+        members[index].local_span.1 = limit;
     }
 
     Ok(ZipIndex {
@@ -306,8 +565,9 @@ pub fn zip_index(data: &[u8]) -> Result<ZipIndex<'_>, FormatError> {
 #[derive(Clone, Copy)]
 struct CdEntry {
     method: u16,
-    comp_size: u32,
-    local_offset: u32,
+    flags: u16,
+    comp_size: u64,
+    local_offset: u64,
 }
 
 fn find_cd_entry(data: &[u8], eocd: &Eocd, name: &[u8]) -> Result<Option<CdEntry>, FormatError> {
@@ -315,8 +575,9 @@ fn find_cd_entry(data: &[u8], eocd: &Eocd, name: &[u8]) -> Result<Option<CdEntry
         .get(name)
         .map(|member| CdEntry {
             method: member.method,
-            comp_size: (member.data_span.1 - member.data_span.0) as u32,
-            local_offset: member.hash_span.0 as u32,
+            flags: member.flags,
+            comp_size: member.comp_size,
+            local_offset: member.hash_span.0 as u64,
         }))
 }
 
@@ -386,16 +647,18 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME)? else {
         return Ok(None);
     };
-    if entry.method != METHOD_STORED {
+    if entry.method != METHOD_STORED || entry.flags != 0 {
         return Err(FormatError::UnsupportedVariant {
             format: FMT,
-            detail: "C2PA ZIP entry must be stored, not compressed",
+            detail: "C2PA ZIP entry must be stored, unencrypted, and have flags zero",
         });
     }
-    super::ensure_manifest_store_size(FMT, entry.comp_size as usize)?;
-    // Read the local file header to find the data offset (extra field length can
-    // differ from the central directory copy).
-    let lh = entry.local_offset as usize;
+    let comp_size = usize64(entry.comp_size, "ZIP64 manifest entry is too large")?;
+    super::ensure_manifest_store_size(FMT, comp_size)?;
+    let lh = usize64(
+        entry.local_offset,
+        "ZIP64 local-header offset exceeds address space",
+    )?;
     if le_u32(data, lh) != Some(SIG_LOCAL) {
         return Err(FormatError::InvalidStructure {
             format: FMT,
@@ -404,10 +667,12 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
     }
     let name_len = le16(data, lh + 26).ok_or(FormatError::Truncated(FMT))? as usize;
     let extra_len = le16(data, lh + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-    let data_start = lh + 30 + name_len + extra_len;
+    let data_start = lh
+        .checked_add(30 + name_len + extra_len)
+        .ok_or(FormatError::Truncated(FMT))?;
     let data_end = data_start
-        .checked_add(entry.comp_size as usize)
-        .filter(|&e| e <= data.len())
+        .checked_add(comp_size)
+        .filter(|&end| end <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
     Ok(Some(
         super::logical_manifest_store(&data[data_start..data_end]).to_vec(),
@@ -422,10 +687,16 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
     let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME)? else {
         return Ok(Vec::new());
     };
-    if entry.method != METHOD_STORED {
-        return Ok(Vec::new());
+    if entry.method != METHOD_STORED || entry.flags != 0 {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "C2PA ZIP entry must be stored, unencrypted, and have flags zero",
+        });
     }
-    let lh = entry.local_offset as usize;
+    let lh = usize64(
+        entry.local_offset,
+        "ZIP64 local-header offset exceeds address space",
+    )?;
     if le_u32(data, lh) != Some(SIG_LOCAL) {
         return Err(FormatError::InvalidStructure {
             format: FMT,
@@ -434,10 +705,13 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
     }
     let name_len = le16(data, lh + 26).ok_or(FormatError::Truncated(FMT))? as usize;
     let extra_len = le16(data, lh + 28).ok_or(FormatError::Truncated(FMT))? as usize;
-    let data_start = lh + 30 + name_len + extra_len;
+    let data_start = lh
+        .checked_add(30 + name_len + extra_len)
+        .ok_or(FormatError::Truncated(FMT))?;
+    let comp_size = usize64(entry.comp_size, "ZIP64 manifest entry is too large")?;
     let data_end = data_start
-        .checked_add(entry.comp_size as usize)
-        .filter(|&e| e <= data.len())
+        .checked_add(comp_size)
+        .filter(|&end| end <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
     Ok(vec![DataHashExclusion {
         start: data_start,
@@ -457,9 +731,9 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     }
 
     let order = local_offset_order(index.members());
-    let first_local = order.first().map_or(eocd.cd_offset as usize, |&member| {
-        index.members[member].local_span.0
-    });
+    let first_local = order
+        .first()
+        .map_or(eocd.cd_offset, |&member| index.members[member].local_span.0);
     let mut out = Vec::with_capacity(asset.len());
     out.extend_from_slice(&asset[..first_local]);
     let mut new_offsets = HashMap::with_capacity(index.members.len());
@@ -524,14 +798,18 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
     // binding, while keeping the resulting package valid for ordinary ZIP
     // readers.
     let crc = crate::c2pa_formats::util::crc32(manifest_store);
-    let cd_start = eocd.cd_offset as usize;
-    let cd_size = eocd.cd_size as usize;
+    let cd_start = eocd.cd_offset;
+    let cd_size = eocd.cd_size;
     if cd_start + cd_size > asset.len() {
         return Err(FormatError::Truncated(FMT));
     }
 
-    // New local file header goes where the central directory currently begins.
-    let new_local_offset = eocd.cd_offset;
+    // The test-only writer intentionally remains ZIP32.
+    let new_local_offset =
+        u32::try_from(eocd.cd_offset).map_err(|_| FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "test-only ZIP writer does not emit ZIP64",
+        })?;
 
     let mut local = Vec::new();
     local.extend_from_slice(&SIG_LOCAL.to_le_bytes());
@@ -570,7 +848,11 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
 
     let new_cd_offset = new_local_offset as usize + local.len();
     let new_cd_size = cd_size + central.len();
-    let new_total = eocd.total_entries + 1;
+    let new_total =
+        u16::try_from(eocd.total_entries + 1).map_err(|_| FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "test-only ZIP writer does not emit ZIP64",
+        })?;
 
     let mut out = Vec::with_capacity(asset.len() + local.len() + central.len() + 22);
     // Local entries up to where the old central directory started.
@@ -863,5 +1145,150 @@ mod tests {
     #[test]
     fn rejects_non_zip() {
         assert!(extract(b"not a zip file at all really").is_err());
+    }
+
+    fn zip64_with_manifest_and_descriptor() -> (Vec<u8>, Vec<u8>) {
+        let store = dummy_manifest_store();
+        let data_name = b"payload.bin";
+        let payload = b"descriptor-covered";
+        let mut zip = Vec::new();
+        let manifest_offset = zip.len() as u64;
+        let manifest_crc = crc32(&store);
+        zip.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&METHOD_STORED.to_le_bytes());
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&manifest_crc.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&(ENTRY_NAME.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(ENTRY_NAME);
+        zip.extend_from_slice(&0x0001u16.to_le_bytes());
+        zip.extend_from_slice(&16u16.to_le_bytes());
+        zip.extend_from_slice(&(store.len() as u64).to_le_bytes());
+        zip.extend_from_slice(&(store.len() as u64).to_le_bytes());
+        zip.extend_from_slice(&store);
+
+        let payload_offset = zip.len() as u64;
+        let payload_crc = crc32(payload);
+        zip.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&METHOD_STORED.to_le_bytes());
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&(data_name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(data_name);
+        zip.extend_from_slice(&0x0001u16.to_le_bytes());
+        zip.extend_from_slice(&16u16.to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        zip.extend_from_slice(payload);
+        zip.extend_from_slice(&SIG_DESCRIPTOR.to_le_bytes());
+        zip.extend_from_slice(&payload_crc.to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+
+        let cd_offset = zip.len() as u64;
+        for (name, crc, size, offset, flags) in [
+            (
+                ENTRY_NAME,
+                manifest_crc,
+                store.len() as u64,
+                manifest_offset,
+                0u16,
+            ),
+            (
+                data_name.as_slice(),
+                payload_crc,
+                payload.len() as u64,
+                payload_offset,
+                8u16,
+            ),
+        ] {
+            zip.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+            zip.extend_from_slice(&45u16.to_le_bytes());
+            zip.extend_from_slice(&45u16.to_le_bytes());
+            zip.extend_from_slice(&flags.to_le_bytes());
+            zip.extend_from_slice(&METHOD_STORED.to_le_bytes());
+            zip.extend_from_slice(&[0; 4]);
+            zip.extend_from_slice(&crc.to_le_bytes());
+            zip.extend_from_slice(&u32::MAX.to_le_bytes());
+            zip.extend_from_slice(&u32::MAX.to_le_bytes());
+            zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            zip.extend_from_slice(&28u16.to_le_bytes());
+            zip.extend_from_slice(&0u16.to_le_bytes());
+            zip.extend_from_slice(&0u16.to_le_bytes());
+            zip.extend_from_slice(&0u16.to_le_bytes());
+            zip.extend_from_slice(&0u32.to_le_bytes());
+            zip.extend_from_slice(&u32::MAX.to_le_bytes());
+            zip.extend_from_slice(name);
+            zip.extend_from_slice(&0x0001u16.to_le_bytes());
+            zip.extend_from_slice(&24u16.to_le_bytes());
+            zip.extend_from_slice(&size.to_le_bytes());
+            zip.extend_from_slice(&size.to_le_bytes());
+            zip.extend_from_slice(&offset.to_le_bytes());
+        }
+        let cd_size = zip.len() as u64 - cd_offset;
+        let zip64_offset = zip.len() as u64;
+        zip.extend_from_slice(&SIG_ZIP64_EOCD.to_le_bytes());
+        zip.extend_from_slice(&44u64.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&2u64.to_le_bytes());
+        zip.extend_from_slice(&2u64.to_le_bytes());
+        zip.extend_from_slice(&cd_size.to_le_bytes());
+        zip.extend_from_slice(&cd_offset.to_le_bytes());
+        zip.extend_from_slice(&SIG_ZIP64_LOCATOR.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&zip64_offset.to_le_bytes());
+        zip.extend_from_slice(&1u32.to_le_bytes());
+        zip.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&u16::MAX.to_le_bytes());
+        zip.extend_from_slice(&u16::MAX.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        (zip, store)
+    }
+
+    #[test]
+    fn zip64_reader_hashes_descriptor_and_end_records() {
+        let (archive, store) = zip64_with_manifest_and_descriptor();
+        assert_eq!(extract(&archive).unwrap(), Some(store));
+        let index = zip_index(&archive).unwrap();
+        assert_eq!(index.members().len(), 2);
+        let payload = index.get(b"payload.bin").unwrap();
+        assert_eq!(
+            payload.hash_span().1 - payload.data_span.1,
+            24,
+            "signed ZIP64 descriptor is part of the member hash"
+        );
+        let parts = index.central_directory_hash_parts();
+        assert_eq!(parts.len(), 2, "manifest CRC is the only central gap");
+        assert!(
+            parts
+                .last()
+                .unwrap()
+                .windows(4)
+                .any(|bytes| bytes == SIG_ZIP64_EOCD.to_le_bytes()),
+            "ZIP64 EOCD and locator are covered by the central-directory digest"
+        );
+
+        let mut tampered = archive;
+        let eocd = find_eocd(&tampered).unwrap();
+        let locator = eocd.eocd_offset - 20;
+        let zip64 = le64(&tampered, locator + 8).unwrap() as usize;
+        tampered[zip64 + 48..zip64 + 56].copy_from_slice(&0u64.to_le_bytes());
+        assert!(zip_index(&tampered).is_err());
     }
 }

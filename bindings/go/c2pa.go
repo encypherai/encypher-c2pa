@@ -24,7 +24,9 @@ import (
 
 const (
 	ReportSchemaVersion = "1.0"
+	C2PAProfile22       = "c2pa-2.2"
 	C2PAProfile         = "c2pa-2.4"
+	C2PAProfile25       = "c2pa-2.5"
 )
 
 const maxPathAssetBytes int64 = 128 * 1024 * 1024
@@ -58,12 +60,23 @@ type CAWGTrustConfiguration struct {
 	NotAfter        string           `json:"not_after,omitempty"`
 }
 
+// TrustListSource retains the identity of a caller-supplied claim or TSA trust
+// list. URI is an identifier and is never fetched by verification.
+type TrustListSource struct {
+	URI             string `json:"uri"`
+	Type            string `json:"type"`
+	Identifier      string `json:"identifier,omitempty"`
+	CertificatesPEM string `json:"certificates_pem"`
+}
+
 // Options mirrors the SDK VerifyOptions JSON. TrustAnchorNotBefore and
 // TrustAnchorNotAfter are RFC 3339 instants bounding when the caller-supplied
 // anchors are trusted; the bundled snapshots are unaffected.
 type Options struct {
 	TrustPEM            string `json:"trust_pem,omitempty"`
+	ClaimTrustSources     []TrustListSource `json:"claim_trust_sources,omitempty"`
 	TSATrustPEM         string `json:"tsa_trust_pem,omitempty"`
+	TSATrustSources       []TrustListSource `json:"tsa_trust_sources,omitempty"`
 	AllowedCertsPEM     string `json:"allowed_list_pem,omitempty"`
 	CAWGTrustPEM        string `json:"cawg_trust_pem,omitempty"`
 	CAWGAllowedCertsPEM string `json:"cawg_allowed_certs_pem,omitempty"`
@@ -84,11 +97,11 @@ type Options struct {
 	// stream segments where the player expects a discontinuity. Single-asset
 	// verification ignores them.
 	ExpectedSeekPositions []int `json:"expected_seek_positions,omitempty"`
-	// SpecVersion selects the C2PA validation policy: "" or "2.4" (the
-	// default, identical reports) or "2.5" for the proposed C2PA 2.5 draft.
-	// "2.5" reports profile "c2pa-2.5" and cannot be combined with
-	// StrictConformance. Any other value fails with unsupported_spec_version
-	// before the asset is read.
+	// SpecVersion selects the C2PA validation policy: "2.2", "" or "2.4"
+	// (the default, identical reports), or "2.5" for the proposed draft.
+	// StrictConformance selects the published program posture under 2.2/2.4
+	// and strict technical core validation under 2.5. The latter makes no
+	// certified or Conformance Program claim.
 	SpecVersion       string `json:"spec_version,omitempty"`
 	StrictConformance bool   `json:"strict_conformance,omitempty"`
 	ValidationTime    string `json:"validation_time,omitempty"`
@@ -104,6 +117,12 @@ type Options struct {
 	// loopback and private addresses and accept plaintext http. Do not set it
 	// on a host that verifies files sent in by strangers.
 	OnlineAllowPrivateNetworks bool              `json:"online_allow_private_networks,omitempty"`
+	// ExternalData is caller-supplied linked-resource evidence, keyed by URI
+	// with base64 values. Media types bind the corresponding bodies, and
+	// ExternalDataUnreachable records attempted retrievals with no usable body.
+	ExternalData             map[string]string `json:"external_data,omitempty"`
+	ExternalDataMediaTypes   map[string]string `json:"external_data_media_types,omitempty"`
+	ExternalDataUnreachable  []string          `json:"external_data_unreachable,omitempty"`
 	Telemetry                  *TelemetryOptions `json:"telemetry,omitempty"`
 }
 
@@ -297,6 +316,204 @@ func VerifyWithManifestStore(asset []byte, manifestStore []byte, mimeType string
 	return envelope.Report, nil
 }
 
+// ManifestDigest identifies one manifest in store order.
+type ManifestDigest struct {
+	Label  string `json:"label"`
+	SHA256 string `json:"sha256"`
+}
+
+// StoreOnlyValidation is a store-level verdict with no asset-content claim.
+type StoreOnlyValidation struct {
+	Report              Report           `json:"report"`
+	ActiveManifestLabel *string          `json:"active_manifest_label"`
+	StoreManifests      []ManifestDigest `json:"store_manifests"`
+}
+
+type storeOnlyResponseEnvelope struct {
+	OK     bool                 `json:"ok"`
+	Result *StoreOnlyValidation `json:"result"`
+	Error  *VerificationError   `json:"error"`
+}
+
+// VerifyManifestStoreOnly validates claim, assertion, signature, trust and
+// identity evidence without asset bytes. Intact stores remain "unbound".
+func VerifyManifestStoreOnly(manifestStore []byte, options *Options) (*StoreOnlyValidation, error) {
+	if len(manifestStore) == 0 {
+		return nil, errors.New("manifest store is required")
+	}
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	storePtr := (*C.uint8_t)(unsafe.Pointer(&manifestStore[0]))
+	opts := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(opts))
+	result := C.encypher_c2pa_verify_manifest_store_only(
+		storePtr,
+		C.size_t(len(manifestStore)),
+		opts,
+	)
+	runtime.KeepAlive(manifestStore)
+	if result == nil {
+		return nil, errors.New("verifier returned no result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+	var envelope storeOnlyResponseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return nil, fmt.Errorf("decode verifier response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return nil, errors.New("store-only validation failed without a structured error")
+	}
+	if envelope.Result == nil {
+		return nil, errors.New("store-only validation succeeded without a result")
+	}
+	return envelope.Result, nil
+}
+
+// ManifestBindingTarget binds caller evidence to exact store bytes, the active
+// manifest and the operative assertion reference.
+type ManifestBindingTarget struct {
+	ManifestStoreSHA256   [32]byte `json:"manifest_store_sha256"`
+	ActiveManifestLabel   string   `json:"active_manifest_label"`
+	ActiveManifestSHA256  [32]byte `json:"active_manifest_sha256"`
+	BindingManifestLabel  string   `json:"binding_manifest_label"`
+	BindingAssertionLabel string   `json:"binding_assertion_label"`
+	BindingReferenceAlg   string   `json:"binding_reference_alg"`
+	BindingReferenceHash  []byte   `json:"binding_reference_hash"`
+}
+
+type bindingTargetResponseEnvelope struct {
+	OK     bool                   `json:"ok"`
+	Target *ManifestBindingTarget `json:"target"`
+	Error  *VerificationError     `json:"error"`
+}
+
+// BindingTarget derives the exact target a trusted caller must independently
+// compare against asset bytes. A nil target means no unique operative binding.
+func BindingTarget(manifestStore []byte, hostless bool, options *Options) (*ManifestBindingTarget, error) {
+	if len(manifestStore) == 0 {
+		return nil, errors.New("manifest store is required")
+	}
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	storePtr := (*C.uint8_t)(unsafe.Pointer(&manifestStore[0]))
+	opts := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(opts))
+	result := C.encypher_c2pa_binding_target(
+		storePtr,
+		C.size_t(len(manifestStore)),
+		C.bool(hostless),
+		opts,
+	)
+	runtime.KeepAlive(manifestStore)
+	if result == nil {
+		return nil, errors.New("verifier returned no result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+	var envelope bindingTargetResponseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return nil, fmt.Errorf("decode binding-target response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return nil, errors.New("binding-target derivation failed without a structured error")
+	}
+	return envelope.Target, nil
+}
+
+// VerifyWithCallerBinding validates a store after a trusted caller compared
+// the exact target against asset bytes. A mismatch requires an explanation.
+func VerifyWithCallerBinding(
+	manifestStore []byte,
+	contentMime string,
+	hostless bool,
+	target *ManifestBindingTarget,
+	matched bool,
+	explanation string,
+	engine string,
+	options *Options,
+) (*Report, error) {
+	if len(manifestStore) == 0 || target == nil {
+		return nil, errors.New("manifest store and binding target are required")
+	}
+	if contentMime == "" || engine == "" {
+		return nil, errors.New("content MIME type and engine are required")
+	}
+	if matched && explanation != "" {
+		return nil, errors.New("explanation is only valid for a mismatch")
+	}
+	if !matched && explanation == "" {
+		return nil, errors.New("a mismatch requires explanation")
+	}
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	targetJSON, err := json.Marshal(target)
+	if err != nil {
+		return nil, fmt.Errorf("encode binding target: %w", err)
+	}
+	var verdictJSON []byte
+	if matched {
+		verdictJSON = []byte(`"Match"`)
+	} else {
+		verdictJSON, err = json.Marshal(map[string]any{
+			"Mismatch": map[string]string{"explanation": explanation},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode binding verdict: %w", err)
+		}
+	}
+	storePtr := (*C.uint8_t)(unsafe.Pointer(&manifestStore[0]))
+	mime := C.CString(contentMime)
+	targetValue := C.CString(string(targetJSON))
+	verdict := C.CString(string(verdictJSON))
+	engineValue := C.CString(engine)
+	opts := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(mime))
+	defer C.free(unsafe.Pointer(targetValue))
+	defer C.free(unsafe.Pointer(verdict))
+	defer C.free(unsafe.Pointer(engineValue))
+	defer C.free(unsafe.Pointer(opts))
+	result := C.encypher_c2pa_verify_with_caller_binding(
+		storePtr,
+		C.size_t(len(manifestStore)),
+		mime,
+		C.bool(hostless),
+		targetValue,
+		verdict,
+		engineValue,
+		opts,
+	)
+	runtime.KeepAlive(manifestStore)
+	if result == nil {
+		return nil, errors.New("verifier returned no result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+	var envelope responseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return nil, fmt.Errorf("decode verifier response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return nil, errors.New("caller-binding validation failed without a structured error")
+	}
+	if envelope.Report == nil {
+		return nil, errors.New("caller-binding validation succeeded without a report")
+	}
+	return envelope.Report, nil
+}
+
 // StreamEncapsulation is how a fragmented stream is packaged.
 type StreamEncapsulation string
 
@@ -342,6 +559,96 @@ type streamResponseEnvelope struct {
 	OK     bool               `json:"ok"`
 	Report *StreamReport      `json:"report"`
 	Error  *VerificationError `json:"error"`
+}
+
+// ErtmpReport is the result of VerifyErtmp.
+type ErtmpReport struct {
+	SchemaVersion string `json:"schema_version"`
+	Integrity     string `json:"integrity"`
+	Manifests     []struct {
+		ManifestID string `json:"manifest_id"`
+		Report     Report `json:"report"`
+	} `json:"manifests"`
+	Segments []struct {
+		Track struct {
+			MediaType string `json:"media_type"`
+			TrackID   uint8  `json:"track_id"`
+		} `json:"track"`
+		SequenceNumber *uint64  `json:"sequence_number"`
+		ManifestID     *string  `json:"manifest_id"`
+		KeyID          *string  `json:"key_id"`
+		Valid          bool     `json:"valid"`
+		Failures       []string `json:"failures"`
+	} `json:"segments"`
+	Failures []string `json:"failures"`
+}
+
+type ertmpResponseEnvelope struct {
+	OK     bool               `json:"ok"`
+	Report *ErtmpReport       `json:"report"`
+	Error  *VerificationError `json:"error"`
+}
+
+// SoftBindingQuery selects exactly one read-only resolution route. Route is
+// binding_get, binding_post, content, or reference. Content requires
+// Consent="upload_asset"; reference requires Consent="disclose_reference".
+type SoftBindingQuery struct {
+	Route        string          `json:"route"`
+	Alg          *string         `json:"alg,omitempty"`
+	Value        *string         `json:"value,omitempty"`
+	HintAlg      *string         `json:"hint_alg,omitempty"`
+	HintValue    *string         `json:"hint_value,omitempty"`
+	ReferenceURL *string         `json:"reference_url,omitempty"`
+	AssetLength  *uint64         `json:"asset_length,omitempty"`
+	AssetType    *string         `json:"asset_type,omitempty"`
+	Region       json.RawMessage `json:"region,omitempty"`
+	Consent      *string         `json:"consent,omitempty"`
+}
+
+// SoftBindingResolverOptions is the mandatory network boundary for recovery.
+// Every service, federation, and repository origin must appear exactly in
+// AllowedOrigins. Redirects are refused.
+type SoftBindingResolverOptions struct {
+	AllowedOrigins       []string `json:"allowed_origins"`
+	AllowPrivateNetworks bool     `json:"allow_private_networks,omitempty"`
+	MaxResults           uint16   `json:"max_results,omitempty"`
+	FetchStatus          bool     `json:"fetch_status,omitempty"`
+	FetchReceipts        bool     `json:"fetch_receipts,omitempty"`
+}
+
+// SoftBindingResolution is discovery evidence and locally verified stores.
+// Status and each receipt are server-reported operational evidence, not local
+// cryptographic verdicts.
+type SoftBindingResolution struct {
+	Discovery    json.RawMessage `json:"discovery"`
+	Capabilities json.RawMessage `json:"capabilities"`
+	Algorithms   json.RawMessage `json:"algorithms"`
+	Status       json.RawMessage `json:"status,omitempty"`
+	Recovered    []struct {
+		Matched json.RawMessage `json:"matched"`
+		Report  Report          `json:"report"`
+		Receipt json.RawMessage `json:"receipt,omitempty"`
+	} `json:"recovered"`
+}
+
+// SoftBindingReceiptEvidence is a repository's report, not a local
+// cryptographic receipt verdict.
+type SoftBindingReceiptEvidence struct {
+	Receipt                json.RawMessage `json:"receipt"`
+	ServerReportedVerified bool            `json:"server_reported_verified"`
+	ServerError            *string         `json:"server_error,omitempty"`
+}
+
+type softBindingReceiptResponseEnvelope struct {
+	OK       bool                        `json:"ok"`
+	Evidence *SoftBindingReceiptEvidence `json:"evidence"`
+	Error    *VerificationError          `json:"error"`
+}
+
+type softBindingResponseEnvelope struct {
+	OK         bool                   `json:"ok"`
+	Resolution *SoftBindingResolution `json:"resolution"`
+	Error      *VerificationError     `json:"error"`
 }
 
 // VerifyFragmented verifies a Merkle-bound fragmented ISO BMFF stream.
@@ -474,6 +781,181 @@ func VerifyStream(initSegment []byte, segments [][]byte, mimeType string, encaps
 		return nil, errors.New("verification succeeded without a report")
 	}
 	return envelope.Report, nil
+}
+
+// VerifyErtmp verifies caller-parsed Enhanced RTMP events in exact wire order.
+// inputJSON contains bilateral capsEx, object_encoding and the ordered events
+// array. Aggregate timestamps must already be normalized and each Multitrack
+// event must contain only the selected track packet. Nil options select 2.5.
+func VerifyErtmp(inputJSON json.RawMessage, options *Options) (*ErtmpReport, error) {
+	if len(inputJSON) == 0 {
+		return nil, errors.New("E-RTMP input JSON is required")
+	}
+	if options == nil {
+		options = &Options{SpecVersion: "2.5"}
+	}
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	input := C.CString(string(inputJSON))
+	defer C.free(unsafe.Pointer(input))
+	opts := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(opts))
+
+	result := C.encypher_c2pa_verify_ertmp(input, opts)
+	runtime.KeepAlive(inputJSON)
+	if result == nil {
+		return nil, errors.New("verifier returned no result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+
+	var envelope ertmpResponseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return nil, fmt.Errorf("decode E-RTMP verifier response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return nil, errors.New("E-RTMP verification failed without a structured error")
+	}
+	if envelope.Report == nil {
+		return nil, errors.New("E-RTMP verification succeeded without a report")
+	}
+	return envelope.Report, nil
+}
+
+// ResolveSoftBinding queries an allowlisted soft-binding service and verifies
+// each recovered manifest store against asset. Set options.Online to true (or
+// ENCYPHER_C2PA_ONLINE=on) to authorize access. The service's advertised C2PA
+// version never changes options.SpecVersion.
+func ResolveSoftBinding(asset []byte, mimeType string, serviceRoot string, query SoftBindingQuery, options *Options, resolverOptions SoftBindingResolverOptions) (*SoftBindingResolution, error) {
+	if mimeType == "" {
+		return nil, errors.New("mime type is required")
+	}
+	if serviceRoot == "" {
+		return nil, errors.New("soft-binding service root is required")
+	}
+	if len(resolverOptions.AllowedOrigins) == 0 {
+		return nil, errors.New("at least one exact allowed origin is required")
+	}
+	queryJSON, err := json.Marshal(query)
+	if err != nil {
+		return nil, fmt.Errorf("encode soft-binding query: %w", err)
+	}
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	resolverJSON, err := json.Marshal(resolverOptions)
+	if err != nil {
+		return nil, fmt.Errorf("encode soft-binding resolver options: %w", err)
+	}
+	var assetPtr *C.uint8_t
+	if len(asset) > 0 {
+		assetPtr = (*C.uint8_t)(unsafe.Pointer(&asset[0]))
+	}
+	mime := C.CString(mimeType)
+	defer C.free(unsafe.Pointer(mime))
+	root := C.CString(serviceRoot)
+	defer C.free(unsafe.Pointer(root))
+	queryArg := C.CString(string(queryJSON))
+	defer C.free(unsafe.Pointer(queryArg))
+	optionsArg := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(optionsArg))
+	resolverArg := C.CString(string(resolverJSON))
+	defer C.free(unsafe.Pointer(resolverArg))
+
+	result := C.encypher_c2pa_resolve_soft_binding(
+		assetPtr,
+		C.size_t(len(asset)),
+		mime,
+		root,
+		queryArg,
+		optionsArg,
+		resolverArg,
+	)
+	runtime.KeepAlive(asset)
+	if result == nil {
+		return nil, errors.New("soft-binding resolver returned no result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+
+	var envelope softBindingResponseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return nil, fmt.Errorf("decode soft-binding resolution response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return nil, errors.New("soft-binding resolution failed without a structured error")
+	}
+	if envelope.Resolution == nil {
+		return nil, errors.New("soft-binding resolution succeeded without evidence")
+	}
+	return envelope.Resolution, nil
+}
+
+// RequestSoftBindingReceiptVerification submits receipt to a repository. Its
+// result remains server-reported operational evidence.
+func RequestSoftBindingReceiptVerification(serviceRoot string, manifestID string, receipt json.RawMessage, options *Options, resolverOptions SoftBindingResolverOptions) (*SoftBindingReceiptEvidence, error) {
+	if serviceRoot == "" {
+		return nil, errors.New("soft-binding service root is required")
+	}
+	if manifestID == "" {
+		return nil, errors.New("soft-binding manifest id is required")
+	}
+	if len(receipt) == 0 {
+		return nil, errors.New("soft-binding receipt is required")
+	}
+	if len(resolverOptions.AllowedOrigins) == 0 {
+		return nil, errors.New("at least one exact allowed origin is required")
+	}
+	optionsJSON, err := marshalOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	resolverJSON, err := json.Marshal(resolverOptions)
+	if err != nil {
+		return nil, fmt.Errorf("encode soft-binding resolver options: %w", err)
+	}
+	root := C.CString(serviceRoot)
+	defer C.free(unsafe.Pointer(root))
+	id := C.CString(manifestID)
+	defer C.free(unsafe.Pointer(id))
+	receiptArg := C.CString(string(receipt))
+	defer C.free(unsafe.Pointer(receiptArg))
+	optionsArg := C.CString(string(optionsJSON))
+	defer C.free(unsafe.Pointer(optionsArg))
+	resolverArg := C.CString(string(resolverJSON))
+	defer C.free(unsafe.Pointer(resolverArg))
+	result := C.encypher_c2pa_request_soft_binding_receipt_verification(
+		root,
+		id,
+		receiptArg,
+		optionsArg,
+		resolverArg,
+	)
+	if result == nil {
+		return nil, errors.New("soft-binding receipt verifier returned no result")
+	}
+	defer C.encypher_c2pa_free_string(result)
+	var envelope softBindingReceiptResponseEnvelope
+	if err := json.Unmarshal([]byte(C.GoString(result)), &envelope); err != nil {
+		return nil, fmt.Errorf("decode soft-binding receipt response: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return nil, errors.New("soft-binding receipt verification failed without a structured error")
+	}
+	if envelope.Evidence == nil {
+		return nil, errors.New("soft-binding receipt verification succeeded without evidence")
+	}
+	return envelope.Evidence, nil
 }
 
 func validateOptions(options *Options) error {

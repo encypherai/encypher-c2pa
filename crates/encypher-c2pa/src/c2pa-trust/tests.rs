@@ -4,7 +4,7 @@
 //! Unit tests for trust-list, EKU policy, chain validation, and revocation.
 
 use super::*;
-use der::Encode;
+use der::{Decode, Encode};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, SerialNumber,
@@ -141,6 +141,65 @@ fn trust_list_anchor_subjects() {
     assert_eq!(
         trust.anchor_subjects(),
         vec!["Encypher Test Root CA".to_string()]
+    );
+}
+
+#[test]
+fn trust_source_is_associated_with_every_parsed_anchor() {
+    let (_, pem) = make_cert(|_| {});
+    let source =
+        TrustSource::new("https://c2pa.org/trustlist", "c2pa.trustList").with_identifier("42");
+    let trust = TrustList::from_pem(&pem)
+        .expect("parse pem")
+        .with_source(source.clone());
+
+    assert_eq!(trust.anchors.len(), 1);
+    assert_eq!(trust.anchors[0].source.as_deref(), Some(&source));
+}
+
+#[test]
+fn matching_anchor_sources_are_actual_purpose_scoped_and_deterministic() {
+    let (der, _) = make_cert(|_| {});
+    let first = TrustSource::new("urn:example:claim-a", "com.example.trustList")
+        .with_identifier("snapshot-a");
+    let second = TrustSource::new("urn:example:claim-b", "com.example.trustList");
+    let tsa = TrustSource::new("urn:example:tsa", "c2pa.tsaTrustList");
+    let inactive = TrustSource::new("urn:example:future", "c2pa.trustList");
+
+    let mut future =
+        TrustAnchor::new(der.clone(), AnchorPurpose::ClaimSigning).with_source(inactive);
+    future.not_before = Some(datetime!(2027-01-01 0:00 UTC));
+    let trust = TrustList {
+        anchors: vec![
+            TrustAnchor::new(der.clone(), AnchorPurpose::ClaimSigning).with_source(first.clone()),
+            // Repeated metadata is emitted only once.
+            TrustAnchor::new(der.clone(), AnchorPurpose::ClaimSigning).with_source(first.clone()),
+            TrustAnchor::new(der.clone(), AnchorPurpose::ClaimSigning).with_source(second.clone()),
+            // The same certificate configured for TSA use cannot leak into a
+            // claim-signing result.
+            TrustAnchor::new(der.clone(), AnchorPurpose::TimeStamping).with_source(tsa),
+            future,
+        ],
+    };
+    let result = validate_chain(
+        &der,
+        &[],
+        &trust,
+        AnchorPurpose::ClaimSigning,
+        Some(datetime!(2026-01-01 0:00 UTC)),
+    );
+
+    assert!(result.trusted, "{:?}", result.reason);
+    assert_eq!(result.anchor, Some(0));
+    assert_eq!(
+        result
+            .terminating_anchor(&trust)
+            .map(TrustAnchor::fingerprint),
+        Some(fingerprint_hex(&der))
+    );
+    assert_eq!(
+        result.matching_anchor_sources(&trust),
+        vec![&first, &second]
     );
 }
 
@@ -392,4 +451,91 @@ fn revocation_denylist_matches_by_fingerprint() {
     let denylist = RevocationDenylist::new(std::iter::empty(), [fp.to_uppercase()]);
     // Normalization lowercases tokens, so an uppercase fingerprint still matches.
     assert!(denylist.is_revoked(&der));
+}
+
+const ML_DSA_ROOTS: [&[u8]; 3] = [
+    include_bytes!("../c2pa-crypto/fixtures/ml_dsa_44_rfc9881_cert.der"),
+    include_bytes!("../c2pa-crypto/fixtures/ml_dsa_65_rfc9881_cert.der"),
+    include_bytes!("../c2pa-crypto/fixtures/ml_dsa_87_rfc9881_cert.der"),
+];
+const PSS_ROOT: &[u8] = include_bytes!("../c2pa-crypto/fixtures/pss_spki_cert.der");
+
+#[test]
+fn explicit_v2_5_resolves_mldsa_and_pss_issuers_without_legacy_fallback() {
+    for certificate in ML_DSA_ROOTS.into_iter().chain([PSS_ROOT]) {
+        assert_eq!(
+            resolve_issuer_with(
+                certificate,
+                std::iter::once(certificate),
+                CertificateProfile::V2_5,
+            ),
+            Some(certificate)
+        );
+        assert_eq!(
+            resolve_issuer(certificate, std::iter::once(certificate)),
+            None,
+            "the unsuffixed API must preserve the 2.4 algorithm behavior"
+        );
+
+        let mut tampered = Certificate::from_der(certificate).expect("certificate");
+        let mut signature = tampered.signature.raw_bytes().to_vec();
+        let midpoint = signature.len() / 2;
+        signature[midpoint] ^= 0x01;
+        tampered.signature = der::asn1::BitString::from_bytes(&signature).expect("signature");
+        let tampered = tampered.to_der().expect("DER");
+        assert_eq!(
+            resolve_issuer_with(
+                &tampered,
+                std::iter::once(certificate),
+                CertificateProfile::V2_5,
+            ),
+            None
+        );
+    }
+}
+
+fn leaf_with_algorithms(
+    spki: x509_cert::spki::SubjectPublicKeyInfoOwned,
+    algorithm: x509_cert::spki::AlgorithmIdentifierOwned,
+) -> Vec<u8> {
+    let mut leaf = Certificate::from_der(&leaf_with_ekus(&[OID_C2PA_CLAIM_SIGNING])).expect("leaf");
+    leaf.tbs_certificate.subject_public_key_info = spki;
+    leaf.tbs_certificate.signature = algorithm.clone();
+    leaf.signature_algorithm = algorithm;
+    leaf.to_der().expect("DER")
+}
+
+#[test]
+fn v2_5_claim_leaf_profile_enforces_mldsa_oid_parameters_and_key_width() {
+    let certificate = Certificate::from_der(ML_DSA_ROOTS[0]).expect("RFC 9881 certificate");
+    let spki = certificate.tbs_certificate.subject_public_key_info;
+    let algorithm = x509_cert::spki::AlgorithmIdentifierOwned {
+        oid: const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17"),
+        parameters: None,
+    };
+    let valid = leaf_with_algorithms(spki.clone(), algorithm.clone());
+    assert!(leaf_acceptable_der_with(&valid, CertificateProfile::V2_5));
+    assert!(!leaf_acceptable_der(&valid));
+    assert_eq!(
+        leaf_acceptable_der_with(&valid, CertificateProfile::V2_2),
+        leaf_acceptable_der_with(&valid, CertificateProfile::V2_4)
+    );
+
+    let with_parameters = x509_cert::spki::AlgorithmIdentifierOwned {
+        parameters: Some(der::Any::null()),
+        ..algorithm.clone()
+    };
+    assert!(!leaf_acceptable_der_with(
+        &leaf_with_algorithms(spki.clone(), with_parameters),
+        CertificateProfile::V2_5,
+    ));
+
+    let mut short_key = spki;
+    let bits = short_key.subject_public_key.raw_bytes().to_vec();
+    short_key.subject_public_key =
+        der::asn1::BitString::from_bytes(&bits[..bits.len() - 1]).expect("key");
+    assert!(!leaf_acceptable_der_with(
+        &leaf_with_algorithms(short_key, algorithm),
+        CertificateProfile::V2_5,
+    ));
 }

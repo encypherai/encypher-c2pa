@@ -129,7 +129,6 @@ mod addresses {
 
 struct Request {
     method: String,
-    target: String,
     content_type: Option<String>,
     user_agent: Option<String>,
     body: Vec<u8>,
@@ -181,7 +180,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     reader.read_line(&mut start).ok()?;
     let mut parts = start.split_whitespace();
     let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
+    parts.next()?;
     let mut content_length = 0_usize;
     let mut content_type = None;
     let mut user_agent = None;
@@ -211,7 +210,6 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     }
     Some(Request {
         method,
-        target,
         content_type,
         user_agent,
         body,
@@ -242,7 +240,7 @@ fn redirect_response(location: &str) -> Vec<u8> {
 #[cfg(feature = "online")]
 mod fetcher {
     use super::*;
-    use crate::online::native::{join_redirect, NativeFetcher};
+    use crate::online::native::NativeFetcher;
 
     fn manifest_request(url: &str) -> FetchRequest<'_> {
         FetchRequest {
@@ -347,49 +345,19 @@ mod fetcher {
         assert!(error.detail.contains("512 byte limit"), "{}", error.detail);
     }
 
-    /// Each hop is judged afresh, so a server cannot redirect its way to a
-    /// scheme this SDK refused at the start.
+    /// Redirects are never followed. The signed asset controls the original
+    /// endpoint, not the endpoint named by a server response.
     #[test]
-    fn a_redirect_to_a_refused_scheme_is_blocked_at_that_hop() {
-        let server = TestServer::start(|_, _| redirect_response("ftp://files.invalid/store.c2pa"));
+    fn a_redirect_is_refused_without_following_it() {
+        let server = TestServer::start(|_, _| redirect_response("/final"));
         let url = server.url("/ocsp");
         let error = NativeFetcher::new(true)
             .fetch(&ocsp_request(&url, b"der"))
-            .expect_err("the redirect target must be refused");
+            .expect_err("redirect responses must be refused");
         assert!(error.blocked, "{}", error.detail);
-        assert!(error.detail.contains("ftp"), "{}", error.detail);
+        assert!(error.detail.contains("redirect"), "{}", error.detail);
         assert_eq!(server.hits(), 1);
-    }
-
-    #[test]
-    fn a_redirect_chain_stops_at_the_hop_limit() {
-        let server = TestServer::start(|index, _| redirect_response(&format!("/hop-{index}")));
-        let url = server.url("/ocsp");
-        let error = NativeFetcher::new(true)
-            .fetch(&ocsp_request(&url, b"der"))
-            .expect_err("an endless redirect chain must stop");
-        assert!(error.blocked, "{}", error.detail);
-        assert!(error.detail.contains("redirects"), "{}", error.detail);
-        // The first request plus the three hops it is allowed to follow.
-        assert_eq!(server.hits(), 4);
-        assert_eq!(error.requests_used, 4);
-    }
-
-    #[test]
-    fn a_redirect_within_the_limit_is_followed_to_the_body() {
-        let server = TestServer::start(|index, request| {
-            if index == 0 {
-                redirect_response("/final")
-            } else {
-                ok_response("application/ocsp-response", request.target.as_bytes())
-            }
-        });
-        let url = server.url("/ocsp");
-        let response = NativeFetcher::new(true)
-            .fetch(&ocsp_request(&url, b"der"))
-            .expect("the redirect is followed");
-        assert_eq!(response.bytes, b"/final");
-        assert_eq!(response.requests_used, 2);
+        assert_eq!(error.requests_used, 1);
     }
 
     #[test]
@@ -404,28 +372,6 @@ mod fetcher {
             .expect_err("503 is not an answer");
         assert!(!error.blocked, "{}", error.detail);
         assert!(error.detail.contains("503"), "{}", error.detail);
-    }
-
-    #[test]
-    fn redirect_targets_resolve_against_the_url_that_produced_them() {
-        let base = "https://store.test/a/b/store.c2pa?v=1";
-        assert_eq!(
-            join_redirect(base, "https://other.test/x").as_deref(),
-            Some("https://other.test/x")
-        );
-        assert_eq!(
-            join_redirect(base, "/root.c2pa").as_deref(),
-            Some("https://store.test/root.c2pa")
-        );
-        assert_eq!(
-            join_redirect(base, "next.c2pa").as_deref(),
-            Some("https://store.test/a/b/next.c2pa")
-        );
-        assert_eq!(
-            join_redirect(base, "//elsewhere.test/x").as_deref(),
-            Some("https://elsewhere.test/x")
-        );
-        assert_eq!(join_redirect(base, "  "), None);
     }
 }
 
@@ -589,6 +535,7 @@ impl Fetcher for ScriptedFetcher {
         match self.answers.get(request.url) {
             Some(Ok(bytes)) => Ok(FetchOk {
                 bytes: bytes.clone(),
+                media_type: None,
                 requests_used: 1,
             }),
             Some(Err(detail)) => Err(FetchErr {

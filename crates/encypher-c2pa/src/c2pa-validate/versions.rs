@@ -50,16 +50,15 @@ use crate::c2pa_core::SpecVersion;
 use crate::c2pa_formats::AssetFormat;
 use serde_json::{json, Value as Json};
 
-/// The highest revision the default (historical) ladder evaluates. Raising it
-/// would add a rung to every existing report, so it is fixed at 2.4 and only an
-/// explicitly selected newer policy extends the ladder.
+/// The historical default public policy is 2.4, selected by the public option
+/// resolver before this module is called. An explicit policy evaluates only
+/// through its own revision: 2.2 cannot silently use 2.4 requirements, and a
+/// future registered revision cannot inherit 2.5 without its own rules.
 pub(crate) const HISTORICAL_CEILING: SpecVersion = SpecVersion::V2_4;
 
-/// The ladder ceiling for the caller-selected validation policy `policy`: the
-/// historical ceiling, raised to `policy` when the caller selected a newer
-/// revision.
+/// The ladder ceiling for the caller-selected validation policy.
 pub(crate) fn ladder_ceiling(policy: SpecVersion) -> SpecVersion {
-    policy.max(HISTORICAL_CEILING)
+    policy
 }
 
 /// Claim generation: the 1.x claim v1 shape vs the 2.x claim v2 shape.
@@ -444,6 +443,14 @@ fn format_min_version(format: AssetFormat) -> Option<SpecVersion> {
         | AssetFormat::TextUnstructured
         | AssetFormat::TextStructured { .. }
         | AssetFormat::TextHtml => Some(SpecVersion::V2_4),
+        AssetFormat::Midi
+        | AssetFormat::Ttml
+        | AssetFormat::Onnx
+        | AssetFormat::SafeTensors
+        | AssetFormat::Parquet
+        | AssetFormat::BlockFact
+        | AssetFormat::Warc
+        | AssetFormat::AppendOnlyText { .. } => Some(SpecVersion::V2_5),
         _ => None,
     }
 }
@@ -587,7 +594,7 @@ pub(crate) fn evaluate_for(
     }
     // Creation rules first applying in proposed 2.5, read only when the frame
     // reaches 2.5.
-    let (actions_reasons_v2_5, actions_deprecations_v2_5) = if ceiling >= SpecVersion::V2_5 {
+    let (actions_reasons_v2_5, actions_deprecations_v2_5) = if ceiling == SpecVersion::V2_5 {
         actions_creation_findings(manifest)
     } else {
         (Vec::new(), Vec::new())
@@ -616,7 +623,7 @@ pub(crate) fn evaluate_for(
                     reasons.push(why.clone());
                 }
             }
-            if version >= SpecVersion::V2_5 {
+            if version == SpecVersion::V2_5 {
                 reasons.extend(actions_reasons_v2_5.iter().cloned());
             }
             let deprecations: Vec<String> = deprecated

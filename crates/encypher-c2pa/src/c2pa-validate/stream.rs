@@ -44,8 +44,8 @@ use crate::c2pa_formats::{
 };
 
 use super::live_video::{
-    validate_emsg_segment, validate_init_segment, validate_live_video_assertion,
-    validate_segment_manifest, validate_session_keys, LiveVideoApplicability,
+    validate_emsg_segment_with, validate_init_segment, validate_live_video_assertion,
+    validate_segment_manifest, validate_session_keys_with, LiveVideoApplicability,
     LiveVideoManifestState, LIVEVIDEO_CONTINUITY_METHOD_INVALID, LIVEVIDEO_SEGMENT_INVALID,
     LIVEVIDEO_SESSION_KEY_INVALID,
 };
@@ -273,6 +273,7 @@ pub fn verify_stream_safe_with_expected_seeks<'a>(
         ica_trusted_issuers: cawg_ica_trusted_issuers,
         ica_trust_anchors: cawg_ica_trust_anchors,
         ica_status_lists: cawg_ica_status_lists,
+        graph_inputs: super::ingredient_graph::GraphInputs::default(),
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         verify_stream_with_expected_seeks(
@@ -352,11 +353,13 @@ fn verify_delivered_live_session(
     );
 
     let keys_url = format!("self#jumbf=/c2pa/{manifest_id}/c2pa.assertions/{SESSION_KEYS_LABEL}");
+    let algorithms = super::spec25::claim_algorithms(input.profile);
     let keys = match &delivery.session_keys {
-        Ok(assertion_cbor) => validate_session_keys(
+        Ok(assertion_cbor) => validate_session_keys_with(
             applicability,
             assertion_cbor,
             &delivery.signer_chain_der,
+            algorithms,
             &mut out.results,
             &keys_url,
         ),
@@ -387,13 +390,14 @@ fn verify_delivered_live_session(
                     .into(),
             );
         }
-        if let Some(info) = validate_emsg_segment(
+        if let Some(info) = validate_emsg_segment_with(
             applicability,
             segment,
             expected_sequence_number,
             manifest_id,
             &keys,
             validation_time,
+            algorithms,
             &mut out.results,
             &url,
         ) {
