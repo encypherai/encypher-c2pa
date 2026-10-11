@@ -1116,10 +1116,10 @@ fn verify_with_fragments_mode_and_expected_seeks(
         return Ok(out);
     }
 
-    let store_bytes = match crate::c2pa_formats::extract_manifest_with(
+    let store_bytes = match crate::c2pa_formats::extract_manifest_for_spec(
         format,
         input.data,
-        spec25::text_rules(input.profile),
+        input.profile.version,
     ) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
@@ -7147,8 +7147,6 @@ fn verify_primary_hard_binding(
     // asset bytes can still hash correctly because assertions live inside the
     // excluded manifest carrier, so never report a positive hard binding after
     // that failure.
-    let binding_compromised = results.has_failure(ASSERTION_HASHED_URI_MISMATCH)
-        || results.has_failure(HASHED_URI_MISSING);
     let Some(binding) = claim_refs
         .binding_plan(format == AssetFormat::C2paStore)
         .primary()
@@ -7167,6 +7165,8 @@ fn verify_primary_hard_binding(
     match alabel {
         "c2pa.hash.boxes" => {
             if let Some(cbor) = indexed.payload {
+                let binding_compromised = results.has_failure(ASSERTION_HASHED_URI_MISMATCH)
+                    || results.has_failure(HASHED_URI_MISSING);
                 verify_boxes_hash(
                     cbor,
                     claim,
@@ -7182,15 +7182,7 @@ fn verify_primary_hard_binding(
         }
         "c2pa.hash.collection.data" => {
             if let Some(cbor) = indexed.payload {
-                verify_collection_hash(
-                    cbor,
-                    claim,
-                    data,
-                    format,
-                    binding_compromised,
-                    label,
-                    results,
-                );
+                verify_collection_hash(cbor, claim, data, format, label, profile, results);
             }
             return;
         }
@@ -7198,6 +7190,8 @@ fn verify_primary_hard_binding(
         _ if !is_supported_whole_asset_hash_label(alabel) => return,
         _ => {}
     }
+    let binding_compromised = results.has_failure(ASSERTION_HASHED_URI_MISMATCH)
+        || results.has_failure(HASHED_URI_MISSING);
     let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/{alabel}");
     let is_bmff = is_supported_bmff_hash_label(alabel);
     let mismatch_code = if is_bmff {
@@ -7353,10 +7347,10 @@ fn verify_primary_hard_binding(
         let carrier = if rendition == update_manifest::StoreRendition::Detached {
             None
         } else {
-            crate::c2pa_formats::compute_data_hash_exclusions_with(
+            crate::c2pa_formats::compute_data_hash_exclusions_for_spec(
                 format,
                 data,
-                spec25::text_rules(profile),
+                profile.version,
             )
             .ok()
         };
@@ -8998,10 +8992,12 @@ fn verify_collection_hash(
     claim: &Value,
     data: &[u8],
     format: AssetFormat,
-    binding_compromised: bool,
     label: &str,
+    profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
+    let binding_compromised = results.has_failure(ASSERTION_HASHED_URI_MISMATCH)
+        || results.has_failure(HASHED_URI_MISSING);
     let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/c2pa.hash.collection.data");
     let malformed = |results: &mut ValidationResults, why: String| {
         results.push_failure(ASSERTION_COLLECTION_HASH_MALFORMED, url.clone(), why);
@@ -9037,7 +9033,16 @@ fn verify_collection_hash(
         verify_warc_collection_hash(uris, alg, data, binding_compromised, &url, results);
         return;
     }
-    let index = match crate::c2pa_formats::zip_index(data) {
+    let index_result = match profile.version {
+        SpecVersion::V1_4
+        | SpecVersion::V2_0
+        | SpecVersion::V2_1
+        | SpecVersion::V2_2
+        | SpecVersion::V2_3
+        | SpecVersion::V2_4 => crate::c2pa_formats::zip_index(data),
+        SpecVersion::V2_5 => crate::c2pa_formats::zip_index_v2_5(data),
+    };
+    let index = match index_result {
         Ok(index) => index,
         Err(error) => {
             malformed(
@@ -15648,13 +15653,61 @@ mod tests {
             &vmap(Vec::new()),
             &archive,
             AssetFormat::Zip,
-            false,
             "urn:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
 
         assert!(results.has_success(ASSERTION_COLLECTION_HASH_MATCH));
         assert!(!results.has_failure(ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT));
+    }
+
+    #[test]
+    fn zip64_collection_hash_is_admitted_only_by_v2_5() {
+        let (archive, _) = crate::c2pa_formats::zip64_test_asset();
+        let index = crate::c2pa_formats::zip_index_v2_5(&archive).expect("2.5 ZIP64 index");
+        let payload = index.get(b"payload.bin").expect("payload entry");
+        let (start, end) = payload.hash_span();
+        let assertion = vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            (
+                "uris",
+                Value::Array(vec![vmap(vec![
+                    ("uri", Value::Text("payload.bin".into())),
+                    ("hash", Value::Bytes(sha(&archive[start..end]))),
+                ])]),
+            ),
+            (
+                "zip_central_directory_hash",
+                Value::Bytes(hash_parts("sha256", index.central_directory_hash_parts()).unwrap()),
+            ),
+        ]);
+        let encoded = enc(&assertion);
+
+        let mut legacy = ValidationResults::default();
+        verify_collection_hash(
+            &encoded,
+            &vmap(Vec::new()),
+            &archive,
+            AssetFormat::Zip,
+            "urn:test",
+            EngineProfile::GENEROUS,
+            &mut legacy,
+        );
+        assert!(legacy.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
+
+        let mut v2_5 = ValidationResults::default();
+        verify_collection_hash(
+            &encoded,
+            &vmap(Vec::new()),
+            &archive,
+            AssetFormat::Zip,
+            "urn:test",
+            EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular),
+            &mut v2_5,
+        );
+        assert!(v2_5.has_success(ASSERTION_COLLECTION_HASH_MATCH));
+        assert!(!v2_5.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
     }
 
     fn remote_only_font(uri: &str) -> Vec<u8> {
@@ -16981,8 +17034,8 @@ mod tests {
             &vmap(Vec::new()),
             &[],
             AssetFormat::Zip,
-            false,
             "urn:c2pa:test",
+            EngineProfile::GENEROUS,
             &mut collection_results,
         );
         assert!(collection_results.has_failure(ALGORITHM_UNSUPPORTED));
@@ -16999,8 +17052,8 @@ mod tests {
             &vmap(Vec::new()),
             &[],
             AssetFormat::Zip,
-            false,
             "urn:c2pa:test",
+            EngineProfile::GENEROUS,
             &mut missing_results,
         );
         assert!(missing_results.has_failure(ALGORITHM_UNSUPPORTED));
@@ -17026,8 +17079,8 @@ mod tests {
             &claim,
             &empty_zip,
             AssetFormat::Zip,
-            false,
             "urn:c2pa:test",
+            EngineProfile::GENEROUS,
             &mut results,
         );
         assert!(results.has_success(ASSERTION_COLLECTION_HASH_MATCH));

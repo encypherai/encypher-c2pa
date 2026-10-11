@@ -63,6 +63,7 @@ The proposed 2.5 policy reads the carriers 2.5 adds: Standard MIDI Files (`audio
 - HTML: only elements inside `head` count; more than one there locates no manifest.
 - Placement checked in the regular 2.5 posture: the PNG `caBX` chunk before the first `IDAT`, the BMFF manifest box after `ftyp` and before the first `mdat`/`moov` or adjacent to `moov` (an `update` box last), and the TIFF entry in the first or last IFD. A violation reports `general.error`.
 - BMFF: excluding `ftyp` becomes an optional exclusion (`assertion.bmffHash.additionalExclusionsPresent`), and a fragmented hash carrying both `hash` and `merkle` is `assertion.bmffHash.malformed`.
+- ZIP: bounded single-disk ZIP64 archives are read, including their extended-information fields, 64-bit data descriptors, and ZIP64 end records. Only exact `spec_version: "2.5"` admits ZIP64; the 2.2 and 2.4 policies and versionless format helpers retain their prior ZIP32-only behavior.
 - An unreadable manifest store reports `manifest.inaccessible.malformed`.
 
 ## Test fixtures

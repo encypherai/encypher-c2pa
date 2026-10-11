@@ -689,9 +689,8 @@ pub fn detached_manifest_evidence(
 }
 
 /// [`detached_manifest_evidence`] under the policy `options.spec_version`
-/// selects. Only the text carriers locate their store differently under 2.5
-/// (one valid wrapper, head-scoped HTML, strict structured references), so
-/// a 2.5 extraction returns exactly the store a 2.5 verification reads.
+/// selects. A 2.5 extraction therefore returns exactly the store and carrier
+/// span that a 2.5 verification reads.
 ///
 /// Only `spec_version` and `strict_conformance` are read; an unknown policy
 /// fails with [`Error::UnsupportedSpecVersion`] before the asset is parsed.
@@ -701,11 +700,6 @@ pub fn detached_manifest_evidence_with_options(
     options: &VerifyOptions,
 ) -> Result<Option<DetachedManifestEvidence>, Error> {
     let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
-    let rules = if profile.version == SpecVersion::V2_5 {
-        crate::c2pa_formats::TextLocatorRules::V2_5
-    } else {
-        crate::c2pa_formats::TextLocatorRules::V2_4
-    };
     let mime = canonicalize_mime(mime_type);
     require_embedded_mime(&mime, profile)?;
     let format = crate::c2pa_formats::AssetFormat::from_mime(&mime)
@@ -713,13 +707,15 @@ pub fn detached_manifest_evidence_with_options(
     if !crate::c2pa_formats::supports_hash_mode(&mime) {
         return Ok(None);
     }
-    let Some(manifest_store) = crate::c2pa_formats::extract_manifest_with(format, data, rules)
-        .map_err(|error| Error::Verification(error.to_string()))?
+    let Some(manifest_store) =
+        crate::c2pa_formats::extract_manifest_for_spec(format, data, profile.version)
+            .map_err(|error| Error::Verification(error.to_string()))?
     else {
         return Ok(None);
     };
-    let spans = crate::c2pa_formats::compute_data_hash_exclusions_with(format, data, rules)
-        .map_err(|error| Error::Verification(error.to_string()))?;
+    let spans =
+        crate::c2pa_formats::compute_data_hash_exclusions_for_spec(format, data, profile.version)
+            .map_err(|error| Error::Verification(error.to_string()))?;
     let [span] = spans.as_slice() else {
         return Ok(None);
     };
@@ -2312,6 +2308,51 @@ mod tests {
                 .contains("cawg_trust_configurations[0].certificates_pem"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn zip64_is_admitted_only_by_the_caller_selected_v2_5_policy() {
+        let (archive, _) = crate::c2pa_formats::zip64_test_asset();
+        for spec_version in [None, Some("2.4")] {
+            let error = verify_with_options(
+                &archive,
+                "application/zip",
+                &VerifyOptions {
+                    spec_version: spec_version.map(str::to_string),
+                    ..VerifyOptions::default()
+                },
+            )
+            .expect_err("legacy policy must refuse ZIP64");
+            assert!(
+                matches!(error, Error::Verification(_)),
+                "{spec_version:?} returned {error:?}"
+            );
+        }
+
+        let error = verify_with_options(
+            &archive,
+            "application/zip",
+            &VerifyOptions {
+                spec_version: Some("2.2".into()),
+                ..VerifyOptions::default()
+            },
+        )
+        .expect_err("2.2 must refuse a ZIP MIME outside its format set");
+        assert!(
+            matches!(&error, Error::UnsupportedMime(mime) if mime == "application/zip"),
+            "2.2 returned {error:?}"
+        );
+
+        let report = verify_with_options(
+            &archive,
+            "application/zip",
+            &VerifyOptions {
+                spec_version: Some("2.5".into()),
+                ..VerifyOptions::default()
+            },
+        )
+        .expect("2.5 ZIP64 verification returns a report");
+        assert!(report.present, "2.5 did not reach the ZIP64 manifest");
     }
 
     /// CAWG-ID13-DELTA-009: a trust configuration's certificates and window

@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+use crate::c2pa_core::SpecVersion;
+
 use thiserror::Error;
 
 mod append_text;
@@ -572,8 +574,11 @@ pub(crate) use {
 /// Re-export ZIP collection helpers for `c2pa.hash.collection.data`.
 pub(crate) use zip::{
     zip_central_directory_hash_parts, zip_entry_data, zip_entry_hash_span, zip_entry_local_span,
-    zip_entry_names, zip_index,
+    zip_entry_names, zip_index, zip_index_v2_5,
 };
+
+#[cfg(test)]
+pub(crate) use zip::tests::zip64_with_manifest_and_descriptor as zip64_test_asset;
 
 /// Re-export: the payload spans of every top-level `mdat` box, in file order
 /// (monolithic chunked-mdat merkle validation).
@@ -721,6 +726,18 @@ fn logical_manifest_store(data: &[u8]) -> &[u8] {
     }
 }
 
+fn text_locator_rules(spec_version: SpecVersion) -> TextLocatorRules {
+    match spec_version {
+        SpecVersion::V1_4
+        | SpecVersion::V2_0
+        | SpecVersion::V2_1
+        | SpecVersion::V2_2
+        | SpecVersion::V2_3
+        | SpecVersion::V2_4 => TextLocatorRules::V2_4,
+        SpecVersion::V2_5 => TextLocatorRules::V2_5,
+    }
+}
+
 /// Extract the raw JUMBF manifest-store bytes from `data` under the C2PA 2.4
 /// text locator (the signer's and every default reader's rules).
 ///
@@ -728,17 +745,16 @@ fn logical_manifest_store(data: &[u8]) -> &[u8] {
 /// [`crate::c2pa_core::jumbf::parse_manifest_store`]), `Ok(None)` if the asset is valid
 /// but has no manifest, or `Err` if the container is malformed.
 pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
-    extract_manifest_with(format, data, TextLocatorRules::V2_4)
+    extract_manifest_for_spec(format, data, SpecVersion::V2_4)
 }
 
-/// [`extract_manifest`] under an explicit text locator. Only the text formats
-/// read `rules`; every other container locates its store identically in 2.4
-/// and 2.5.
-pub(crate) fn extract_manifest_with(
+/// [`extract_manifest`] under an explicit caller-selected specification.
+pub(crate) fn extract_manifest_for_spec(
     format: AssetFormat,
     data: &[u8],
-    rules: TextLocatorRules,
+    spec_version: SpecVersion,
 ) -> Result<Option<Vec<u8>>, FormatError> {
+    let rules = text_locator_rules(spec_version);
     let manifest = match format {
         AssetFormat::Jpeg => jpeg::extract(data),
         AssetFormat::Png => png::extract(data),
@@ -749,6 +765,7 @@ pub(crate) fn extract_manifest_with(
         AssetFormat::Svg => svg::extract(data),
         AssetFormat::Pdf if rules == TextLocatorRules::V2_5 => pdf::extract_v2_5(data),
         AssetFormat::Pdf => pdf::extract(data),
+        AssetFormat::Zip if spec_version == SpecVersion::V2_5 => zip::extract_v2_5(data),
         AssetFormat::Zip => zip::extract(data),
         AssetFormat::Id3 => id3::extract(data),
         AssetFormat::Flac => flac::extract(data),
@@ -926,16 +943,17 @@ pub fn compute_data_hash_exclusions(
     format: AssetFormat,
     asset_with_placeholder: &[u8],
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
-    compute_data_hash_exclusions_with(format, asset_with_placeholder, TextLocatorRules::V2_4)
+    compute_data_hash_exclusions_for_spec(format, asset_with_placeholder, SpecVersion::V2_4)
 }
 
-/// [`compute_data_hash_exclusions`] under an explicit text locator, so a 2.5
-/// verification measures the carrier its own locator selected.
-pub(crate) fn compute_data_hash_exclusions_with(
+/// [`compute_data_hash_exclusions`] under an explicit caller-selected
+/// specification, so verification measures the carrier its own locator read.
+pub(crate) fn compute_data_hash_exclusions_for_spec(
     format: AssetFormat,
     asset_with_placeholder: &[u8],
-    rules: TextLocatorRules,
+    spec_version: SpecVersion,
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
+    let rules = text_locator_rules(spec_version);
     match format {
         AssetFormat::Jpeg => jpeg::exclusions(asset_with_placeholder),
         AssetFormat::Png => png::exclusions(asset_with_placeholder),
@@ -961,6 +979,9 @@ pub(crate) fn compute_data_hash_exclusions_with(
             pdf::exclusions_v2_5(asset_with_placeholder)
         }
         AssetFormat::Pdf => pdf::exclusions(asset_with_placeholder),
+        AssetFormat::Zip if spec_version == SpecVersion::V2_5 => {
+            zip::exclusions_v2_5(asset_with_placeholder)
+        }
         AssetFormat::Zip => zip::exclusions(asset_with_placeholder),
         AssetFormat::Id3 => id3::exclusions(asset_with_placeholder),
         AssetFormat::Font => font::exclusions(asset_with_placeholder),

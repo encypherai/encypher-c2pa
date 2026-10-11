@@ -1,12 +1,13 @@
 // Copyright 2026 Encypher Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-//! ZIP/ZIP64 verifier for C2PA collection bindings.
+//! ZIP verifier for C2PA collection bindings.
 //!
 //! The manifest store is the stored, unencrypted entry
-//! `META-INF/content_credential.c2pa`. Reader geometry supports ZIP32 and
-//! single-disk ZIP64, including ZIP64 extended-information fields and 64-bit
-//! data descriptors. The public crate has no production writer.
+//! `META-INF/content_credential.c2pa`. Versionless and pre-2.5 paths preserve
+//! the legacy ZIP32-only policy. Exact C2PA 2.5 paths also support single-disk
+//! ZIP64, including ZIP64 extended-information fields and 64-bit data
+//! descriptors. The public crate has no production writer.
 
 use std::collections::HashMap;
 
@@ -23,6 +24,11 @@ const SIG_ZIP64_LOCATOR: u32 = 0x0706_4b50;
 const SIG_DESCRIPTOR: u32 = 0x0807_4b50;
 const METHOD_STORED: u16 = 0;
 const MAX_ZIP_ENTRIES: usize = 1 << 20;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZipRules {
+    Legacy,
+    V2_5,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -55,7 +61,7 @@ fn usize64(value: u64, detail: &'static str) -> Result<usize, FormatError> {
     })
 }
 
-fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
+fn find_eocd(data: &[u8], rules: ZipRules) -> Result<Eocd, FormatError> {
     if data.len() < 22 {
         return Err(FormatError::InvalidStructure {
             format: FMT,
@@ -82,6 +88,21 @@ fn find_eocd(data: &[u8]) -> Result<Eocd, FormatError> {
                 }
                 pos -= 1;
                 continue;
+            }
+            if rules == ZipRules::Legacy {
+                if entries == u16::MAX || cd_size == u32::MAX || cd_offset == u32::MAX {
+                    return Err(FormatError::UnsupportedVariant {
+                        format: FMT,
+                        detail: "ZIP64 archive",
+                    });
+                }
+                return Ok(Eocd {
+                    total_entries: entries as usize,
+                    cd_size: cd_size as usize,
+                    cd_offset: cd_offset as usize,
+                    directory_end: pos,
+                    eocd_offset: pos,
+                });
             }
             let has_zip64_locator = pos
                 .checked_sub(20)
@@ -558,7 +579,15 @@ fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, Form
 }
 
 pub fn zip_index(data: &[u8]) -> Result<ZipIndex<'_>, FormatError> {
-    let eocd = find_eocd(data)?;
+    zip_index_with_rules(data, ZipRules::Legacy)
+}
+
+pub(crate) fn zip_index_v2_5(data: &[u8]) -> Result<ZipIndex<'_>, FormatError> {
+    zip_index_with_rules(data, ZipRules::V2_5)
+}
+
+fn zip_index_with_rules(data: &[u8], rules: ZipRules) -> Result<ZipIndex<'_>, FormatError> {
+    let eocd = find_eocd(data, rules)?;
     build_zip_index(data, &eocd)
 }
 
@@ -643,7 +672,15 @@ pub fn zip_entry_hash_span(data: &[u8], name: &str) -> Result<Option<(usize, usi
 
 /// Extract the manifest store from the `META-INF/content_credential.c2pa` entry.
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
-    let eocd = find_eocd(data)?;
+    extract_with_rules(data, ZipRules::Legacy)
+}
+
+pub(crate) fn extract_v2_5(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    extract_with_rules(data, ZipRules::V2_5)
+}
+
+fn extract_with_rules(data: &[u8], rules: ZipRules) -> Result<Option<Vec<u8>>, FormatError> {
+    let eocd = find_eocd(data, rules)?;
     let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME)? else {
         return Ok(None);
     };
@@ -683,7 +720,18 @@ pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
 /// Only the manifest payload bytes are excluded; the surrounding ZIP structures
 /// (local header, central directory, EOCD) are covered by the data hash.
 pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatError> {
-    let eocd = find_eocd(data)?;
+    exclusions_with_rules(data, ZipRules::Legacy)
+}
+
+pub(crate) fn exclusions_v2_5(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatError> {
+    exclusions_with_rules(data, ZipRules::V2_5)
+}
+
+fn exclusions_with_rules(
+    data: &[u8],
+    rules: ZipRules,
+) -> Result<Vec<DataHashExclusion>, FormatError> {
+    let eocd = find_eocd(data, rules)?;
     let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME)? else {
         return Ok(Vec::new());
     };
@@ -724,7 +772,7 @@ pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatEr
 /// all offsets stay consistent. A no-op when the asset has no manifest entry.
 #[cfg(test)]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
-    let eocd = find_eocd(asset)?;
+    let eocd = find_eocd(asset, ZipRules::Legacy)?;
     let index = build_zip_index(asset, &eocd)?;
     if index.get(ENTRY_NAME).is_none() {
         return Ok(asset.to_vec());
@@ -782,7 +830,7 @@ pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
 #[cfg(test)]
 pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, FormatError> {
     let clean = strip(asset)?;
-    let eocd = find_eocd(&clean)?;
+    let eocd = find_eocd(&clean, ZipRules::Legacy)?;
     if manifest_store.len() > u32::MAX as usize {
         return Err(FormatError::ManifestTooLarge {
             format: FMT,
@@ -879,7 +927,7 @@ pub(crate) fn embed(asset: &[u8], manifest_store: &[u8]) -> Result<Vec<u8>, Form
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::c2pa_formats::tests::dummy_manifest_store;
     use crate::c2pa_formats::util::crc32;
@@ -982,7 +1030,7 @@ mod tests {
     fn preexisting_entry_still_present() {
         let store = dummy_manifest_store();
         let embedded = embed(&tiny_zip(), &store).unwrap();
-        let eocd = find_eocd(&embedded).unwrap();
+        let eocd = find_eocd(&embedded, ZipRules::Legacy).unwrap();
         assert_eq!(eocd.total_entries, 2);
         assert!(find_cd_entry(&embedded, &eocd, b"mimetype")
             .unwrap()
@@ -993,7 +1041,7 @@ mod tests {
     fn manifest_crc_is_valid_and_omitted_from_cd_hash() {
         let store = dummy_manifest_store();
         let embedded = embed(&tiny_zip(), &store).unwrap();
-        let eocd = find_eocd(&embedded).unwrap();
+        let eocd = find_eocd(&embedded, ZipRules::Legacy).unwrap();
         let entry = find_cd_entry(&embedded, &eocd, ENTRY_NAME)
             .unwrap()
             .expect("manifest entry");
@@ -1129,7 +1177,7 @@ mod tests {
         assert!(zip_index(&duplicate).is_err());
 
         let mut zip64 = tiny_zip();
-        let eocd = find_eocd(&zip64).unwrap().eocd_offset;
+        let eocd = find_eocd(&zip64, ZipRules::Legacy).unwrap().eocd_offset;
         zip64[eocd + 10..eocd + 12].copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(matches!(
             zip_index(&zip64),
@@ -1147,7 +1195,7 @@ mod tests {
         assert!(extract(b"not a zip file at all really").is_err());
     }
 
-    fn zip64_with_manifest_and_descriptor() -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn zip64_with_manifest_and_descriptor() -> (Vec<u8>, Vec<u8>) {
         let store = dummy_manifest_store();
         let data_name = b"payload.bin";
         let payload = b"descriptor-covered";
@@ -1262,10 +1310,24 @@ mod tests {
     }
 
     #[test]
-    fn zip64_reader_hashes_descriptor_and_end_records() {
+    fn zip64_is_rejected_by_legacy_and_read_under_v2_5() {
         let (archive, store) = zip64_with_manifest_and_descriptor();
-        assert_eq!(extract(&archive).unwrap(), Some(store));
-        let index = zip_index(&archive).unwrap();
+        assert!(matches!(
+            extract(&archive),
+            Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "ZIP64 archive",
+            })
+        ));
+        assert!(matches!(
+            zip_index(&archive),
+            Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "ZIP64 archive",
+            })
+        ));
+        assert_eq!(extract_v2_5(&archive).unwrap(), Some(store));
+        let index = zip_index_v2_5(&archive).unwrap();
         assert_eq!(index.members().len(), 2);
         let payload = index.get(b"payload.bin").unwrap();
         assert_eq!(
@@ -1285,10 +1347,10 @@ mod tests {
         );
 
         let mut tampered = archive;
-        let eocd = find_eocd(&tampered).unwrap();
+        let eocd = find_eocd(&tampered, ZipRules::V2_5).unwrap();
         let locator = eocd.eocd_offset - 20;
         let zip64 = le64(&tampered, locator + 8).unwrap() as usize;
         tampered[zip64 + 48..zip64 + 56].copy_from_slice(&0u64.to_le_bytes());
-        assert!(zip_index(&tampered).is_err());
+        assert!(zip_index_v2_5(&tampered).is_err());
     }
 }
