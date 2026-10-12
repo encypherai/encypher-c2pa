@@ -4875,10 +4875,11 @@ fn verify_cawg_content_assertions(
     }
 }
 
-/// Assertion labels a cloud data assertion may not reference because they are
-/// hard bindings (C2PA 2.4 Validation, `c2pa.cloud-data` validation, step 2).
-/// `c2pa.action` is the spec's spelling: the very first, singular actions
-/// label, distinct from the deprecated `c2pa.actions` caught one step later.
+/// Assertion labels a cloud data assertion may not reference as hard bindings
+/// under the frozen C2PA 2.2/2.4 policies.
+///
+/// `c2pa.action` is the C2PA 2.4 specification's spelling for the first,
+/// singular actions assertion.
 const CLOUD_DATA_HARD_BINDING_LABELS: &[&str] = &[
     "c2pa.cloud-data",
     "c2pa.action",
@@ -4891,8 +4892,19 @@ const CLOUD_DATA_HARD_BINDING_LABELS: &[&str] = &[
     "c2pa.hash.multi-asset",
 ];
 
-/// Assertion labels a cloud data assertion may not reference at all
-/// (C2PA 2.4 Validation, `c2pa.cloud-data` validation, step 4).
+/// Exact C2PA 2.5 cloud-data hard-binding prohibition list.
+const CLOUD_DATA_HARD_BINDING_LABELS_V2_5: &[&str] = &[
+    "c2pa.hash.bmff.v2",
+    "c2pa.hash.bmff.v3",
+    "c2pa.hash.boxes",
+    "c2pa.hash.collection.data",
+    "c2pa.hash.data",
+    "c2pa.hash.multi-asset",
+    "c2pa.hash.segment",
+];
+
+/// Assertion labels a cloud data assertion may not reference at all under the
+/// frozen C2PA 2.2/2.4 policies.
 const CLOUD_DATA_FORBIDDEN_LABELS: &[&str] = &[
     "c2pa.actions",
     "c2pa.actions.v2",
@@ -4908,8 +4920,18 @@ const CLOUD_DATA_FORBIDDEN_LABELS: &[&str] = &[
     "c2pa.ingredient.v3",
 ];
 
-/// Assertion labels an external reference assertion may not reference
-/// (C2PA 2.4 Validation, `c2pa.external-reference` validation, step 4).
+/// Exact C2PA 2.5 cloud-data general prohibition list.
+const CLOUD_DATA_FORBIDDEN_LABELS_V2_5: &[&str] = &[
+    "c2pa.actions",
+    "c2pa.actions.v2",
+    "c2pa.cloud-data",
+    "c2pa.ingredient",
+    "c2pa.ingredient.v2",
+    "c2pa.ingredient.v3",
+];
+
+/// Assertion labels an external reference assertion may not reference under
+/// the frozen C2PA 2.2/2.4 policies.
 const EXTERNAL_REFERENCE_FORBIDDEN_LABELS: &[&str] = &[
     "c2pa.actions",
     "c2pa.actions.v2",
@@ -4920,6 +4942,24 @@ const EXTERNAL_REFERENCE_FORBIDDEN_LABELS: &[&str] = &[
     "c2pa.hash.collection.data",
     "c2pa.hash.data",
     "c2pa.hash.multi-asset",
+    "c2pa.ingredient",
+    "c2pa.ingredient.v2",
+    "c2pa.ingredient.v3",
+];
+
+/// Exact C2PA 2.5 external-reference prohibition list.
+const EXTERNAL_REFERENCE_FORBIDDEN_LABELS_V2_5: &[&str] = &[
+    "c2pa.actions",
+    "c2pa.actions.v2",
+    "c2pa.cloud-data",
+    "c2pa.external-reference",
+    "c2pa.hash.bmff.v2",
+    "c2pa.hash.bmff.v3",
+    "c2pa.hash.boxes",
+    "c2pa.hash.collection.data",
+    "c2pa.hash.data",
+    "c2pa.hash.multi-asset",
+    "c2pa.hash.segment",
     "c2pa.ingredient",
     "c2pa.ingredient.v2",
     "c2pa.ingredient.v3",
@@ -5039,7 +5079,12 @@ fn verify_cloud_data_assertion(
         return;
     };
     let referenced_kind = base_assertion_label(referenced);
-    if CLOUD_DATA_HARD_BINDING_LABELS.contains(&referenced_kind) {
+    let hard_binding_labels = if spec25::applies(profile) {
+        CLOUD_DATA_HARD_BINDING_LABELS_V2_5
+    } else {
+        CLOUD_DATA_HARD_BINDING_LABELS
+    };
+    if hard_binding_labels.contains(&referenced_kind) {
         results.push_failure(
             ASSERTION_CLOUD_DATA_HARD_BINDING,
             url.to_string(),
@@ -5057,7 +5102,12 @@ fn verify_cloud_data_assertion(
         );
         return;
     }
-    if CLOUD_DATA_FORBIDDEN_LABELS.contains(&referenced_kind) {
+    let forbidden_labels = if spec25::applies(profile) {
+        CLOUD_DATA_FORBIDDEN_LABELS_V2_5
+    } else {
+        CLOUD_DATA_FORBIDDEN_LABELS
+    };
+    if forbidden_labels.contains(&referenced_kind) {
         malformed(
             results,
             &format!("cloud data assertion may not reference {referenced}"),
@@ -5130,7 +5180,12 @@ fn verify_external_reference_assertion(
     }
     let referenced = assertion.get("label").and_then(Value::as_text);
     if let Some(referenced) = referenced {
-        if EXTERNAL_REFERENCE_FORBIDDEN_LABELS.contains(&base_assertion_label(referenced)) {
+        let forbidden_labels = if spec25::applies(profile) {
+            EXTERNAL_REFERENCE_FORBIDDEN_LABELS_V2_5
+        } else {
+            EXTERNAL_REFERENCE_FORBIDDEN_LABELS
+        };
+        if forbidden_labels.contains(&base_assertion_label(referenced)) {
             malformed(
                 results,
                 &format!("external reference may not reference {referenced}"),
@@ -9207,7 +9262,12 @@ fn verify_collection_hash(
             malformed(results, "uri entry missing uri or hash".into());
             return;
         };
-        let Some(member_name) = canonical_collection_uri_member(uri) else {
+        let member_name = if profile.version == SpecVersion::V2_5 {
+            canonical_collection_uri_member_for_policy(uri, true)
+        } else {
+            canonical_collection_uri_member(uri)
+        };
+        let Some(member_name) = member_name else {
             results.push_failure(
                 ASSERTION_COLLECTION_HASH_INVALID_URI,
                 url,
@@ -9217,6 +9277,11 @@ fn verify_collection_hash(
         };
         if !declared.insert(uri.to_string()) {
             malformed(results, format!("duplicate collection URI '{uri}'"));
+            return;
+        }
+        if profile.version == SpecVersion::V2_5 && member_name == "META-INF/content_credential.c2pa"
+        {
+            malformed(results, "collection includes its own manifest store".into());
             return;
         }
         let Some(member) = index.get(member_name.as_bytes()) else {
@@ -9230,7 +9295,7 @@ fn verify_collection_hash(
         let (start, end) = member.hash_span();
         let exact_match =
             hash_bytes(alg, &data[start..end]).is_some_and(|hash| hash.as_slice() == expected);
-        let public_vector_match = !exact_match && {
+        let public_vector_match = profile.version != SpecVersion::V2_5 && !exact_match && {
             let (local_start, local_end) = member.local_span();
             hash_bytes(alg, &data[local_start..local_end])
                 .is_some_and(|hash| hash.as_slice() == expected)
@@ -9240,6 +9305,21 @@ fn verify_collection_hash(
                 ASSERTION_COLLECTION_HASH_MISMATCH,
                 url,
                 format!("collection entry '{member_name}' hash mismatch"),
+            );
+            return;
+        }
+    }
+    if profile.version == SpecVersion::V2_5 {
+        let expected_count = index
+            .members()
+            .iter()
+            .filter(|member| member.raw_name() != b"META-INF/content_credential.c2pa")
+            .count();
+        if declared.len() != expected_count {
+            results.push_failure(
+                ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT,
+                url,
+                "collection must include every non-manifest ZIP entry".into(),
             );
             return;
         }
@@ -9370,6 +9450,10 @@ fn canonical_collection_member_uri(member: &str) -> Option<String> {
 }
 
 fn canonical_collection_uri_member(uri: &str) -> Option<String> {
+    canonical_collection_uri_member_for_policy(uri, false)
+}
+
+fn canonical_collection_uri_member_for_policy(uri: &str, allow_directory: bool) -> Option<String> {
     let bytes = uri.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
@@ -9396,7 +9480,15 @@ fn canonical_collection_uri_member(uri: &str) -> Option<String> {
         }
     }
     let member = String::from_utf8(decoded).ok()?;
-    (canonical_collection_member_uri(&member).as_deref() == Some(uri)).then_some(member)
+    let canonical = if allow_directory && member.ends_with('/') {
+        canonical_collection_member_uri(member.strip_suffix('/')?).map(|mut name| {
+            name.push('/');
+            name
+        })
+    } else {
+        canonical_collection_member_uri(&member)
+    };
+    (canonical.as_deref() == Some(uri)).then_some(member)
 }
 
 /// Maximum number of `c2pa.hash.data` exclusion ranges the verifier accepts.
@@ -15800,6 +15892,18 @@ mod tests {
 
         assert!(results.has_success(ASSERTION_COLLECTION_HASH_MATCH));
         assert!(!results.has_failure(ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT));
+        let mut exact = ValidationResults::default();
+        verify_collection_hash(
+            &enc(&assertion),
+            &vmap(Vec::new()),
+            (&archive, AssetFormat::Zip),
+            "urn:test",
+            EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular),
+            false,
+            &mut exact,
+        );
+        assert!(exact.has_failure(ASSERTION_COLLECTION_HASH_INCORRECT_FILE_COUNT));
+        assert!(!exact.has_success(ASSERTION_COLLECTION_HASH_MATCH));
     }
 
     #[test]
@@ -15848,6 +15952,56 @@ mod tests {
         );
         assert!(v2_5.has_success(ASSERTION_COLLECTION_HASH_MATCH));
         assert!(!v2_5.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
+    }
+
+    #[test]
+    fn zip_v2_5_binds_directory_local_records() {
+        let archive = stored_zip(&[("dir/", b""), ("dir/file.txt", b"content")]);
+        let index = crate::c2pa_formats::zip_index_v2_5(&archive).unwrap();
+        let resources = index
+            .members()
+            .iter()
+            .map(|member| {
+                let (start, end) = member.hash_span();
+                vmap(vec![
+                    (
+                        "uri",
+                        Value::Text(std::str::from_utf8(member.raw_name()).unwrap().into()),
+                    ),
+                    ("hash", Value::Bytes(sha(&archive[start..end]))),
+                ])
+            })
+            .collect();
+        let assertion = enc(&vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            ("uris", Value::Array(resources)),
+            (
+                "zip_central_directory_hash",
+                Value::Bytes(hash_parts("sha256", index.central_directory_hash_parts()).unwrap()),
+            ),
+        ]));
+        let directory_start = index.get(b"dir/").unwrap().hash_span().0;
+        let verify_binding = |bytes: &[u8], version| {
+            let mut results = ValidationResults::default();
+            verify_collection_hash(
+                &assertion,
+                &vmap(Vec::new()),
+                (bytes, AssetFormat::Zip),
+                "urn:test",
+                EngineProfile::new(version, OperatingMode::Regular),
+                false,
+                &mut results,
+            );
+            results
+        };
+        assert!(verify_binding(&archive, SpecVersion::V2_5)
+            .has_success(ASSERTION_COLLECTION_HASH_MATCH));
+        assert!(verify_binding(&archive, SpecVersion::V2_4)
+            .has_failure(ASSERTION_COLLECTION_HASH_INVALID_URI));
+        let mut changed = archive;
+        changed[directory_start + 10] ^= 1;
+        assert!(verify_binding(&changed, SpecVersion::V2_5)
+            .has_failure(ASSERTION_COLLECTION_HASH_MISMATCH));
     }
 
     fn remote_only_font(uri: &str) -> Vec<u8> {
@@ -18611,6 +18765,124 @@ mod tests {
             results.has_failure(ASSERTION_CLOUD_DATA_MALFORMED),
             "{results:?}"
         );
+    }
+
+    #[test]
+    fn exact_2_5_remote_reference_prohibitions_preserve_older_policy_results() {
+        let external_reference = |referenced: &str| {
+            vmap(vec![
+                ("label", Value::Text(referenced.into())),
+                (
+                    "location",
+                    vmap(vec![("url", Value::Text("https://store.test/b".into()))]),
+                ),
+            ])
+        };
+        let cases = [
+            (
+                "c2pa.cloud-data",
+                cloud_data("c2pa.hash.segment"),
+                ASSERTION_CLOUD_DATA_HARD_BINDING,
+            ),
+            (
+                "c2pa.external-reference",
+                external_reference("c2pa.hash.segment"),
+                ASSERTION_EXTERNAL_REFERENCE_MALFORMED,
+            ),
+            (
+                "c2pa.external-reference",
+                external_reference("c2pa.cloud-data"),
+                ASSERTION_EXTERNAL_REFERENCE_MALFORMED,
+            ),
+        ];
+
+        for (assertion_label, assertion, failure_code) in &cases {
+            let proposed = run_external_data(
+                assertion_label,
+                assertion,
+                "gathered_assertions",
+                ClaimGeneration::V2,
+                ManifestKind::Standard,
+                v2_5(),
+            );
+            assert!(
+                proposed.has_failure(failure_code),
+                "{assertion_label} {failure_code}: {proposed:?}"
+            );
+            assert_eq!(
+                compute_state(&proposed, v2_5()),
+                ValidationState::Invalid,
+                "{assertion_label} {failure_code}"
+            );
+
+            for legacy_profile in [
+                EngineProfile::CONFORMANCE_V2_2,
+                EngineProfile::GENEROUS,
+                EngineProfile::strict(SpecVersion::V2_4),
+            ] {
+                let legacy = run_external_data(
+                    assertion_label,
+                    assertion,
+                    "gathered_assertions",
+                    ClaimGeneration::V2,
+                    ManifestKind::Standard,
+                    legacy_profile,
+                );
+                assert!(
+                    !legacy.has_failure(failure_code),
+                    "{assertion_label} changed {legacy_profile:?}: {legacy:?}"
+                );
+                assert!(
+                    legacy.has_failure(ASSERTION_INACCESSIBLE),
+                    "{assertion_label} lost its prior inaccessible status: {legacy:?}"
+                );
+                assert_eq!(
+                    compute_state(&legacy, legacy_profile),
+                    ValidationState::Valid,
+                    "{assertion_label} changed {legacy_profile:?}"
+                );
+            }
+        }
+
+        // In 2.5, a cloud-data assertion that references another cloud-data
+        // assertion is on the general malformed list, not the hard-binding
+        // list. The older policies retain their prior hardBinding status.
+        let nested_cloud = cloud_data("c2pa.cloud-data");
+        let proposed = run_external_data(
+            "c2pa.cloud-data",
+            &nested_cloud,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            v2_5(),
+        );
+        assert!(proposed.has_failure(ASSERTION_CLOUD_DATA_MALFORMED));
+        assert!(!proposed.has_failure(ASSERTION_CLOUD_DATA_HARD_BINDING));
+
+        let legacy = run_external_data(
+            "c2pa.cloud-data",
+            &nested_cloud,
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            EngineProfile::GENEROUS,
+        );
+        assert!(legacy.has_failure(ASSERTION_CLOUD_DATA_HARD_BINDING));
+        assert!(!legacy.has_failure(ASSERTION_CLOUD_DATA_MALFORMED));
+
+        // A valid ordinary external assertion remains advisory under 2.5.
+        let ordinary = run_external_data(
+            "c2pa.cloud-data",
+            &cloud_data("c2pa.metadata"),
+            "gathered_assertions",
+            ClaimGeneration::V2,
+            ManifestKind::Standard,
+            v2_5(),
+        );
+        assert!(ordinary.has_failure(ASSERTION_INACCESSIBLE));
+        assert!(!ordinary.has_failure(ASSERTION_CLOUD_DATA_HARD_BINDING));
+        assert!(!ordinary.has_failure(ASSERTION_CLOUD_DATA_MALFORMED));
+        assert_eq!(compute_state(&ordinary, v2_5()), ValidationState::Valid);
     }
 
     /// A well-formed cloud data assertion is reported as unread, not rejected:

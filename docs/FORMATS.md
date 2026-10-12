@@ -61,6 +61,24 @@ Generic XML-comment embedding is unsupported under 2.5 for every XML-derived typ
 
 E-RTMP uses `verify_ertmp` or `verify_ertmp_with_options` with caller-supplied audio/video track events, including codec configuration, frames and named metadata. It validates segment signatures, continuity and manifest refreshes without treating the transport as a file MIME. The API does not invent the audio metadata packet assignment missing from the referenced transport specification.
 
+Rust callers can decode complete FLV files with `ertmp_input_from_flv` or
+post-handshake publisher-to-server RTMP chunk traces with
+`ertmp_input_from_rtmp_connections`, then pass the result's `.input` to the verifier.
+Each RTMP connection supplies its own capability context and initial chunk size.
+Those values are caller assertions, not authenticated negotiation evidence.
+The adapters bound total wire bytes, in-flight message bytes, active chunk
+streams, event count and owned event payloads. They preserve globally unique
+`(mediaType, trackId)` pairs across message streams and reject conflicting use.
+No transport encoder or manifest writer is part of the public API.
+The result's index-aligned `.event_contexts` retains source message-stream IDs,
+codec FourCCs and multitrack framing. FLV has no RTMP message-stream identity,
+so its contexts report no such ID. Reconnect events have no media context.
+The pinned transport specification has no audio Metadata packet assignment.
+Consequently, these wire adapters cannot supply closing SegmentInfo for audio
+tracks; audio wire frames cannot establish a complete valid stream. The
+normalized event API can verify caller-supplied audio metadata independently
+of an unresolved wire packet assignment.
+
 WARC uses `c2pa.hash.collection.data` for both embedded and separately supplied stores. Detached verification permits zero in-band C2PA records; it does not substitute a whole-file data hash. Both paths enforce record-ID bijection and bounded decompression, and hash the complete uncompressed records. Recompressing unchanged records preserves the binding.
 
 Exact 2.5 also reads these existing standard-carrier spellings, without expanding the frozen 2.2 or 2.4 MIME sets:

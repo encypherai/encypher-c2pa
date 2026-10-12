@@ -3,11 +3,11 @@
 
 //! Verification of C2PA live-media carriage over Enhanced RTMP.
 //!
-//! This module starts at the E-RTMP message boundary. The caller remains the
-//! RTMP parser and supplies events in wire order, including normalized
-//! timestamps for packets extracted from Aggregate Messages and only the
-//! selected track packet from a Multitrack message. No audio Metadata packet
-//! number is assumed here: the pinned E-RTMP dependency does not define one.
+//! Callers may supply normalized events directly or use the bounded FLV and RTMP
+//! wire adapters re-exported by this crate. Direct event callers remain
+//! responsible for normalized Aggregate timestamps and selecting individual
+//! Multitrack packets. No audio Metadata packet number is assumed here: the
+//! pinned E-RTMP revision does not define one.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -72,7 +72,8 @@ pub enum ErtmpEvent {
         track: ErtmpTrack,
         /// RTMP chunk stream carrying this track.
         chunk_stream_id: u32,
-        /// Codec configuration payload only, without E-RTMP packet framing.
+        /// Codec configuration payload only, without E-RTMP packet framing. A
+        /// present Opus SequenceStart may have a zero-byte payload.
         payload: Vec<u8>,
     },
     /// One coded-frame packet. Protocol, configuration, metadata and control bytes
@@ -255,8 +256,15 @@ struct Accepted {
 struct ManifestDelivery {
     store: Vec<u8>,
     keys: Vec<ValidatedSessionKey>,
+    delivered_config_revision: u64,
     bound_initialization_sha256: Option<[u8; 32]>,
     report: Option<VerificationReport>,
+}
+
+struct ActiveManifest {
+    manifest_id: String,
+    config_revision: u64,
+    delivered_since_reconnect: bool,
 }
 
 struct Verifier<'a> {
@@ -268,7 +276,7 @@ struct Verifier<'a> {
     manifests: HashMap<String, ManifestDelivery>,
     key_tracks: HashMap<Vec<u8>, ErtmpTrack>,
     next_config_revision: u64,
-    manifest_seen_since_reconnect: bool,
+    active_manifest: Option<ActiveManifest>,
     segment_reports: Vec<ErtmpSegmentReport>,
     failures: Vec<String>,
 }
@@ -288,7 +296,7 @@ impl<'a> Verifier<'a> {
             manifests: HashMap::new(),
             key_tracks: HashMap::new(),
             next_config_revision: 1,
-            manifest_seen_since_reconnect: false,
+            active_manifest: None,
             segment_reports: Vec::new(),
             failures: Vec::new(),
         }
@@ -305,14 +313,6 @@ impl<'a> Verifier<'a> {
                 chunk_stream_id,
                 payload,
             } => {
-                if payload.is_empty() {
-                    self.fail(format!(
-                        "{}:{} codec configuration is empty",
-                        track.media_type.token(),
-                        track.track_id
-                    ));
-                    return Ok(());
-                }
                 if !self.configs.contains_key(track) && self.configs.len() >= MAX_TRACKS {
                     return Err(Error::Verification(format!(
                         "E-RTMP track count exceeds {MAX_TRACKS}"
@@ -345,9 +345,12 @@ impl<'a> Verifier<'a> {
                     ));
                     return Ok(());
                 }
-                if !self.manifest_seen_since_reconnect {
+                let current_revision = self.next_config_revision.saturating_sub(1);
+                if !self.active_manifest.as_ref().is_some_and(|active| {
+                    active.config_revision == current_revision && active.delivered_since_reconnect
+                }) {
                     self.fail(
-                        "coded frame arrived after reconnect before the active manifest was resent",
+                        "coded frame arrived before a manifest was delivered for the active codec configuration",
                     );
                 }
                 let (config_chunk_stream_id, config_revision) = match self.configs.get(track) {
@@ -389,9 +392,14 @@ impl<'a> Verifier<'a> {
                 name,
                 value,
             } if name == "c2paManifest" => {
-                let (manifest_id, delivery) = manifest_delivery(value, self.profile)?;
-                self.manifests.insert(manifest_id, delivery);
-                self.manifest_seen_since_reconnect = true;
+                let revision = self.next_config_revision.saturating_sub(1);
+                let (manifest_id, delivery) = manifest_delivery(value, self.profile, revision)?;
+                self.manifests.insert(manifest_id.clone(), delivery);
+                self.active_manifest = Some(ActiveManifest {
+                    manifest_id,
+                    config_revision: revision,
+                    delivered_since_reconnect: true,
+                });
                 if let Some(config) = self.configs.get(track) {
                     if config.chunk_stream_id != *chunk_stream_id {
                         self.fail(format!(
@@ -441,7 +449,9 @@ impl<'a> Verifier<'a> {
             }
         }
         self.configs.clear();
-        self.manifest_seen_since_reconnect = false;
+        if let Some(active) = self.active_manifest.as_mut() {
+            active.delivered_since_reconnect = false;
+        }
     }
 
     fn segment_info(
@@ -553,11 +563,28 @@ impl<'a> Verifier<'a> {
             return Err("sequenceNumber does not increase by exactly one for this track".into());
         }
 
+        let active = self
+            .active_manifest
+            .as_ref()
+            .ok_or_else(|| "no active manifest has been delivered".to_string())?;
+        if info.manifest_id != active.manifest_id {
+            return Err("SegmentInfo manifestId does not match the active manifest".into());
+        }
+        if !active.delivered_since_reconnect {
+            return Err("active manifest was not resent after reconnect".into());
+        }
+        let required_manifest_revision = self.next_config_revision.saturating_sub(1);
+        if active.config_revision != required_manifest_revision {
+            return Err("active manifest was not delivered after the codec configuration".into());
+        }
         let initialization = initialization_data(&self.configs);
         let initialization_sha256: [u8; 32] = Sha256::digest(&initialization).into();
         let delivery = self.manifests.get_mut(&info.manifest_id).ok_or_else(|| {
             "manifestId has not been delivered in c2paManifest Metadata".to_string()
         })?;
+        if delivery.delivered_config_revision != required_manifest_revision {
+            return Err("manifestId was not delivered after the active codec configuration".into());
+        }
         match delivery.bound_initialization_sha256 {
             Some(bound) if bound != initialization_sha256 => {
                 return Err(
@@ -729,6 +756,19 @@ fn untrusted_segment_info(cose_sign1: &[u8]) -> Result<SegmentInfo, String> {
     else {
         return Err("rtmp-segment-info-map is not a map".into());
     };
+    if !has_exact_keys(
+        &map,
+        &[
+            "mediaType",
+            "trackId",
+            "sequenceNumber",
+            "segmentHash",
+            "manifestId",
+            "manifestUri",
+        ],
+    ) {
+        return Err("rtmp-segment-info-map contains an unknown or duplicate field".into());
+    }
     let media_type = match unique(&map, "mediaType").and_then(Value::as_text) {
         Some("video") => ErtmpMediaType::Video,
         Some("audio") => ErtmpMediaType::Audio,
@@ -744,21 +784,59 @@ fn untrusted_segment_info(cose_sign1: &[u8]) -> Result<SegmentInfo, String> {
     let hash_map = unique(&map, "segmentHash")
         .and_then(Value::as_map)
         .ok_or_else(|| "rtmp-segment-info-map segmentHash is invalid".to_string())?;
+    if !has_exact_keys(hash_map, &["alg", "hash"]) || hash_map.len() != 2 {
+        return Err("rtmp-segment-info-map segmentHash fields are invalid".into());
+    }
     let algorithm = unique(hash_map, "alg")
         .and_then(Value::as_text)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "rtmp segment hash algorithm is missing".to_string())?
+        .filter(|value| matches!(*value, "sha256" | "sha384" | "sha512"))
+        .ok_or_else(|| "rtmp segment hash algorithm is invalid".to_string())?
         .to_string();
     let hash = unique(hash_map, "hash")
         .and_then(Value::as_bytes)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "rtmp segment hash is missing".to_string())?
+        .filter(|value| {
+            value.len()
+                == match algorithm.as_str() {
+                    "sha256" => 32,
+                    "sha384" => 48,
+                    "sha512" => 64,
+                    _ => unreachable!("algorithm was validated above"),
+                }
+        })
+        .ok_or_else(|| "rtmp segment hash length is invalid".to_string())?
         .to_vec();
     let manifest_id = unique(&map, "manifestId")
         .and_then(Value::as_text)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "rtmp-segment-info-map manifestId is invalid".to_string())?
         .to_string();
+    if let Some(manifest_uri) = unique(&map, "manifestUri") {
+        let uri_map = manifest_uri
+            .as_map()
+            .ok_or_else(|| "rtmp-segment-info-map manifestUri is invalid".to_string())?;
+        let uri_algorithm = unique(uri_map, "alg")
+            .and_then(Value::as_text)
+            .filter(|value| matches!(*value, "sha256" | "sha384" | "sha512"));
+        let uri_hash = unique(uri_map, "hash").and_then(Value::as_bytes);
+        if !has_exact_keys(uri_map, &["url", "alg", "hash"])
+            || uri_map.len() != 3
+            || unique(uri_map, "url")
+                .and_then(Value::as_text)
+                .is_none_or(str::is_empty)
+            || uri_algorithm.is_none()
+            || uri_hash.is_none_or(|value| {
+                value.len()
+                    != match uri_algorithm {
+                        Some("sha256") => 32,
+                        Some("sha384") => 48,
+                        Some("sha512") => 64,
+                        _ => 0,
+                    }
+            })
+        {
+            return Err("rtmp-segment-info-map manifestUri is invalid".into());
+        }
+    }
     Ok(SegmentInfo {
         track: ErtmpTrack {
             media_type,
@@ -775,6 +853,7 @@ fn untrusted_segment_info(cose_sign1: &[u8]) -> Result<SegmentInfo, String> {
 fn manifest_delivery(
     manifest_store: &[u8],
     profile: EngineProfile,
+    delivered_config_revision: u64,
 ) -> Result<(String, ManifestDelivery), Error> {
     let expanded = crate::c2pa_core::jumbf::expand_store(manifest_store)
         .map_err(|error| Error::Verification(error.to_string()))?;
@@ -830,6 +909,7 @@ fn manifest_delivery(
         ManifestDelivery {
             store: manifest_store.to_vec(),
             keys,
+            delivered_config_revision,
             bound_initialization_sha256: None,
             report: None,
         },
@@ -917,12 +997,24 @@ fn segment_digest(algorithm: &str, frames: &[Frame<'_>]) -> Option<Vec<u8>> {
             Some(hasher.finalize().to_vec())
         }};
     }
-    match algorithm.to_ascii_lowercase().as_str() {
-        "sha256" | "sha-256" => digest!(Sha256),
-        "sha384" | "sha-384" => digest!(Sha384),
-        "sha512" | "sha-512" => digest!(Sha512),
+    match algorithm {
+        "sha256" => digest!(Sha256),
+        "sha384" => digest!(Sha384),
+        "sha512" => digest!(Sha512),
         _ => None,
     }
+}
+
+fn has_exact_keys(map: &[(Value, Value)], allowed: &[&str]) -> bool {
+    map.iter().enumerate().all(|(index, (key, _))| {
+        let Some(key) = key.as_text() else {
+            return false;
+        };
+        allowed.contains(&key)
+            && !map[..index]
+                .iter()
+                .any(|(prior, _)| prior.as_text() == Some(key))
+    })
 }
 
 fn unique<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
@@ -944,6 +1036,112 @@ fn unsigned(value: Option<&Value>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mark_active_manifest(verifier: &mut Verifier<'_>, revision: u64) {
+        verifier.active_manifest = Some(ActiveManifest {
+            manifest_id: "urn:c2pa:test".into(),
+            config_revision: revision,
+            delivered_since_reconnect: true,
+        });
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Text(value.into())
+    }
+
+    fn fake_segment_info(map: Value) -> Vec<u8> {
+        let payload = crate::c2pa_cbor::encode(
+            &map,
+            crate::c2pa_cbor::Profile::CanonicalForHashedSubstructures,
+        )
+        .unwrap();
+        crate::c2pa_cbor::encode(
+            &Value::Tag(
+                18,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(Vec::new()),
+                    Value::Map(Vec::new()),
+                    Value::Bytes(payload),
+                    Value::Bytes(Vec::new()),
+                ])),
+            ),
+            crate::c2pa_cbor::Profile::CanonicalForHashedSubstructures,
+        )
+        .unwrap()
+    }
+
+    fn signed_segment_info(map: Value) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+
+        let profile = crate::c2pa_cbor::Profile::CanonicalForHashedSubstructures;
+        let key = SigningKey::from_slice(&[0x5e; 32]).unwrap();
+        let point = key.verifying_key().to_encoded_point(false);
+        let key_id = b"stale-key".to_vec();
+        let cose_key = crate::c2pa_cbor::encode(
+            &Value::Map(vec![
+                (Value::Integer(1), Value::Integer(2)),
+                (Value::Integer(2), Value::Bytes(key_id.clone())),
+                (Value::Integer(3), Value::Integer(-9)),
+                (Value::Integer(-1), Value::Integer(1)),
+                (
+                    Value::Integer(-2),
+                    Value::Bytes(point.x().unwrap().to_vec()),
+                ),
+                (
+                    Value::Integer(-3),
+                    Value::Bytes(point.y().unwrap().to_vec()),
+                ),
+            ]),
+            profile,
+        )
+        .unwrap();
+        let protected = crate::c2pa_cbor::encode(
+            &Value::Map(vec![(Value::Integer(1), Value::Integer(-9))]),
+            profile,
+        )
+        .unwrap();
+        let payload = crate::c2pa_cbor::encode(&map, profile).unwrap();
+        let to_sign = crate::c2pa_cbor::encode(
+            &Value::Array(vec![
+                text("Signature1"),
+                Value::Bytes(protected.clone()),
+                Value::Bytes(Vec::new()),
+                Value::Bytes(payload.clone()),
+            ]),
+            profile,
+        )
+        .unwrap();
+        let signature: Signature = key.sign(&to_sign);
+        let cose_sign1 = crate::c2pa_cbor::encode(
+            &Value::Tag(
+                18,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(vec![(Value::Integer(4), Value::Bytes(key_id.clone()))]),
+                    Value::Bytes(payload),
+                    Value::Bytes(signature.to_bytes().to_vec()),
+                ])),
+            ),
+            profile,
+        )
+        .unwrap();
+        (cose_sign1, cose_key, key_id)
+    }
+
+    fn segment_info_map(manifest_id: &str, hash: Vec<u8>) -> Vec<(Value, Value)> {
+        vec![
+            (text("mediaType"), text("video")),
+            (text("sequenceNumber"), Value::Integer(0)),
+            (
+                text("segmentHash"),
+                Value::Map(vec![
+                    (text("alg"), text("sha256")),
+                    (text("hash"), Value::Bytes(hash)),
+                ]),
+            ),
+            (text("manifestId"), text(manifest_id)),
+        ]
+    }
 
     #[test]
     fn initialization_data_is_video_then_audio_in_ascending_track_order() {
@@ -992,6 +1190,253 @@ mod tests {
     }
 
     #[test]
+    fn present_empty_opus_configuration_remains_distinct_from_absent_configuration() {
+        let options = VerifyOptions {
+            spec_version: Some("2.5".into()),
+            ..VerifyOptions::default()
+        };
+        let profile =
+            resolve_profile(options.spec_version.as_deref(), options.strict_conformance).unwrap();
+        let validation_time = parse_validation_time(None).unwrap();
+        let event = ErtmpEvent::CodecConfig {
+            track: ErtmpTrack {
+                media_type: ErtmpMediaType::Audio,
+                track_id: 0,
+            },
+            chunk_stream_id: 4,
+            payload: Vec::new(),
+        };
+        let mut verifier = Verifier::new(profile, &options, validation_time);
+        verifier.event(&event).unwrap();
+        let config = verifier.configs.get(&ErtmpTrack {
+            media_type: ErtmpMediaType::Audio,
+            track_id: 0,
+        });
+        assert!(config.is_some_and(|config| config.payload.is_empty()));
+    }
+
+    #[test]
+    fn frames_require_manifest_delivery_after_the_active_configuration() {
+        let options = VerifyOptions {
+            spec_version: Some("2.5".into()),
+            ..VerifyOptions::default()
+        };
+        let profile =
+            resolve_profile(options.spec_version.as_deref(), options.strict_conformance).unwrap();
+        let validation_time = parse_validation_time(None).unwrap();
+        let track = ErtmpTrack {
+            media_type: ErtmpMediaType::Video,
+            track_id: 0,
+        };
+        let config = ErtmpEvent::CodecConfig {
+            track,
+            chunk_stream_id: 4,
+            payload: b"config".to_vec(),
+        };
+        let frame = ErtmpEvent::Frame {
+            track,
+            chunk_stream_id: 4,
+            timestamp: 1,
+            composition_time_offset: 0,
+            coded_data: b"frame".to_vec(),
+        };
+
+        let mut valid = Verifier::new(profile, &options, validation_time);
+        valid.event(&config).unwrap();
+        let revision = valid.next_config_revision.saturating_sub(1);
+        mark_active_manifest(&mut valid, revision);
+        valid.event(&frame).unwrap();
+        assert!(valid.failures.is_empty());
+
+        let mut reordered = Verifier::new(profile, &options, validation_time);
+        mark_active_manifest(&mut reordered, 0);
+        reordered.event(&config).unwrap();
+        reordered.event(&frame).unwrap();
+        assert!(reordered.failures.iter().any(|failure| failure
+            == "coded frame arrived before a manifest was delivered for the active codec configuration"));
+    }
+
+    #[test]
+    fn reconnect_requires_config_then_manifest_before_frames_resume() {
+        let options = VerifyOptions {
+            spec_version: Some("2.5".into()),
+            ..VerifyOptions::default()
+        };
+        let profile =
+            resolve_profile(options.spec_version.as_deref(), options.strict_conformance).unwrap();
+        let validation_time = parse_validation_time(None).unwrap();
+        let track = ErtmpTrack {
+            media_type: ErtmpMediaType::Video,
+            track_id: 0,
+        };
+        let config = ErtmpEvent::CodecConfig {
+            track,
+            chunk_stream_id: 4,
+            payload: b"config".to_vec(),
+        };
+        let frame = ErtmpEvent::Frame {
+            track,
+            chunk_stream_id: 4,
+            timestamp: 1,
+            composition_time_offset: 0,
+            coded_data: b"frame".to_vec(),
+        };
+        let reconnect = ErtmpEvent::Reconnect;
+
+        let mut valid = Verifier::new(profile, &options, validation_time);
+        valid.event(&config).unwrap();
+        let revision = valid.next_config_revision.saturating_sub(1);
+        mark_active_manifest(&mut valid, revision);
+        valid.event(&reconnect).unwrap();
+        valid.event(&config).unwrap();
+        let revision = valid.next_config_revision.saturating_sub(1);
+        mark_active_manifest(&mut valid, revision);
+        valid.event(&frame).unwrap();
+        assert!(valid.failures.is_empty());
+
+        let mut reordered = Verifier::new(profile, &options, validation_time);
+        reordered.event(&config).unwrap();
+        let revision = reordered.next_config_revision.saturating_sub(1);
+        mark_active_manifest(&mut reordered, revision);
+        reordered.event(&reconnect).unwrap();
+        let revision = reordered.next_config_revision.saturating_sub(1);
+        mark_active_manifest(&mut reordered, revision);
+        reordered.event(&config).unwrap();
+        reordered.event(&frame).unwrap();
+        assert!(reordered.failures.iter().any(|failure| failure
+            == "coded frame arrived before a manifest was delivered for the active codec configuration"));
+    }
+
+    #[test]
+    fn segment_info_schema_rejects_unknown_fields_aliases_and_wrong_digest_lengths() {
+        let valid = segment_info_map("urn:c2pa:a", vec![0; 32]);
+        assert!(untrusted_segment_info(&fake_segment_info(Value::Map(valid.clone()))).is_ok());
+
+        let mut unknown = valid.clone();
+        unknown.push((text("extra"), Value::Integer(1)));
+        assert!(
+            untrusted_segment_info(&fake_segment_info(Value::Map(unknown)))
+                .err()
+                .expect("unknown field must fail")
+                .contains("unknown or duplicate")
+        );
+
+        let mut nested_unknown = valid.clone();
+        let Value::Map(hash) = &mut nested_unknown[2].1 else {
+            unreachable!("fixture segmentHash is a map");
+        };
+        hash.push((text("extra"), Value::Integer(1)));
+        assert!(
+            untrusted_segment_info(&fake_segment_info(Value::Map(nested_unknown)))
+                .err()
+                .expect("unknown hash field must fail")
+                .contains("segmentHash fields")
+        );
+
+        let mut alias = valid.clone();
+        let Value::Map(hash) = &mut alias[2].1 else {
+            unreachable!("fixture segmentHash is a map");
+        };
+        hash[0].1 = text("sha-256");
+        assert!(
+            untrusted_segment_info(&fake_segment_info(Value::Map(alias)))
+                .err()
+                .expect("unregistered algorithm must fail")
+                .contains("algorithm is invalid")
+        );
+
+        let wrong_length = segment_info_map("urn:c2pa:a", vec![0; 31]);
+        assert!(
+            untrusted_segment_info(&fake_segment_info(Value::Map(wrong_length)))
+                .err()
+                .expect("wrong digest length must fail")
+                .contains("hash length")
+        );
+    }
+
+    #[test]
+    fn signed_historical_manifest_key_cannot_authorize_a_new_segment() {
+        let options = VerifyOptions {
+            spec_version: Some("2.5".into()),
+            ..VerifyOptions::default()
+        };
+        let profile =
+            resolve_profile(options.spec_version.as_deref(), options.strict_conformance).unwrap();
+        let validation_time = parse_validation_time(None).unwrap();
+        let track = ErtmpTrack {
+            media_type: ErtmpMediaType::Video,
+            track_id: 0,
+        };
+        let frames = vec![Frame {
+            chunk_stream_id: 4,
+            timestamp: 1,
+            composition_time_offset: 0,
+            coded_data: b"frame",
+            config_revision: 1,
+        }];
+        let hash = segment_digest("sha256", &frames).unwrap();
+        let (cose_sign1, cose_key, key_id) =
+            signed_segment_info(Value::Map(segment_info_map("manifest-a", hash)));
+
+        let mut verifier = Verifier::new(profile, &options, validation_time);
+        verifier.configs.insert(
+            track,
+            Config {
+                chunk_stream_id: 4,
+                payload: b"config",
+                revision: 1,
+            },
+        );
+        verifier.next_config_revision = 2;
+        verifier.tracks.insert(
+            track,
+            TrackState {
+                frames,
+                ..Default::default()
+            },
+        );
+        verifier.manifests.insert(
+            "manifest-a".into(),
+            ManifestDelivery {
+                store: Vec::new(),
+                keys: vec![ValidatedSessionKey {
+                    cose_key,
+                    key_id: key_id.clone(),
+                    minimum_sequence_number: 0,
+                    created_at: validation_time - time::Duration::days(1),
+                    expires_at: validation_time + time::Duration::days(1),
+                }],
+                delivered_config_revision: 1,
+                bound_initialization_sha256: Some(Sha256::digest(b"config").into()),
+                report: None,
+            },
+        );
+        verifier.active_manifest = Some(ActiveManifest {
+            manifest_id: "manifest-a".into(),
+            config_revision: 1,
+            delivered_since_reconnect: true,
+        });
+        let accepted = verifier
+            .authenticate_candidate(track, 4, 1, &cose_sign1)
+            .unwrap();
+        assert_eq!(accepted.key_id, key_id);
+
+        verifier.active_manifest = Some(ActiveManifest {
+            manifest_id: "manifest-b".into(),
+            config_revision: 1,
+            delivered_since_reconnect: true,
+        });
+
+        assert_eq!(
+            verifier
+                .authenticate_candidate(track, 4, 1, &cose_sign1)
+                .err()
+                .expect("historical manifest must fail"),
+            "SegmentInfo manifestId does not match the active manifest"
+        );
+    }
+
+    #[test]
     fn segment_hash_covers_timestamp_signed_cto_and_coded_bytes() {
         let frame = Frame {
             chunk_stream_id: 6,
@@ -1003,7 +1448,11 @@ mod tests {
         let expected =
             Sha256::digest([&[0x01, 0x02, 0x03, 0x04, 0xff, 0xff, 0xfe][..], b"frame"].concat())
                 .to_vec();
-        assert_eq!(segment_digest("sha256", &[frame]), Some(expected));
+        assert_eq!(
+            segment_digest("sha256", std::slice::from_ref(&frame)),
+            Some(expected)
+        );
+        assert!(segment_digest("sha-256", std::slice::from_ref(&frame)).is_none());
     }
 
     #[test]

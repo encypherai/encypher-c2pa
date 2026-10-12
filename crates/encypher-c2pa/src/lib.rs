@@ -83,9 +83,9 @@ pub use ertmp::{
     ErtmpMediaType, ErtmpSegmentReport, ErtmpTrack, ErtmpVerificationReport,
 };
 pub use ertmp_wire::{
-    encode_flv_tag, encode_rtmp_message, encode_video_metadata_payload, ertmp_input_from_flv,
-    ertmp_input_from_rtmp_connections, ErtmpConnectionContext, ErtmpWireError, ErtmpWireLimits,
-    FlvWireOptions, RtmpWireOptions,
+    ertmp_input_from_flv, ertmp_input_from_rtmp_connections, ErtmpConnectionContext,
+    ErtmpWireError, ErtmpWireEventContext, ErtmpWireInput, ErtmpWireLimits, FlvWireOptions,
+    RtmpWireConnection,
 };
 mod soft_binding;
 pub use soft_binding::{
