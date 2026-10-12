@@ -117,6 +117,9 @@ def verify(
     telemetry: Optional[bool] = None,
     telemetry_endpoint: Optional[str] = None,
     online: Optional[bool] = None,
+    external_data: Optional[Mapping[str, str]] = None,
+    external_data_media_types: Optional[Mapping[str, str]] = None,
+    external_data_unreachable: Optional[Sequence[str]] = None,
     online_allow_private_networks: bool = False,
 ) -> Mapping[str, Any]:
     """Verify one asset locally and return a JSON-compatible report.
@@ -157,6 +160,14 @@ def verify(
     outside it: a ``.c2pa`` sidecar, or a store fetched from the URI the asset
     declares in its XMP ``dcterms:provenance`` key. Pass bytes or a path. This
     SDK never fetches it for you. It cannot be combined with ``fragments``.
+    ``external_data`` supplies content the manifest names by URI. Its values
+    are standard base64 strings, not raw bytes. ``external_data_media_types``
+    records the observed media type for each supplied URI.
+    ``external_data_unreachable`` records URIs whose retrieval was attempted
+    but produced no usable body; omitting a URI means retrieval was not
+    attempted. These inputs are evidence only. They do not enable ``online``
+    and this SDK does not fetch an omitted resource unless online verification
+    is separately enabled.
     Telemetry sends bounded failure codes, never asset bytes, manifests, paths,
     keys, trust material, or account identifiers.
     ``online`` allows this call to fetch what the asset references: a manifest
@@ -206,6 +217,15 @@ def verify(
         "strict_conformance": bool(strict_conformance),
         "spec_version": spec_version,
         "validation_time": validation_time,
+        "external_data": dict(external_data)
+        if external_data is not None
+        else None,
+        "external_data_media_types": dict(external_data_media_types)
+        if external_data_media_types is not None
+        else None,
+        "external_data_unreachable": list(external_data_unreachable)
+        if external_data_unreachable is not None
+        else None,
         "online": online,
         "online_allow_private_networks": bool(online_allow_private_networks),
         "telemetry": {
@@ -470,6 +490,9 @@ def verify_stream(
     telemetry: Optional[bool] = None,
     telemetry_endpoint: Optional[str] = None,
     online: Optional[bool] = None,
+    external_data: Optional[Mapping[str, str]] = None,
+    external_data_media_types: Optional[Mapping[str, str]] = None,
+    external_data_unreachable: Optional[Sequence[str]] = None,
     online_allow_private_networks: bool = False,
 ) -> Mapping[str, Any]:
     """Verify a fragmented fMP4/CMAF stream and return a JSON-compatible report.
@@ -490,8 +513,9 @@ def verify_stream(
 
     The returned report carries a top-level ``integrity``, the init manifest's
     report under ``stream``, per-segment reports under ``segments``, and the
-    recomputed ``chain_valid`` for per-segment streams. Trust and telemetry
-    options behave exactly as in :func:`verify`, and so does ``spec_version``.
+    recomputed ``chain_valid`` for per-segment streams. Trust, telemetry,
+    caller-supplied external resource evidence, and ``spec_version`` behave
+    exactly as in :func:`verify`.
     """
     options = {
         "trust_pem": trust_pem,
@@ -527,6 +551,15 @@ def verify_stream(
         "spec_version": spec_version,
         "validation_time": validation_time,
         "online": online,
+        "external_data": dict(external_data)
+        if external_data is not None
+        else None,
+        "external_data_media_types": dict(external_data_media_types)
+        if external_data_media_types is not None
+        else None,
+        "external_data_unreachable": list(external_data_unreachable)
+        if external_data_unreachable is not None
+        else None,
         "online_allow_private_networks": bool(online_allow_private_networks),
         "telemetry": {
             "enabled": telemetry,
