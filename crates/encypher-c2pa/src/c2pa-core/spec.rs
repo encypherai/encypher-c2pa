@@ -663,13 +663,33 @@ pub fn mimes_for_version(version: SpecVersion) -> Vec<&'static str> {
 /// certified or signable scope: no 2.5 conformance program exists, and
 /// [`mimes_for_version`] stays empty for 2.5.
 ///
-/// Registered types come from the 2.5 embedding index. `audio/midi`,
-/// `application/onnx`, `application/safetensors` and `application/jsonl` are
-/// non-normative spellings for formats the index lists without a registered
-/// type ("—"); [`canonicalize_mime`] folds common informal spellings into
-/// them. The textual `application/*` types are formats with a comment syntax
-/// that the structured-text applicability clause covers by example.
+/// The first groups are standard carrier names already present in generator
+/// product matrices: ZIP package types and the Conformance Program's generic
+/// container declarations. They remain 2.5-only in this public verifier so
+/// adding verification coverage cannot change the frozen 2.2 or 2.4 public
+/// surfaces. The remaining registered types come from the 2.5 embedding index.
+/// `audio/midi`, `application/onnx`, `application/safetensors` and
+/// `application/jsonl` are non-normative spellings for formats the index lists
+/// without a registered type ("-"); [`canonicalize_mime`] folds common
+/// informal spellings into them. The textual `application/*` types are formats
+/// with a comment syntax that the structured-text applicability clause covers
+/// by example.
 pub const V2_5_READER_MIMES: &[&str] = &[
+    // Standard ZIP package types present in generator product matrices.
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.apple.numbers",
+    "application/x-krita",
+    "image/openraster",
+    "application/vnd.adobe.indesign-idml-package",
+    "application/vnd.google-earth.kmz",
+    "model/3mf",
+    // Standard generic-container declarations.
+    "image/x-tiff-based",
+    "image/x-riff-based",
+    "video/x-riff-based",
+    "audio/x-riff-based",
+    "video/x-bmff-based",
     "application/warc",
     "application/ttml+xml",
     "application/vnd.apache.parquet",
@@ -688,14 +708,28 @@ pub const V2_5_READER_MIMES: &[&str] = &[
     "application/x-latex",
 ];
 
+/// True for a syntactically valid member of the OpenDocument media-type
+/// family. C2PA 2.5 assigns the family to the ZIP carrier rather than limiting
+/// it to the four concrete members in the frozen 2.4 registry.
+pub(crate) fn is_open_document_family(canon_mime: &str) -> bool {
+    canon_mime
+        .strip_prefix("application/vnd.oasis.opendocument.")
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&byte))
+        })
+}
+
 /// Whether a validation policy for `version` reads assets of `mime` (already
 /// canonicalized) with an embedded-manifest reader.
 ///
 /// The explicit 2.2 policy uses its registered format set. Other established
 /// policies through 2.4 retain the 2.4 reader set. Exactly 2.5 adds
-/// [`V2_5_READER_MIMES`], every other `text/*` type and every XML-derived
-/// `+xml` type. A future enum variant must register its own behavior rather
-/// than silently inheriting 2.5.
+/// [`V2_5_READER_MIMES`], the OpenDocument family, every other `text/*` type
+/// and every XML-derived `+xml` type. A future enum variant must register its
+/// own behavior rather than silently inheriting 2.5.
 pub fn reader_permits(canon_mime: &str, version: SpecVersion) -> bool {
     if version == SpecVersion::V2_2 {
         return mime_in_version(canon_mime, SpecVersion::V2_2);
@@ -705,6 +739,7 @@ pub fn reader_permits(canon_mime: &str, version: SpecVersion) -> bool {
     }
     version == SpecVersion::V2_5
         && (V2_5_READER_MIMES.contains(&canon_mime)
+            || is_open_document_family(canon_mime)
             || canon_mime.starts_with("text/")
             || canon_mime.ends_with("+xml"))
 }
@@ -856,6 +891,34 @@ mod tests {
         assert!(CONF_2_2.permits_mime("application/svg+xml"));
         assert!(!CONF_2_2.permits_mime("audio/x-flac"));
         assert!(conf_2_4().permits_mime("audio/x-flac"));
+    }
+
+    #[test]
+    fn additional_standard_containers_are_exactly_v2_5_reader_capabilities() {
+        for mime in V2_5_READER_MIMES {
+            assert!(reader_permits(mime, SpecVersion::V2_5), "{mime}");
+        }
+        for mime in [
+            "application/vnd.adobe.indesign-idml-package",
+            "application/vnd.apple.pages",
+            "image/openraster",
+            "image/x-tiff-based",
+            "video/x-bmff-based",
+        ] {
+            assert!(!reader_permits(mime, SpecVersion::V2_4), "{mime}");
+        }
+
+        let open_document = "application/vnd.oasis.opendocument.text-template";
+        assert!(is_open_document_family(open_document));
+        assert!(reader_permits(open_document, SpecVersion::V2_5));
+        assert!(!reader_permits(open_document, SpecVersion::V2_4));
+        for malformed in [
+            "application/vnd.oasis.opendocument.",
+            "application/vnd.oasis.opendocument.text/template",
+            "application/vnd.oasis.opendocument.text template",
+        ] {
+            assert!(!is_open_document_family(malformed), "{malformed}");
+        }
     }
 
     #[test]

@@ -1712,13 +1712,15 @@ pub fn supported_mime_types() -> Vec<&'static str> {
 
 /// Canonical MIME types the caller-selected policy reads with an embedded
 /// manifest carrier. `None` is exactly `"2.4"`. The finite 2.2 and 2.4 lists
-/// come from the shared format registry. `"2.5"` adds WARC, MIDI, TTML, ONNX,
-/// SafeTensors, Parquet, BlockFact, append-only JSON Lines, WebVTT and textual
-/// comment-syntax types. It also reads other `text/*` and `+xml` types by
-/// family, which no finite list can enumerate. Generic XML-comment embedding
-/// stays unreadable under 2.5 (upstream issue 2590), so XML types without a
-/// dedicated carrier are omitted. Any well-formed type can still be verified
-/// against a separately supplied store with [`verify_with_manifest_store`].
+/// come from the shared format registry. `"2.5"` adds the standard ZIP package
+/// and generic-container names used by generator products, plus WARC, MIDI,
+/// TTML, ONNX, SafeTensors, Parquet, BlockFact, append-only JSON Lines, WebVTT
+/// and textual comment-syntax types. It also reads the OpenDocument family,
+/// other `text/*` types and `+xml` types by family, which no finite list can
+/// enumerate. Generic XML-comment embedding stays unreadable under 2.5
+/// (upstream issue 2590), so XML types without a dedicated carrier are omitted.
+/// Any well-formed type can still be verified against a separately supplied
+/// store with [`verify_with_manifest_store`].
 pub fn supported_mime_types_for(spec_version: Option<&str>) -> Result<Vec<&'static str>, Error> {
     let profile = resolve_profile(spec_version, false)?;
     let registry_version = match profile.version {

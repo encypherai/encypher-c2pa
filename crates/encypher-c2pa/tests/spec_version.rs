@@ -11,6 +11,34 @@ use encypher_c2pa::{
     verify_with_options, Error, VerifyOptions, C2PA_PROFILE, C2PA_PROFILE_2_2, C2PA_PROFILE_2_5,
 };
 
+const ADDITIONAL_STANDARD_CONTAINER_MIMES: &[&str] = &[
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.apple.numbers",
+    "application/x-krita",
+    "image/openraster",
+    "application/vnd.adobe.indesign-idml-package",
+    "application/vnd.google-earth.kmz",
+    "model/3mf",
+    "image/x-tiff-based",
+    "image/x-riff-based",
+    "video/x-riff-based",
+    "audio/x-riff-based",
+    "video/x-bmff-based",
+];
+
+const ADDITIONAL_STANDARD_ZIP_MIMES: &[&str] = &[
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.apple.numbers",
+    "application/x-krita",
+    "image/openraster",
+    "application/vnd.adobe.indesign-idml-package",
+    "application/vnd.google-earth.kmz",
+    "model/3mf",
+    "application/vnd.oasis.opendocument.text-template",
+];
+
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -74,7 +102,28 @@ fn mime_capabilities_follow_the_selected_policy() {
     assert!(v24.contains(&"text/csv"));
     assert!(v25.contains(&"image/jpeg"));
     assert!(v25.contains(&"application/warc"));
+    for mime in ADDITIONAL_STANDARD_CONTAINER_MIMES {
+        assert!(!v24.contains(mime), "{mime} changed the frozen 2.4 list");
+        assert!(
+            v25.contains(mime),
+            "{mime} missing from the 2.5 reader list"
+        );
+    }
     assert!(supported_mime_types_for(Some("2.6")).is_err());
+}
+
+#[test]
+fn exact_2_5_reads_every_additional_standard_zip_mime_without_changing_2_4() {
+    let asset = fixture("signed_generic.zip");
+    for mime in ADDITIONAL_STANDARD_ZIP_MIMES {
+        let report = verify_with_options(&asset, mime, &options(Some("2.5")))
+            .unwrap_or_else(|error| panic!("{mime}: {error}"));
+        assert!(report.present, "{mime}: embedded manifest was not read");
+
+        let error = verify_with_options(&asset, mime, &options(Some("2.4")))
+            .expect_err("the frozen 2.4 public MIME surface must not expand");
+        assert_eq!(error.code(), "unsupported_mime", "{mime}");
+    }
 }
 
 #[test]

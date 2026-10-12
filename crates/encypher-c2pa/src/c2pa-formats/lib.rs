@@ -221,7 +221,7 @@ impl AssetFormat {
             // verification. They are deliberately absent from FORMAT_REGISTRY, so
             // the profile-gated signing resolver refuses them (read-only),
             // matching c2pa-rs's TiffIO raw handling.
-            "image/x-sony-arw" | "image/x-nikon-nef" => Self::Tiff,
+            "image/x-sony-arw" | "image/x-nikon-nef" | "image/x-tiff-based" => Self::Tiff,
             "image/avif"
             | "image/heic"
             | "image/heic-sequence"
@@ -231,11 +231,13 @@ impl AssetFormat {
             | "video/quicktime"
             | "audio/mp4"
             | "video/x-m4v"
-            | "application/mp4" => Self::Bmff,
+            | "application/mp4"
+            | "video/x-bmff-based" => Self::Bmff,
             "image/gif" => Self::Gif,
             "image/svg+xml" => Self::Svg,
             "image/jxl" => Self::Jxl,
-            "video/x-msvideo" | "audio/wav" => Self::Riff,
+            "video/x-msvideo" | "audio/wav" | "image/x-riff-based" | "video/x-riff-based"
+            | "audio/x-riff-based" => Self::Riff,
             "audio/mpeg" => Self::Id3,
             "audio/flac" => Self::Flac,
             "audio/ogg" => Self::Ogg,
@@ -243,6 +245,14 @@ impl AssetFormat {
             "application/zip"
             | "application/x-zip-based"
             | "application/epub+zip"
+            | "application/vnd.apple.keynote"
+            | "application/vnd.apple.pages"
+            | "application/vnd.apple.numbers"
+            | "application/x-krita"
+            | "image/openraster"
+            | "application/vnd.adobe.indesign-idml-package"
+            | "application/vnd.google-earth.kmz"
+            | "model/3mf"
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
             | "application/vnd.ms-word.document.macroenabled.12"
@@ -338,6 +348,7 @@ impl AssetFormat {
                     comment_suffix: "",
                 }
             }
+            other if crate::c2pa_core::spec::is_open_document_family(other) => Self::Zip,
             other => match c2pa_text::structured::comment_syntax(other) {
                 Some((comment_prefix, comment_suffix)) => Self::TextStructured {
                     comment_prefix,
@@ -1123,6 +1134,35 @@ mod tests {
                 AssetFormat::from_mime(mime).is_some(),
                 "v2.4 registry MIME has no format implementation: {mime}"
             );
+        }
+    }
+
+    #[test]
+    fn v2_5_additional_standard_containers_route_to_their_family_readers() {
+        let cases = [
+            ("application/vnd.apple.keynote", AssetFormat::Zip),
+            ("application/vnd.apple.pages", AssetFormat::Zip),
+            ("application/vnd.apple.numbers", AssetFormat::Zip),
+            ("application/x-krita", AssetFormat::Zip),
+            ("image/openraster", AssetFormat::Zip),
+            (
+                "application/vnd.adobe.indesign-idml-package",
+                AssetFormat::Zip,
+            ),
+            ("application/vnd.google-earth.kmz", AssetFormat::Zip),
+            ("model/3mf", AssetFormat::Zip),
+            ("image/x-tiff-based", AssetFormat::Tiff),
+            ("image/x-riff-based", AssetFormat::Riff),
+            ("video/x-riff-based", AssetFormat::Riff),
+            ("audio/x-riff-based", AssetFormat::Riff),
+            ("video/x-bmff-based", AssetFormat::Bmff),
+            (
+                "application/vnd.oasis.opendocument.text-template",
+                AssetFormat::Zip,
+            ),
+        ];
+        for (mime, format) in cases {
+            assert_eq!(AssetFormat::from_mime(mime), Some(format), "{mime}");
         }
     }
     #[test]
