@@ -304,7 +304,7 @@ fn local_data_span(
     method_size_offset: (u16, u16, u32, u64, u64, u64),
     expected_name: &[u8],
     rules: ZipRules,
-) -> Result<(usize, usize), FormatError> {
+) -> Result<(usize, usize, bool), FormatError> {
     let (method, flags, crc, comp_size, uncomp_size, local_offset) = method_size_offset;
     let lh = usize64(
         local_offset,
@@ -342,22 +342,33 @@ fn local_data_span(
         .checked_add(extra_len)
         .filter(|&offset| offset <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
-    if rules == ZipRules::V2_5 && flags & 8 == 0 {
+    let mut local_zip64_sizes = false;
+    if rules == ZipRules::V2_5 {
         let local_crc = le_u32(data, lh + 14).ok_or(FormatError::Truncated(FMT))?;
         let local_comp32 = le_u32(data, lh + 18).ok_or(FormatError::Truncated(FMT))?;
         let local_uncomp32 = le_u32(data, lh + 22).ok_or(FormatError::Truncated(FMT))?;
-        let (local_uncomp, local_comp, _, _) = zip64_central_values(
+        local_zip64_sizes = validate_zip64_extra(
             &data[name_end..data_start],
             local_uncomp32,
             local_comp32,
             0,
             0,
+            true,
         )?;
-        if local_crc != crc || local_comp != comp_size || local_uncomp != uncomp_size {
-            return Err(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "ZIP local CRC or sizes disagree with central directory",
-            });
+        if flags & 8 == 0 {
+            let (local_uncomp, local_comp, _, _) = zip64_central_values(
+                &data[name_end..data_start],
+                local_uncomp32,
+                local_comp32,
+                0,
+                0,
+            )?;
+            if local_crc != crc || local_comp != comp_size || local_uncomp != uncomp_size {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "ZIP local CRC or sizes disagree with central directory",
+                });
+            }
         }
     }
     let comp_size = usize64(comp_size, "ZIP64 member is too large")?;
@@ -365,7 +376,72 @@ fn local_data_span(
         .checked_add(comp_size)
         .filter(|&offset| offset <= eocd.cd_offset)
         .ok_or(FormatError::Truncated(FMT))?;
-    Ok((data_start, data_end))
+    Ok((data_start, data_end, local_zip64_sizes))
+}
+
+fn validate_zip64_extra(
+    extra: &[u8],
+    uncomp32: u32,
+    comp32: u32,
+    offset32: u32,
+    disk32: u16,
+    local: bool,
+) -> Result<bool, FormatError> {
+    let needs =
+        uncomp32 == u32::MAX || comp32 == u32::MAX || offset32 == u32::MAX || disk32 == u16::MAX;
+    let mut cursor = 0usize;
+    let mut zip64 = None;
+    while cursor < extra.len() {
+        let id = le16(extra, cursor).ok_or(FormatError::Truncated(FMT))?;
+        let size = le16(extra, cursor + 2).ok_or(FormatError::Truncated(FMT))? as usize;
+        let start = cursor + 4;
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= extra.len())
+            .ok_or(FormatError::Truncated(FMT))?;
+        if id == 0x0001 && zip64.replace(&extra[start..end]).is_some() {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "duplicate ZIP64 extended information field",
+            });
+        }
+        cursor = end;
+    }
+    let Some(field) = zip64 else {
+        if needs {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "ZIP64 extended information field is missing",
+            });
+        }
+        return Ok(false);
+    };
+    if local && (uncomp32 == u32::MAX || comp32 == u32::MAX) {
+        if uncomp32 != u32::MAX || comp32 != u32::MAX || field.len() != 16 {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "local ZIP64 extra field must contain both size values",
+            });
+        }
+    } else {
+        let expected = usize::from(uncomp32 == u32::MAX) * 8
+            + usize::from(comp32 == u32::MAX) * 8
+            + usize::from(offset32 == u32::MAX) * 8
+            + usize::from(disk32 == u16::MAX) * 4;
+        if field.len() != expected {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "ZIP64 extended-information field has unexpected trailing bytes",
+            });
+        }
+    }
+    if local && !needs {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "local ZIP64 extra field lacks both size sentinels",
+        });
+    }
+    Ok(true)
 }
 
 fn zip64_central_values(
@@ -576,15 +652,28 @@ fn build_zip_index<'a>(
                 detail: "duplicate ZIP entry name",
             });
         }
-        let (uncomp_size, comp_size, local_offset, zip64_sizes) =
+        let central_zip64_extra = if rules == ZipRules::V2_5 {
+            validate_zip64_extra(
+                &data[name_end..extra_end],
+                uncomp32,
+                comp32,
+                offset32,
+                disk,
+                false,
+            )?
+        } else {
+            false
+        };
+        let (uncomp_size, comp_size, local_offset, central_zip64_sizes) =
             zip64_central_values(&data[name_end..extra_end], uncomp32, comp32, offset32, disk)?;
-        let data_span = local_data_span(
+        let (data_start, data_end, local_zip64_sizes) = local_data_span(
             data,
             eocd,
             (method, flags, crc, comp_size, uncomp_size, local_offset),
             raw_name,
             rules,
         )?;
+        let data_span = (data_start, data_end);
         let local_offset = usize64(
             local_offset,
             "ZIP64 local-header offset exceeds address space",
@@ -602,7 +691,7 @@ fn build_zip_index<'a>(
             crc,
             comp_size,
             uncomp_size,
-            zip64_sizes,
+            zip64_sizes: central_zip64_extra || central_zip64_sizes || local_zip64_sizes,
             data_span,
             hash_span,
             local_span: hash_span,
@@ -1158,6 +1247,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exact_zip64_extra_validation_rejects_unselected_and_duplicate_fields() {
+        let empty = [0x0001u16.to_le_bytes(), 0u16.to_le_bytes()].concat();
+        assert!(validate_zip64_extra(&empty, 0, 0, 0, 0, false).unwrap());
+        assert!(validate_zip64_extra(&empty, 0, 0, 0, 0, true).is_err());
+
+        let redundant = [
+            0x0001u16.to_le_bytes().as_slice(),
+            8u16.to_le_bytes().as_slice(),
+            7u64.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        assert!(validate_zip64_extra(&redundant, 0, 0, 0, 0, false).is_err());
+
+        for duplicate in [
+            [empty.as_slice(), empty.as_slice()].concat(),
+            [empty.as_slice(), redundant.as_slice()].concat(),
+        ] {
+            assert!(validate_zip64_extra(&duplicate, 0, 0, 0, 0, false).is_err());
+        }
+
+        let one_local_sentinel = [
+            0x0001u16.to_le_bytes().as_slice(),
+            16u16.to_le_bytes().as_slice(),
+            7u64.to_le_bytes().as_slice(),
+            7u64.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        for (uncomp32, comp32) in [(u32::MAX, 7), (7, u32::MAX)] {
+            assert!(
+                validate_zip64_extra(&one_local_sentinel, uncomp32, comp32, 0, 0, true,).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn re_embed_replaces_manifest() {
         let first = embed(&tiny_zip(), b"FIRST-manifest-store").unwrap();
         let second = embed(&first, b"SECOND-manifest-store").unwrap();
@@ -1363,6 +1487,97 @@ pub(crate) mod tests {
     #[test]
     fn rejects_non_zip() {
         assert!(extract(b"not a zip file at all really").is_err());
+    }
+
+    fn forced_local_zip64_descriptor(payload: &[u8], signed: bool) -> Vec<u8> {
+        let name = b"payload.bin";
+        let crc = crc32(payload);
+        let size = payload.len() as u64;
+        let mut zip = Vec::new();
+        zip.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&METHOD_STORED.to_le_bytes());
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&u32::MAX.to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(&0x0001u16.to_le_bytes());
+        zip.extend_from_slice(&16u16.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes());
+        zip.extend_from_slice(payload);
+        if signed {
+            zip.extend_from_slice(&SIG_DESCRIPTOR.to_le_bytes());
+        }
+        zip.extend_from_slice(&crc.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes());
+
+        let cd_offset = zip.len() as u32;
+        zip.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&METHOD_STORED.to_le_bytes());
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&crc.to_le_bytes());
+        zip.extend_from_slice(&(size as u32).to_le_bytes());
+        zip.extend_from_slice(&(size as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(name);
+        let cd_size = zip.len() as u32 - cd_offset;
+        zip.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&1u16.to_le_bytes());
+        zip.extend_from_slice(&1u16.to_le_bytes());
+        zip.extend_from_slice(&cd_size.to_le_bytes());
+        zip.extend_from_slice(&cd_offset.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip
+    }
+
+    #[test]
+    fn forced_local_zip64_descriptor_width_covers_all_size_fields() {
+        for (payload, signed) in [
+            (b"".as_slice(), false),
+            (b"".as_slice(), true),
+            (b"descriptor payload".as_slice(), false),
+            (b"descriptor payload".as_slice(), true),
+        ] {
+            let valid = forced_local_zip64_descriptor(payload, signed);
+            let member = zip_index_v2_5(&valid)
+                .unwrap_or_else(|error| {
+                    panic!("payload {} signed {signed}: {error}", payload.len())
+                })
+                .get(b"payload.bin")
+                .copied()
+                .expect("payload member");
+            assert_eq!(
+                member.hash_span().1 - member.data_span.1,
+                if signed { 24 } else { 20 },
+                "complete ZIP64 descriptor must be hashed"
+            );
+
+            let trailing_uncompressed_size = member.hash_span().1 - 8;
+            let mut malformed = valid;
+            malformed[trailing_uncompressed_size] ^= 1;
+            assert!(
+                zip_index_v2_5(&malformed).is_err(),
+                "payload {} signed {signed}: trailing ZIP64 size mutation",
+                payload.len()
+            );
+        }
     }
 
     pub(crate) fn zip64_with_manifest_and_descriptor() -> (Vec<u8>, Vec<u8>) {

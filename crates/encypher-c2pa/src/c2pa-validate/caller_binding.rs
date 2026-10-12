@@ -28,13 +28,14 @@ use sha2::{Digest, Sha256};
 use super::{
     assertion_label_for_manifest, base_assertion_label, bmff_exclusion_maps,
     bmff_has_additional_exclusions, canonical_collection_uri_member,
-    canonical_collection_uri_member_for_policy, decode, exclusions, inherited_hard_binding,
-    is_allowed_hash_algorithm, is_supported_bmff_hash_label, resolved_hash_algorithm, segment_hash,
-    spec25, versions, AssetFormat, ClaimAssertionReference, ClaimAssertionRefs, EngineProfile,
-    ManifestKind, ParsedManifest, SpecVersion, StoreContext, ValidationResults, Value,
-    ALGORITHM_UNSUPPORTED, ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
-    ASSERTION_BMFF_HASH_MALFORMED, ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH,
-    ASSERTION_BOXES_HASH_MALFORMED, ASSERTION_BOXES_HASH_MATCH, ASSERTION_BOXES_HASH_MISMATCH,
+    canonical_collection_uri_member_for_policy, decode, enforce_primary_binding_label, exclusions,
+    inherited_hard_binding, is_allowed_hash_algorithm, is_supported_bmff_hash_label,
+    resolved_hash_algorithm, segment_hash, spec25, versions, AssetFormat, ClaimAssertionReference,
+    ClaimAssertionRefs, EngineProfile, ManifestKind, ParsedManifest, SpecVersion, StoreContext,
+    ValidationResults, Value, ALGORITHM_UNSUPPORTED,
+    ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT, ASSERTION_BMFF_HASH_MALFORMED,
+    ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH, ASSERTION_BOXES_HASH_MALFORMED,
+    ASSERTION_BOXES_HASH_MATCH, ASSERTION_BOXES_HASH_MISMATCH,
     ASSERTION_COLLECTION_HASH_INVALID_URI, ASSERTION_COLLECTION_HASH_MALFORMED,
     ASSERTION_COLLECTION_HASH_MATCH, ASSERTION_COLLECTION_HASH_MISMATCH,
     ASSERTION_COMPOUND_CONTENT_MALFORMED, ASSERTION_COMPOUND_CONTENT_MATCH,
@@ -246,6 +247,9 @@ fn schema_defect(
             let Some(Value::Array(uris)) = assertion.get("uris") else {
                 return Some((malformed, "no uris field".into()));
             };
+            if profile.version == SpecVersion::V2_5 && uris.is_empty() {
+                return Some((malformed, "collection must contain at least one URI".into()));
+            }
             if let Some(defect) = algorithm_defect(resolved_hash_algorithm(assertion, claim)) {
                 return Some(defect);
             }
@@ -356,6 +360,15 @@ pub(super) fn apply(
         );
         return;
     };
+    if !enforce_primary_binding_label(
+        &target.binding_assertion_label,
+        format,
+        profile,
+        &target.binding_manifest_label,
+        results,
+    ) {
+        return;
+    }
     let url = format!(
         "self#jumbf=/c2pa/{}/c2pa.assertions/{}",
         target.binding_manifest_label, target.binding_assertion_label
@@ -484,6 +497,31 @@ mod tests {
                 ASSERTION_COLLECTION_HASH_INVALID_URI,
                 "uri '_rels/' is not a valid collection URI".into(),
             )),
+        );
+    }
+
+    #[test]
+    fn exact_2_5_rejects_empty_collection_caller_evidence() {
+        let assertion = Value::Map(vec![
+            (Value::Text("alg".into()), Value::Text("sha256".into())),
+            (Value::Text("uris".into()), Value::Array(Vec::new())),
+            (
+                Value::Text("zip_central_directory_hash".into()),
+                Value::Bytes(vec![0; 32]),
+            ),
+        ]);
+        let defect = schema_defect(
+            "c2pa.hash.collection.data",
+            Some(&assertion),
+            &Value::Map(Vec::new()),
+            Some(AssetFormat::Zip),
+            EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular),
+            "self#collection",
+            &mut ValidationResults::default(),
+        );
+        assert_eq!(
+            defect.map(|(code, _)| code),
+            Some(ASSERTION_COLLECTION_HASH_MALFORMED)
         );
     }
 }

@@ -1881,6 +1881,11 @@ pub fn verify_prehashed_manifest<'a>(
     if format == AssetFormat::C2paStore {
         return Err(ValidateError::UnsupportedMime(content_mime.to_string()));
     }
+    if required_primary_binding_label(Some(format), input.profile).is_some() {
+        return Err(ValidateError::HardBinding(
+            "C2PA 2.5 ZIP collection bindings require per-resource and central-directory hashes; one prehashed digest cannot verify them".into(),
+        ));
+    }
 
     let expanded = match expand_for_validation(manifest_store, input.profile) {
         Ok(expanded) => expanded,
@@ -3612,39 +3617,56 @@ fn verify_manifest_bound<'a>(
             let _ =
                 verify_prehashed_hard_binding(&claim, &claim_refs, digest, &label, &mut results);
         } else if let Some(format) = binding.format() {
-            // 2.5: a sole `c2pa.hash.segment` is the operative binding of an
-            // append-only checkpoint and is validated over the file's bytes.
-            let segment = caller_binding::operative_reference(&claim_refs, false, input.profile)
-                .filter(|reference| reference.label.is_some_and(spec25::is_segment_hash_label));
-            if let Some(reference) = segment {
-                verify_segment_binding(
-                    &claim,
-                    &claim_refs,
-                    reference,
-                    input.data,
-                    format,
-                    binding.detached(),
-                    &label,
-                    &mut graph_resources,
-                    &mut graph_budget,
-                    &mut results,
-                );
-            } else {
-                let _ = verify_data_hash(
-                    &claim,
-                    &claim_refs,
-                    input.data,
-                    format,
-                    fragments,
-                    if binding.detached() {
-                        update_manifest::StoreRendition::Detached
-                    } else {
-                        update_manifest::StoreRendition::AsSigned
-                    },
-                    &label,
-                    input.profile,
-                    &mut results,
-                );
+            let binding_allowed =
+                match caller_binding::operative_reference(&claim_refs, false, input.profile)
+                    .and_then(|reference| reference.label)
+                {
+                    Some(binding_label) => enforce_primary_binding_label(
+                        binding_label,
+                        Some(format),
+                        input.profile,
+                        &label,
+                        &mut results,
+                    ),
+                    None => true,
+                };
+            if binding_allowed {
+                // 2.5: a sole `c2pa.hash.segment` is the operative binding of an
+                // append-only checkpoint and is validated over the file's bytes.
+                let segment =
+                    caller_binding::operative_reference(&claim_refs, false, input.profile).filter(
+                        |reference| reference.label.is_some_and(spec25::is_segment_hash_label),
+                    );
+                if let Some(reference) = segment {
+                    verify_segment_binding(
+                        &claim,
+                        &claim_refs,
+                        reference,
+                        input.data,
+                        format,
+                        binding.detached(),
+                        &label,
+                        &mut graph_resources,
+                        &mut graph_budget,
+                        &mut results,
+                    );
+                } else {
+                    let _ = verify_data_hash(
+                        &claim,
+                        &claim_refs,
+                        input.data,
+                        format,
+                        fragments,
+                        if binding.detached() {
+                            update_manifest::StoreRendition::Detached
+                        } else {
+                            update_manifest::StoreRendition::AsSigned
+                        },
+                        &label,
+                        input.profile,
+                        &mut results,
+                    );
+                }
             }
         } else {
             binding.apply_without_asset(
@@ -3884,6 +3906,41 @@ fn is_supported_hard_binding_label(label: &str, compound_ok: bool) -> bool {
         || label == "c2pa.hash.boxes"
         || label == "c2pa.hash.collection.data"
         || (compound_ok && label == "c2pa.compound.content")
+}
+
+/// The primary binding kind mandated by the selected policy for an actual
+/// carrier format. Claims and declared MIME never select this policy.
+fn required_primary_binding_label(
+    format: Option<AssetFormat>,
+    profile: EngineProfile,
+) -> Option<&'static str> {
+    (profile.version == SpecVersion::V2_5 && format == Some(AssetFormat::Zip))
+        .then_some("c2pa.hash.collection.data")
+}
+
+/// Enforce a format's required primary binding before any byte comparison or
+/// caller-supplied verdict can report a match.
+fn enforce_primary_binding_label(
+    binding_label: &str,
+    format: Option<AssetFormat>,
+    profile: EngineProfile,
+    manifest_label: &str,
+    results: &mut ValidationResults,
+) -> bool {
+    let Some(required) = required_primary_binding_label(format, profile) else {
+        return true;
+    };
+    if base_assertion_label(binding_label) == required {
+        return true;
+    }
+    results.push_failure(
+        ASSERTION_COLLECTION_HASH_MISMATCH,
+        format!("self#jumbf=/c2pa/{manifest_label}/c2pa.assertions/{binding_label}"),
+        format!(
+            "C2PA 2.5 ZIP assets require {required} as the primary hard binding, not {binding_label}"
+        ),
+    );
+    false
 }
 
 fn is_multi_asset_binding_label(label: &str) -> bool {
@@ -7330,6 +7387,9 @@ fn verify_primary_hard_binding(
     let Some(alabel) = binding.label else {
         return;
     };
+    if !enforce_primary_binding_label(alabel, Some(format), profile, label, results) {
+        return;
+    }
     if alabel == COMPOUND_CONTENT_LABEL {
         return;
     }
@@ -9193,6 +9253,10 @@ fn verify_collection_hash(
         malformed(results, "no uris field".into());
         return;
     };
+    if profile.version == SpecVersion::V2_5 && uris.is_empty() {
+        malformed(results, "collection must contain at least one URI".into());
+        return;
+    }
     let Some(alg) = resolved_hash_algorithm(&map, claim) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
@@ -17716,6 +17780,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_2_5_rejects_empty_collection_binding() {
+        let archive = stored_zip(&[]);
+        let collection = enc(&vmap(vec![
+            ("uris", Value::Array(Vec::new())),
+            ("alg", Value::Text("sha256".into())),
+            (
+                "zip_central_directory_hash",
+                Value::Bytes(hash_bytes("sha256", &archive).unwrap()),
+            ),
+        ]));
+        let mut results = ValidationResults::default();
+        verify_collection_hash(
+            &collection,
+            &vmap(vec![]),
+            (&archive, AssetFormat::Zip),
+            "urn:c2pa:test",
+            EngineProfile::new(SpecVersion::V2_5, crate::c2pa_core::OperatingMode::Regular),
+            false,
+            &mut results,
+        );
+        assert!(results.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
+        assert!(!results.has_success(ASSERTION_COLLECTION_HASH_MATCH));
+    }
+
+    #[test]
     fn bmff_optional_boxes_are_reported_as_additional_exclusions() {
         let map = |xpath: &str| crate::c2pa_formats::BmffExclusionMap {
             xpath: xpath.into(),
@@ -17849,6 +17938,22 @@ mod tests {
         data: &[u8],
         exclusions: &[(usize, usize)],
     ) -> ValidationResults {
+        data_hash_binding_over_for_profile(
+            format,
+            signed,
+            data,
+            exclusions,
+            EngineProfile::GENEROUS,
+        )
+    }
+
+    fn data_hash_binding_over_for_profile(
+        format: AssetFormat,
+        signed: &[u8],
+        data: &[u8],
+        exclusions: &[(usize, usize)],
+        profile: EngineProfile,
+    ) -> ValidationResults {
         let declared = Value::Array(
             exclusions
                 .iter()
@@ -17890,10 +17995,35 @@ mod tests {
             &[],
             update_manifest::StoreRendition::AsSigned,
             &manifest.label,
-            EngineProfile::GENEROUS,
+            profile,
             &mut results,
         );
         results
+    }
+
+    #[test]
+    fn exact_2_5_zip_refuses_a_data_hash_primary_binding() {
+        let empty_zip = [
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let legacy = data_hash_binding(AssetFormat::Zip, &empty_zip, &[]);
+        assert!(legacy.has_success(ASSERTION_DATA_HASH_MATCH), "{legacy:?}");
+
+        let exact_2_5 = data_hash_binding_over_for_profile(
+            AssetFormat::Zip,
+            &empty_zip,
+            &empty_zip,
+            &[],
+            EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular),
+        );
+        assert!(
+            exact_2_5.has_failure(ASSERTION_COLLECTION_HASH_MISMATCH),
+            "{exact_2_5:?}"
+        );
+        assert!(
+            !exact_2_5.has_success(ASSERTION_DATA_HASH_MATCH),
+            "{exact_2_5:?}"
+        );
     }
 
     /// A JPEG carrying a real manifest store, with the byte span of its C2PA

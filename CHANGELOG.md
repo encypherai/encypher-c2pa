@@ -39,6 +39,7 @@ All notable changes to this project are recorded here.
 - Exact `"2.5"` certificate paths apply RFC 5280 policy mappings and inhibition through bounded RFC 9618 policy levels, including self-issued key rollover. Processing stops at the selected trust anchor: its encoded validity, path-length, name and policy constraints do not replace configured trust authority. C2PA certificate-profile admission still applies to anchors, including duplicate-extension rejection and a verified self-signed exemption when AKI is absent. Policy qualifiers use their RFC DER shapes, including all four `DisplayText` encodings and overlong `explicitText`. The 2.2 and 2.4 trust paths remain unchanged.
 - Caller-verified ZIP collection bindings now apply the exact 2.5 directory-entry URI policy. Directory URIs remain invalid under 2.2 and 2.4.
 - Exact 2.5 ZIP verification checks local CRC and sizes against the central directory, resolves local ZIP64 size fields, rejects inconsistent classic/ZIP64 end records and nonzero disk starts, and consumes ZIP64 extra fields exactly. Earlier policies remain unchanged.
+- Exact 2.5 ZIP extraction and verification use the same structural rules, including complete ZIP64 descriptors when only the local header uses ZIP64. ZIP assets require a collection primary binding; a single prehashed digest is insufficient. Empty collections are malformed under exact 2.5, including caller-verified evidence.
 
 ## 1.7.0 - 2026-10-01
 
