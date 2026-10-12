@@ -74,12 +74,18 @@ pub use c2pa_validate::refs::{ExternalResource, ExternalResources};
 mod config_dir;
 mod default_trust;
 mod ertmp;
+mod ertmp_wire;
 mod native_online;
 mod online;
 mod online_consent;
 pub use ertmp::{
     verify_ertmp, verify_ertmp_with_options, ErtmpEvent, ErtmpInput, ErtmpManifestReport,
     ErtmpMediaType, ErtmpSegmentReport, ErtmpTrack, ErtmpVerificationReport,
+};
+pub use ertmp_wire::{
+    encode_flv_tag, encode_rtmp_message, encode_video_metadata_payload, ertmp_input_from_flv,
+    ertmp_input_from_rtmp_connections, ErtmpConnectionContext, ErtmpWireError, ErtmpWireLimits,
+    FlvWireOptions, RtmpWireOptions,
 };
 mod soft_binding;
 pub use soft_binding::{
