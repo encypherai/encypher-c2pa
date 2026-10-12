@@ -7234,7 +7234,15 @@ fn verify_primary_hard_binding(
         }
         "c2pa.hash.collection.data" => {
             if let Some(cbor) = indexed.payload {
-                verify_collection_hash(cbor, claim, data, format, label, profile, results);
+                verify_collection_hash(
+                    cbor,
+                    claim,
+                    (data, format),
+                    label,
+                    profile,
+                    rendition == update_manifest::StoreRendition::Detached,
+                    results,
+                );
             }
             return;
         }
@@ -9042,12 +9050,13 @@ fn verify_boxes_hash_with_spans(
 fn verify_collection_hash(
     cbor: &[u8],
     claim: &Value,
-    data: &[u8],
-    format: AssetFormat,
+    asset: (&[u8], AssetFormat),
     label: &str,
     profile: EngineProfile,
+    detached: bool,
     results: &mut ValidationResults,
 ) {
+    let (data, format) = asset;
     let binding_compromised = results.has_failure(ASSERTION_HASHED_URI_MISMATCH)
         || results.has_failure(HASHED_URI_MISSING);
     let url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/c2pa.hash.collection.data");
@@ -9082,7 +9091,15 @@ fn verify_collection_hash(
     // 2.5 Hashing of WARC files: a WARC collection binds records by
     // `WARC-Record-ID`, not ZIP members, and has no central directory.
     if format == AssetFormat::Warc {
-        verify_warc_collection_hash(uris, alg, data, binding_compromised, &url, results);
+        verify_warc_collection_hash(
+            uris,
+            alg,
+            data,
+            detached,
+            binding_compromised,
+            &url,
+            results,
+        );
         return;
     }
     let index_result = match profile.version {
@@ -9183,15 +9200,18 @@ fn verify_collection_hash(
 }
 
 /// 2.5 Validating a collection data hash, Hashing of WARC files: every record
-/// other than the C2PA manifest record corresponds to exactly one `uris`
-/// entry by `WARC-Record-ID`, each record's uncompressed bytes hash to its
-/// entry, record IDs are unique, and compressed records stay within the
-/// decompression bound and their declared `Content-Length`. Every one of
-/// those defects is `assertion.collectionHash.mismatch`.
+/// other than an in-band C2PA manifest record corresponds to exactly one
+/// `uris` entry by `WARC-Record-ID`, each record's uncompressed bytes hash to
+/// its entry, record IDs are unique, and compressed records stay within the
+/// decompression bound and their declared `Content-Length`. A separately
+/// supplied store does not require an in-band record; embedded validation
+/// still does. Every one of those defects is
+/// `assertion.collectionHash.mismatch`.
 fn verify_warc_collection_hash(
     uris: &[Value],
     alg: &str,
     data: &[u8],
+    detached: bool,
     binding_compromised: bool,
     url: &str,
     results: &mut ValidationResults,
@@ -9237,7 +9257,7 @@ fn verify_warc_collection_hash(
         }
         entries.push((uri, expected));
     }
-    match crate::c2pa_formats::warc_verify_collection(&archive, entries, |bytes| {
+    match crate::c2pa_formats::warc_verify_collection(&archive, !detached, entries, |bytes| {
         hash_bytes(alg, bytes).unwrap_or_default()
     }) {
         Ok(matched) => {
@@ -15704,10 +15724,10 @@ mod tests {
         verify_collection_hash(
             &enc(&assertion),
             &vmap(Vec::new()),
-            &archive,
-            AssetFormat::Zip,
+            (&archive, AssetFormat::Zip),
             "urn:test",
             EngineProfile::GENEROUS,
+            false,
             &mut results,
         );
 
@@ -15741,10 +15761,10 @@ mod tests {
         verify_collection_hash(
             &encoded,
             &vmap(Vec::new()),
-            &archive,
-            AssetFormat::Zip,
+            (&archive, AssetFormat::Zip),
             "urn:test",
             EngineProfile::GENEROUS,
+            false,
             &mut legacy,
         );
         assert!(legacy.has_failure(ASSERTION_COLLECTION_HASH_MALFORMED));
@@ -15753,10 +15773,10 @@ mod tests {
         verify_collection_hash(
             &encoded,
             &vmap(Vec::new()),
-            &archive,
-            AssetFormat::Zip,
+            (&archive, AssetFormat::Zip),
             "urn:test",
             EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular),
+            false,
             &mut v2_5,
         );
         assert!(v2_5.has_success(ASSERTION_COLLECTION_HASH_MATCH));
@@ -17085,10 +17105,10 @@ mod tests {
         verify_collection_hash(
             &collection,
             &vmap(Vec::new()),
-            &[],
-            AssetFormat::Zip,
+            (&[], AssetFormat::Zip),
             "urn:c2pa:test",
             EngineProfile::GENEROUS,
+            false,
             &mut collection_results,
         );
         assert!(collection_results.has_failure(ALGORITHM_UNSUPPORTED));
@@ -17103,10 +17123,10 @@ mod tests {
         verify_collection_hash(
             &missing_algorithm,
             &vmap(Vec::new()),
-            &[],
-            AssetFormat::Zip,
+            (&[], AssetFormat::Zip),
             "urn:c2pa:test",
             EngineProfile::GENEROUS,
+            false,
             &mut missing_results,
         );
         assert!(missing_results.has_failure(ALGORITHM_UNSUPPORTED));
@@ -17130,10 +17150,10 @@ mod tests {
         verify_collection_hash(
             &collection,
             &claim,
-            &empty_zip,
-            AssetFormat::Zip,
+            (&empty_zip, AssetFormat::Zip),
             "urn:c2pa:test",
             EngineProfile::GENEROUS,
+            false,
             &mut results,
         );
         assert!(results.has_success(ASSERTION_COLLECTION_HASH_MATCH));

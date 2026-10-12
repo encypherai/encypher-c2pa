@@ -61,6 +61,8 @@ Generic XML-comment embedding is unsupported under 2.5 for every XML-derived typ
 
 E-RTMP uses `verify_ertmp` or `verify_ertmp_with_options` with caller-supplied audio/video track events, including codec configuration, frames and named metadata. It validates segment signatures, continuity and manifest refreshes without treating the transport as a file MIME. The API does not invent the audio metadata packet assignment missing from the referenced transport specification.
 
+WARC uses `c2pa.hash.collection.data` for both embedded and separately supplied stores. Detached verification permits zero in-band C2PA records; it does not substitute a whole-file data hash. Both paths enforce record-ID bijection and bounded decompression, and hash the complete uncompressed records. Recompressing unchanged records preserves the binding.
+
 Exact 2.5 also reads these existing standard-carrier spellings, without expanding the frozen 2.2 or 2.4 MIME sets:
 
 - ZIP packages: `application/vnd.apple.keynote`, `application/vnd.apple.pages`, `application/vnd.apple.numbers`, `application/x-krita`, `image/openraster`, `application/vnd.adobe.indesign-idml-package`, `application/vnd.google-earth.kmz` and `model/3mf`.

@@ -176,8 +176,11 @@ pub(crate) enum RecordDefect {
 /// `assertion.collectionHash.mismatch` under the validation clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WarcCollectionFailure {
-    /// The file has no single C2PA manifest record, so no collection exists.
+    /// Embedded validation did not locate exactly one C2PA manifest record, or
+    /// multiple provenance records made the carrier ambiguous.
     ManifestNotLocated,
+    /// A located C2PA manifest record violates the WARC carrier placement rules.
+    ManifestPlacement(&'static str),
     /// A record failed decompression bounds or its `Content-Length`.
     RecordDefect {
         record_id: String,
@@ -199,6 +202,9 @@ impl fmt::Display for WarcCollectionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ManifestNotLocated => f.write_str("WARC file has no single C2PA manifest record"),
+            Self::ManifestPlacement(detail) => {
+                write!(f, "WARC manifest placement invalid: {detail}")
+            }
             Self::RecordDefect { record_id, defect } => match defect {
                 RecordDefect::TooLarge => write!(
                     f,
@@ -418,19 +424,33 @@ pub(crate) fn placement_error(data: &[u8]) -> Result<Option<&'static str>, Forma
 }
 
 /// Check a collection data hash against the file, in the order the validation
-/// clause prescribes: decompression bounds, unique record identifiers, then a
-/// bijection between collection entries and records with matching hashes.
+/// clause prescribes: optional carrier presence, decompression bounds, unique
+/// record identifiers, then a bijection between collection entries and records
+/// with matching hashes.
 ///
-/// `entries` are the `(uri, hash)` pairs of the assertion; the caller has
-/// already resolved the algorithm and rejected malformed URIs. `hash` computes
-/// that algorithm over a record. Returns the number of records bound.
+/// `require_manifest` distinguishes embedded discovery from a supplied store.
+/// Embedded validation requires exactly one in-band C2PA record. A supplied
+/// store permits no in-band record, but still rejects ambiguous or misplaced
+/// provenance records. `entries` are the `(uri, hash)` pairs of the assertion;
+/// the caller has already resolved the algorithm and rejected malformed URIs.
+/// `hash` computes that algorithm over a record. Returns the number of records
+/// bound.
 pub(crate) fn verify_collection<'e>(
     archive: &WarcArchive<'_>,
+    require_manifest: bool,
     entries: impl IntoIterator<Item = (&'e str, &'e [u8])>,
     mut hash: impl FnMut(&[u8]) -> Vec<u8>,
 ) -> Result<usize, WarcCollectionFailure> {
-    if !matches!(archive.manifest, Located::One(_)) {
-        return Err(WarcCollectionFailure::ManifestNotLocated);
+    match archive.manifest {
+        Located::One(_) => {
+            if let Some(detail) = archive.placement_error() {
+                return Err(WarcCollectionFailure::ManifestPlacement(detail));
+            }
+        }
+        Located::None if !require_manifest => {}
+        Located::None | Located::Ambiguous => {
+            return Err(WarcCollectionFailure::ManifestNotLocated);
+        }
     }
     if let Some((record_id, defect)) = archive.defect() {
         return Err(WarcCollectionFailure::RecordDefect {
@@ -1402,6 +1422,7 @@ mod tests {
         let archive = WarcArchive::parse_with_limits(asset, limits).unwrap();
         verify_collection(
             &archive,
+            true,
             entries
                 .iter()
                 .map(|(id, hash)| (id.as_str(), hash.as_slice())),
@@ -1718,7 +1739,11 @@ mod tests {
         let twice_bytes = twice.concat();
         let archive = WarcArchive::parse(&twice_bytes).unwrap();
         assert_eq!(
-            verify_collection(&archive, std::iter::empty(), sha256),
+            verify_collection(&archive, true, std::iter::empty(), sha256),
+            Err(WarcCollectionFailure::ManifestNotLocated)
+        );
+        assert_eq!(
+            verify_collection(&archive, false, std::iter::empty(), sha256),
             Err(WarcCollectionFailure::ManifestNotLocated)
         );
 
@@ -1763,6 +1788,73 @@ mod tests {
             .iter()
             .any(|(id, _)| id == PROVENANCE_ID));
         assert_eq!(extract(&records[..last].concat()).unwrap(), None);
+    }
+
+    #[test]
+    fn supplied_store_collection_allows_zero_carrier_recompression_and_rejects_defects() {
+        let records = signed_records();
+        let signed = entries(&records);
+        let unsigned_records = records[..records.len() - 1].to_vec();
+        let unsigned = unsigned_records.concat();
+        let raw_archive = WarcArchive::parse(&unsigned).unwrap();
+        let pairs = || {
+            signed
+                .iter()
+                .map(|(id, hash)| (id.as_str(), hash.as_slice()))
+        };
+        assert_eq!(
+            verify_collection(&raw_archive, true, pairs(), sha256),
+            Err(WarcCollectionFailure::ManifestNotLocated)
+        );
+        assert_eq!(
+            verify_collection(&raw_archive, false, pairs(), sha256),
+            Ok(signed.len())
+        );
+
+        // WARC collection hashes bind each uncompressed record. Recompressing
+        // unchanged records therefore preserves the same detached manifest.
+        let gzip = per_record_gzip(&unsigned_records);
+        let gzip_archive = WarcArchive::parse(&gzip).unwrap();
+        assert_eq!(
+            verify_collection(&gzip_archive, false, pairs(), sha256),
+            Ok(signed.len())
+        );
+
+        // A representation change is allowed; a covered record change is not.
+        let mut changed_records = unsigned_records.clone();
+        let changed_at = changed_records[1]
+            .windows(b"<html>first</html>".len())
+            .position(|window| window == b"<html>first</html>")
+            .expect("covered response body");
+        changed_records[1][changed_at + b"<html>".len()] = b'F';
+        let changed_gzip = per_record_gzip(&changed_records);
+        let changed_archive = WarcArchive::parse(&changed_gzip).unwrap();
+        assert!(matches!(
+            verify_collection(&changed_archive, false, pairs(), sha256),
+            Err(WarcCollectionFailure::HashMismatch(_))
+        ));
+
+        let mut bad = signed.clone();
+        bad[0].1[0] ^= 1;
+        assert!(matches!(
+            verify_collection(
+                &raw_archive,
+                false,
+                bad.iter().map(|(id, hash)| (id.as_str(), hash.as_slice())),
+                sha256,
+            ),
+            Err(WarcCollectionFailure::HashMismatch(_))
+        ));
+
+        let mut misplaced = records.clone();
+        let last = misplaced.len() - 1;
+        misplaced.swap(last - 1, last);
+        let misplaced_bytes = misplaced.concat();
+        let archive = WarcArchive::parse(&misplaced_bytes).unwrap();
+        assert!(matches!(
+            verify_collection(&archive, false, pairs(), sha256),
+            Err(WarcCollectionFailure::ManifestPlacement(_))
+        ));
     }
 
     #[test]
