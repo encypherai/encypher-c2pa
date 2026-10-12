@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, VerificationReport, C2PA_PROFILE};
+use crate::{Error, VerificationReport, C2PA_PROFILE, C2PA_PROFILE_2_5};
 
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
     "https://api.encypher.com/api/v1/sdk-validation-failures";
@@ -72,7 +72,7 @@ pub(crate) fn validation_failure_telemetry_with_enabled(
         return None;
     }
 
-    let (failure_kind, status_codes, canonical_mime) = match result {
+    let (failure_kind, status_codes, canonical_mime, profile) = match result {
         Ok(report) if report.integrity == "invalid" => {
             let codes = report
                 .validation_results
@@ -83,12 +83,14 @@ pub(crate) fn validation_failure_telemetry_with_enabled(
                 "invalid_provenance",
                 bounded_codes(codes),
                 report.mime_type.clone(),
+                safe_profile(&report.profile),
             )
         }
         Err(Error::Verification(_)) => (
             "verification_error",
             vec!["verification_error".to_string()],
             safe_mime(mime_type)?,
+            C2PA_PROFILE,
         ),
         _ => return None,
     };
@@ -97,11 +99,21 @@ pub(crate) fn validation_failure_telemetry_with_enabled(
         schema_version: TELEMETRY_SCHEMA_VERSION.to_string(),
         sdk_name: safe_sdk_name(options.sdk_name.as_deref()),
         sdk_version: env!("CARGO_PKG_VERSION").to_string(),
-        profile: C2PA_PROFILE.to_string(),
+        profile: profile.to_string(),
         mime_type: canonical_mime,
         failure_kind: failure_kind.to_string(),
         status_codes,
     })
+}
+
+/// The report's validation-policy profile, restricted to the fixed tokens this
+/// SDK emits so telemetry never carries free-form text.
+fn safe_profile(profile: &str) -> &'static str {
+    if profile == C2PA_PROFILE_2_5 {
+        C2PA_PROFILE_2_5
+    } else {
+        C2PA_PROFILE
+    }
 }
 
 fn bounded_codes<'a>(codes: impl Iterator<Item = &'a str>) -> Vec<String> {

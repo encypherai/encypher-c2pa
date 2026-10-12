@@ -49,28 +49,49 @@ const FORMATS: &[AssetFormat] = &[
     AssetFormat::Ogg,
     AssetFormat::Font,
     AssetFormat::Jxl,
+    AssetFormat::Midi,
+    AssetFormat::Ttml,
+    AssetFormat::Onnx,
+    AssetFormat::SafeTensors,
+    AssetFormat::Parquet,
+    AssetFormat::BlockFact,
+    AssetFormat::Warc,
+    AssetFormat::AppendOnlyText {
+        flavor: crate::c2pa_formats::AppendOnlyFlavor::PlainText,
+    },
+    AssetFormat::AppendOnlyText {
+        flavor: crate::c2pa_formats::AppendOnlyFlavor::JsonLines,
+    },
 ];
 
 /// Format magic prefixes — exercises the "looks valid then turns hostile" path,
 /// which is where length/offset parsing bugs hide.
 const MAGICS: &[&[u8]] = &[
-    &[0xFF, 0xD8, 0xFF],               // JPEG SOI
-    b"\x89PNG\r\n\x1a\n",              // PNG
-    b"RIFF",                           // RIFF
-    b"II*\x00",                        // TIFF LE
-    b"MM\x00*",                        // TIFF BE
-    b"II+\x00\x08\x00\x00\x00",        // BigTIFF LE
-    b"MM\x00+\x00\x08\x00\x00",        // BigTIFF BE
-    b"GIF89a",                         // GIF
-    b"<?xml version=\"1.0\"?><svg",    // SVG
-    b"%PDF-1.7",                       // PDF
-    b"PK\x03\x04",                     // ZIP
-    b"ID3\x04\x00",                    // ID3
-    b"fLaC",                           // FLAC
-    b"OggS",                           // Ogg
-    b"\x00\x01\x00\x00",               // SFNT/OTF
-    b"\x00\x00\x00\x0cJXL \r\n\x87\n", // JXL
-    b"\x00\x00\x00\x18ftypisom",       // BMFF
+    &[0xFF, 0xD8, 0xFF],                                        // JPEG SOI
+    b"\x89PNG\r\n\x1a\n",                                       // PNG
+    b"RIFF",                                                    // RIFF
+    b"II*\x00",                                                 // TIFF LE
+    b"MM\x00*",                                                 // TIFF BE
+    b"II+\x00\x08\x00\x00\x00",                                 // BigTIFF LE
+    b"MM\x00+\x00\x08\x00\x00",                                 // BigTIFF BE
+    b"GIF89a",                                                  // GIF
+    b"<?xml version=\"1.0\"?><svg",                             // SVG
+    b"%PDF-1.7",                                                // PDF
+    b"PK\x03\x04",                                              // ZIP
+    b"ID3\x04\x00",                                             // ID3
+    b"fLaC",                                                    // FLAC
+    b"OggS",                                                    // Ogg
+    b"\x00\x01\x00\x00",                                        // SFNT/OTF
+    b"\x00\x00\x00\x0cJXL \r\n\x87\n",                          // JXL
+    b"\x00\x00\x00\x18ftypisom",                                // BMFF
+    b"MThd\x00\x00\x00\x06\x00\x01",                            // MIDI
+    b"<tt:tt xmlns:tt=\"http://www.w3.org/ns/ttml\"><tt:head>", // TTML
+    b"\x08\x09\x72\x02",                                        // ONNX (ir_version, then field 14)
+    b"\x40\x00\x00\x00\x00\x00\x00\x00{\"__metadata__\":{",     // SafeTensors
+    b"PAR1",                                                    // Parquet
+    b"\xfa\x49\x41\x00\x00\x00\x00\x02{}",                      // BlockFact
+    b"WARC/1.1\r\n",                                            // WARC
+    b"-----BEGIN C2PA CHECKPOINT----- ",                        // append-only text
 ];
 
 #[test]

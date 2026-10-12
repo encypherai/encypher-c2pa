@@ -129,7 +129,6 @@ mod addresses {
 
 struct Request {
     method: String,
-    target: String,
     content_type: Option<String>,
     user_agent: Option<String>,
     body: Vec<u8>,
@@ -181,7 +180,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     reader.read_line(&mut start).ok()?;
     let mut parts = start.split_whitespace();
     let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
+    parts.next()?;
     let mut content_length = 0_usize;
     let mut content_type = None;
     let mut user_agent = None;
@@ -211,7 +210,6 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     }
     Some(Request {
         method,
-        target,
         content_type,
         user_agent,
         body,
@@ -242,7 +240,7 @@ fn redirect_response(location: &str) -> Vec<u8> {
 #[cfg(feature = "online")]
 mod fetcher {
     use super::*;
-    use crate::online::native::{join_redirect, NativeFetcher};
+    use crate::online::native::NativeFetcher;
 
     fn manifest_request(url: &str) -> FetchRequest<'_> {
         FetchRequest {
@@ -253,6 +251,7 @@ mod fetcher {
             accept: Some("application/c2pa"),
             limit: 1024,
             allow_http: false,
+            remaining_requests: MAX_REQUESTS,
         }
     }
 
@@ -265,6 +264,7 @@ mod fetcher {
             accept: Some("application/ocsp-response"),
             limit: 1024,
             allow_http: false,
+            remaining_requests: MAX_REQUESTS,
         }
     }
 
@@ -345,51 +345,23 @@ mod fetcher {
             .expect_err("an oversized body must be refused");
         assert!(error.blocked, "{}", error.detail);
         assert!(error.detail.contains("512 byte limit"), "{}", error.detail);
+        assert_eq!(error.received_bytes, 513);
     }
 
-    /// Each hop is judged afresh, so a server cannot redirect its way to a
-    /// scheme this SDK refused at the start.
+    /// Redirects are never followed. The signed asset controls the original
+    /// endpoint, not the endpoint named by a server response.
     #[test]
-    fn a_redirect_to_a_refused_scheme_is_blocked_at_that_hop() {
-        let server = TestServer::start(|_, _| redirect_response("ftp://files.invalid/store.c2pa"));
+    fn a_redirect_is_refused_without_following_it() {
+        let server = TestServer::start(|_, _| redirect_response("/final"));
         let url = server.url("/ocsp");
         let error = NativeFetcher::new(true)
             .fetch(&ocsp_request(&url, b"der"))
-            .expect_err("the redirect target must be refused");
+            .expect_err("redirect responses must be refused");
         assert!(error.blocked, "{}", error.detail);
-        assert!(error.detail.contains("ftp"), "{}", error.detail);
+        assert!(error.detail.contains("redirect"), "{}", error.detail);
         assert_eq!(server.hits(), 1);
-    }
-
-    #[test]
-    fn a_redirect_chain_stops_at_the_hop_limit() {
-        let server = TestServer::start(|index, _| redirect_response(&format!("/hop-{index}")));
-        let url = server.url("/ocsp");
-        let error = NativeFetcher::new(true)
-            .fetch(&ocsp_request(&url, b"der"))
-            .expect_err("an endless redirect chain must stop");
-        assert!(error.blocked, "{}", error.detail);
-        assert!(error.detail.contains("redirects"), "{}", error.detail);
-        // The first request plus the three hops it is allowed to follow.
-        assert_eq!(server.hits(), 4);
-        assert_eq!(error.requests_used, 4);
-    }
-
-    #[test]
-    fn a_redirect_within_the_limit_is_followed_to_the_body() {
-        let server = TestServer::start(|index, request| {
-            if index == 0 {
-                redirect_response("/final")
-            } else {
-                ok_response("application/ocsp-response", request.target.as_bytes())
-            }
-        });
-        let url = server.url("/ocsp");
-        let response = NativeFetcher::new(true)
-            .fetch(&ocsp_request(&url, b"der"))
-            .expect("the redirect is followed");
-        assert_eq!(response.bytes, b"/final");
-        assert_eq!(response.requests_used, 2);
+        assert_eq!(error.requests_used, 1);
+        assert_eq!(error.received_bytes, 0);
     }
 
     #[test]
@@ -404,28 +376,41 @@ mod fetcher {
             .expect_err("503 is not an answer");
         assert!(!error.blocked, "{}", error.detail);
         assert!(error.detail.contains("503"), "{}", error.detail);
+        assert_eq!(error.received_bytes, 0);
     }
 
     #[test]
-    fn redirect_targets_resolve_against_the_url_that_produced_them() {
-        let base = "https://store.test/a/b/store.c2pa?v=1";
-        assert_eq!(
-            join_redirect(base, "https://other.test/x").as_deref(),
-            Some("https://other.test/x")
-        );
-        assert_eq!(
-            join_redirect(base, "/root.c2pa").as_deref(),
-            Some("https://store.test/root.c2pa")
-        );
-        assert_eq!(
-            join_redirect(base, "next.c2pa").as_deref(),
-            Some("https://store.test/a/b/next.c2pa")
-        );
-        assert_eq!(
-            join_redirect(base, "//elsewhere.test/x").as_deref(),
-            Some("https://elsewhere.test/x")
-        );
-        assert_eq!(join_redirect(base, "  "), None);
+    fn a_partial_failed_read_reports_the_bytes_that_arrived() {
+        let server = TestServer::start(|_, _| {
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/ocsp-response\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n3\r\nabc\r\nnot-a-chunk-size\r\n"
+                .to_vec()
+        });
+        let url = server.url("/ocsp");
+        let error = NativeFetcher::new(true)
+            .fetch(&ocsp_request(&url, b"der"))
+            .expect_err("invalid framing after a complete chunk must fail");
+
+        assert!(!error.blocked, "{}", error.detail);
+        assert!(!error.received_response, "{}", error.detail);
+        assert!(error.received_bytes > 0, "{error:?}");
+        assert_eq!(error.requests_used, 1);
+    }
+
+    #[test]
+    fn a_redirect_is_refused_before_exceeding_the_remaining_request_budget() {
+        let server = TestServer::start(|_, _| redirect_response("/final"));
+        let url = server.url("/ocsp");
+        let error = NativeFetcher::new(true)
+            .fetch(&FetchRequest {
+                remaining_requests: 1,
+                ..ocsp_request(&url, b"der")
+            })
+            .expect_err("a second request is outside the remaining budget");
+
+        assert!(error.blocked, "{}", error.detail);
+        assert!(error.detail.contains("budget"), "{}", error.detail);
+        assert_eq!(error.requests_used, 1);
+        assert_eq!(server.hits(), 1);
     }
 }
 
@@ -589,6 +574,7 @@ impl Fetcher for ScriptedFetcher {
         match self.answers.get(request.url) {
             Some(Ok(bytes)) => Ok(FetchOk {
                 bytes: bytes.clone(),
+                media_type: None,
                 requests_used: 1,
             }),
             Some(Err(detail)) => Err(FetchErr {
@@ -596,12 +582,14 @@ impl Fetcher for ScriptedFetcher {
                 received_response: false,
                 detail: detail.clone(),
                 requests_used: 1,
+                received_bytes: 0,
             }),
             None => Err(FetchErr {
                 blocked: true,
                 received_response: false,
                 detail: format!("{} was not scripted", request.url),
                 requests_used: 1,
+                received_bytes: 0,
             }),
         }
     }
@@ -622,8 +610,224 @@ impl Fetcher for RefusedOcspFetcher {
                 "the endpoint was refused before I/O".to_string()
             },
             requests_used: usize::from(self.received_response),
+            received_bytes: usize::from(self.received_response),
         })
     }
+}
+
+#[derive(Default)]
+struct SessionProbe {
+    observations: Arc<Mutex<Vec<(usize, usize)>>>,
+    failed_read_bytes: usize,
+}
+
+impl Fetcher for SessionProbe {
+    fn fetch(&self, request: &FetchRequest<'_>) -> FetchResult {
+        let mut observations = self
+            .observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        observations.push((request.remaining_requests, request.limit));
+        let first = observations.len() == 1;
+        drop(observations);
+
+        if first && self.failed_read_bytes > 0 {
+            Err(FetchErr {
+                blocked: false,
+                received_response: false,
+                detail: "the response body ended during a read".to_string(),
+                requests_used: 1,
+                received_bytes: self.failed_read_bytes,
+            })
+        } else {
+            Ok(FetchOk {
+                bytes: Vec::new(),
+                media_type: None,
+                requests_used: 1,
+            })
+        }
+    }
+}
+
+fn external_need(uri: impl Into<String>) -> NetworkNeed {
+    NetworkNeed::ExternalData {
+        uri: uri.into(),
+        assertion_label: "c2pa.cloud-data".to_string(),
+    }
+}
+
+#[test]
+fn a_partial_ocsp_read_remains_unreachable_in_legacy_fetch_all() {
+    let need = NetworkNeed::Ocsp {
+        purpose: OcspPurpose::ClaimSigner,
+        responder_url: "http://ocsp.test/".to_string(),
+        request_der: b"request".to_vec(),
+        certificate_sha256_hex: "aa11".to_string(),
+    };
+    let fetcher = SessionProbe {
+        observations: Arc::new(Mutex::new(Vec::new())),
+        failed_read_bytes: 7,
+    };
+
+    let (_, evidence) = fetch_all(&fetcher, &[need]);
+
+    assert!(evidence.ocsp_responses.is_empty());
+    assert_eq!(evidence.ocsp_unreachable, vec!["aa11".to_string()]);
+}
+
+#[test]
+fn a_session_debits_failed_read_bytes_before_the_next_frontier() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut session = FetchSession::with_fetcher(Box::new(SessionProbe {
+        observations: Arc::clone(&observations),
+        failed_read_bytes: 7,
+    }));
+
+    let (first_request, first_result) = session.fetch(&external_need("https://cdn.test/first.bin"));
+    assert_eq!(first_request.outcome, "failed");
+    assert_eq!(
+        first_result
+            .expect_err("the first read fails")
+            .received_bytes,
+        7
+    );
+
+    let (second_request, second_result) =
+        session.fetch(&external_need("https://cdn.test/second.bin"));
+    assert_eq!(second_request.outcome, "fetched");
+    second_result.expect("the second frontier is fetched");
+
+    assert_eq!(
+        *observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        vec![
+            (MAX_REQUESTS, MAX_EXTERNAL_DATA_BYTES),
+            (MAX_REQUESTS - 1, MAX_EXTERNAL_DATA_BYTES - 7),
+        ]
+    );
+}
+
+#[test]
+fn a_session_stops_after_the_cumulative_received_body_budget_is_spent() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut session = FetchSession::with_fetcher(Box::new(SessionProbe {
+        observations: Arc::clone(&observations),
+        failed_read_bytes: MAX_RECEIVED_BYTES,
+    }));
+
+    let (_, first_result) = session.fetch(&external_need("https://cdn.test/failed.bin"));
+    assert_eq!(
+        first_result.expect_err("the read fails").received_bytes,
+        MAX_RECEIVED_BYTES
+    );
+    let (request, result) = session.fetch(&external_need("https://cdn.test/skipped.bin"));
+
+    assert_eq!(request.outcome, "skipped");
+    let error = result.expect_err("the body budget is exhausted");
+    assert!(error.blocked);
+    assert!(!error.received_response);
+    assert_eq!(error.requests_used, 0);
+    assert!(request.detail.contains("response budget"));
+    assert_eq!(
+        observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_session_persists_the_request_budget_across_frontiers() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut session = FetchSession::with_fetcher(Box::new(SessionProbe {
+        observations: Arc::clone(&observations),
+        failed_read_bytes: 0,
+    }));
+
+    for index in 0..MAX_REQUESTS {
+        let (request, result) =
+            session.fetch(&external_need(format!("https://cdn.test/{index}.bin")));
+        assert_eq!(request.outcome, "fetched");
+        result.expect("request remains inside the budget");
+    }
+    let (request, error) = session.fetch(&external_need("https://cdn.test/over-budget.bin"));
+
+    assert_eq!(request.outcome, "skipped");
+    let error = error.expect_err("no request remains");
+    assert!(error.blocked);
+    assert!(!error.received_response);
+    assert_eq!(error.requests_used, 0);
+    let remaining: Vec<usize> = observations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .map(|(remaining, _)| *remaining)
+        .collect();
+    assert_eq!(remaining, (1..=MAX_REQUESTS).rev().collect::<Vec<_>>());
+}
+
+#[test]
+fn a_session_preserves_each_need_kind_body_limit() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut session = FetchSession::with_fetcher(Box::new(SessionProbe {
+        observations: Arc::clone(&observations),
+        failed_read_bytes: 0,
+    }));
+    let needs = [
+        NetworkNeed::RemoteManifest {
+            uri: "https://store.test/store.c2pa".to_string(),
+        },
+        NetworkNeed::Ocsp {
+            purpose: OcspPurpose::ClaimSigner,
+            responder_url: "http://ocsp.test/".to_string(),
+            request_der: b"request".to_vec(),
+            certificate_sha256_hex: "aa11".to_string(),
+        },
+        NetworkNeed::DidDocument {
+            did: "did:web:issuer.test".to_string(),
+            url: "https://issuer.test/.well-known/did.json".to_string(),
+        },
+        external_need("https://cdn.test/data.bin"),
+    ];
+
+    for need in &needs {
+        session
+            .fetch(need)
+            .1
+            .expect("the probe accepts the request");
+    }
+
+    let limits: Vec<usize> = observations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .map(|(_, limit)| *limit)
+        .collect();
+    assert_eq!(
+        limits,
+        [
+            MAX_MANIFEST_BYTES,
+            MAX_OCSP_BYTES,
+            MAX_DID_DOCUMENT_BYTES,
+            MAX_EXTERNAL_DATA_BYTES,
+        ]
+    );
+}
+
+#[cfg(not(feature = "online"))]
+#[test]
+fn a_session_reports_the_disabled_native_transport_explicitly() {
+    let mut session = FetchSession::new(false);
+    let (request, result) = session.fetch(&external_need("https://cdn.test/data.bin"));
+
+    assert_eq!(request.outcome, "blocked");
+    let error = result.expect_err("this build has no native transport");
+    assert!(error.blocked);
+    assert!(!error.received_response);
+    assert_eq!(error.requests_used, 0);
+    assert!(error.detail.contains("without the online feature"));
 }
 
 fn sdk_ocsp_needs(

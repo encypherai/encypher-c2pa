@@ -431,7 +431,33 @@ pub(crate) fn xmp_packet(data: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Is the manifest store where C2PA requires it?
+/// C2PA 2.5 Locating the Active Manifest, Special Considerations for TIFF:
+/// "the C2PA Manifest Store shall be located in either the first IFD or the
+/// last IFD". More than one C2PA entry remains ambiguous.
+pub(crate) fn placement_error_v2_5(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    let t = read_header(data)?;
+    let chain = walk(data, t, true)?;
+    let mut carriers: Vec<usize> = Vec::new();
+    for (position, ifd) in chain.iter().enumerate() {
+        for index in 0..ifd.count {
+            if ifd.tag(t, index) == TAG_C2PA {
+                carriers.push(position);
+            }
+        }
+    }
+    match carriers.as_slice() {
+        [] => Ok(None),
+        [carrier] if *carrier == 0 || *carrier + 1 == chain.len() => Ok(None),
+        [_] => Ok(Some(
+            "TIFF C2PA entry is in neither the first nor the last IFD",
+        )),
+        _ => Ok(Some(
+            "TIFF main-IFD chain contains more than one C2PA entry",
+        )),
+    }
+}
+
+/// Is the manifest store where C2PA requires it (C2PA 2.4 rules)?
 ///
 /// 2.2 A.3.5 requires the store to be the only entry of the last IFD, "the IFD
 /// immediately preceding the end of the file", at any page count. 2.4 A.3.6

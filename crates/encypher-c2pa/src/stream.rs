@@ -235,7 +235,9 @@ fn verify_stream_with_options_and_expected_seeks(
     method: StreamMethod,
     options: &VerifyOptions,
 ) -> Result<StreamVerificationReport, Error> {
-    let mime = resolve_mime(mime_type)?;
+    // Every BMFF type is in the 2.4 registry, so the policy-independent
+    // registry check is the right one; the BMFF test below narrows it.
+    let mime = resolve_mime(mime_type, crate::c2pa_core::EngineProfile::GENEROUS)?;
     if crate::c2pa_formats::AssetFormat::from_mime(&mime)
         != Some(crate::c2pa_formats::AssetFormat::Bmff)
     {

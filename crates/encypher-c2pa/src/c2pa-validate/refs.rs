@@ -25,12 +25,10 @@
 //!    assertion metadata (via a `metadata` field), if the `metadata` field is
 //!    present, the validator shall not perform any validation on the contents
 //!    of that structure." So no path in this module descends into `metadata`.
-//! 3. **No network, and no external references.** Only `self#jumbf=` URIs are
-//!    resolved here. A field whose CDDL type is the internal/external union
-//!    (`c2pa.ingredient.v2`/`v3`'s `data`) is validated only when its `url` is
-//!    a `self#jumbf=` reference; an `http(s)` URL is external data, which
-//!    C2PA 2.4 External Data Validation keeps out of standard validation
-//!    entirely and routes through the cloud-data / external-reference rules.
+//! 3. **No network.** External `http` or `https` references are resolved only
+//!    through an injected [`ExternalResources`] provider over bytes the caller
+//!    already holds. Without a provider, retrieval remains optional and is
+//!    reported as informational.
 //! 4. **Store-scoped, exact-label resolution.** The procedure is scoped to the
 //!    C2PA Manifest Store: an ingredient `thumbnail` commonly names the
 //!    thumbnail already sitting in the INGREDIENT's manifest rather than
@@ -66,19 +64,125 @@
 
 use super::{
     hash_bytes, is_allowed_hash_algorithm, is_generous, ClaimAssertionRefs, ClaimGeneration,
-    EngineProfile, ValidationResults, ALGORITHM_UNSUPPORTED, CLAIM_MALFORMED, HASHED_URI_MISMATCH,
-    HASHED_URI_MISSING,
+    EngineProfile, OnlineEvidence, ValidationResults, ALGORITHM_UNSUPPORTED,
+    ASSERTION_HASHED_URI_MATCH, HASHED_URI_MISMATCH, HASHED_URI_MISSING,
 };
 use crate::c2pa_cbor::Value;
 use crate::c2pa_core::jumbf::ParsedManifest;
+use std::collections::HashMap;
 
-/// Ceiling on the number of nested references one manifest walk examines.
-///
-/// Matches [`super::MAX_CLAIM_ASSERTION_REFERENCES`]: a claim may not declare
-/// more assertions than that, and no honest assertion set carries more nested
-/// references than the store carries assertions. Input beyond the bound is
-/// rejected rather than hashed.
-const MAX_NESTED_REFERENCES: usize = 4_096;
+/// What a caller-side retrieval attempt for one external hashed URI produced.
+pub enum ExternalResource<'a> {
+    /// No retrieval was attempted.
+    NotAttempted,
+    /// Retrieval was attempted but no usable body was obtained.
+    Unavailable,
+    /// Retrieved bytes and the observed response media type, when available.
+    Retrieved {
+        /// Bytes to verify against the reference digest.
+        bytes: &'a [u8],
+        /// Media type reported by the transport.
+        media_type: Option<&'a str>,
+    },
+}
+
+/// Injected, network-free source of external hashed-URI resources.
+pub trait ExternalResources {
+    /// Resolve one external URL without allowing the verifier to open a socket.
+    fn resolve(&self, url: &str) -> ExternalResource<'_>;
+}
+
+enum CachedResource<'a> {
+    NotAttempted,
+    Unavailable,
+    Retrieved {
+        bytes: &'a [u8],
+        media_type: Option<&'a str>,
+    },
+}
+
+pub(super) enum ResolvedResource<'a> {
+    NotAttempted,
+    Unavailable,
+    Retrieved {
+        bytes: &'a [u8],
+        media_type: Option<&'a str>,
+    },
+}
+
+pub(super) struct ResourceCache<'a> {
+    provider: Option<&'a dyn ExternalResources>,
+    evidence: OnlineEvidence<'a>,
+    outcomes: HashMap<String, CachedResource<'a>>,
+}
+
+impl<'a> ResourceCache<'a> {
+    pub(super) fn with_evidence(
+        provider: Option<&'a dyn ExternalResources>,
+        evidence: OnlineEvidence<'a>,
+    ) -> Self {
+        Self {
+            provider,
+            evidence,
+            outcomes: HashMap::new(),
+        }
+    }
+
+    pub(super) fn resolve(&mut self, url: &str) -> ResolvedResource<'_> {
+        if !self.outcomes.contains_key(url) {
+            let supplied = self
+                .evidence
+                .external_data
+                .and_then(|resources| resources.get(url));
+            let outcome = if let Some(bytes) = supplied {
+                let media_type = self
+                    .evidence
+                    .external_data_media_types
+                    .and_then(|media_types| media_types.get(url))
+                    .map(String::as_str);
+                CachedResource::Retrieved {
+                    bytes: bytes.as_slice(),
+                    media_type,
+                }
+            } else if self.evidence.external_is_unreachable(url) {
+                CachedResource::Unavailable
+            } else {
+                match self.provider {
+                    None => CachedResource::NotAttempted,
+                    Some(provider) => Self::fetch(provider, url),
+                }
+            };
+            self.outcomes.insert(url.to_string(), outcome);
+        }
+        match self.outcomes.get(url).expect("resource outcome inserted") {
+            CachedResource::NotAttempted => ResolvedResource::NotAttempted,
+            CachedResource::Unavailable => ResolvedResource::Unavailable,
+            CachedResource::Retrieved { bytes, media_type } => ResolvedResource::Retrieved {
+                bytes,
+                media_type: *media_type,
+            },
+        }
+    }
+
+    /// Borrow the provider's stable response directly. `ExternalResources`
+    /// ties the response lifetime to its own borrow, so memoization needs no
+    /// payload or media-type copy.
+    fn fetch(provider: &'a dyn ExternalResources, url: &str) -> CachedResource<'a> {
+        match provider.resolve(url) {
+            ExternalResource::NotAttempted => CachedResource::NotAttempted,
+            ExternalResource::Unavailable => CachedResource::Unavailable,
+            ExternalResource::Retrieved { bytes, media_type } => {
+                CachedResource::Retrieved { bytes, media_type }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReferenceWalk {
+    pub(super) examined: usize,
+    pub(super) truncated: bool,
+}
 
 /// Ceiling on `related` action nesting. `action-item-map-v2.related` is a list
 /// of action items, so it recurses; the bound keeps a hostile assertion from
@@ -239,17 +343,17 @@ fn locate<'v>(
     out: &mut Vec<Located<'v>>,
     limit: usize,
 ) -> bool {
-    if out.len() >= limit {
-        return true;
-    }
     match steps.split_first() {
         None => {
+            if out.len() >= limit {
+                return true;
+            }
             out.push(Located {
                 kind,
                 value,
                 path: path.clone(),
             });
-            out.len() >= limit
+            false
         }
         Some((Step::Field(name), rest)) => {
             let Some(child) = value.get(name) else {
@@ -307,6 +411,17 @@ fn locate<'v>(
     }
 }
 
+/// Immutable inputs for one assertion-reference walk.
+pub(super) struct AssertionReferenceContext<'a, 'm> {
+    pub claim: &'a Value,
+    pub claim_refs: &'a ClaimAssertionRefs<'m>,
+    pub generation: ClaimGeneration,
+    pub profile: EngineProfile,
+    pub manifest_label: &'a str,
+    pub manifests: &'a [ParsedManifest<'m>],
+    pub budget: usize,
+}
+
 /// Validate every schema-declared `hashed_uri` field of every standard
 /// assertion the claim declares.
 ///
@@ -316,14 +431,19 @@ fn locate<'v>(
 /// Assertion values come from the claim's own bounded index, so nothing is
 /// decoded twice and nothing undeclared is walked.
 pub(super) fn verify_assertion_references(
-    claim: &Value,
-    claim_refs: &ClaimAssertionRefs<'_>,
-    generation: ClaimGeneration,
-    profile: EngineProfile,
-    manifest_label: &str,
-    manifests: &[ParsedManifest<'_>],
+    context: AssertionReferenceContext<'_, '_>,
+    resources: &mut ResourceCache<'_>,
     results: &mut ValidationResults,
-) {
+) -> ReferenceWalk {
+    let AssertionReferenceContext {
+        claim,
+        claim_refs,
+        generation,
+        profile,
+        manifest_label,
+        manifests,
+        budget,
+    } = context;
     // The blanket reference rule is a 2.x requirement that 1.x-era generators
     // could not follow: they wrote an action's `parameters.ingredient` hash
     // before the assertion it names was final, so the digest in that position
@@ -332,7 +452,10 @@ pub(super) fn verify_assertion_references(
     // exactly as it is held to the `c2pa.actions` ingredient-resolution rules
     // in [`super::verify_action_assertions`].
     if generation == ClaimGeneration::V1 && is_generous(profile) {
-        return;
+        return ReferenceWalk {
+            examined: 0,
+            truncated: false,
+        };
     }
     let claim_alg = claim.get("alg").and_then(Value::as_text);
     let mut seen: Vec<&str> = Vec::new();
@@ -359,12 +482,8 @@ pub(super) fn verify_assertion_references(
         let assertion_alg = assertion.get("alg").and_then(Value::as_text);
         let mut located = Vec::new();
         let mut capped = false;
+        let capacity = budget.saturating_sub(examined);
         for field in fields {
-            let remaining = MAX_NESTED_REFERENCES.saturating_sub(examined + located.len());
-            if remaining == 0 {
-                capped = true;
-                break;
-            }
             let mut path = String::new();
             if locate(
                 assertion,
@@ -373,7 +492,7 @@ pub(super) fn verify_assertion_references(
                 0,
                 &mut path,
                 &mut located,
-                remaining,
+                capacity,
             ) {
                 capped = true;
                 break;
@@ -389,20 +508,108 @@ pub(super) fn verify_assertion_references(
                 manifest_label,
                 manifests,
                 assertion_alg.or(claim_alg),
+                resources,
                 results,
             );
         }
         if capped {
-            results.push_failure(
-                CLAIM_MALFORMED,
-                assertion_url,
-                format!(
-                    "assertion reference count exceeds verifier bound ({MAX_NESTED_REFERENCES})"
-                ),
-            );
-            return;
+            return ReferenceWalk {
+                examined,
+                truncated: true,
+            };
         }
     }
+    ReferenceWalk {
+        examined,
+        truncated: false,
+    }
+}
+
+/// Locate network-resolvable, schema-declared references without validating
+/// their contents. The examined count matches [`verify_assertion_references`]
+/// so discovery and final verification consume the same reference budget.
+pub(super) fn locate_external_references(
+    claim_refs: &ClaimAssertionRefs<'_>,
+    generation: ClaimGeneration,
+    profile: EngineProfile,
+    budget: usize,
+) -> (Vec<String>, ReferenceWalk) {
+    if generation == ClaimGeneration::V1 && is_generous(profile) {
+        return (
+            Vec::new(),
+            ReferenceWalk {
+                examined: 0,
+                truncated: false,
+            },
+        );
+    }
+    let mut urls = Vec::new();
+    let mut seen = Vec::new();
+    let mut examined = 0usize;
+    for reference in &claim_refs.references {
+        let Some(label) = reference.label else {
+            continue;
+        };
+        if seen.contains(&label) {
+            continue;
+        }
+        seen.push(label);
+        let fields = ref_fields(label);
+        if fields.is_empty() {
+            continue;
+        }
+        let Some(assertion) = claim_refs
+            .indexed(label)
+            .and_then(|indexed| indexed.decoded.as_ref())
+        else {
+            continue;
+        };
+        let capacity = budget.saturating_sub(examined);
+        let mut located = Vec::new();
+        let mut capped = false;
+        for field in fields {
+            let mut path = String::new();
+            if locate(
+                assertion,
+                field.kind,
+                field.path,
+                0,
+                &mut path,
+                &mut located,
+                capacity,
+            ) {
+                capped = true;
+                break;
+            }
+        }
+        examined = examined.saturating_add(located.len());
+        for reference in located {
+            let Some(url) = reference.value.get("url").and_then(Value::as_text) else {
+                continue;
+            };
+            if reference.kind == Kind::Either
+                && (url.starts_with("https://") || url.starts_with("http://"))
+            {
+                urls.push(url.to_string());
+            }
+        }
+        if capped {
+            return (
+                urls,
+                ReferenceWalk {
+                    examined,
+                    truncated: true,
+                },
+            );
+        }
+    }
+    (
+        urls,
+        ReferenceWalk {
+            examined,
+            truncated: false,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // one reference's full context; splitting it hides the flow
@@ -414,6 +621,7 @@ fn validate_reference(
     manifest_label: &str,
     manifests: &[ParsedManifest<'_>],
     inherited_alg: Option<&str>,
+    resources: &mut ResourceCache<'_>,
     results: &mut ValidationResults,
 ) {
     let path = &located.path;
@@ -429,9 +637,15 @@ fn validate_reference(
         return;
     };
     if located.kind == Kind::Either && !url.starts_with("self#jumbf=") {
-        // A `hashed_ext_uri` in the union position. External data is not part
-        // of standard validation (C2PA 2.4 External Data Validation), so this
-        // procedure has nothing to say about it.
+        validate_external_reference(
+            located,
+            url,
+            alabel,
+            assertion_url,
+            inherited_alg,
+            resources,
+            results,
+        );
         return;
     }
     let Some(destination) = resolve(url, manifest_label, manifests) else {
@@ -494,6 +708,119 @@ fn validate_reference(
             url.to_string(),
             format!("{alabel} field '{path}' hashed uri mismatch: {url}"),
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_external_reference(
+    located: &Located<'_>,
+    url: &str,
+    alabel: &str,
+    assertion_url: &str,
+    inherited_alg: Option<&str>,
+    resources: &mut ResourceCache<'_>,
+    results: &mut ValidationResults,
+) {
+    const NOT_RETRIEVED: &str = "com.encypher.reference.externalNotRetrieved";
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        results.push_failure(
+            HASHED_URI_MISSING,
+            assertion_url.to_string(),
+            format!(
+                "{alabel} field '{}' has an invalid external URL",
+                located.path
+            ),
+        );
+        return;
+    }
+    let algorithm = located
+        .value
+        .get("alg")
+        .and_then(Value::as_text)
+        .or(inherited_alg);
+    let Some(algorithm) = algorithm.filter(|value| is_allowed_hash_algorithm(value)) else {
+        results.push_failure(
+            ALGORITHM_UNSUPPORTED,
+            assertion_url.to_string(),
+            format!(
+                "{alabel} field '{}' has no supported hash algorithm",
+                located.path
+            ),
+        );
+        return;
+    };
+    let Some(expected) = located.value.get("hash").and_then(Value::as_bytes) else {
+        results.push_failure(
+            HASHED_URI_MISMATCH,
+            assertion_url.to_string(),
+            format!("{alabel} field '{}' has no hash", located.path),
+        );
+        return;
+    };
+    match resources.resolve(url) {
+        ResolvedResource::NotAttempted => results.push_informational(
+            NOT_RETRIEVED,
+            url.to_string(),
+            format!(
+                "{alabel} field '{}' references external data that was not retrieved",
+                located.path
+            ),
+        ),
+        ResolvedResource::Unavailable => results.push_failure(
+            HASHED_URI_MISSING,
+            url.to_string(),
+            format!(
+                "{alabel} field '{}' external data could not be retrieved",
+                located.path
+            ),
+        ),
+        ResolvedResource::Retrieved { bytes, media_type } => {
+            if let Some(declared) = located.value.get("size").and_then(|value| match value {
+                Value::Integer(value) => usize::try_from(*value).ok(),
+                _ => None,
+            }) {
+                if declared != bytes.len() {
+                    results.push_failure(
+                        HASHED_URI_MISMATCH,
+                        url.to_string(),
+                        format!(
+                            "{alabel} field '{}' declares {declared} bytes; retrieved {}",
+                            located.path,
+                            bytes.len()
+                        ),
+                    );
+                    return;
+                }
+            }
+            if let (Some(declared), Some(observed)) = (
+                located.value.get("dc:format").and_then(Value::as_text),
+                media_type,
+            ) {
+                if declared != observed {
+                    results.push_informational(
+                        NOT_RETRIEVED,
+                        url.to_string(),
+                        format!(
+                            "{alabel} field '{}' declares dc:format '{declared}' but was retrieved as '{observed}'",
+                            located.path
+                        ),
+                    );
+                }
+            }
+            if hash_bytes(algorithm, bytes).as_deref() == Some(expected) {
+                results.push_success(
+                    ASSERTION_HASHED_URI_MATCH,
+                    url.to_string(),
+                    format!("{alabel} field '{}' hashed uri matched", located.path),
+                );
+            } else {
+                results.push_failure(
+                    HASHED_URI_MISMATCH,
+                    url.to_string(),
+                    format!("{alabel} field '{}' hashed uri mismatch", located.path),
+                );
+            }
+        }
     }
 }
 
@@ -652,13 +979,18 @@ mod tests {
         let manifests = [fixture.manifest()];
         let refs = ClaimAssertionRefs::build(&manifests[0], claim, generation);
         let mut results = ValidationResults::default();
+        let mut resources = ResourceCache::with_evidence(None, OnlineEvidence::default());
         verify_assertion_references(
-            claim,
-            &refs,
-            generation,
-            profile,
-            MANIFEST,
-            &manifests,
+            AssertionReferenceContext {
+                claim,
+                claim_refs: &refs,
+                generation,
+                profile,
+                manifest_label: MANIFEST,
+                manifests: &manifests,
+                budget: usize::MAX,
+            },
+            &mut resources,
             &mut results,
         );
         results
@@ -1038,5 +1370,93 @@ mod tests {
             "{:?}",
             out.results.failure
         );
+    }
+
+    #[test]
+    fn resource_cache_borrows_and_memoizes_provider_payloads() {
+        use std::cell::Cell;
+
+        struct Provider {
+            calls: Cell<usize>,
+            bytes: [u8; 4],
+        }
+
+        impl ExternalResources for Provider {
+            fn resolve(&self, url: &str) -> ExternalResource<'_> {
+                assert_eq!(url, "https://example.test/icon");
+                self.calls.set(self.calls.get() + 1);
+                ExternalResource::Retrieved {
+                    bytes: &self.bytes,
+                    media_type: Some("image/png"),
+                }
+            }
+        }
+
+        let provider = Provider {
+            calls: Cell::new(0),
+            bytes: [1, 2, 3, 4],
+        };
+        let mut cache = ResourceCache::with_evidence(Some(&provider), OnlineEvidence::default());
+        for _ in 0..2 {
+            let ResolvedResource::Retrieved { bytes, media_type } =
+                cache.resolve("https://example.test/icon")
+            else {
+                panic!("provider payload was not returned");
+            };
+            assert_eq!(bytes.as_ptr(), provider.bytes.as_ptr());
+            assert_eq!(media_type, Some("image/png"));
+        }
+        assert_eq!(provider.calls.get(), 1);
+    }
+
+    #[test]
+    fn resource_cache_gives_online_evidence_precedence_over_the_provider() {
+        use std::cell::Cell;
+
+        struct Provider {
+            calls: Cell<usize>,
+        }
+
+        impl ExternalResources for Provider {
+            fn resolve(&self, _: &str) -> ExternalResource<'_> {
+                self.calls.set(self.calls.get() + 1);
+                ExternalResource::Retrieved {
+                    bytes: b"provider",
+                    media_type: None,
+                }
+            }
+        }
+
+        const URL: &str = "https://example.test/evidence";
+        let provider = Provider {
+            calls: Cell::new(0),
+        };
+        let bodies = HashMap::from([(URL.to_string(), b"evidence".to_vec())]);
+        let media_types = HashMap::from([(URL.to_string(), "text/plain".to_string())]);
+        let mut cache = ResourceCache::with_evidence(
+            Some(&provider),
+            OnlineEvidence {
+                external_data: Some(&bodies),
+                external_data_media_types: Some(&media_types),
+                ..OnlineEvidence::default()
+            },
+        );
+        let ResolvedResource::Retrieved { bytes, media_type } = cache.resolve(URL) else {
+            panic!("online evidence was not returned");
+        };
+        assert_eq!(bytes, b"evidence");
+        assert_eq!(media_type, Some("text/plain"));
+        assert_eq!(provider.calls.get(), 0);
+
+        let unreachable = [URL.to_string()];
+        let mut cache = ResourceCache::with_evidence(
+            Some(&provider),
+            OnlineEvidence {
+                external_data_unreachable: Some(&unreachable),
+                ..OnlineEvidence::default()
+            },
+        );
+        assert!(matches!(cache.resolve(URL), ResolvedResource::Unavailable));
+        assert_eq!(provider.calls.get(), 0);
     }
 }

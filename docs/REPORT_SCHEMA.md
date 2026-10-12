@@ -9,7 +9,7 @@ Additive fields may appear within schema 1.x. A field removal, rename, type chan
 | Field | Type | Meaning |
 |---|---|---|
 | `schema_version` | string | Public report contract version. |
-| `profile` | string | Engine profile used for verification. Current value: `c2pa-2.4`. |
+| `profile` | string | Validation policy that produced the report: `c2pa-2.4` (default, and `spec_version: "2.4"`) or `c2pa-2.5` (`spec_version: "2.5"`, the proposed C2PA 2.5 draft). `manifest_report.engine_profile.spec_version` carries the same choice; under `c2pa-2.5` it is present even when no manifest was located. |
 | `mime_type` | string | Normalized MIME type used to choose the container reader. |
 | `present` | boolean | A readable active C2PA manifest is present. |
 | `integrity` | string | `valid`, `invalid`, or `absent`. This is not a trust decision. |
@@ -125,7 +125,7 @@ Extension codes use the `com.encypher.` prefix, as C2PA 2.4 requires of codes ou
 | `com.encypher.cawg.legacyProfile` | informational | The identity signature verifies over the CAWG 1.1 field order, not CAWG Identity 1.3 deterministic CBOR. Strict mode reports `cawg.x509.signature.mismatch` instead. |
 | `com.encypher.claim.generatorInfoMissing` | informational | A v1 claim carries `claim_generator` but no `claim_generator_info`. Strict mode reports `claim.malformed`. |
 | `com.encypher.ingredient.legacyClaimHash` | informational | A legacy `c2pa_manifest` ingredient link matched the C2PA 1.0 hash over the ingredient's claim bytes. Default posture only. |
-| `com.encypher.ingredient.graphLimitExceeded` | informational | Recursive ingredient validation reached its depth or manifest ceiling. Never affects validity. |
+| `com.encypher.resource.graphLimitExceeded` | informational | Recursive ingredient and reference validation reached its depth, node, reference, or byte ceiling. Never affects validity. |
 | `com.encypher.assertion.boxesHash.overlappingRestartSegments` | informational | A JPEG box hash matched the overlapping restart layout c2pa-rs writes rather than the C2PA 2.4 layout. Default posture only. |
 | `com.encypher.cawg.metadata.invalid`, `com.encypher.cawg.trainingMining.invalid` | failure (assertion-scoped) | The CAWG metadata or training-and-mining assertion is malformed. Never changes C2PA integrity. |
 | `com.encypher.cawg.trainingMining.effectiveUse` | informational | `details.entries` maps each standard use to `declaredUse`, `effectiveUse`, and any `constraintInfo`. |

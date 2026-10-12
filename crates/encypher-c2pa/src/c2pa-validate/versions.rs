@@ -4,13 +4,20 @@
 //! Spec-version classification of a parsed manifest — the version ladder.
 //!
 //! Given a parsed manifest and its decoded claim, [`evaluate`] determines, for
-//! every [`SpecVersion`] the engine knows, whether the manifest's
+//! every [`SpecVersion`] up to a ceiling, whether the manifest's
 //! validator-observable structure conforms to that revision's creation rules,
 //! and picks the revision the manifest *validated under*:
 //!
 //! - the **declared** revision (`claim_generator_info.specVersion`) when it is
 //!   among the conformant set, else
 //! - the **highest** conformant revision, else `None`.
+//!
+//! The ceiling is the classification frame, not the declared version: the
+//! historical ladder ([`HISTORICAL_CEILING`], 1.4 through 2.4) is what every
+//! default verification reports, so adding a revision to [`SpecVersion`] never
+//! changes an existing report. A caller that explicitly selects the proposed
+//! 2.5 policy extends the ladder to 2.5 through [`ladder_ceiling`]. Nothing a
+//! manifest declares can raise the ceiling.
 //!
 //! The ladder is purely structural: claim generation (v1 vs v2), per-revision
 //! required claim fields, and feature-introduction minimums for assertions and
@@ -19,25 +26,40 @@
 //! clears `validated_under` when the overall validation state is `Invalid`.
 //!
 //! Feature-introduction data is grounded in the C2PA knowledge graph
-//! (entity presence per spec version, KG tags v1.1.4–v1.2.4):
+//! (entity presence per spec version, KG tags v1.1.4–v1.2.4) and, for 2.5, in
+//! the proposed draft (specs-core `cd61a4d1`):
 //!
-//! | feature                          | introduced |
-//! |----------------------------------|------------|
-//! | claim v2 (`ClaimMapV2`)          | 2.0        |
-//! | `c2pa.ingredient.v3`             | 2.1        |
-//! | `c2pa.hash.collection.*`         | 2.1        |
-//! | `c2pa.hash.multi-asset` (+parts) | 2.2        |
-//! | text embedding (A.7/A.8/A.9)     | 2.4        |
+//! | feature                                    | introduced |
+//! |--------------------------------------------|------------|
+//! | claim v2 (`ClaimMapV2`)                    | 2.0        |
+//! | `c2pa.ingredient.v3`                       | 2.1        |
+//! | `c2pa.hash.collection.*`                   | 2.1        |
+//! | `c2pa.hash.multi-asset` (+parts)           | 2.2        |
+//! | text embedding (A.7/A.8/A.9)               | 2.4        |
+//! | `c2pa.linked-resource-integrity`           | 2.5        |
+//! | `c2pa.hash.segment`                        | 2.5        |
+//! | `allActionsIncluded` required in actions v2 | 2.5       |
 //!
-//! Claim v1 (`ClaimMap`) is *defined* in every revision through 2.4 (validators
+//! Claim v1 (`ClaimMap`) is *defined* in every revision through 2.5 (validators
 //! must still read v1 stores), but a v1 claim is only *creatable* under 1.x —
 //! so a v1-claim manifest conforms to the 1.x rule set alone.
 
-use crate::c2pa_cbor::Value;
+use crate::c2pa_cbor::{decode, Value};
 use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_core::SpecVersion;
 use crate::c2pa_formats::AssetFormat;
 use serde_json::{json, Value as Json};
+
+/// The historical default public policy is 2.4, selected by the public option
+/// resolver before this module is called. An explicit policy evaluates only
+/// through its own revision: 2.2 cannot silently use 2.4 requirements, and a
+/// future registered revision cannot inherit 2.5 without its own rules.
+pub(crate) const HISTORICAL_CEILING: SpecVersion = SpecVersion::V2_4;
+
+/// The ladder ceiling for the caller-selected validation policy.
+pub(crate) fn ladder_ceiling(policy: SpecVersion) -> SpecVersion {
+    policy
+}
 
 /// Claim generation: the 1.x claim v1 shape vs the 2.x claim v2 shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,13 +373,67 @@ pub fn v2_missing_fields(claim: &Value) -> Vec<&'static str> {
 /// label is defined across every revision the engine knows (or is external to
 /// the C2PA spec, e.g. `cawg.*`, vendor assertions).
 fn assertion_min_version(label: &str) -> Option<SpecVersion> {
-    if label.starts_with("c2pa.hash.multi-asset") || label.starts_with("c2pa.hash.data.part") {
+    if label.starts_with("c2pa.linked-resource-integrity") || label.starts_with("c2pa.hash.segment")
+    {
+        Some(SpecVersion::V2_5)
+    } else if label.starts_with("c2pa.hash.multi-asset") || label.starts_with("c2pa.hash.data.part")
+    {
         Some(SpecVersion::V2_2)
     } else if label.starts_with("c2pa.ingredient.v3") || label.starts_with("c2pa.hash.collection") {
         Some(SpecVersion::V2_1)
     } else {
         None
     }
+}
+
+/// Whether `label` names a `c2pa.actions.v2` assertion, counting the
+/// multi-instance spellings (`c2pa.actions.v2__1`).
+fn is_actions_v2_label(label: &str) -> bool {
+    label == "c2pa.actions.v2" || label.starts_with("c2pa.actions.v2__")
+}
+
+/// Whether `label` names an actions assertion of either version.
+fn is_actions_label(label: &str) -> bool {
+    is_actions_v2_label(label) || label == "c2pa.actions" || label.starts_with("c2pa.actions__")
+}
+
+/// Creation rules that first apply in proposed 2.5 and are visible in the
+/// stored actions assertions.
+///
+/// Actions, `actions-map-v2`: "The generator shall set the `actions-map-v2`
+/// field, `allActionsIncluded`" (optional before 2.5). Actions, deprecated
+/// actions: `c2pa.removed` "shall no longer be written" from 2.5, which the
+/// ladder records as a deprecation note, never a gate, like every other
+/// deprecation. A payload that does not decode as CBOR is left to the
+/// assertion validators and contributes nothing here.
+fn actions_creation_findings(manifest: &ParsedManifest) -> (Vec<String>, Vec<String>) {
+    let mut reasons = Vec::new();
+    let mut deprecations = Vec::new();
+    for (label, payload) in &manifest.assertions {
+        if !is_actions_label(label) {
+            continue;
+        }
+        let Ok(assertion) = decode(*payload) else {
+            continue;
+        };
+        if is_actions_v2_label(label)
+            && !matches!(assertion.get("allActionsIncluded"), Some(Value::Bool(_)))
+        {
+            reasons.push(format!(
+                "actions assertion '{label}' omits the boolean allActionsIncluded field, required from 2.5"
+            ));
+        }
+        let removed = matches!(assertion.get("actions"), Some(Value::Array(actions))
+        if actions.iter().any(|action| {
+            action.get("action").and_then(Value::as_text) == Some("c2pa.removed")
+        }));
+        if removed {
+            deprecations.push(format!(
+                "actions assertion '{label}' writes c2pa.removed, deprecated as of 2.5"
+            ));
+        }
+    }
+    (reasons, deprecations)
 }
 
 /// The earliest spec revision whose embedding annex covers `format`.
@@ -367,6 +443,14 @@ fn format_min_version(format: AssetFormat) -> Option<SpecVersion> {
         | AssetFormat::TextUnstructured
         | AssetFormat::TextStructured { .. }
         | AssetFormat::TextHtml => Some(SpecVersion::V2_4),
+        AssetFormat::Midi
+        | AssetFormat::Ttml
+        | AssetFormat::Onnx
+        | AssetFormat::SafeTensors
+        | AssetFormat::Parquet
+        | AssetFormat::BlockFact
+        | AssetFormat::Warc
+        | AssetFormat::AppendOnlyText { .. } => Some(SpecVersion::V2_5),
         _ => None,
     }
 }
@@ -440,17 +524,24 @@ impl VersionVerdict {
     }
 }
 
-/// Run the version ladder over a parsed manifest and its decoded claim.
+/// Run the historical version ladder (1.4 through [`HISTORICAL_CEILING`]) over
+/// a parsed manifest and its decoded claim.
 pub fn evaluate(manifest: &ParsedManifest, claim: &Value, format: AssetFormat) -> VersionVerdict {
-    evaluate_for(manifest, claim, Some(format))
+    evaluate_for(manifest, claim, Some(format), HISTORICAL_CEILING)
 }
 
-/// [`evaluate`] without a host format when the caller verifies the content
-/// binding itself: the format floor is then the caller's to apply.
+/// [`evaluate`] with an explicit `ceiling` (see [`ladder_ceiling`]) and an
+/// optional host format. `format` is `None` when the caller verifies the
+/// content binding itself: the format floor is then the caller's to apply.
+///
+/// Rungs above `ceiling` are not evaluated, and a feature introduced above it
+/// is outside the frame entirely, so the historical frame classifies exactly
+/// as it did before newer revisions were known.
 pub(crate) fn evaluate_for(
     manifest: &ParsedManifest,
     claim: &Value,
     format: Option<AssetFormat>,
+    ceiling: SpecVersion,
 ) -> VersionVerdict {
     let generation = claim_generation(manifest, claim);
     let declared = declared_spec_version(claim);
@@ -471,7 +562,7 @@ pub(crate) fn evaluate_for(
     // Feature-introduction minimums observed in this manifest.
     let mut minimums: Vec<(SpecVersion, String)> = Vec::new();
     for (label, _) in &manifest.assertions {
-        if let Some(min) = assertion_min_version(label) {
+        if let Some(min) = assertion_min_version(label).filter(|min| *min <= ceiling) {
             minimums.push((
                 min,
                 format!("assertion '{label}' requires >= {}", min.version_str()),
@@ -501,9 +592,20 @@ pub(crate) fn evaluate_for(
             ));
         }
     }
+    // Creation rules first applying in proposed 2.5, read only when the frame
+    // reaches 2.5.
+    let (actions_reasons_v2_5, actions_deprecations_v2_5) = if ceiling == SpecVersion::V2_5 {
+        actions_creation_findings(manifest)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    for note in actions_deprecations_v2_5 {
+        deprecated.push((SpecVersion::V2_5, note));
+    }
 
     let evaluations: Vec<VersionEvaluation> = SpecVersion::ALL
         .iter()
+        .filter(|version| **version <= ceiling)
         .map(|&version| {
             let mut reasons: Vec<String> = Vec::new();
             match (generation, version) {
@@ -520,6 +622,9 @@ pub(crate) fn evaluate_for(
                 if version < *min {
                     reasons.push(why.clone());
                 }
+            }
+            if version == SpecVersion::V2_5 {
+                reasons.extend(actions_reasons_v2_5.iter().cloned());
             }
             let deprecations: Vec<String> = deprecated
                 .iter()

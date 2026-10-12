@@ -5,8 +5,9 @@
 //!
 //! Three orthogonal axes describe how the engine operates:
 //!
-//! - [`SpecVersion`] — which C2PA spec revision (2.2, 2.4). Drives the emitted
-//!   `specVersion` string, the in-scope format set, and version-specific rules.
+//! - [`SpecVersion`] — which C2PA spec revision (2.2, 2.4, proposed 2.5).
+//!   Drives the emitted `specVersion` string, the in-scope format set, and
+//!   version-specific rules.
 //! - [`OperatingMode`] — restricted to the certified/conformance-evaluated
 //!   surface ([`OperatingMode::Conformance`]) vs the full engine capability
 //!   ([`OperatingMode::Regular`]).
@@ -25,9 +26,9 @@
 
 /// C2PA specification revision.
 ///
-/// Ordered by release: `V1_4 < V2_0 < V2_1 < V2_2 < V2_3 < V2_4`, so the
-/// verifier's version ladder can compare revisions directly. `V1_4` stands in
-/// for the whole claim-v1 generation (1.0–1.4): the 1.x revisions are not
+/// Ordered by release: `V1_4 < V2_0 < V2_1 < V2_2 < V2_3 < V2_4 < V2_5`, so
+/// the verifier's version ladder can compare revisions directly. `V1_4` stands
+/// in for the whole claim-v1 generation (1.0–1.4): the 1.x revisions are not
 /// distinguishable from a manifest's validator-observable structure, and 1.4
 /// is the terminal 1.x rule set.
 ///
@@ -35,7 +36,9 @@
 /// certified set) and [`SpecVersion::V2_4`] (the next application target);
 /// the other revisions exist for *validation* — classifying which spec
 /// revision an in-the-wild manifest conforms to — and have no entries in
-/// [`FORMAT_REGISTRY`].
+/// [`FORMAT_REGISTRY`]. [`SpecVersion::V2_5`] is the proposed 2.5 draft
+/// (specs-core `cd61a4d1`): it is selectable as an explicit validation policy
+/// only, carries no certified format scope, and is never a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum SpecVersion {
     /// C2PA 1.4 — the terminal claim-v1 revision (stands in for 1.0–1.4).
@@ -52,18 +55,37 @@ pub enum SpecVersion {
     V2_3,
     /// C2PA 2.4 — the next conformance application target (adds text + more).
     V2_4,
+    /// Proposed C2PA 2.5 (draft specs-core `cd61a4d1`). Explicit opt-in only.
+    V2_5,
 }
 
 impl SpecVersion {
     /// Every revision the engine can validate against, ascending.
-    pub const ALL: [SpecVersion; 6] = [
+    pub const ALL: [SpecVersion; 7] = [
         SpecVersion::V1_4,
         SpecVersion::V2_0,
         SpecVersion::V2_1,
         SpecVersion::V2_2,
         SpecVersion::V2_3,
         SpecVersion::V2_4,
+        SpecVersion::V2_5,
     ];
+
+    /// Revisions exposed as caller-selected public verification policies.
+    ///
+    /// Operation-specific APIs may support a strict subset, but no public
+    /// surface may accept a revision absent here.
+    pub const PUBLIC_POLICIES: [SpecVersion; 3] =
+        [SpecVersion::V2_2, SpecVersion::V2_4, SpecVersion::V2_5];
+
+    /// Stable string-valued public policy capabilities, in ascending order.
+    pub const PUBLIC_POLICY_STRINGS: [&'static str; 3] = ["2.2", "2.4", "2.5"];
+
+    /// Parse a caller-selected public verification policy.
+    pub fn public_policy_from_str(s: &str) -> Option<Self> {
+        let version = Self::from_str(s)?;
+        Self::PUBLIC_POLICIES.contains(&version).then_some(version)
+    }
 
     /// The string emitted in `claim_generator_info.specVersion`.
     pub fn version_str(self) -> &'static str {
@@ -74,6 +96,7 @@ impl SpecVersion {
             SpecVersion::V2_2 => "2.2",
             SpecVersion::V2_3 => "2.3",
             SpecVersion::V2_4 => "2.4",
+            SpecVersion::V2_5 => "2.5",
         }
     }
 
@@ -90,6 +113,7 @@ impl SpecVersion {
             "2.2" => Some(SpecVersion::V2_2),
             "2.3" => Some(SpecVersion::V2_3),
             "2.4" => Some(SpecVersion::V2_4),
+            "2.5" => Some(SpecVersion::V2_5),
             _ => None,
         }
     }
@@ -212,7 +236,7 @@ impl EngineProfile {
     ///
     /// - In [`OperatingMode::Conformance`], only MIME types registered for the
     ///   active [`SpecVersion`] are permitted. Validation-only revisions
-    ///   (1.4/2.0/2.1/2.3) have no certified scope, so conformance mode falls
+    ///   (1.4/2.0/2.1/2.3/2.5) have no certified scope, so conformance mode falls
     ///   back to the full known-format set for them — their strictness comes
     ///   from the target-spec-version conformance check in the verifier, not
     ///   from a format gate.
@@ -260,6 +284,19 @@ pub fn canonicalize_mime(mime: &str) -> String {
         "application/svg+xml" => "image/svg+xml".to_string(),
         "text/javascript" => "application/javascript".to_string(),
         "text/yaml" | "application/x-yaml" => "application/yaml".to_string(),
+        // C2PA 2.5 carriers. MIDI, ONNX, SafeTensors and JSON Lines have no
+        // IANA-registered media type; the canonical spellings below are this
+        // engine's documented, non-normative choices (see
+        // [`V2_5_READER_MIMES`]), and the common informal spellings fold into
+        // them.
+        "audio/x-midi" | "audio/mid" => "audio/midi".to_string(),
+        "application/x-onnx" => "application/onnx".to_string(),
+        "application/x-safetensors" => "application/safetensors".to_string(),
+        "application/x-ndjson"
+        | "application/ndjson"
+        | "application/jsonlines"
+        | "application/x-jsonlines" => "application/jsonl".to_string(),
+        "application/x-parquet" => "application/vnd.apache.parquet".to_string(),
         other => other.to_string(),
     }
 }
@@ -603,7 +640,7 @@ fn mime_known(canon_mime: &str) -> bool {
 }
 
 /// True when `version` defines a certified format scope (any registry row).
-/// The validation-only revisions (1.4/2.0/2.1/2.3) have none.
+/// The validation-only revisions (1.4/2.0/2.1/2.3/2.5) have none.
 fn version_has_scope(version: SpecVersion) -> bool {
     FORMAT_REGISTRY
         .iter()
@@ -619,6 +656,92 @@ pub fn mimes_for_version(version: SpecVersion) -> Vec<&'static str> {
         .filter(|e| e.versions.contains(&version))
         .map(|e| e.mime)
         .collect()
+}
+
+/// Media types the explicitly selected C2PA 2.5 validation policy reads in
+/// addition to the C2PA 2.4 registry. This is reader capability, not a
+/// certified or signable scope: no 2.5 conformance program exists, and
+/// [`mimes_for_version`] stays empty for 2.5.
+///
+/// The first groups are standard carrier names already present in generator
+/// product matrices: ZIP package types and the Conformance Program's generic
+/// container declarations. They remain 2.5-only in this public verifier so
+/// adding verification coverage cannot change the frozen 2.2 or 2.4 public
+/// surfaces. The remaining registered types come from the 2.5 embedding index.
+/// `audio/midi`, `application/onnx`, `application/safetensors` and
+/// `application/jsonl` are non-normative spellings for formats the index lists
+/// without a registered type ("-"); [`canonicalize_mime`] folds common
+/// informal spellings into them. The textual `application/*` types are formats
+/// with a comment syntax that the structured-text applicability clause covers
+/// by example.
+pub const V2_5_READER_MIMES: &[&str] = &[
+    // Standard ZIP package types present in generator product matrices.
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.apple.numbers",
+    "application/x-krita",
+    "image/openraster",
+    "application/vnd.adobe.indesign-idml-package",
+    "application/vnd.google-earth.kmz",
+    "model/3mf",
+    // Standard generic-container declarations.
+    "image/x-tiff-based",
+    "image/x-riff-based",
+    "video/x-riff-based",
+    "audio/x-riff-based",
+    "video/x-bmff-based",
+    "application/warc",
+    "application/ttml+xml",
+    "application/vnd.apache.parquet",
+    "image/vnd.blockfact.facti",
+    "audio/vnd.blockfact.facta",
+    "video/vnd.blockfact.factv",
+    "audio/midi",
+    "application/onnx",
+    "application/safetensors",
+    "application/jsonl",
+    "text/vtt",
+    "application/sql",
+    "application/x-sh",
+    "application/postscript",
+    "application/x-tex",
+    "application/x-latex",
+];
+
+/// True for a syntactically valid member of the OpenDocument media-type
+/// family. C2PA 2.5 assigns the family to the ZIP carrier rather than limiting
+/// it to the four concrete members in the frozen 2.4 registry.
+pub(crate) fn is_open_document_family(canon_mime: &str) -> bool {
+    canon_mime
+        .strip_prefix("application/vnd.oasis.opendocument.")
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&byte))
+        })
+}
+
+/// Whether a validation policy for `version` reads assets of `mime` (already
+/// canonicalized) with an embedded-manifest reader.
+///
+/// The explicit 2.2 policy uses its registered format set. Other established
+/// policies through 2.4 retain the 2.4 reader set. Exactly 2.5 adds
+/// [`V2_5_READER_MIMES`], the OpenDocument family, every other `text/*` type
+/// and every XML-derived `+xml` type. A future enum variant must register its
+/// own behavior rather than silently inheriting 2.5.
+pub fn reader_permits(canon_mime: &str, version: SpecVersion) -> bool {
+    if version == SpecVersion::V2_2 {
+        return mime_in_version(canon_mime, SpecVersion::V2_2);
+    }
+    if mime_in_version(canon_mime, SpecVersion::V2_4) {
+        return true;
+    }
+    version == SpecVersion::V2_5
+        && (V2_5_READER_MIMES.contains(&canon_mime)
+            || is_open_document_family(canon_mime)
+            || canon_mime.starts_with("text/")
+            || canon_mime.ends_with("+xml"))
 }
 
 /// The certified C2PA 2.2 MIME set, as the *accepted* input forms (aliases
@@ -771,6 +894,34 @@ mod tests {
     }
 
     #[test]
+    fn additional_standard_containers_are_exactly_v2_5_reader_capabilities() {
+        for mime in V2_5_READER_MIMES {
+            assert!(reader_permits(mime, SpecVersion::V2_5), "{mime}");
+        }
+        for mime in [
+            "application/vnd.adobe.indesign-idml-package",
+            "application/vnd.apple.pages",
+            "image/openraster",
+            "image/x-tiff-based",
+            "video/x-bmff-based",
+        ] {
+            assert!(!reader_permits(mime, SpecVersion::V2_4), "{mime}");
+        }
+
+        let open_document = "application/vnd.oasis.opendocument.text-template";
+        assert!(is_open_document_family(open_document));
+        assert!(reader_permits(open_document, SpecVersion::V2_5));
+        assert!(!reader_permits(open_document, SpecVersion::V2_4));
+        for malformed in [
+            "application/vnd.oasis.opendocument.",
+            "application/vnd.oasis.opendocument.text/template",
+            "application/vnd.oasis.opendocument.text template",
+        ] {
+            assert!(!is_open_document_family(malformed), "{malformed}");
+        }
+    }
+
+    #[test]
     fn mimes_for_version_filters_correctly() {
         let v22 = mimes_for_version(SpecVersion::V2_2);
         let v24 = mimes_for_version(SpecVersion::V2_4);
@@ -783,6 +934,10 @@ mod tests {
     fn spec_version_round_trips() {
         assert_eq!(SpecVersion::from_str("2.2"), Some(SpecVersion::V2_2));
         assert_eq!(SpecVersion::from_str("2.4"), Some(SpecVersion::V2_4));
+        assert_eq!(SpecVersion::from_str("2.5"), Some(SpecVersion::V2_5));
+        assert_eq!(SpecVersion::V2_5.version_str(), "2.5");
+        assert!(SpecVersion::V2_4 < SpecVersion::V2_5);
+        assert!(mimes_for_version(SpecVersion::V2_5).is_empty());
         assert_eq!(SpecVersion::from_str("9.9"), None);
     }
 

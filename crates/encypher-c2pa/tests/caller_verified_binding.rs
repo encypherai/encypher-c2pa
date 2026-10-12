@@ -11,9 +11,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use encypher_c2pa::{
-    detached_manifest_evidence, verify_with_manifest_store, verify_with_options, CawgEvaluation,
-    CawgEvaluator, CawgProfile, CawgStoreHost, Error, TelemetryOptions, VerificationReport,
-    VerifyOptions,
+    binding_target, detached_manifest_evidence, verify_with_caller_verified_binding_and_cawg,
+    verify_with_cawg, verify_with_manifest_store, verify_with_options, CallerBindingEvidence,
+    CallerBindingVerdict, CawgEvaluation, CawgEvaluator, CawgProfile, CawgStoreHost, Error,
+    GraphInputs, GraphLimits, TelemetryOptions, VerificationReport, VerifyOptions,
 };
 
 fn vector(path: &str) -> Vec<u8> {
@@ -125,7 +126,7 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
 
     let CawgEvaluation::Evaluated {
         manifest_label,
-        store_manifest_sha256,
+        store_manifests,
         ..
     } = evaluation
     else {
@@ -135,9 +136,9 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
         Some(manifest_label.as_str()),
         full.manifest_report["active_manifest"].as_str()
     );
-    assert!(store_manifest_sha256
+    assert!(store_manifests
         .iter()
-        .any(|(label, _)| *label == manifest_label));
+        .any(|manifest| manifest.label == manifest_label));
 }
 
 /// Statuses the pipeline records outside the identity step (here the
@@ -296,17 +297,83 @@ fn the_document_signing_anchor_requirement_follows_the_option() {
 }
 
 #[test]
+fn caller_built_cawg_and_binding_share_the_supplied_graph_budget() {
+    let asset = vector(ES256_JPEG);
+    let store = store_of(&asset, "image/jpeg");
+    let evaluator = CawgEvaluator::new(&es256_options(), &generous()).expect("evaluator");
+    let options = offline(VerifyOptions {
+        allowed_list_pem: Some(text("generated/identity-1.2/trust/claim-allowed.pem")),
+        validation_time: Some("2026-08-06T00:00:00Z".into()),
+        ..VerifyOptions::default()
+    });
+    let graph_inputs = || GraphInputs {
+        external: None,
+        limits: GraphLimits::lowered(32, 0, 16_384, 64 * 1024 * 1024),
+    };
+    let has = |report: &VerificationReport, code: &str| {
+        report
+            .validation_results
+            .success
+            .iter()
+            .chain(&report.validation_results.informational)
+            .chain(&report.validation_results.failure)
+            .any(|status| status.code == code)
+    };
+
+    let embedded = verify_with_cawg(&asset, "image/jpeg", &options, &evaluator, graph_inputs())
+        .expect("embedded CAWG graph verification");
+    assert!(has(&embedded, "com.encypher.resource.graphLimitExceeded"));
+    assert!(has(&embedded, "cawg.identity.trusted"));
+
+    let target = binding_target(&store, CawgStoreHost::Asset, &VerifyOptions::default())
+        .expect("binding target")
+        .expect("unique binding");
+    let evidence = CallerBindingEvidence::new(target, CallerBindingVerdict::Match, "test engine")
+        .expect("caller evidence");
+    let caller = verify_with_caller_verified_binding_and_cawg(
+        &store,
+        "image/jpeg",
+        CawgStoreHost::Asset,
+        &evidence,
+        &options,
+        &evaluator,
+        graph_inputs(),
+    )
+    .expect("caller-binding CAWG graph verification");
+    assert!(has(&caller, "com.encypher.resource.graphLimitExceeded"));
+    assert!(has(&caller, "com.encypher.hardBinding.callerVerified"));
+    assert!(has(&caller, "cawg.identity.trusted"));
+}
+
+#[test]
 fn unknown_spec_versions_are_rejected() {
-    for version in ["1.3", "2.5", ""] {
+    for version in ["2.6", "9.9", "2.5.0", ""] {
         let error = CawgProfile::new(version, false, false).expect_err(version);
         assert!(
             matches!(&error, Error::Verification(message) if message.contains("spec_version")),
             "{version}: {error}"
         );
     }
-    for version in ["1.4", "2.0", "2.1", "2.2", "2.3", "2.4"] {
+    for version in [
+        "1.0", "1.1", "1.2", "1.3", "1.4", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5",
+    ] {
         CawgProfile::new(version, false, false).unwrap_or_else(|e| panic!("{version}: {e}"));
     }
+    // The proposed 2.5 policy permits strict technical validation under the
+    // core-spec bar, but has no published Conformance Program profile.
+    CawgProfile::new("2.5", true, false).expect("strict 2.5 core profile");
+    for mode in [false, true] {
+        assert!(CawgProfile::new("2.5", mode, true).is_err());
+    }
+    // The evaluator takes its revision from the profile, never from options.
+    let options = VerifyOptions {
+        spec_version: Some("2.4".into()),
+        validation_time: Some("2026-01-01T00:00:00Z".into()),
+        ..VerifyOptions::default()
+    };
+    let error = CawgEvaluator::new(&options, &CawgProfile::new("2.4", false, false).unwrap())
+        .expect_err("spec_version in options is ambiguous");
+    assert!(error.to_string().contains("spec_version"));
 }
 
 /// A manifest store superbox with the same description box and no children.

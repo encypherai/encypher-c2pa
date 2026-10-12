@@ -64,10 +64,38 @@ mod c2pa_trust;
 #[path = "c2pa-validate/lib.rs"]
 #[allow(dead_code, unused_imports, reason = "production kernel mirror")]
 mod c2pa_validate;
+pub use c2pa_validate::external_discovery::{
+    locate_external_resources, locate_external_resources_with_manifest_store,
+    ExternalDidDocumentRequest, ExternalResourceKind, ExternalResourcePlan,
+    ExternalResourceRequest, ExternalResourceStopReason, GraphLimitKind,
+};
+pub use c2pa_validate::ingredient_graph::{GraphInputs, GraphLimits};
+pub use c2pa_validate::refs::{ExternalResource, ExternalResources};
 mod config_dir;
 mod default_trust;
+mod ertmp;
+mod ertmp_wire;
+mod native_online;
 mod online;
 mod online_consent;
+pub use ertmp::{
+    verify_ertmp, verify_ertmp_with_options, ErtmpEvent, ErtmpInput, ErtmpManifestReport,
+    ErtmpMediaType, ErtmpSegmentReport, ErtmpTrack, ErtmpVerificationReport,
+};
+pub use ertmp_wire::{
+    ertmp_input_from_flv, ertmp_input_from_rtmp_connections, ErtmpConnectionContext,
+    ErtmpWireError, ErtmpWireEventContext, ErtmpWireInput, ErtmpWireLimits, FlvWireOptions,
+    RtmpWireConnection,
+};
+mod soft_binding;
+pub use soft_binding::{
+    request_soft_binding_receipt_verification, resolve_soft_binding, RecoveredSoftBindingManifest,
+    SoftBindingAlgorithm, SoftBindingAlgorithms, SoftBindingCapabilities,
+    SoftBindingDisclosureConsent, SoftBindingDiscovery, SoftBindingFetchRequest,
+    SoftBindingHttpMethod, SoftBindingMatch, SoftBindingQuery, SoftBindingReceiptEvidence,
+    SoftBindingReceiptVerificationSession, SoftBindingResolution, SoftBindingResolverOptions,
+    SoftBindingResolverSession,
+};
 mod stream;
 pub use stream::{
     verify_stream, verify_stream_with_options, SegmentReport, StreamEncapsulation, StreamMethod,
@@ -78,7 +106,13 @@ mod caller_verified_binding;
 mod telemetry;
 mod telemetry_consent;
 #[cfg(feature = "caller-verified-binding")]
-pub use caller_verified_binding::{CawgEvaluation, CawgEvaluator, CawgProfile, CawgStoreHost};
+pub use caller_verified_binding::{
+    binding_target, verify_fragmented_with_cawg, verify_manifest_store_only_with_cawg,
+    verify_with_caller_verified_binding, verify_with_caller_verified_binding_and_cawg,
+    verify_with_cawg, verify_with_manifest_store_and_cawg, CallerBindingEvidence,
+    CallerBindingVerdict, CawgEvaluation, CawgEvaluator, CawgProfile, CawgStoreHost,
+    ManifestBindingTarget,
+};
 pub use config_dir::config_directory;
 pub use default_trust::SNAPSHOT_DATE as DEFAULT_TRUST_SNAPSHOT_DATE;
 
@@ -105,11 +139,12 @@ use std::path::Path;
 
 use crate::c2pa_core::{
     spec::{canonicalize_mime, mimes_for_version},
-    EngineProfile, SpecVersion,
+    ComplianceLevel, EngineProfile, OperatingMode, SpecVersion,
 };
 use crate::c2pa_trust::{AnchorPurpose, CawgTrustSource, TrustList};
 use crate::c2pa_validate::{
     verify_fragmented_with_cawg_options_and_expected_seeks_safe as verify_fragmented_safe,
+    verify_with_cawg_options_and_graph_inputs_safe as verify_graph_safe,
     verify_with_cawg_options_safe as verify_safe, StatusCode as CoreStatus,
     ValidationResults as CoreResults, VerifyInput, ASSERTION_BMFF_HASH_MALFORMED,
     ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH, ASSERTION_BOXES_HASH_MALFORMED,
@@ -127,7 +162,14 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+/// Report `profile` of the explicitly selected C2PA 2.2 policy.
+pub const C2PA_PROFILE_2_2: &str = "c2pa-2.2";
+/// Report `profile` of the default C2PA 2.4 validation policy.
 pub const C2PA_PROFILE: &str = "c2pa-2.4";
+/// Report `profile` of the explicitly selected proposed C2PA 2.5 policy.
+pub const C2PA_PROFILE_2_5: &str = "c2pa-2.5";
+/// Every value [`VerifyOptions::spec_version`] accepts. `None` means `"2.4"`.
+pub const SPEC_VERSIONS: &[&str] = &SpecVersion::PUBLIC_POLICY_STRINGS;
 const MAX_MANIFEST_STORE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PATH_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 /// Largest DER `OCSPResponse` accepted as caller-supplied evidence.
@@ -140,8 +182,14 @@ const MAX_EXTERNAL_DATA_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
 pub struct VerifyOptions {
     /// PEM bundle of claim-signing trust anchors.
     pub trust_pem: Option<String>,
+    /// Claim-signing trust lists with reliable source metadata for C2PA 2.5
+    /// crJSON. Each source remains separate until the matching anchor is known.
+    pub claim_trust_sources: Option<Vec<TrustListSource>>,
     /// PEM bundle of timestamp-authority trust anchors.
     pub tsa_trust_pem: Option<String>,
+    /// Timestamp-authority trust lists with reliable source metadata for C2PA
+    /// 2.5 crJSON. These certificates never enter the claim-signing store.
+    pub tsa_trust_sources: Option<Vec<TrustListSource>>,
     /// PEM bundle of directly allowed end-entity certificates.
     pub allowed_list_pem: Option<String>,
     /// PEM bundle of trust anchors for CAWG named-actor (identity) X.509
@@ -209,15 +257,46 @@ pub struct VerifyOptions {
     /// The bytes are hashed against the assertion's own `alg`/`hash` pair
     /// before anything else is done with them.
     pub external_data: Option<HashMap<String, String>>,
+    /// Media types observed while retrieving `external_data`, keyed by the
+    /// same URI. Linked-resource integrity uses this to evaluate `dc:format`;
+    /// bytes without an observed type cannot be reported as a format match.
+    pub external_data_media_types: Option<HashMap<String, String>>,
+    /// External-resource URIs for which retrieval was attempted but yielded no
+    /// usable body. Linked-resource integrity reports these as `inaccessible`
+    /// rather than as resources the validator chose to skip.
+    pub external_data_unreachable: Option<Vec<String>>,
     /// Zero-based indexes into supplied fragments or stream segments where the
     /// player expects a discontinuity. Values must be unique, strictly
     /// increasing, and in bounds. Ignored by single-asset verification.
     pub expected_seek_positions: Vec<usize>,
-    /// Apply the C2PA 2.4 Conformance Program posture instead of the default
-    /// generous core-spec read. This raises applicable SHOULD requirements to
-    /// the conformance bar and emits strict diagnostics in the reader report.
-    /// It also requires CAWG Identity 1.3 deterministic `signer_payload` CBOR;
-    /// the default accepts the CAWG 1.1 field order with
+    /// C2PA validation policy: `"2.2"`, `"2.4"`, or `"2.5"`. `None` is the
+    /// default and is identical to `"2.4"`, preserving current behavior and
+    /// report bytes. The caller selects this policy; a claim's declared
+    /// `specVersion` never selects or upgrades it.
+    ///
+    /// `"2.5"` validates under the proposed C2PA 2.5 draft (specs-core
+    /// `cd61a4d1`): its text-carrier locating rules, padding admission,
+    /// action and assertion-metadata time checks, `relatedAssertions`, linked
+    /// resource integrity, `claim.actions.missing`,
+    /// `manifest.inaccessible.malformed`, BMFF hash rules, and the ESP claim
+    /// signature algorithms. Reports carry `profile: "c2pa-2.5"`. With
+    /// `strict_conformance`, 2.5 uses strict technical validation under the
+    /// core-spec compliance bar; this is not a certified or published
+    /// Conformance Program profile. It also reads the carriers 2.5 adds
+    /// (append-only text, WARC, MIDI, TTML, ONNX, SafeTensors, Parquet,
+    /// BlockFact, WebVTT and other structured text) and validates
+    /// `c2pa.hash.segment` bindings; see [`supported_mime_types_for`].
+    ///
+    /// Any other value fails with [`Error::UnsupportedSpecVersion`] before
+    /// asset I/O. The policy is never inferred from what a manifest declares.
+    pub spec_version: Option<String>,
+    /// Apply strict technical validation. Under the default 2.4 policy this is
+    /// the C2PA 2.4 Conformance Program posture, including its upgraded SHOULD
+    /// requirements. Under the 2.5 policy it selects conformance mode with the
+    /// core-spec compliance bar and strict diagnostics; it does not claim
+    /// certified scope or an unpublished 2.5 Conformance Program. The flag
+    /// also requires CAWG Identity 1.3 deterministic `signer_payload` CBOR; the
+    /// default accepts the CAWG 1.1 field order with
     /// `com.encypher.cawg.legacyProfile`.
     pub strict_conformance: bool,
     /// Refuse the CAWG field-order `signer_payload` encoding that c2pa-rs
@@ -254,6 +333,21 @@ pub struct VerifyOptions {
     pub online_allow_private_networks: bool,
 }
 
+/// Caller-supplied external resource evidence decoded while validating all
+/// verification options.
+///
+/// Network adapters that retain an owned [`ExternalResources`] provider use
+/// this to avoid decoding large base64 bodies again before final verification.
+#[derive(Debug, Default)]
+pub struct ValidatedExternalData {
+    /// Decoded bodies keyed by the URI declared in signed manifest content.
+    pub data: HashMap<String, Vec<u8>>,
+    /// Observed media types keyed by the same URI.
+    pub media_types: HashMap<String, String>,
+    /// URIs the caller attempted but could not retrieve.
+    pub unreachable: Vec<String>,
+}
+
 impl VerifyOptions {
     /// Resolve and validate every option without reading or parsing an asset.
     ///
@@ -262,6 +356,38 @@ impl VerifyOptions {
     pub fn validate(&self) -> Result<(), Error> {
         ResolvedOptions::resolve(self).map(|_| ())
     }
+
+    /// Validate every option and retain decoded external-data evidence.
+    ///
+    /// This has the same error ordering and checks as [`Self::validate`].
+    pub fn validate_with_external_data(&self) -> Result<ValidatedExternalData, Error> {
+        let resolved = ResolvedOptions::resolve(self)?;
+        Ok(ValidatedExternalData {
+            data: resolved.external_data,
+            media_types: resolved.external_data_media_types,
+            unreachable: resolved.external_data_unreachable,
+        })
+    }
+}
+
+/// One caller-supplied trust list with provenance retained for C2PA 2.5 crJSON.
+///
+/// `uri` identifies the list and is never fetched. `source_type` is emitted as
+/// the required `type` member. Only a source whose certificate actually
+/// accepted the claim signer or timestamp signer may be reported.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustListSource {
+    /// URI identifying this trust list. It need not be resolvable.
+    pub uri: String,
+    /// Standard trust-list type, read from the `type` JSON member.
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// Optional list-specific identifier.
+    #[serde(default)]
+    pub identifier: Option<String>,
+    /// PEM certificates supplied by this source.
+    pub certificates_pem: String,
 }
 
 /// One entry of the CAWG Identity 1.3 trust configuration a caller supplies.
@@ -404,6 +530,43 @@ pub struct LocalEvidence {
     pub asset_sha256: String,
     /// The active manifest's hard binding and this pass's verdict on it.
     pub hard_binding: LocalHardBinding,
+    /// Label of the store's active manifest, when `manifest_store` parses.
+    pub active_manifest_label: Option<String>,
+    /// Every manifest of `manifest_store` with the expanded-domain SHA-256 an
+    /// ingredient reference to it uses, in store order. Empty without a
+    /// readable store.
+    pub store_manifests: Vec<ManifestDigest>,
+}
+
+/// One manifest of a store and its expanded-domain SHA-256, the digest an
+/// ingredient's `activeManifest` reference to it carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManifestDigest {
+    /// The manifest's label.
+    pub label: String,
+    /// Lowercase hex SHA-256 over the manifest's expanded JUMBF content.
+    pub sha256: String,
+}
+
+/// The active label and manifest digests of `manifest_store`; empty when it
+/// does not parse (the report then already carries the reason).
+fn manifest_identity(manifest_store: Option<&[u8]>) -> (Option<String>, Vec<ManifestDigest>) {
+    let Some(store) = manifest_store else {
+        return (None, Vec::new());
+    };
+    match std::panic::catch_unwind(|| crate::c2pa_validate::store_manifest_identity(store)) {
+        Ok(Ok((active, digests))) => (
+            active,
+            digests
+                .into_iter()
+                .map(|digest| ManifestDigest {
+                    label: digest.label,
+                    sha256: hex::encode(digest.sha256),
+                })
+                .collect(),
+        ),
+        _ => (None, Vec::new()),
+    }
 }
 
 /// The hard binding a [`LocalEvidence`] pass checked.
@@ -416,6 +579,25 @@ pub struct LocalHardBinding {
     pub algorithm: Option<String>,
     /// `match`, `mismatch`, or `unknown`, from the same pass's status codes.
     pub status: String,
+}
+
+/// What one manifest store proves with no asset: claim, assertion,
+/// ingredient, signature, time-stamp, revocation, trust and identity
+/// validation, and nothing about content.
+///
+/// This is the evidence a writer records for a source or ingredient it holds
+/// only as a store. `report.hard_binding` is `not_evaluated`, and
+/// `report.integrity` is `unbound` when no failure invalidates the claim
+/// (`invalid` otherwise): no asset bytes were compared, so the result never
+/// says the asset is intact.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreOnlyValidation {
+    /// The report of the store-level pass.
+    pub report: VerificationReport,
+    /// Label of the store's active manifest.
+    pub active_manifest_label: Option<String>,
+    /// Every manifest of the store with its expanded-domain SHA-256.
+    pub store_manifests: Vec<ManifestDigest>,
 }
 
 /// Bytes go to `serialize_bytes`, so a JavaScript binding receives a
@@ -477,6 +659,8 @@ pub enum Error {
     InvalidTrust(String),
     #[error("invalid validation time: {0}")]
     InvalidValidationTime(String),
+    #[error("unsupported spec version: {0}")]
+    UnsupportedSpecVersion(String),
     #[error("verification failed: {0}")]
     Verification(String),
     #[error("could not read asset: {0}")]
@@ -495,6 +679,7 @@ impl Error {
             Self::UnsupportedMime(_) => "unsupported_mime",
             Self::InvalidTrust(_) => "invalid_trust_material",
             Self::InvalidValidationTime(_) => "invalid_validation_time",
+            Self::UnsupportedSpecVersion(_) => "unsupported_spec_version",
             Self::Verification(_) => "verification_error",
             Self::Io(_) => "io_error",
             Self::OnlinePreference(_) => "online_preference_error",
@@ -530,7 +715,7 @@ pub fn verify_fragmented(
     )
 }
 /// Extract the signed manifest store and its contiguous carrier for detached
-/// server validation.
+/// server validation, locating it under the default C2PA 2.4 policy.
 ///
 /// This is read-only. It never performs network I/O and never constructs or
 /// writes a manifest. `Ok(None)` means the asset has no embedded manifest or
@@ -539,19 +724,37 @@ pub fn detached_manifest_evidence(
     data: &[u8],
     mime_type: &str,
 ) -> Result<Option<DetachedManifestEvidence>, Error> {
+    detached_manifest_evidence_with_options(data, mime_type, &VerifyOptions::default())
+}
+
+/// [`detached_manifest_evidence`] under the policy `options.spec_version`
+/// selects. A 2.5 extraction therefore returns exactly the store and carrier
+/// span that a 2.5 verification reads.
+///
+/// Only `spec_version` and `strict_conformance` are read; an unknown policy
+/// fails with [`Error::UnsupportedSpecVersion`] before the asset is parsed.
+pub fn detached_manifest_evidence_with_options(
+    data: &[u8],
+    mime_type: &str,
+    options: &VerifyOptions,
+) -> Result<Option<DetachedManifestEvidence>, Error> {
+    let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
     let mime = canonicalize_mime(mime_type);
+    require_embedded_mime(&mime, profile)?;
     let format = crate::c2pa_formats::AssetFormat::from_mime(&mime)
         .ok_or_else(|| Error::UnsupportedMime(mime.clone()))?;
     if !crate::c2pa_formats::supports_hash_mode(&mime) {
         return Ok(None);
     }
-    let Some(manifest_store) = crate::c2pa_formats::extract_manifest(format, data)
-        .map_err(|error| Error::Verification(error.to_string()))?
+    let Some(manifest_store) =
+        crate::c2pa_formats::extract_manifest_for_spec(format, data, profile.version)
+            .map_err(|error| Error::Verification(error.to_string()))?
     else {
         return Ok(None);
     };
-    let spans = crate::c2pa_formats::compute_data_hash_exclusions(format, data)
-        .map_err(|error| Error::Verification(error.to_string()))?;
+    let spans =
+        crate::c2pa_formats::compute_data_hash_exclusions_for_spec(format, data, profile.version)
+            .map_err(|error| Error::Verification(error.to_string()))?;
     let [span] = spans.as_slice() else {
         return Ok(None);
     };
@@ -596,14 +799,47 @@ pub fn verify_with_manifest_store(
     result
 }
 
+/// [`verify_with_manifest_store`] with caller-controlled external resource
+/// resolution and lowered graph ceilings. The manifest store and external
+/// resources are supplied by the caller; this function performs no network
+/// I/O and completes the graph and CAWG checks in one verification pass.
+pub fn verify_with_manifest_store_and_graph_inputs(
+    asset: &[u8],
+    manifest_store: &[u8],
+    mime_type: &str,
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<VerificationReport, Error> {
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let result = (|| {
+        let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
+        let mime = resolve_detached_mime(mime_type, profile)?;
+        detached_pass(asset, manifest_store, &mime, options, graph_inputs)
+            .map(|(report, _, _)| report)
+    })();
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    result
+}
+
 fn verify_with_manifest_store_inner(
     asset: &[u8],
     manifest_store: &[u8],
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
-    let mime = resolve_mime(mime_type)?;
-    let (mut report, needs, _) = detached_pass(asset, manifest_store, &mime, options)?;
+    let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
+    let mime = resolve_detached_mime(mime_type, profile)?;
+    if profile.version == SpecVersion::V2_5 {
+        let resolved = ResolvedOptions::resolve(options)?;
+        return verify_detached_online_v25(asset, manifest_store, &mime, options, resolved);
+    }
+    let (mut report, needs, _) = detached_pass(
+        asset,
+        manifest_store,
+        &mime,
+        options,
+        GraphInputs::default(),
+    )?;
     let (network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
@@ -612,7 +848,8 @@ fn verify_with_manifest_store_inner(
     // The store the caller supplied is the one that binds this asset. Pass 2
     // re-reads it with the fetched evidence; it never swaps in another store.
     let next = online::apply_evidence(options, &evidence);
-    let (mut report, _, _) = detached_pass(asset, manifest_store, &mime, &next)?;
+    let (mut report, _, _) =
+        detached_pass(asset, manifest_store, &mime, &next, GraphInputs::default())?;
     report.network = network;
     Ok(report)
 }
@@ -624,6 +861,28 @@ fn detached_pass(
     manifest_store: &[u8],
     mime: &str,
     options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
+    detached_pass_resolved(
+        asset,
+        manifest_store,
+        mime,
+        options,
+        &resolved,
+        options.cawg_did_documents.as_ref(),
+        graph_inputs,
+    )
+}
+
+fn detached_pass_resolved(
+    asset: &[u8],
+    manifest_store: &[u8],
+    mime: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+    did_documents: Option<&HashMap<String, Value>>,
+    graph_inputs: GraphInputs<'_>,
 ) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     if manifest_store.is_empty() {
         return Err(Error::Verification("manifest store is empty".into()));
@@ -633,7 +892,6 @@ fn detached_pass(
             "manifest store exceeds the {MAX_MANIFEST_STORE_BYTES} byte limit"
         )));
     }
-    let resolved = ResolvedOptions::resolve(options)?;
     let input = resolved.input(asset, mime);
     let mut output = crate::c2pa_validate::verify_detached_safe(
         manifest_store,
@@ -643,19 +901,133 @@ fn detached_pass(
         resolved.cawg_trust(),
         resolved.cawg_allowed_certs(),
         resolved.cawg_document_signing_require_anchor,
-        options.cawg_did_documents.as_ref(),
+        did_documents,
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),
         options.cawg_ica_status_lists.as_ref(),
+        graph_inputs,
     )
     .map_err(map_validate_error)?;
     let needs = online::network_needs(&output);
     let capture = PassCapture::take(&mut output);
     Ok((
-        report_from_output(output, mime.to_string(), &resolved),
+        report_from_output(output, mime.to_string(), resolved),
         needs,
         capture,
     ))
+}
+
+/// Validate a manifest store on its own, with no asset.
+///
+/// For a writer recording an ingredient or source it holds only as a store:
+/// everything about the store is checked - claim structure, the selected
+/// policy's assertion, action, ingredient and redaction rules, hashed-URI
+/// bindings, the claim signature, time stamps, revocation, trust and CAWG
+/// identity - and nothing about content. The report says so:
+/// `hard_binding` is `not_evaluated` with the informational
+/// `com.encypher.hardBinding.notEvaluated`, and `integrity` is `unbound`
+/// rather than `valid` when no failure invalidates the claim.
+///
+/// Options are read as for [`verify_with_options`]. This entry point never
+/// fetches (`online: Some(true)` is refused) and sends no telemetry.
+pub fn verify_manifest_store_only(
+    manifest_store: &[u8],
+    options: &VerifyOptions,
+) -> Result<StoreOnlyValidation, Error> {
+    verify_manifest_store_only_with_graph_inputs(manifest_store, options, GraphInputs::default())
+}
+
+/// [`verify_manifest_store_only`] with caller-controlled external resource
+/// resolution and lowered graph ceilings. Content remains deliberately
+/// unevaluated, so a valid result stays unbound.
+pub fn verify_manifest_store_only_with_graph_inputs(
+    manifest_store: &[u8],
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<StoreOnlyValidation, Error> {
+    if options.online == Some(true) {
+        return Err(Error::Verification(
+            "online must not be Some(true): store-only validation never fetches".into(),
+        ));
+    }
+    let resolved = ResolvedOptions::resolve(options)?;
+    if manifest_store.is_empty() {
+        return Err(Error::Verification("manifest store is empty".into()));
+    }
+    if manifest_store.len() > MAX_MANIFEST_STORE_BYTES {
+        return Err(Error::Verification(format!(
+            "manifest store exceeds the {MAX_MANIFEST_STORE_BYTES} byte limit"
+        )));
+    }
+    let input = resolved.input(&[], "application/c2pa");
+    let cawg_inputs = crate::c2pa_validate::CawgTrustInputs::new(
+        resolved.cawg_trust(),
+        resolved.cawg_allowed_certs(),
+        resolved.cawg_document_signing_require_anchor,
+        options.cawg_did_documents.as_ref(),
+        options.cawg_ica_trusted_issuers.as_deref(),
+        options.cawg_ica_trust_anchors.as_deref(),
+        options.cawg_ica_status_lists.as_ref(),
+        graph_inputs,
+    );
+    let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::c2pa_validate::verify_store_binding(
+            manifest_store,
+            crate::c2pa_validate::StoreBinding::StoreOnly,
+            &input,
+            cawg_inputs,
+        )
+    }))
+    .map_err(|_| Error::Verification("verification panicked".into()))?
+    .map_err(map_validate_error)?;
+    Ok(finish_store_only_validation(
+        manifest_store,
+        output,
+        &resolved,
+    ))
+}
+
+fn finish_store_only_validation(
+    manifest_store: &[u8],
+    output: crate::c2pa_validate::VerifyOutput,
+    resolved: &ResolvedOptions,
+) -> StoreOnlyValidation {
+    let mut report = report_from_output(output, "application/c2pa".to_string(), resolved);
+    report.hard_binding = "not_evaluated".to_string();
+    if report.integrity == "valid" {
+        report.integrity = "unbound".to_string();
+        if let Some(verdict) = report
+            .manifest_report
+            .pointer_mut("/provenance_verdict")
+            .and_then(Value::as_object_mut)
+        {
+            verdict.insert("integrity".to_string(), Value::from("unbound"));
+        }
+    }
+    let (active_manifest_label, store_manifests) = manifest_identity(Some(manifest_store));
+    StoreOnlyValidation {
+        report,
+        active_manifest_label,
+        store_manifests,
+    }
+}
+
+/// Verify with caller-controlled external resource resolution and lowered graph
+/// ceilings. Policy selection, trust defaults and all verdict logic are the
+/// same as [`verify_with_options`]; this function performs no network I/O.
+pub fn verify_with_graph_inputs(
+    data: &[u8],
+    mime_type: &str,
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<VerificationReport, Error> {
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let result = (|| {
+        let resolved = ResolvedOptions::resolve(options)?;
+        embedded_graph_pass(data, None, mime_type, options, &resolved, graph_inputs)
+    })();
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    result
 }
 
 /// Verify asset bytes against the bundled trust snapshots plus any static
@@ -667,7 +1039,7 @@ pub fn verify_with_options(
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
     let resolved = ResolvedOptions::resolve(options)?;
-    verify_with_resolved_options(data, None, mime_type, options, &resolved)
+    verify_with_resolved_options(data, None, mime_type, options, resolved)
 }
 
 /// Verify asset bytes exactly as [`verify_with_options`] does and return the
@@ -686,7 +1058,7 @@ pub fn local_evidence_with_options(
     let resolved = ResolvedOptions::resolve(options)?;
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let (result, capture) =
-        match verify_with_options_inner(data, None, mime_type, options, &resolved) {
+        match verify_with_options_inner(data, None, mime_type, options, resolved) {
             Ok((report, capture)) => (Ok(report), capture),
             Err(error) => (Err(error), PassCapture::default()),
         };
@@ -697,6 +1069,8 @@ pub fn local_evidence_with_options(
         "mismatch" => "mismatch",
         _ => "unknown",
     };
+    let (active_manifest_label, store_manifests) =
+        manifest_identity(capture.manifest_store.as_deref());
     Ok(LocalEvidence {
         manifest_store_sha256: capture
             .manifest_store
@@ -708,6 +1082,8 @@ pub fn local_evidence_with_options(
             algorithm: capture.hard_binding_label,
             status: status.to_string(),
         },
+        active_manifest_label,
+        store_manifests,
         report,
     })
 }
@@ -717,7 +1093,7 @@ fn verify_with_resolved_options(
     fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
-    resolved: &ResolvedOptions,
+    resolved: ResolvedOptions,
 ) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let result = verify_with_options_inner(data, fragments, mime_type, options, resolved)
@@ -761,8 +1137,39 @@ pub fn verify_fragmented_with_options(
     let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
         == Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
-        verify_with_options_inner(init_segment, Some(fragments), &mime, options, &resolved)
+        verify_with_options_inner(init_segment, Some(fragments), &mime, options, resolved)
             .map(|(report, _)| report)
+    } else {
+        Err(Error::UnsupportedMime(mime))
+    };
+    enqueue_failure_telemetry(mime_type, &result, options, telemetry_enabled);
+    result
+}
+
+/// [`verify_fragmented_with_options`] with caller-controlled external resource
+/// resolution and lowered graph ceilings. The fragments, graph walk, and CAWG
+/// identity checks run in one verification pass without network I/O.
+pub fn verify_fragmented_with_graph_inputs(
+    init_segment: &[u8],
+    fragments: &[&[u8]],
+    mime_type: &str,
+    options: &VerifyOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<VerificationReport, Error> {
+    let resolved = ResolvedOptions::resolve(options)?;
+    let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
+    let mime = canonicalize_mime(mime_type);
+    let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
+        == Some(crate::c2pa_formats::AssetFormat::Bmff)
+    {
+        embedded_graph_pass(
+            init_segment,
+            Some(fragments),
+            &mime,
+            options,
+            &resolved,
+            graph_inputs,
+        )
     } else {
         Err(Error::UnsupportedMime(mime))
     };
@@ -792,13 +1199,23 @@ pub(crate) struct ResolvedOptions {
     ocsp_responses: HashMap<String, Vec<u8>>,
     ocsp_unreachable: Vec<String>,
     external_data: HashMap<String, Vec<u8>>,
+    external_data_media_types: HashMap<String, String>,
+    external_data_unreachable: Vec<String>,
 }
 
 impl ResolvedOptions {
     pub(crate) fn resolve(options: &VerifyOptions) -> Result<Self, Error> {
+        // The policy selector is resolved first, so an unknown value fails
+        // before any trust material is parsed or asset read.
+        let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
         let use_defaults = !options.no_default_trust;
         let validation_time = parse_validation_time(options.validation_time.as_deref())?;
-        let custom_claim_trust = options.trust_pem.is_some() || options.allowed_list_pem.is_some();
+        let custom_claim_trust = options.trust_pem.is_some()
+            || options
+                .claim_trust_sources
+                .as_ref()
+                .is_some_and(|sources| !sources.is_empty())
+            || options.allowed_list_pem.is_some();
         let bounds = (
             parse_optional_instant(
                 options.trust_anchor_not_before.as_deref(),
@@ -814,18 +1231,21 @@ impl ResolvedOptions {
         Ok(Self {
             claim_trust: resolve_trust(
                 options.trust_pem.as_deref(),
+                options.claim_trust_sources.as_deref(),
                 use_defaults.then(default_trust::claim_signing),
                 AnchorPurpose::ClaimSigning,
                 bounds,
             )?,
             tsa_trust: resolve_trust(
                 options.tsa_trust_pem.as_deref(),
+                options.tsa_trust_sources.as_deref(),
                 use_defaults.then(default_trust::timestamp_authorities),
                 AnchorPurpose::TimeStamping,
                 bounds,
             )?,
             allowed_certs: resolve_trust(
                 options.allowed_list_pem.as_deref(),
+                None,
                 use_defaults.then(default_trust::allowed_claim_signers),
                 AnchorPurpose::ClaimSigning,
                 bounds,
@@ -833,6 +1253,7 @@ impl ResolvedOptions {
             cawg_trust: extend_trust(
                 resolve_trust(
                     options.cawg_trust_pem.as_deref(),
+                    None,
                     use_defaults.then(default_trust::cawg_identity),
                     AnchorPurpose::CawgIdentity,
                     bounds,
@@ -842,6 +1263,7 @@ impl ResolvedOptions {
             cawg_allowed_certs: extend_trust(
                 resolve_trust(
                     options.cawg_allowed_certs_pem.as_deref(),
+                    None,
                     use_defaults.then(default_trust::cawg_allowed_identities),
                     AnchorPurpose::CawgIdentity,
                     bounds,
@@ -858,11 +1280,7 @@ impl ResolvedOptions {
                 (false, true) => "caller_supplied_static_material",
                 (false, false) => "none",
             },
-            profile: if options.strict_conformance {
-                EngineProfile::strict(SpecVersion::V2_4)
-            } else {
-                EngineProfile::GENEROUS
-            },
+            profile,
             cawg_strict_encoding: options.cawg_strict_encoding,
             cawg_document_signing_require_anchor: options
                 .cawg_document_signing_require_anchor
@@ -878,7 +1296,34 @@ impl ResolvedOptions {
                 "external_data",
                 MAX_EXTERNAL_DATA_EVIDENCE_BYTES,
             )?,
+            external_data_media_types: options
+                .external_data_media_types
+                .clone()
+                .unwrap_or_default(),
+            external_data_unreachable: options
+                .external_data_unreachable
+                .clone()
+                .unwrap_or_default(),
         })
+    }
+
+    fn take_external_data(&mut self) -> ValidatedExternalData {
+        ValidatedExternalData {
+            data: std::mem::take(&mut self.external_data),
+            media_types: std::mem::take(&mut self.external_data_media_types),
+            unreachable: std::mem::take(&mut self.external_data_unreachable),
+        }
+    }
+
+    fn apply_ocsp_update(&mut self, update: native_online::OcspUpdate) {
+        for (certificate, response) in update.responses {
+            self.ocsp_responses.entry(certificate).or_insert(response);
+        }
+        for certificate in update.unreachable {
+            if !self.ocsp_unreachable.contains(&certificate) {
+                self.ocsp_unreachable.push(certificate);
+            }
+        }
     }
 
     pub(crate) fn input<'a>(&'a self, data: &'a [u8], mime: &'a str) -> VerifyInput<'a> {
@@ -896,6 +1341,10 @@ impl ResolvedOptions {
                 ocsp_unreachable: (!self.ocsp_unreachable.is_empty())
                     .then_some(self.ocsp_unreachable.as_slice()),
                 external_data: (!self.external_data.is_empty()).then_some(&self.external_data),
+                external_data_media_types: (!self.external_data_media_types.is_empty())
+                    .then_some(&self.external_data_media_types),
+                external_data_unreachable: (!self.external_data_unreachable.is_empty())
+                    .then_some(self.external_data_unreachable.as_slice()),
             },
         }
     }
@@ -906,6 +1355,61 @@ impl ResolvedOptions {
 
     pub(crate) fn cawg_allowed_certs(&self) -> Option<&TrustList> {
         self.cawg_allowed_certs.as_ref().map(ResolvedTrust::get)
+    }
+}
+
+/// The engine profile for the caller's policy selection.
+///
+/// `None` and `"2.4"` are the same policy and resolve to the same profile, so
+/// the two produce byte-identical reports. `"2.2"` is an explicit older policy.
+/// Strict 2.2 and 2.4 select their published program postures. Strict 2.5 is a
+/// technical core-spec posture with strict diagnostics; it never claims a
+/// certified or Conformance Program scope.
+fn resolve_profile(spec_version: Option<&str>, strict: bool) -> Result<EngineProfile, Error> {
+    let version = match spec_version {
+        None => SpecVersion::V2_4,
+        Some(value) => SpecVersion::public_policy_from_str(value).ok_or_else(|| {
+            Error::UnsupportedSpecVersion(format!(
+                "spec_version {value:?} is not one of {}",
+                SpecVersion::PUBLIC_POLICIES
+                    .iter()
+                    .map(|version| format!("{:?}", version.version_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?,
+    };
+    match (version, strict) {
+        (SpecVersion::V2_2, true) => Ok(EngineProfile::strict(SpecVersion::V2_2)),
+        (SpecVersion::V2_2, false) => Ok(EngineProfile {
+            version,
+            ..EngineProfile::GENEROUS
+        }),
+        (SpecVersion::V2_4, true) => Ok(EngineProfile::strict(SpecVersion::V2_4)),
+        (SpecVersion::V2_4, false) => Ok(EngineProfile::GENEROUS),
+        (SpecVersion::V2_5, true) => Ok(EngineProfile::new(
+            SpecVersion::V2_5,
+            OperatingMode::Conformance,
+        )
+        .with_compliance(ComplianceLevel::CoreSpec)
+        .with_debug(true)),
+        (SpecVersion::V2_5, false) => Ok(EngineProfile {
+            version,
+            ..EngineProfile::GENEROUS
+        }),
+        _ => Err(Error::UnsupportedSpecVersion(format!(
+            "spec_version {:?} is registered but has no public verification policy",
+            version.version_str()
+        ))),
+    }
+}
+
+/// The report `profile` for an engine profile's validation policy.
+fn report_profile(profile: EngineProfile) -> &'static str {
+    match profile.version {
+        SpecVersion::V2_5 => C2PA_PROFILE_2_5,
+        SpecVersion::V2_2 => C2PA_PROFILE_2_2,
+        _ => C2PA_PROFILE,
     }
 }
 
@@ -936,15 +1440,73 @@ fn decode_base64_map(
     Ok(decoded)
 }
 
-/// Canonicalize `mime_type` and reject one the C2PA 2.4 profile cannot read.
-pub(crate) fn resolve_mime(mime_type: &str) -> Result<String, Error> {
+/// Canonicalize `mime_type` and reject one the selected policy has no
+/// embedded-manifest reader for. The 2.4 policy reads exactly the 2.4
+/// registry; the 2.5 policy adds the carriers and text families 2.5 defines
+/// ([`crate::c2pa_core::spec::reader_permits`]).
+pub(crate) fn resolve_mime(mime_type: &str, profile: EngineProfile) -> Result<String, Error> {
     let mime = canonicalize_mime(mime_type);
-    if !mimes_for_version(SpecVersion::V2_4).contains(&mime.as_str())
+    if !crate::c2pa_core::spec::reader_permits(&mime, profile.version)
         || crate::c2pa_formats::AssetFormat::from_mime(&mime).is_none()
     {
         return Err(Error::UnsupportedMime(mime));
     }
     Ok(mime)
+}
+
+/// Canonicalize the media type of an asset bound by a separately supplied
+/// store.
+///
+/// The 2.4 policy keeps its published behavior: only a type it reads with an
+/// embedded-manifest reader is accepted. Under 2.5 a byte-range hard binding
+/// applies to any asset type, so any syntactically valid `type/subtype` is
+/// accepted: one with an embedded carrier keeps that reader, and any other is
+/// read as opaque bytes. A host-less `application/c2pa` store is never an
+/// asset.
+fn resolve_detached_mime(mime_type: &str, profile: EngineProfile) -> Result<String, Error> {
+    if profile.version != SpecVersion::V2_5 {
+        return resolve_mime(mime_type, profile);
+    }
+    let mime = canonicalize_mime(mime_type);
+    let token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&byte))
+    };
+    let well_formed = mime
+        .split_once('/')
+        .is_some_and(|(kind, subtype)| token(kind) && token(subtype));
+    if !well_formed || mime == "application/c2pa" {
+        return Err(Error::UnsupportedMime(mime));
+    }
+    Ok(mime)
+}
+
+/// Whether `mime` would be read with the generic XML comment armor: an
+/// XML-derived type without a dedicated carrier.
+fn is_xml_comment_carrier(mime: &str) -> bool {
+    (matches!(mime, "application/xml" | "text/xml") || mime.ends_with("+xml"))
+        && matches!(
+            crate::c2pa_formats::AssetFormat::from_mime(mime),
+            Some(crate::c2pa_formats::AssetFormat::TextStructured {
+                comment_prefix: "<!--",
+                ..
+            })
+        )
+}
+
+fn require_embedded_mime(mime: &str, profile: EngineProfile) -> Result<(), Error> {
+    // The draft's generic XML comment armor contains "--", forbidden inside
+    // XML comments (upstream issue 2590), so no well-formed XML document can
+    // carry it. This covers every XML-derived type without a dedicated
+    // carrier (XML, XHTML, RSS, Atom, MathML, ...). Dedicated SVG/TTML
+    // carriers and separately supplied manifest stores are not this
+    // embedding method and stay readable.
+    if profile.version == SpecVersion::V2_5 && is_xml_comment_carrier(mime) {
+        return Err(Error::UnsupportedMime(mime.to_owned()));
+    }
+    Ok(())
 }
 
 pub(crate) fn map_validate_error(error: crate::c2pa_validate::ValidateError) -> Error {
@@ -981,7 +1543,7 @@ pub(crate) fn report_from_output(
     );
     VerificationReport {
         schema_version: REPORT_SCHEMA_VERSION.to_string(),
-        profile: C2PA_PROFILE.to_string(),
+        profile: report_profile(resolved.profile).to_string(),
         mime_type: mime,
         present,
         integrity,
@@ -1005,11 +1567,16 @@ fn verify_with_options_inner(
     fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
-    resolved: &ResolvedOptions,
+    resolved: ResolvedOptions,
 ) -> Result<(VerificationReport, PassCapture), Error> {
-    let mime = resolve_mime(mime_type)?;
+    let mime = resolve_mime(mime_type, resolved.profile)?;
+    require_embedded_mime(&mime, resolved.profile)?;
+    if resolved.profile.version == SpecVersion::V2_5 {
+        return verify_embedded_online_v25(data, fragments, &mime, options, resolved);
+    }
+
     let (mut report, needs, capture) =
-        embedded_pass_resolved(data, fragments, &mime, options, resolved)?;
+        embedded_pass_resolved(data, fragments, &mime, options, &resolved)?;
     let (mut network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
@@ -1020,7 +1587,7 @@ fn verify_with_options_inner(
         // The asset said where its manifest store lives and the store was
         // fetched. Pass 2 verifies the asset against it exactly as it would
         // against a sidecar handed in by the caller, hard binding and all.
-        (Some(store), None) => detached_pass(data, store, &mime, &next),
+        (Some(store), None) => detached_pass(data, store, &mime, &next, GraphInputs::default()),
         _ => embedded_pass(data, fragments, &mime, &next),
     };
     match second {
@@ -1028,15 +1595,167 @@ fn verify_with_options_inner(
             second.network = network;
             Ok((second, second_capture))
         }
-        // What the server returned is not a manifest store this asset can be
-        // verified against. That is an answer about the file, not a failure of
-        // this SDK, so the offline verdict stands and the reason is recorded.
+        // Legacy policies preserve their established fallback when a remote
+        // body is not a usable store. Exact 2.5 never takes this route.
         Err(error) => {
             network.mark_unusable("remote_manifest", error.to_string());
             report.network = network;
             Ok((report, capture))
         }
     }
+}
+
+fn merged_did_documents(
+    pinned: Option<&HashMap<String, Value>>,
+    fetched: HashMap<String, Value>,
+) -> Option<HashMap<String, Value>> {
+    if fetched.is_empty() {
+        return None;
+    }
+    let mut merged = pinned.cloned().unwrap_or_default();
+    for (did, document) in fetched {
+        merged.entry(did).or_insert(document);
+    }
+    Some(merged)
+}
+
+fn verify_embedded_online_v25(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime: &str,
+    options: &VerifyOptions,
+    mut resolved: ResolvedOptions,
+) -> Result<(VerificationReport, PassCapture), Error> {
+    let mut plan = locate_external_resources(data, mime, options, GraphLimits::default())?;
+    let terminal_uri = (!plan.manifest_store_present)
+        .then(|| {
+            plan.resources
+                .iter()
+                .find(|request| request.kind == ExternalResourceKind::SegmentManifestStore)
+                .map(|request| request.uri.clone())
+        })
+        .flatten();
+    let mut online = native_online::NativeOnline::new(resolved.take_external_data(), options);
+
+    while !plan.resources.is_empty() {
+        let frontier = plan.resources.clone();
+        for request in &frontier {
+            online.ensure_graph_resource(
+                options,
+                request,
+                terminal_uri.as_deref() == Some(request.uri.as_str()),
+            );
+        }
+        plan.continue_with(online.resources())?;
+    }
+    online.mark_discovery_stop(plan.stop_reason.as_ref());
+
+    let fetched_dids = online.resolve_did_documents(
+        options,
+        plan.did_documents(),
+        options.cawg_did_documents.as_ref(),
+    );
+    let merged_dids = merged_did_documents(options.cawg_did_documents.as_ref(), fetched_dids);
+    let did_documents = merged_dids.as_ref().or(options.cawg_did_documents.as_ref());
+    let graph_inputs = GraphInputs {
+        external: Some(online.resources()),
+        limits: GraphLimits::default(),
+    };
+    let (mut report, mut needs, mut capture) = embedded_graph_pass_resolved(
+        data,
+        fragments,
+        mime,
+        options,
+        &resolved,
+        did_documents,
+        graph_inputs,
+    )?;
+
+    let ocsp = online.fetch_ocsp(options, &needs);
+    if ocsp.has_evidence() {
+        resolved.apply_ocsp_update(ocsp);
+        let graph_inputs = GraphInputs {
+            external: Some(online.resources()),
+            limits: GraphLimits::default(),
+        };
+        (report, needs, capture) = embedded_graph_pass_resolved(
+            data,
+            fragments,
+            mime,
+            options,
+            &resolved,
+            did_documents,
+            graph_inputs,
+        )?;
+    }
+    report.network = online.finish(&needs);
+    Ok((report, capture))
+}
+
+fn verify_detached_online_v25(
+    asset: &[u8],
+    manifest_store: &[u8],
+    mime: &str,
+    options: &VerifyOptions,
+    mut resolved: ResolvedOptions,
+) -> Result<VerificationReport, Error> {
+    let mut plan = locate_external_resources_with_manifest_store(
+        asset,
+        manifest_store,
+        mime,
+        options,
+        GraphLimits::default(),
+    )?;
+    let mut online = native_online::NativeOnline::new(resolved.take_external_data(), options);
+    while !plan.resources.is_empty() {
+        let frontier = plan.resources.clone();
+        for request in &frontier {
+            online.ensure_graph_resource(options, request, false);
+        }
+        plan.continue_with(online.resources())?;
+    }
+    online.mark_discovery_stop(plan.stop_reason.as_ref());
+
+    let fetched_dids = online.resolve_did_documents(
+        options,
+        plan.did_documents(),
+        options.cawg_did_documents.as_ref(),
+    );
+    let merged_dids = merged_did_documents(options.cawg_did_documents.as_ref(), fetched_dids);
+    let did_documents = merged_dids.as_ref().or(options.cawg_did_documents.as_ref());
+    let graph_inputs = GraphInputs {
+        external: Some(online.resources()),
+        limits: GraphLimits::default(),
+    };
+    let (mut report, mut needs, _) = detached_pass_resolved(
+        asset,
+        manifest_store,
+        mime,
+        options,
+        &resolved,
+        did_documents,
+        graph_inputs,
+    )?;
+
+    let ocsp = online.fetch_ocsp(options, &needs);
+    if ocsp.has_evidence() {
+        resolved.apply_ocsp_update(ocsp);
+        let graph_inputs = GraphInputs {
+            external: Some(online.resources()),
+            limits: GraphLimits::default(),
+        };
+        (report, needs, _) = detached_pass_resolved(
+            asset,
+            manifest_store,
+            mime,
+            options,
+            &resolved,
+            did_documents,
+            graph_inputs,
+        )?;
+    }
+    report.network = online.finish(&needs);
+    Ok(report)
 }
 
 /// One offline verification of an asset's own bytes, with the network needs it
@@ -1071,6 +1790,7 @@ fn embedded_pass_resolved(
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),
             options.cawg_ica_status_lists.as_ref(),
+            GraphInputs::default(),
         ),
         None => verify_safe(
             &input,
@@ -1081,6 +1801,75 @@ fn embedded_pass_resolved(
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),
             options.cawg_ica_status_lists.as_ref(),
+        ),
+    }
+    .map_err(map_validate_error)?;
+    let needs = online::network_needs(&output);
+    let capture = PassCapture::take(&mut output);
+    Ok((
+        report_from_output(output, mime.to_string(), resolved),
+        needs,
+        capture,
+    ))
+}
+
+fn embedded_graph_pass(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime_type: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<VerificationReport, Error> {
+    let mime = resolve_mime(mime_type, resolved.profile)?;
+    require_embedded_mime(&mime, resolved.profile)?;
+    embedded_graph_pass_resolved(
+        data,
+        fragments,
+        &mime,
+        options,
+        resolved,
+        options.cawg_did_documents.as_ref(),
+        graph_inputs,
+    )
+    .map(|(report, _, _)| report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn embedded_graph_pass_resolved(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+    did_documents: Option<&HashMap<String, Value>>,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
+    let input = resolved.input(data, mime);
+    let mut output = match fragments {
+        Some(fragments) => verify_fragmented_safe(
+            &input,
+            fragments,
+            &options.expected_seek_positions,
+            resolved.cawg_trust(),
+            resolved.cawg_allowed_certs(),
+            resolved.cawg_document_signing_require_anchor,
+            did_documents,
+            options.cawg_ica_trusted_issuers.as_deref(),
+            options.cawg_ica_trust_anchors.as_deref(),
+            options.cawg_ica_status_lists.as_ref(),
+            graph_inputs,
+        ),
+        None => verify_graph_safe(
+            &input,
+            resolved.cawg_trust(),
+            resolved.cawg_allowed_certs(),
+            resolved.cawg_document_signing_require_anchor,
+            did_documents,
+            options.cawg_ica_trusted_issuers.as_deref(),
+            options.cawg_ica_trust_anchors.as_deref(),
+            options.cawg_ica_status_lists.as_ref(),
+            graph_inputs,
         ),
     }
     .map_err(map_validate_error)?;
@@ -1111,7 +1900,7 @@ pub fn verify_file(
             .to_string(),
     };
     let data = read_path_asset(path, MAX_PATH_ASSET_BYTES)?;
-    verify_with_resolved_options(&data, None, &mime, options, &resolved)
+    verify_with_resolved_options(&data, None, &mime, options, resolved)
 }
 
 fn read_path_asset(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
@@ -1181,6 +1970,40 @@ pub fn supported_mime_types() -> Vec<&'static str> {
     mimes.sort_unstable();
     mimes.dedup();
     mimes
+}
+
+/// Canonical MIME types the caller-selected policy reads with an embedded
+/// manifest carrier. `None` is exactly `"2.4"`. The finite 2.2 and 2.4 lists
+/// come from the shared format registry. `"2.5"` adds the standard ZIP package
+/// and generic-container names used by generator products, plus WARC, MIDI,
+/// TTML, ONNX, SafeTensors, Parquet, BlockFact, append-only JSON Lines, WebVTT
+/// and textual comment-syntax types. It also reads the OpenDocument family,
+/// other `text/*` types and `+xml` types by family, which no finite list can
+/// enumerate. Generic XML-comment embedding stays unreadable under 2.5
+/// (upstream issue 2590), so XML types without a dedicated carrier are omitted.
+/// Any well-formed type can still be verified against a separately supplied
+/// store with [`verify_with_manifest_store`].
+pub fn supported_mime_types_for(spec_version: Option<&str>) -> Result<Vec<&'static str>, Error> {
+    let profile = resolve_profile(spec_version, false)?;
+    let registry_version = match profile.version {
+        SpecVersion::V2_5 => SpecVersion::V2_4,
+        version => version,
+    };
+    let mut mimes: Vec<_> = mimes_for_version(registry_version)
+        .into_iter()
+        .chain(
+            (profile.version == SpecVersion::V2_5)
+                .then_some(crate::c2pa_core::spec::V2_5_READER_MIMES)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
+        .filter(|mime| crate::c2pa_formats::AssetFormat::from_mime(mime).is_some())
+        .filter(|mime| require_embedded_mime(mime, profile).is_ok())
+        .collect();
+    mimes.sort_unstable();
+    mimes.dedup();
+    Ok(mimes)
 }
 
 /// Every filename extension the SDK maps to a MIME type, with its mapping.
@@ -1301,6 +2124,21 @@ pub const SUPPORTED_EXTENSIONS: &[(&str, &str)] = &[
     ("yml", "application/yaml"),
     ("toml", "application/toml"),
     ("py", "text/x-python"),
+    // Carriers C2PA 2.5 adds. Their media types are read only under the 2.5
+    // policy; the default 2.4 policy reports them as unsupported.
+    ("warc", "application/warc"),
+    ("mid", "audio/midi"),
+    ("midi", "audio/midi"),
+    ("ttml", "application/ttml+xml"),
+    ("onnx", "application/onnx"),
+    ("safetensors", "application/safetensors"),
+    ("parquet", "application/vnd.apache.parquet"),
+    ("facti", "image/vnd.blockfact.facti"),
+    ("facta", "audio/vnd.blockfact.facta"),
+    ("factv", "video/vnd.blockfact.factv"),
+    ("jsonl", "application/jsonl"),
+    ("ndjson", "application/jsonl"),
+    ("vtt", "text/vtt"),
 ];
 
 /// Infer a MIME type from a filename extension, case-insensitively.
@@ -1338,11 +2176,12 @@ impl ResolvedTrust {
 /// two root stores that section names.
 fn resolve_trust(
     custom_pem: Option<&str>,
+    sources: Option<&[TrustListSource]>,
     bundled: Option<&'static TrustList>,
     purpose: AnchorPurpose,
     bounds: (Option<OffsetDateTime>, Option<OffsetDateTime>),
 ) -> Result<Option<ResolvedTrust>, Error> {
-    let custom = custom_pem
+    let mut custom = custom_pem
         .map(|pem| TrustList::from_pem_for(purpose, pem))
         .transpose()
         .map_err(|error| Error::InvalidTrust(error.to_string()))?
@@ -1351,6 +2190,40 @@ fn resolve_trust(
             AnchorPurpose::CawgIdentity => trust.with_cawg_source(CawgTrustSource::CallerSupplied),
             _ => trust,
         });
+    for (index, source) in sources.unwrap_or_default().iter().enumerate() {
+        if source.uri.trim().is_empty() || url::Url::parse(&source.uri).is_err() {
+            return Err(Error::InvalidTrust(format!(
+                "trust source {index} has an invalid uri"
+            )));
+        }
+        if source.source_type.trim().is_empty() {
+            return Err(Error::InvalidTrust(format!(
+                "trust source {index} has an empty type"
+            )));
+        }
+        if source
+            .identifier
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(Error::InvalidTrust(format!(
+                "trust source {index} has an empty identifier"
+            )));
+        }
+        let mut metadata =
+            crate::c2pa_trust::TrustSource::new(source.uri.clone(), source.source_type.clone());
+        if let Some(identifier) = &source.identifier {
+            metadata = metadata.with_identifier(identifier.clone());
+        }
+        let sourced = TrustList::from_pem_for(purpose, &source.certificates_pem)
+            .map_err(|error| Error::InvalidTrust(format!("trust source {index}: {error}")))?
+            .with_bounds(bounds.0, bounds.1)
+            .with_source(metadata);
+        match &mut custom {
+            Some(custom) => custom.anchors.extend(sourced.anchors),
+            None => custom = Some(sourced),
+        }
+    }
     match (bundled, custom) {
         (None, None) => Ok(None),
         (Some(trust), None) => Ok(Some(ResolvedTrust::Bundled(trust))),
@@ -1484,6 +2357,7 @@ fn hard_binding_status(results: &CoreResults) -> String {
         ASSERTION_BOXES_HASH_MATCH,
         ASSERTION_COLLECTION_HASH_MATCH,
         ASSERTION_MULTI_ASSET_HASH_MATCH,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_MATCH,
     ];
     const FAILURES: &[&str] = &[
         ASSERTION_DATA_HASH_MISMATCH,
@@ -1495,14 +2369,28 @@ fn hard_binding_status(results: &CoreResults) -> String {
         ASSERTION_COLLECTION_HASH_MALFORMED,
         ASSERTION_MULTI_ASSET_HASH_MISMATCH,
         ASSERTION_MULTI_ASSET_HASH_MALFORMED,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_MISMATCH,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_MALFORMED,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_PARTIAL_COVERAGE,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_PREDECESSOR_MISMATCH,
     ];
     // Checked before the match set, and it has to be: a manifest that binds
     // only its init segment DOES produce `assertion.bmffHash.match` over those
     // bytes, so a match-first read would answer "match" for a stream whose
     // media segments nothing covered. The axis answers "is every byte the
     // caller presented bound?", so an unbound or unauthenticated segment is a
-    // mismatch no matter what else matched (PRD 1.1.1).
-    if results.has_failure(crate::c2pa_validate::live_video::LIVEVIDEO_SEGMENT_INVALID) {
+    // mismatch no matter what else matched (PRD 1.1.1). The same holds for an
+    // append-only file: the active checkpoint can match while an earlier
+    // segment was rewritten, and a refused caller verdict binds nothing.
+    const UNBOUND: &[&str] = &[
+        crate::c2pa_validate::live_video::LIVEVIDEO_SEGMENT_INVALID,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_MISMATCH,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_MALFORMED,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_PARTIAL_COVERAGE,
+        crate::c2pa_validate::ASSERTION_SEGMENT_HASH_PREDECESSOR_MISMATCH,
+        crate::c2pa_validate::HARD_BINDING_CALLER_EVIDENCE_MISMATCH,
+    ];
+    if UNBOUND.iter().any(|code| results.has_failure(code)) {
         "mismatch"
     } else if MATCHES.iter().any(|code| results.has_success(code)) {
         "match"
@@ -1589,9 +2477,11 @@ fn trust_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        mime_from_path, read_bounded_file, supported_mime_types, verify, verify_file,
-        verify_fragmented, verify_with_options, CawgTrustConfiguration, CawgTrustProfile, Error,
-        VerifyOptions,
+        detached_manifest_evidence, mime_from_path, read_bounded_file, supported_mime_types,
+        verify, verify_file, verify_fragmented, verify_fragmented_with_graph_inputs,
+        verify_manifest_store_only_with_graph_inputs, verify_with_manifest_store_and_graph_inputs,
+        verify_with_options, CawgTrustConfiguration, CawgTrustProfile, Error, GraphInputs,
+        GraphLimits, VerificationReport, VerifyOptions,
     };
     use std::{io::Cursor, path::Path};
 
@@ -1727,6 +2617,72 @@ mod tests {
     }
 
     #[test]
+    fn detached_fragmented_and_store_only_routes_honor_one_graph_budget() {
+        let limited = || GraphInputs {
+            external: None,
+            limits: GraphLimits::lowered(32, 0, 16_384, 64 * 1024 * 1024),
+        };
+        let has_node_limit = |report: &VerificationReport| {
+            report
+                .validation_results
+                .informational
+                .iter()
+                .any(|status| {
+                    status.code == "com.encypher.resource.graphLimitExceeded"
+                        && status
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("limit"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("nodes")
+                })
+        };
+
+        let jpeg = include_bytes!("../../../tests/fixtures/signed_test.jpg");
+        let store = detached_manifest_evidence(jpeg, "image/jpeg")
+            .expect("extract detached evidence")
+            .expect("signed JPEG manifest")
+            .manifest_store;
+        let detached = verify_with_manifest_store_and_graph_inputs(
+            jpeg,
+            &store,
+            "image/jpeg",
+            &VerifyOptions::default(),
+            limited(),
+        )
+        .expect("detached graph verification");
+        assert!(
+            has_node_limit(&detached),
+            "{:?}",
+            detached.validation_results
+        );
+
+        let store_only = verify_manifest_store_only_with_graph_inputs(
+            &store,
+            &VerifyOptions::default(),
+            limited(),
+        )
+        .expect("store-only graph verification");
+        assert_eq!(store_only.report.hard_binding, "not_evaluated");
+        assert!(has_node_limit(&store_only.report));
+
+        let mp4 = include_bytes!("../../../tests/fixtures/signed_test.mp4");
+        let fragmented = verify_fragmented_with_graph_inputs(
+            mp4,
+            &[],
+            "video/mp4",
+            &VerifyOptions::default(),
+            limited(),
+        )
+        .expect("fragmented graph verification");
+        assert!(
+            has_node_limit(&fragmented),
+            "{:?}",
+            fragmented.validation_results
+        );
+    }
+
+    #[test]
     fn unratified_hostless_store_is_not_in_public_profile() {
         let error = verify(b"jumb", "application/c2pa").unwrap_err();
         assert!(matches!(error, Error::UnsupportedMime(_)));
@@ -1779,6 +2735,51 @@ mod tests {
                 .contains("cawg_trust_configurations[0].certificates_pem"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn zip64_is_admitted_only_by_the_caller_selected_v2_5_policy() {
+        let (archive, _) = crate::c2pa_formats::zip64_test_asset();
+        for spec_version in [None, Some("2.4")] {
+            let error = verify_with_options(
+                &archive,
+                "application/zip",
+                &VerifyOptions {
+                    spec_version: spec_version.map(str::to_string),
+                    ..VerifyOptions::default()
+                },
+            )
+            .expect_err("legacy policy must refuse ZIP64");
+            assert!(
+                matches!(error, Error::Verification(_)),
+                "{spec_version:?} returned {error:?}"
+            );
+        }
+
+        let error = verify_with_options(
+            &archive,
+            "application/zip",
+            &VerifyOptions {
+                spec_version: Some("2.2".into()),
+                ..VerifyOptions::default()
+            },
+        )
+        .expect_err("2.2 must refuse a ZIP MIME outside its format set");
+        assert!(
+            matches!(&error, Error::UnsupportedMime(mime) if mime == "application/zip"),
+            "2.2 returned {error:?}"
+        );
+
+        let report = verify_with_options(
+            &archive,
+            "application/zip",
+            &VerifyOptions {
+                spec_version: Some("2.5".into()),
+                ..VerifyOptions::default()
+            },
+        )
+        .expect("2.5 ZIP64 verification returns a report");
+        assert!(report.present, "2.5 did not reach the ZIP64 manifest");
     }
 
     /// CAWG-ID13-DELTA-009: a trust configuration's certificates and window

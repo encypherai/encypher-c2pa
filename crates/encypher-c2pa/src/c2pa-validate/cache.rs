@@ -221,6 +221,24 @@ fn trust_fingerprint(input: &crate::c2pa_validate::VerifyInput) -> Vec<u8> {
                     None => h.update([0xfe]),
                 }
             }
+            match &anchor.source {
+                Some(source) => {
+                    h.update([0xfc]);
+                    for value in [source.uri.as_str(), source.source_type.as_str()] {
+                        h.update((value.len() as u64).to_be_bytes());
+                        h.update(value.as_bytes());
+                    }
+                    match source.identifier.as_deref() {
+                        Some(identifier) => {
+                            h.update([1]);
+                            h.update((identifier.len() as u64).to_be_bytes());
+                            h.update(identifier.as_bytes());
+                        }
+                        None => h.update([0]),
+                    }
+                }
+                None => h.update([0xfd]),
+            }
         }
     }
 

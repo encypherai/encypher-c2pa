@@ -56,6 +56,13 @@ pub(super) fn value_from_json(json: &Json, remaining_nodes: &mut usize) -> Optio
     })
 }
 
+const IPTC_DIGITAL_SOURCE_TYPE_PREFIX: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/";
+
+const C2PA_DIGITAL_SOURCE_TYPES: &[&str] = &[
+    "http://c2pa.org/digitalsourcetype/empty",
+    "http://c2pa.org/digitalsourcetype/trainedAlgorithmicData",
+];
+
 pub(super) fn ingredient_shape_error(ingredient: &Value) -> Option<String> {
     match ingredient.get("relationship").and_then(Value::as_text) {
         Some("parentOf" | "inputTo" | "componentOf") => {}
@@ -73,9 +80,9 @@ pub(super) fn ingredient_shape_error(ingredient: &Value) -> Option<String> {
 fn valid_digital_source_type(value: &str) -> bool {
     let value = value.trim();
     value
-        .strip_prefix("http://cv.iptc.org/newscodes/digitalsourcetype/")
+        .strip_prefix(IPTC_DIGITAL_SOURCE_TYPE_PREFIX)
         .is_some_and(|term| !term.is_empty() && !term.contains(['/', '#', '?']))
-        || value == "http://c2pa.org/digitalsourcetype/empty"
+        || C2PA_DIGITAL_SOURCE_TYPES.contains(&value)
 }
 
 pub(super) fn action_shape_errors(
@@ -161,6 +168,34 @@ mod tests {
         )
     }
 
+    /// The complete IPTC vocabulary published on 2024-10-23, including its
+    /// retired terms. The production predicate intentionally accepts new
+    /// single-segment terms in the authoritative namespace as IPTC registers
+    /// them; this table prevents a current or historical registered term from
+    /// being lost.
+    const REGISTERED_IPTC_DIGITAL_SOURCE_TYPES: &[&str] = &[
+        "digitalCapture",
+        "computationalCapture",
+        "negativeFilm",
+        "positiveFilm",
+        "print",
+        "minorHumanEdits",
+        "humanEdits",
+        "algorithmicallyEnhanced",
+        "softwareImage",
+        "digitalArt",
+        "digitalCreation",
+        "dataDrivenMedia",
+        "trainedAlgorithmicMedia",
+        "algorithmicMedia",
+        "screenCapture",
+        "virtualRecording",
+        "composite",
+        "compositeCapture",
+        "compositeSynthetic",
+        "compositeWithTrainedAlgorithmicMedia",
+    ];
+
     #[test]
     fn ingredient_relationship_and_source_are_validated() {
         let missing = map(vec![]);
@@ -179,6 +214,69 @@ mod tests {
         for relationship in ["parentOf", "inputTo", "componentOf"] {
             let valid = map(vec![("relationship", Value::Text(relationship.into()))]);
             assert_eq!(ingredient_shape_error(&valid), None);
+        }
+    }
+
+    #[test]
+    fn every_registered_digital_source_type_is_valid_for_actions_and_ingredients() {
+        assert_eq!(REGISTERED_IPTC_DIGITAL_SOURCE_TYPES.len(), 20);
+        assert_eq!(C2PA_DIGITAL_SOURCE_TYPES.len(), 2);
+
+        for source_type in REGISTERED_IPTC_DIGITAL_SOURCE_TYPES
+            .iter()
+            .map(|term| format!("{IPTC_DIGITAL_SOURCE_TYPE_PREFIX}{term}"))
+            .chain(
+                C2PA_DIGITAL_SOURCE_TYPES
+                    .iter()
+                    .map(|uri| (*uri).to_string()),
+            )
+        {
+            let action = map(vec![(
+                "digitalSourceType",
+                Value::Text(format!(" {source_type} ")),
+            )]);
+            assert!(
+                action_shape_errors(&action, 0, true).is_empty(),
+                "{source_type}"
+            );
+
+            let ingredient = map(vec![
+                ("relationship", Value::Text("componentOf".into())),
+                ("digitalSourceType", Value::Text(source_type.clone())),
+            ]);
+            assert_eq!(ingredient_shape_error(&ingredient), None, "{source_type}");
+        }
+    }
+
+    #[test]
+    fn iptc_namespace_policy_remains_forward_compatible() {
+        let future_term = map(vec![(
+            "digitalSourceType",
+            Value::Text(format!(
+                "{IPTC_DIGITAL_SOURCE_TYPE_PREFIX}futureRegisteredTerm"
+            )),
+        )]);
+        assert!(action_shape_errors(&future_term, 0, true).is_empty());
+
+        for invalid_suffix in ["", "nested/term", "term#fragment", "term?query"] {
+            let invalid = map(vec![(
+                "digitalSourceType",
+                Value::Text(format!("{IPTC_DIGITAL_SOURCE_TYPE_PREFIX}{invalid_suffix}")),
+            )]);
+            assert_eq!(action_shape_errors(&invalid, 0, true).len(), 1);
+        }
+    }
+
+    #[test]
+    fn unregistered_c2pa_digital_source_types_and_aliases_are_rejected() {
+        for source_type in [
+            "http://c2pa.org/digitalsourcetype/trainedAlgorithmicMedia",
+            "http://c2pa.org/digitalsourcetype/unknown",
+            "https://c2pa.org/digitalsourcetype/empty",
+            "c2pa.trainedAlgorithmicData",
+        ] {
+            let action = map(vec![("digitalSourceType", Value::Text(source_type.into()))]);
+            assert_eq!(action_shape_errors(&action, 0, true).len(), 1);
         }
     }
 

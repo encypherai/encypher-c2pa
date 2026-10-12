@@ -53,6 +53,51 @@ Format-specific rules the verifier applies:
 - A collection hash requires every listed member; unlisted files are allowed. For ZIP packages the central-directory hash still detects files added after signing.
 - Under `strict_conformance`, carrier placement is also checked: the GIF block before the first image descriptor, the TIFF entry in the last main IFD, the SVG element under the root `metadata` element, and the BMFF store box after `ftyp` and before `moov` and `mdat`.
 
+### C2PA 2.5 policy (`spec_version: "2.5"`)
+
+The proposed 2.5 policy reads the carriers 2.5 adds: Standard MIDI Files (`audio/midi`, sole/last/first track by SMF format, `FF 7F 00 43 32` event), standalone TTML (`application/ttml+xml`, namespace-matched `/tt:tt/tt:head/tt:metadata/c2pa:manifest`), ONNX (`application/onnx`, `metadata_props` `c2pa:manifest` value), SafeTensors (`application/safetensors`, `__metadata__.c2pa:manifest` value), Parquet (`application/vnd.apache.parquet`, footer `key_value_metadata`; encrypted-footer files carry none), BlockFact (`image/vnd.blockfact.facti`, `audio/vnd.blockfact.facta`, `video/vnd.blockfact.factv`, `C2PA` extension block), WARC (`application/warc`, collection binding by `WARC-Record-ID`), append-only text and JSON Lines checkpoints (`c2pa.hash.segment`, including the predecessor chain), WebVTT (`text/vtt`) and every other `text/*` structured-text type. A duplicate carrier in any of these locates no manifest. MIDI, ONNX, SafeTensors and JSONL have no registered media type; the spellings above are this SDK's non-normative choice.
+
+Generic XML-comment embedding is unsupported under 2.5 for every XML-derived type without a dedicated carrier (XML, XHTML, RSS, Atom): its armor contains `--`, which XML forbids inside comments ([upstream issue 2590](https://github.com/c2pa-org/specs-core/issues/2590)). Separately supplied manifest stores remain readable for those types, and for any well-formed media type as opaque bytes.
+
+E-RTMP uses `verify_ertmp` or `verify_ertmp_with_options` with caller-supplied audio/video track events, including codec configuration, frames and named metadata. It validates segment signatures, continuity and manifest refreshes without treating the transport as a file MIME. The API does not invent the audio metadata packet assignment missing from the referenced transport specification.
+
+Rust callers can decode complete FLV files with `ertmp_input_from_flv` or
+post-handshake publisher-to-server RTMP chunk traces with
+`ertmp_input_from_rtmp_connections`, then pass the result's `.input` to the verifier.
+Each RTMP connection supplies its own capability context and initial chunk size.
+Those values are caller assertions, not authenticated negotiation evidence.
+The adapters bound total wire bytes, in-flight message bytes, active chunk
+streams, event count and owned event payloads. They preserve globally unique
+`(mediaType, trackId)` pairs across message streams and reject conflicting use.
+No transport encoder or manifest writer is part of the public API.
+The result's index-aligned `.event_contexts` retains source message-stream IDs,
+codec FourCCs and multitrack framing. FLV has no RTMP message-stream identity,
+so its contexts report no such ID. Reconnect events have no media context.
+The pinned transport specification has no audio Metadata packet assignment.
+Consequently, these wire adapters cannot supply closing SegmentInfo for audio
+tracks; audio wire frames cannot establish a complete valid stream. The
+normalized event API can verify caller-supplied audio metadata independently
+of an unresolved wire packet assignment.
+
+WARC uses `c2pa.hash.collection.data` for both embedded and separately supplied stores. Detached verification permits zero in-band C2PA records; it does not substitute a whole-file data hash. Both paths enforce record-ID bijection and bounded decompression, and hash the complete uncompressed records. Recompressing unchanged records preserves the binding.
+
+Exact 2.5 also reads these existing standard-carrier spellings, without expanding the frozen 2.2 or 2.4 MIME sets:
+
+- ZIP packages: `application/vnd.apple.keynote`, `application/vnd.apple.pages`, `application/vnd.apple.numbers`, `application/x-krita`, `image/openraster`, `application/vnd.adobe.indesign-idml-package`, `application/vnd.google-earth.kmz` and `model/3mf`.
+- OpenDocument: valid `application/vnd.oasis.opendocument.*` family members use the ZIP reader, including subtypes beyond the four names in the 2.4 list.
+- Generic containers: `image/x-tiff-based`, `image/x-riff-based`, `video/x-riff-based`, `audio/x-riff-based` and `video/x-bmff-based`.
+
+`supported_mime_types_for(Some("2.5"))` enumerates concrete names, not every member of an open MIME family. These routes still require valid carrier bytes. An arbitrary unknown MIME has no invented embedded carrier; use a separately supplied manifest and the 2.5 raw-byte binding path.
+
+- Unstructured text: any trailing padding byte is admitted and the whole variation-selector run is the wrapper's byte range. A candidate that does not decode is ignored, and zero or several valid wrappers locate no manifest instead of reporting `manifest.text.*`.
+- Detached text: hash the supplied asset's exact bytes. Embedded-wrapper exclusions and NFC normalization do not apply to a separately supplied manifest store.
+- Structured text: one `BEGIN`/`END` pair, reference trimmed of space, tab, CR and LF only, and only a valid `data:application/c2pa;base64,` reference embeds a store. Anything else locates no manifest instead of reporting `manifest.structuredText.*`.
+- HTML: only elements inside `head` count; more than one there locates no manifest.
+- Placement checked in the regular 2.5 posture: the PNG `caBX` chunk before the first `IDAT`, the BMFF manifest box after `ftyp` and before the first `mdat`/`moov` or adjacent to `moov` (an `update` box last), and the TIFF entry in the first or last IFD. A violation reports `general.error`.
+- BMFF: excluding `ftyp` becomes an optional exclusion (`assertion.bmffHash.additionalExclusionsPresent`), and a fragmented hash carrying both `hash` and `merkle` is `assertion.bmffHash.malformed`.
+- ZIP: bounded single-disk ZIP64 archives are read, including their extended-information fields, 64-bit data descriptors, and ZIP64 end records. Only exact `spec_version: "2.5"` admits ZIP64; the 2.2 and 2.4 policies and versionless format helpers retain their prior ZIP32-only behavior.
+- An unreadable manifest store reports `manifest.inaccessible.malformed`.
+
 ## Test fixtures
 
 `tests/fixtures/signed_test.jpg` and `signed_test.mp4` exercise the public report contract, together with `signed_bigtiff_le_single_page.tif` (C2PA 2.4 A.3.6, the entry inside the single main IFD) and `signed_bigtiff_be_multi_page.tif` (2.2 A.3.5, a big-endian multi-page asset with a dedicated last IFD). The deeper engine suite covers format extraction, claim parsing, signature algorithms, data hash, BMFF hash, boxes hash, collection hash, multipart bindings, ingredients, trust, OCSP, and malformed input boundaries.
