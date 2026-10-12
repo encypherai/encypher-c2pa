@@ -65,8 +65,9 @@ mod c2pa_trust;
 #[allow(dead_code, unused_imports, reason = "production kernel mirror")]
 mod c2pa_validate;
 pub use c2pa_validate::external_discovery::{
-    locate_external_resources, locate_external_resources_with_manifest_store, ExternalResourceKind,
-    ExternalResourcePlan, ExternalResourceRequest, ExternalResourceStopReason, GraphLimitKind,
+    locate_external_resources, locate_external_resources_with_manifest_store,
+    ExternalDidDocumentRequest, ExternalResourceKind, ExternalResourcePlan,
+    ExternalResourceRequest, ExternalResourceStopReason, GraphLimitKind,
 };
 pub use c2pa_validate::ingredient_graph::{GraphInputs, GraphLimits};
 pub use c2pa_validate::refs::{ExternalResource, ExternalResources};

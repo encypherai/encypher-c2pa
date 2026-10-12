@@ -291,6 +291,46 @@ fn identity_shape(assertion: &Value) -> Result<IdentityShape<'_>, IdentityShapeD
     })
 }
 
+/// Locate DID documents needed by structurally readable, claim-bound ICA
+/// identity assertions without performing identity verification.
+pub(super) fn locate_identity_did_documents(
+    claim_refs: &ClaimAssertionRefs<'_>,
+) -> Vec<(String, String)> {
+    let mut documents = Vec::new();
+    for reference in claim_refs.references.iter().take(MAX_IDENTITY_ASSERTIONS) {
+        let Some(label) = reference.label.filter(|label| is_identity_assertion_label(label)) else {
+            continue;
+        };
+        let Some(assertion) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+        else {
+            continue;
+        };
+        let Ok(shape) = identity_shape(assertion) else {
+            continue;
+        };
+        if shape
+            .signer_payload
+            .get("sig_type")
+            .and_then(Value::as_text)
+            != Some(CAWG_ICA_COSE)
+        {
+            continue;
+        }
+        let Some(document) = super::cawg_ica::locate_did_document(shape.signature) else {
+            continue;
+        };
+        if !documents
+            .iter()
+            .any(|(did, _): &(String, String)| did == &document.0)
+        {
+            documents.push(document);
+        }
+    }
+    documents
+}
+
 fn report_identity_shape_defect(
     results: &mut ValidationResults,
     url: &str,

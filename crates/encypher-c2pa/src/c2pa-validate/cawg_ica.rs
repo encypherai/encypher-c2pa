@@ -476,6 +476,17 @@ impl CoseSign1 {
     }
 }
 
+/// Locate the DID document a structurally readable ICA signature would need.
+///
+/// This is parse-only discovery for network adapters. Cryptographic,
+/// credential, and trust validation remain in [`verify_ica_assertion_with`].
+pub(super) fn locate_did_document(signature: &[u8]) -> Option<(String, String)> {
+    let cose = CoseSign1::parse(signature)?;
+    let credential = parse_ica_credential(cose.payload.as_deref()?).ok()?;
+    let url = super::network_needs::did_web_url(&credential.issuer)?;
+    Some((primary_did(&credential.issuer).to_string(), url))
+}
+
 fn map_int(entries: &[(Value, Value)], key: i128) -> Option<&Value> {
     entries
         .iter()

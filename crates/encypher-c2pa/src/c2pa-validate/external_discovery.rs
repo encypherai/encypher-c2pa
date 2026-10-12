@@ -33,6 +33,15 @@ pub struct ExternalResourceRequest {
     pub kind: ExternalResourceKind,
 }
 
+/// One DID document a network adapter may resolve before final verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDidDocumentRequest {
+    /// Primary DID, without a fragment or query.
+    pub did: String,
+    /// HTTPS URL defined by the `did:web` method.
+    pub url: String,
+}
+
 /// The graph ceiling that stopped parse-only discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphLimitKind {
@@ -150,6 +159,8 @@ struct DiscoverySession {
     flavor: Option<AppendOnlyFlavor>,
     budget: DiscoveryBudget,
     uris: HashMap<String, UriState>,
+    did_document_ids: HashSet<String>,
+    did_documents: Vec<ExternalDidDocumentRequest>,
     stop_reason: Option<ExternalResourceStopReason>,
 }
 
@@ -196,6 +207,15 @@ impl<A: AsRef<[u8]>> ExternalResourcePlan<A> {
     /// Borrow the original asset for the one final verification pass.
     pub fn asset(&self) -> &[u8] {
         self.asset.as_ref()
+    }
+
+    /// DID documents found by parse-only inspection of active ICA identities.
+    ///
+    /// The list accumulates as retrieved initial stores are parsed. Callers
+    /// must prefer a document already pinned in [`VerifyOptions`] and fetch
+    /// only entries that remain unresolved.
+    pub fn did_documents(&self) -> &[ExternalDidDocumentRequest] {
+        &self.session.did_documents
     }
 
     /// Consume the current frontier from caller-held outcomes and discover the
@@ -269,6 +289,8 @@ fn new_plan<A: AsRef<[u8]>>(
             flavor,
             budget: DiscoveryBudget::new(limits),
             uris: HashMap::new(),
+            did_document_ids: HashSet::new(),
+            did_documents: Vec::new(),
             stop_reason: None,
         },
     }
@@ -439,6 +461,18 @@ fn scan_initial_store(
     };
     let active_generation = versions::claim_generation(active_manifest, active_claim);
     let active_refs = ClaimAssertionRefs::build(active_manifest, active_claim, active_generation);
+    for (did, url) in super::cawg::locate_identity_did_documents(&active_refs) {
+        // The did:web mapper emits HTTPS. Keep the check at this public
+        // discovery boundary so malformed future methods never become browser
+        // fetch instructions.
+        if url.starts_with("https://") && session.did_document_ids.insert(did.clone()) {
+            // The plan owns these strings because the parsed store may be a
+            // retrieved body borrowed only for this continuation call.
+            session
+                .did_documents
+                .push(ExternalDidDocumentRequest { did, url });
+        }
+    }
 
     // Final verification spends this shared budget in the same order: active
     // cloud/external data, linked resources, generic references, ingredient

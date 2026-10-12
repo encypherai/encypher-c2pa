@@ -2,16 +2,18 @@
 // Copyright 2026 Encypher Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use encypher_c2pa::{
-    local_evidence_with_options, supported_mime_types, validation_failure_telemetry,
-    verify_ertmp_with_options, verify_fragmented_with_options, verify_stream_with_options,
-    verify_with_manifest_store, verify_with_options, Error, ErtmpInput, NetworkReport,
-    NetworkRequest, SoftBindingHttpMethod, SoftBindingQuery, SoftBindingReceiptVerificationSession,
-    SoftBindingResolverOptions, SoftBindingResolverSession, StreamEncapsulation, StreamMethod,
-    VerificationReport, VerifyOptions,
+    local_evidence_with_options, locate_external_resources, supported_mime_types,
+    validation_failure_telemetry, verify_ertmp_with_options, verify_fragmented_with_options,
+    verify_stream_with_options, verify_with_graph_inputs, verify_with_manifest_store,
+    verify_with_manifest_store_and_graph_inputs, verify_with_options, Error, ErtmpInput,
+    ExternalResource, ExternalResourceKind, ExternalResources, GraphInputs, GraphLimits,
+    NetworkReport, NetworkRequest, SoftBindingHttpMethod, SoftBindingQuery,
+    SoftBindingReceiptVerificationSession, SoftBindingResolverOptions, SoftBindingResolverSession,
+    StreamEncapsulation, StreamMethod, VerificationReport, VerifyOptions,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -105,6 +107,88 @@ export async function fetchOnlineNeeds(needed) {
   }
   return result;
 }
+export function decodeOnlineBase64(encoded) {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+export async function fetchOnlineResource(url, maxBytes, accept) {
+  if (!/^https:\/\//i.test(url)) {
+    return { outcome: "blocked", detail: "https is required", bytes: null, mediaType: null };
+  }
+  try {
+    const headers = accept === null ? undefined : { accept };
+    const response = await fetch(url, {
+      method: "GET",
+      headers,
+      credentials: "omit",
+      redirect: "error",
+      mode: "cors",
+    });
+    if (!response.ok) {
+      return {
+        outcome: "failed",
+        detail: `the server answered HTTP ${response.status}`,
+        bytes: null,
+        mediaType: null,
+      };
+    }
+    const length = Number(response.headers.get("content-length"));
+    if (Number.isFinite(length) && length > maxBytes) {
+      return {
+        outcome: "blocked",
+        detail: `the response is larger than the ${maxBytes} byte remaining limit`,
+        bytes: null,
+        mediaType: null,
+      };
+    }
+    if (!response.body) {
+      return {
+        outcome: "blocked",
+        detail: "the response body is not available as a bounded stream",
+        bytes: null,
+        mediaType: null,
+      };
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        return {
+          outcome: "blocked",
+          detail: `the response is larger than the ${maxBytes} byte remaining limit`,
+          bytes: null,
+          mediaType: null,
+        };
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const mediaType = response.headers.get("content-type")
+      ?.split(";", 1)[0].trim().toLowerCase() || null;
+    return {
+      outcome: "fetched",
+      detail: `${bytes.byteLength} bytes`,
+      bytes,
+      mediaType,
+    };
+  } catch (error) {
+    // Redirect refusal, CORS refusal, CSP, mixed content, and transport
+    // failures are deliberately indistinguishable to browser script.
+    return { outcome: "failed", detail: `${error}`, bytes: null, mediaType: null };
+  }
+}
 export function softBindingHost(url) {
   return new URL(url).hostname;
 }
@@ -162,6 +246,10 @@ extern "C" {
     fn resolve_telemetry_preference() -> bool;
     #[wasm_bindgen(js_name = fetchOnlineNeeds)]
     fn fetch_online_needs(needed: JsValue) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = decodeOnlineBase64)]
+    fn decode_online_base64(encoded: &str) -> JsValue;
+    #[wasm_bindgen(js_name = fetchOnlineResource)]
+    fn fetch_online_resource(url: &str, max_bytes: usize, accept: JsValue) -> js_sys::Promise;
     #[wasm_bindgen(js_name = softBindingHost)]
     fn soft_binding_host(url: &str) -> String;
     #[wasm_bindgen(js_name = fetchSoftBinding)]
@@ -173,6 +261,215 @@ extern "C" {
         body: JsValue,
         max_bytes: usize,
     ) -> js_sys::Promise;
+}
+
+const ONLINE_MAX_REQUESTS: usize = 16;
+const ONLINE_MAX_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
+const ONLINE_MAX_DID_BYTES: usize = 256 * 1024;
+
+enum BrowserResource {
+    CallerSupplied {
+        bytes: Vec<u8>,
+        media_type: Option<String>,
+    },
+    Fetched {
+        bytes: Vec<u8>,
+        media_type: Option<String>,
+    },
+    Unavailable,
+    NotAttempted,
+}
+
+#[derive(Default)]
+struct BrowserResources {
+    entries: HashMap<String, BrowserResource>,
+}
+
+impl BrowserResources {
+    fn from_options(options: &VerifyOptions) -> Self {
+        let mut resources = Self::default();
+        if let Some(unreachable) = options.external_data_unreachable.as_ref() {
+            for uri in unreachable {
+                resources
+                    .entries
+                    .entry(uri.clone())
+                    .or_insert(BrowserResource::Unavailable);
+            }
+        }
+        if let Some(external_data) = options.external_data.as_ref() {
+            for (uri, encoded) in external_data {
+                let bytes = js_sys::Uint8Array::new(&decode_online_base64(encoded)).to_vec();
+                let media_type = options
+                    .external_data_media_types
+                    .as_ref()
+                    .and_then(|types| types.get(uri))
+                    .cloned();
+                resources.entries.insert(
+                    uri.clone(),
+                    BrowserResource::CallerSupplied { bytes, media_type },
+                );
+            }
+        }
+        resources
+    }
+
+    fn contains(&self, uri: &str) -> bool {
+        self.entries.contains_key(uri)
+    }
+
+    fn is_caller_supplied(&self, uri: &str) -> bool {
+        matches!(
+            self.entries.get(uri),
+            Some(BrowserResource::CallerSupplied { .. })
+        )
+    }
+
+    fn bytes(&self, uri: &str) -> Option<&[u8]> {
+        match self.entries.get(uri) {
+            Some(
+                BrowserResource::CallerSupplied { bytes, .. }
+                | BrowserResource::Fetched { bytes, .. },
+            ) => Some(bytes),
+            Some(BrowserResource::Unavailable | BrowserResource::NotAttempted) | None => None,
+        }
+    }
+}
+
+impl ExternalResources for BrowserResources {
+    fn resolve(&self, url: &str) -> ExternalResource<'_> {
+        match self.entries.get(url) {
+            Some(
+                BrowserResource::CallerSupplied { bytes, media_type }
+                | BrowserResource::Fetched { bytes, media_type },
+            ) => ExternalResource::Retrieved {
+                bytes,
+                media_type: media_type.as_deref(),
+            },
+            Some(BrowserResource::Unavailable) => ExternalResource::Unavailable,
+            Some(BrowserResource::NotAttempted) | None => ExternalResource::NotAttempted,
+        }
+    }
+}
+
+struct BrowserOnlineState {
+    resources: BrowserResources,
+    requests: Vec<NetworkRequest>,
+    attempted: HashSet<String>,
+    attempts_left: usize,
+    evidence_bytes_left: usize,
+}
+
+impl BrowserOnlineState {
+    fn new(options: &VerifyOptions) -> Self {
+        Self {
+            resources: BrowserResources::from_options(options),
+            requests: Vec::new(),
+            attempted: HashSet::new(),
+            attempts_left: ONLINE_MAX_REQUESTS,
+            evidence_bytes_left: ONLINE_MAX_EVIDENCE_BYTES,
+        }
+    }
+
+    async fn ensure_resource(
+        &mut self,
+        uri: &str,
+        purpose: &str,
+        per_body_limit: usize,
+        accept: Option<&str>,
+    ) -> Result<Option<usize>, JsValue> {
+        if self.resources.contains(uri) || self.attempted.contains(uri) {
+            return Ok(None);
+        }
+        self.attempted.insert(uri.to_string());
+        if self.attempts_left == 0 {
+            self.resources
+                .entries
+                .insert(uri.to_string(), BrowserResource::NotAttempted);
+            self.requests.push(NetworkRequest {
+                purpose: purpose.to_string(),
+                url: uri.to_string(),
+                outcome: "skipped".to_string(),
+                detail: format!(
+                    "the {ONLINE_MAX_REQUESTS} request budget for one verification is spent"
+                ),
+            });
+            return Ok(Some(self.requests.len() - 1));
+        }
+        self.attempts_left -= 1;
+        if self.evidence_bytes_left == 0 {
+            self.resources
+                .entries
+                .insert(uri.to_string(), BrowserResource::NotAttempted);
+            self.requests.push(NetworkRequest {
+                purpose: purpose.to_string(),
+                url: uri.to_string(),
+                outcome: "blocked".to_string(),
+                detail: format!(
+                    "the {ONLINE_MAX_EVIDENCE_BYTES} byte cumulative evidence budget is spent"
+                ),
+            });
+            return Ok(Some(self.requests.len() - 1));
+        }
+
+        let limit = per_body_limit.min(self.evidence_bytes_left);
+        let accept = accept.map(JsValue::from_str).unwrap_or(JsValue::NULL);
+        let response = JsFuture::from(fetch_online_resource(uri, limit, accept))
+            .await
+            .map_err(|_| {
+                js_error(
+                    "verification_error",
+                    "browser network request failed".to_string(),
+                )
+            })?;
+        let outcome = reflected_string(&response, "outcome")?;
+        let detail = reflected_string(&response, "detail")?;
+        let request_index = self.requests.len();
+        self.requests.push(NetworkRequest {
+            purpose: purpose.to_string(),
+            url: uri.to_string(),
+            outcome: outcome.clone(),
+            detail,
+        });
+        if outcome == "fetched" {
+            let bytes_value = js_sys::Reflect::get(&response, &"bytes".into())?;
+            let bytes = js_sys::Uint8Array::new(&bytes_value).to_vec();
+            self.evidence_bytes_left = self.evidence_bytes_left.saturating_sub(bytes.len());
+            let media_type = js_sys::Reflect::get(&response, &"mediaType".into())?.as_string();
+            self.resources.entries.insert(
+                uri.to_string(),
+                BrowserResource::Fetched { bytes, media_type },
+            );
+        } else {
+            let attempted = uri.starts_with("https://");
+            self.resources.entries.insert(
+                uri.to_string(),
+                if attempted {
+                    BrowserResource::Unavailable
+                } else {
+                    BrowserResource::NotAttempted
+                },
+            );
+        }
+        Ok(Some(request_index))
+    }
+
+    fn mark_failed(&mut self, request: Option<usize>, detail: String) {
+        if let Some(request) = request.and_then(|index| self.requests.get_mut(index)) {
+            request.outcome = "failed".to_string();
+            request.detail = detail;
+        }
+    }
+}
+
+fn reflected_string(value: &JsValue, field: &str) -> Result<String, JsValue> {
+    js_sys::Reflect::get(value, &JsValue::from_str(field))?
+        .as_string()
+        .ok_or_else(|| {
+            js_error(
+                "serialization_error",
+                format!("browser transport returned no {field}"),
+            )
+        })
 }
 
 struct BrowserSoftBindingRequest {
@@ -516,13 +813,211 @@ fn post_failure_telemetry(
     }
 }
 
+fn push_unique_need(needs: &mut Vec<serde_json::Value>, need: serde_json::Value) {
+    if !needs.contains(&need) {
+        needs.push(need);
+    }
+}
+
+async fn verify_online_v25(
+    asset: Vec<u8>,
+    mime_type: String,
+    mut options: VerifyOptions,
+) -> Result<JsValue, JsValue> {
+    options
+        .validate()
+        .map_err(|error| js_error(error.code(), error.to_string()))?;
+    let mut plan = locate_external_resources(asset, &mime_type, &options, GraphLimits::default())
+        .map_err(|error| js_error(error.code(), error.to_string()))?;
+    let terminal_uri = (!plan.manifest_store_present)
+        .then(|| {
+            plan.resources
+                .iter()
+                .find(|request| request.kind == ExternalResourceKind::SegmentManifestStore)
+                .map(|request| request.uri.clone())
+        })
+        .flatten();
+    let mut online = BrowserOnlineState::new(&options);
+    // BrowserResources now owns the decoded caller evidence. Keep one
+    // authoritative provider for discovery and final verification instead of
+    // making the kernel decode and allocate the same bodies again.
+    options.external_data = None;
+    options.external_data_media_types = None;
+    options.external_data_unreachable = None;
+    let mut discovered_needs = Vec::new();
+
+    while !plan.resources.is_empty() {
+        let frontier = plan.resources.clone();
+        for request in &frontier {
+            let terminal = terminal_uri.as_deref() == Some(request.uri.as_str());
+            if !online.resources.is_caller_supplied(&request.uri) {
+                let need = if terminal {
+                    serde_json::json!({
+                        "kind": "remote_manifest",
+                        "uri": request.uri,
+                    })
+                } else if request.kind == ExternalResourceKind::SegmentManifestStore {
+                    serde_json::json!({
+                        "kind": "external_data",
+                        "uri": request.uri,
+                        "assertion_label": "c2pa.hash.segment",
+                    })
+                } else {
+                    // ExternalResourcePlan deliberately exposes opaque URI
+                    // identity without guessing which assertion schema found
+                    // it. Final verification supplies exact labels for any
+                    // unresolved resource.
+                    serde_json::json!({
+                        "kind": "external_data",
+                        "uri": request.uri,
+                    })
+                };
+                push_unique_need(&mut discovered_needs, need);
+            }
+            let purpose = if terminal {
+                "remote_manifest"
+            } else {
+                "external_data"
+            };
+            let accept = (request.kind == ExternalResourceKind::SegmentManifestStore)
+                .then_some("application/c2pa");
+            online
+                .ensure_resource(
+                    &request.uri,
+                    purpose,
+                    ONLINE_MAX_EVIDENCE_BYTES,
+                    accept,
+                )
+                .await?;
+        }
+        plan.continue_with(&online.resources)
+            .map_err(|error| js_error(error.code(), error.to_string()))?;
+    }
+
+    let pinned_dids: HashSet<String> = options
+        .cawg_did_documents
+        .as_ref()
+        .map(|documents| documents.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut fetched_dids = HashMap::new();
+    for request in plan.did_documents() {
+        if pinned_dids.contains(&request.did) {
+            continue;
+        }
+        let caller_supplied = online.resources.is_caller_supplied(&request.url);
+        if !caller_supplied {
+            push_unique_need(
+                &mut discovered_needs,
+                serde_json::json!({
+                    "kind": "did_document",
+                    "did": request.did,
+                    "url": request.url,
+                }),
+            );
+        }
+        let network_request = online
+            .ensure_resource(
+                &request.url,
+                "did_document",
+                ONLINE_MAX_DID_BYTES,
+                Some("application/did+json, application/json"),
+            )
+            .await?;
+        let Some(bytes) = online.resources.bytes(&request.url) else {
+            continue;
+        };
+        if bytes.len() > ONLINE_MAX_DID_BYTES {
+            online.mark_failed(
+                network_request,
+                format!(
+                    "the DID document is larger than the {ONLINE_MAX_DID_BYTES} byte limit"
+                ),
+            );
+            continue;
+        }
+        match serde_json::from_slice(bytes) {
+            Ok(document) => {
+                fetched_dids.insert(request.did.clone(), document);
+            }
+            Err(error) => online.mark_failed(
+                network_request,
+                format!("the DID document is not JSON: {error}"),
+            ),
+        }
+    }
+    if !fetched_dids.is_empty() {
+        let pinned = options.cawg_did_documents.get_or_insert_with(HashMap::new);
+        for (did, document) in fetched_dids {
+            pinned.entry(did).or_insert(document);
+        }
+    }
+
+    let graph_inputs = GraphInputs {
+        external: Some(&online.resources),
+        limits: GraphLimits::default(),
+    };
+    let result = match terminal_uri
+        .as_deref()
+        .and_then(|uri| online.resources.bytes(uri))
+    {
+        Some(store) => verify_with_manifest_store_and_graph_inputs(
+            plan.asset(),
+            store,
+            &mime_type,
+            &options,
+            graph_inputs,
+        ),
+        None => verify_with_graph_inputs(plan.asset(), &mime_type, &options, graph_inputs),
+    };
+    let mut report = result.map_err(|error| js_error(error.code(), error.to_string()))?;
+    let mut needed = report.network.needed;
+    for need in discovered_needs {
+        push_unique_need(&mut needed, need);
+    }
+    for need in &needed {
+        if need.get("kind").and_then(serde_json::Value::as_str) != Some("ocsp") {
+            continue;
+        }
+        let purpose = format!(
+            "ocsp.{}",
+            need.get("purpose")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("claim_signer")
+        );
+        let Some(url) = need
+            .get("responder_url")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !online
+            .requests
+            .iter()
+            .any(|request| request.purpose == purpose && request.url == url)
+        {
+            online.requests.push(NetworkRequest {
+                purpose,
+                url: url.to_string(),
+                outcome: "skipped".to_string(),
+                detail: "a browser cannot make an OCSP request".to_string(),
+            });
+        }
+    }
+    report.network = NetworkReport {
+        enabled: true,
+        needed,
+        requests: online.requests,
+    };
+    report
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| js_error("serialization_error", error.to_string()))
+}
+
 /// Verify an asset, fetching what it references.
 ///
-/// `verify` is synchronous and never touches the network. This entry point
-/// does the same verification, then fetches the resources the report listed
-/// under `network.needed`, then verifies again with what it got. The verdict
-/// still comes from the same offline checks; the network only supplies
-/// evidence.
+/// Under the exact C2PA 2.5 policy, parse-only discovery resolves the complete
+/// external-resource frontier before one authoritative verification. Older
+/// policies retain their established two-pass behavior.
 ///
 /// Fetching happens through the page's own `fetch`, so the page's network
 /// policy applies: same-origin rules, CORS, mixed-content blocking, and any
@@ -558,6 +1053,9 @@ pub async fn verify_online_js(
     }
     // The fetching is done here, in the page, not by the kernel.
     options.online = Some(false);
+    if options.spec_version.as_deref() == Some("2.5") {
+        return verify_online_v25(asset, mime_type, options).await;
+    }
 
     let first = verify_with_options(&asset, &mime_type, &options)
         .map_err(|error| js_error(error.code(), error.to_string()))?;
@@ -586,9 +1084,8 @@ pub async fn verify_online_js(
         pinned.extend(documents);
         options.cawg_did_documents = Some(pinned);
     }
-    // SLICE A SEAM: externally stored assertion content comes back from the
-    // page under `externalData` as uri -> base64. At merge, put it into
-    // `options.external_data`, which is slice A's field on `VerifyOptions`.
+    // Exact 2.5 routes external bytes through the owned provider above.
+    // Legacy policies retain their published two-pass report behavior.
 
     let mut second = match &store {
         Some(store) => verify_with_manifest_store(&asset, store, &mime_type, &options),
