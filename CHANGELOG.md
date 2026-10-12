@@ -38,6 +38,7 @@ All notable changes to this project are recorded here.
 - Live session-key delivery and `emsg` signatures now use the claim-algorithm list selected by `VerifyOptions::spec_version`. The compatibility helpers retain their C2PA 2.4 defaults.
 - Exact `"2.5"` certificate paths apply RFC 5280 policy mappings and inhibition through bounded RFC 9618 policy levels, including self-issued key rollover. Processing stops at the selected trust anchor: its encoded validity, path-length, name and policy constraints do not replace configured trust authority. C2PA certificate-profile admission still applies to anchors, including duplicate-extension rejection and a verified self-signed exemption when AKI is absent. Policy qualifiers use their RFC DER shapes, including all four `DisplayText` encodings and overlong `explicitText`. The 2.2 and 2.4 trust paths remain unchanged.
 - Caller-verified ZIP collection bindings now apply the exact 2.5 directory-entry URI policy. Directory URIs remain invalid under 2.2 and 2.4.
+- Exact 2.5 ZIP verification checks local CRC and sizes against the central directory, resolves local ZIP64 size fields, rejects inconsistent classic/ZIP64 end records and nonzero disk starts, and consumes ZIP64 extra fields exactly. Earlier policies remain unchanged.
 
 ## 1.7.0 - 2026-10-01
 

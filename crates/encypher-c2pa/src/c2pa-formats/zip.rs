@@ -61,6 +61,18 @@ fn usize64(value: u64, detail: &'static str) -> Result<usize, FormatError> {
     })
 }
 
+fn classic_eocd_matches_zip64(
+    (disk, cd_disk, entries_disk, entries, cd_size, cd_offset): (u16, u16, u16, u16, u32, u32),
+    (zip64_disk, zip64_cd_disk, zip64_entries_disk, zip64_entries, zip64_cd_size, zip64_cd_offset): (u32, u32, u64, u64, u64, u64),
+) -> bool {
+    (disk == u16::MAX || u32::from(disk) == zip64_disk)
+        && (cd_disk == u16::MAX || u32::from(cd_disk) == zip64_cd_disk)
+        && (entries_disk == u16::MAX || u64::from(entries_disk) == zip64_entries_disk)
+        && (entries == u16::MAX || u64::from(entries) == zip64_entries)
+        && (cd_size == u32::MAX || u64::from(cd_size) == zip64_cd_size)
+        && (cd_offset == u32::MAX || u64::from(cd_offset) == zip64_cd_offset)
+}
+
 fn find_eocd(data: &[u8], rules: ZipRules) -> Result<Eocd, FormatError> {
     if data.len() < 22 {
         return Err(FormatError::InvalidStructure {
@@ -164,13 +176,32 @@ fn find_eocd(data: &[u8], rules: ZipRules) -> Result<Eocd, FormatError> {
                     detail: "malformed ZIP64 EOCD record",
                 });
             }
+            let zip64_disk = le_u32(data, zip64_offset + 16).ok_or(FormatError::Truncated(FMT))?;
+            let zip64_cd_disk =
+                le_u32(data, zip64_offset + 20).ok_or(FormatError::Truncated(FMT))?;
             let entries_disk64 =
                 le64(data, zip64_offset + 24).ok_or(FormatError::Truncated(FMT))?;
             let entries64 = le64(data, zip64_offset + 32).ok_or(FormatError::Truncated(FMT))?;
-            if entries_disk64 != entries64 {
+            let cd_size64 = le64(data, zip64_offset + 40).ok_or(FormatError::Truncated(FMT))?;
+            let cd_offset64 = le64(data, zip64_offset + 48).ok_or(FormatError::Truncated(FMT))?;
+            if zip64_disk != 0
+                || zip64_cd_disk != 0
+                || entries_disk64 != entries64
+                || !classic_eocd_matches_zip64(
+                    (disk, cd_disk, entries_disk, entries, cd_size, cd_offset),
+                    (
+                        zip64_disk,
+                        zip64_cd_disk,
+                        entries_disk64,
+                        entries64,
+                        cd_size64,
+                        cd_offset64,
+                    ),
+                )
+            {
                 return Err(FormatError::UnsupportedVariant {
                     format: FMT,
-                    detail: "multi-disk ZIP64 archive",
+                    detail: "multi-disk or inconsistent ZIP64 archive",
                 });
             }
             let total_entries = usize64(entries64, "ZIP64 entry count exceeds address space")?;
@@ -180,12 +211,9 @@ fn find_eocd(data: &[u8], rules: ZipRules) -> Result<Eocd, FormatError> {
                     detail: "ZIP archive has too many entries",
                 });
             }
-            let cd_size = usize64(
-                le64(data, zip64_offset + 40).ok_or(FormatError::Truncated(FMT))?,
-                "ZIP64 central directory is too large",
-            )?;
+            let cd_size = usize64(cd_size64, "ZIP64 central directory is too large")?;
             let cd_offset = usize64(
-                le64(data, zip64_offset + 48).ok_or(FormatError::Truncated(FMT))?,
+                cd_offset64,
                 "ZIP64 central directory offset exceeds address space",
             )?;
             return Ok(Eocd {
@@ -273,10 +301,11 @@ impl<'a> ZipIndex<'a> {
 fn local_data_span(
     data: &[u8],
     eocd: &Eocd,
-    method_size_offset: (u16, u16, u64, u64),
+    method_size_offset: (u16, u16, u32, u64, u64, u64),
     expected_name: &[u8],
+    rules: ZipRules,
 ) -> Result<(usize, usize), FormatError> {
-    let (method, flags, comp_size, local_offset) = method_size_offset;
+    let (method, flags, crc, comp_size, uncomp_size, local_offset) = method_size_offset;
     let lh = usize64(
         local_offset,
         "ZIP64 local-header offset exceeds address space",
@@ -313,6 +342,24 @@ fn local_data_span(
         .checked_add(extra_len)
         .filter(|&offset| offset <= data.len())
         .ok_or(FormatError::Truncated(FMT))?;
+    if rules == ZipRules::V2_5 && flags & 8 == 0 {
+        let local_crc = le_u32(data, lh + 14).ok_or(FormatError::Truncated(FMT))?;
+        let local_comp32 = le_u32(data, lh + 18).ok_or(FormatError::Truncated(FMT))?;
+        let local_uncomp32 = le_u32(data, lh + 22).ok_or(FormatError::Truncated(FMT))?;
+        let (local_uncomp, local_comp, _, _) = zip64_central_values(
+            &data[name_end..data_start],
+            local_uncomp32,
+            local_comp32,
+            0,
+            0,
+        )?;
+        if local_crc != crc || local_comp != comp_size || local_uncomp != uncomp_size {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "ZIP local CRC or sizes disagree with central directory",
+            });
+        }
+    }
     let comp_size = usize64(comp_size, "ZIP64 member is too large")?;
     let data_end = data_start
         .checked_add(comp_size)
@@ -392,12 +439,24 @@ fn zip64_central_values(
     };
     if disk32 == u16::MAX {
         let disk = le_u32(field, at).ok_or(FormatError::Truncated(FMT))?;
+        at += 4;
         if disk != 0 {
             return Err(FormatError::UnsupportedVariant {
                 format: FMT,
                 detail: "multi-disk ZIP64 archive",
             });
         }
+    } else if disk32 != 0 {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "multi-disk ZIP archive",
+        });
+    }
+    if at != field.len() {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "ZIP64 extended-information field has unexpected trailing bytes",
+        });
     }
     Ok((
         uncomp,
@@ -467,7 +526,11 @@ fn data_descriptor_end(
         .ok_or(FormatError::Truncated(FMT))
 }
 
-fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, FormatError> {
+fn build_zip_index<'a>(
+    data: &'a [u8],
+    eocd: &Eocd,
+    rules: ZipRules,
+) -> Result<ZipIndex<'a>, FormatError> {
     let (mut pos, cd_end) = central_directory_bounds(data, eocd)?;
     let mut members = Vec::with_capacity(eocd.total_entries);
     let mut by_name = HashMap::with_capacity(eocd.total_entries);
@@ -518,8 +581,9 @@ fn build_zip_index<'a>(data: &'a [u8], eocd: &Eocd) -> Result<ZipIndex<'a>, Form
         let data_span = local_data_span(
             data,
             eocd,
-            (method, flags, comp_size, local_offset),
+            (method, flags, crc, comp_size, uncomp_size, local_offset),
             raw_name,
+            rules,
         )?;
         let local_offset = usize64(
             local_offset,
@@ -588,7 +652,7 @@ pub(crate) fn zip_index_v2_5(data: &[u8]) -> Result<ZipIndex<'_>, FormatError> {
 
 fn zip_index_with_rules(data: &[u8], rules: ZipRules) -> Result<ZipIndex<'_>, FormatError> {
     let eocd = find_eocd(data, rules)?;
-    build_zip_index(data, &eocd)
+    build_zip_index(data, &eocd, rules)
 }
 
 #[derive(Clone, Copy)]
@@ -600,7 +664,7 @@ struct CdEntry {
 }
 
 fn find_cd_entry(data: &[u8], eocd: &Eocd, name: &[u8]) -> Result<Option<CdEntry>, FormatError> {
-    Ok(build_zip_index(data, eocd)?
+    Ok(build_zip_index(data, eocd, ZipRules::Legacy)?
         .get(name)
         .map(|member| CdEntry {
             method: member.method,
@@ -773,7 +837,7 @@ fn exclusions_with_rules(
 #[cfg(test)]
 pub(crate) fn strip(asset: &[u8]) -> Result<Vec<u8>, FormatError> {
     let eocd = find_eocd(asset, ZipRules::Legacy)?;
-    let index = build_zip_index(asset, &eocd)?;
+    let index = build_zip_index(asset, &eocd, ZipRules::Legacy)?;
     if index.get(ENTRY_NAME).is_none() {
         return Ok(asset.to_vec());
     }
@@ -987,6 +1051,83 @@ pub(crate) mod tests {
         v.extend_from_slice(&cd_offset.to_le_bytes());
         v.extend_from_slice(&0u16.to_le_bytes());
         v
+    }
+
+    fn forced_zip64_end_records(mut archive: Vec<u8>) -> Vec<u8> {
+        let classic = find_eocd(&archive, ZipRules::Legacy).unwrap();
+        let entries = classic.total_entries as u64;
+        let cd_size = classic.cd_size as u64;
+        let cd_offset = classic.cd_offset as u64;
+        archive.truncate(classic.eocd_offset);
+        let zip64_offset = archive.len() as u64;
+        archive.extend_from_slice(&SIG_ZIP64_EOCD.to_le_bytes());
+        archive.extend_from_slice(&44u64.to_le_bytes());
+        archive.extend_from_slice(&45u16.to_le_bytes());
+        archive.extend_from_slice(&45u16.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&entries.to_le_bytes());
+        archive.extend_from_slice(&entries.to_le_bytes());
+        archive.extend_from_slice(&cd_size.to_le_bytes());
+        archive.extend_from_slice(&cd_offset.to_le_bytes());
+        archive.extend_from_slice(&SIG_ZIP64_LOCATOR.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&zip64_offset.to_le_bytes());
+        archive.extend_from_slice(&1u32.to_le_bytes());
+        archive.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&(entries as u16).to_le_bytes());
+        archive.extend_from_slice(&(entries as u16).to_le_bytes());
+        archive.extend_from_slice(&(cd_size as u32).to_le_bytes());
+        archive.extend_from_slice(&(cd_offset as u32).to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive
+    }
+
+    #[test]
+    fn exact_v2_5_checks_local_crc_and_sizes_without_changing_legacy_policy() {
+        for field in [14..18, 18..22, 22..26] {
+            let mut malformed = tiny_zip();
+            malformed[field.clone()].fill(0);
+            assert!(zip_index(&malformed).is_ok(), "legacy field {field:?}");
+            assert!(zip_index_v2_5(&malformed).is_err(), "2.5 field {field:?}");
+        }
+    }
+
+    #[test]
+    fn zip64_classic_fields_must_equal_resolved_values_when_not_sentinels() {
+        let valid = forced_zip64_end_records(tiny_zip());
+        assert!(zip_index_v2_5(&valid).is_ok());
+        let eocd = valid.len() - 22;
+        for (field, bytes) in [
+            (4..6, 1u16.to_le_bytes().to_vec()),
+            (6..8, 1u16.to_le_bytes().to_vec()),
+            (8..10, 0u16.to_le_bytes().to_vec()),
+            (10..12, 0u16.to_le_bytes().to_vec()),
+            (12..16, 0u32.to_le_bytes().to_vec()),
+            (16..20, 0u32.to_le_bytes().to_vec()),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[eocd + field.start..eocd + field.end].copy_from_slice(&bytes);
+            assert!(zip_index_v2_5(&malformed).is_err(), "{field:?}");
+        }
+    }
+
+    #[test]
+    fn zip64_central_extra_requires_exact_values_and_a_single_disk() {
+        let mut ordinary_disk = Vec::new();
+        ordinary_disk.extend_from_slice(&0x0001u16.to_le_bytes());
+        ordinary_disk.extend_from_slice(&8u16.to_le_bytes());
+        ordinary_disk.extend_from_slice(&0u64.to_le_bytes());
+        assert!(zip64_central_values(&ordinary_disk, 0, 0, u32::MAX, 1).is_err());
+
+        let mut trailing = Vec::new();
+        trailing.extend_from_slice(&0x0001u16.to_le_bytes());
+        trailing.extend_from_slice(&16u16.to_le_bytes());
+        trailing.extend_from_slice(&0u64.to_le_bytes());
+        trailing.extend_from_slice(&0u64.to_le_bytes());
+        assert!(zip64_central_values(&trailing, 0, 0, u32::MAX, 0).is_err());
     }
 
     #[test]
