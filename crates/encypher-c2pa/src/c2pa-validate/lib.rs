@@ -1140,11 +1140,13 @@ fn verify_with_fragments_mode_and_expected_seeks(
                     match cawg_inputs.graph_inputs.external {
                         Some(provider) => match provider.resolve(&remote.uri) {
                             refs::ExternalResource::Retrieved { bytes, .. } => {
-                                return verify_detached_with_cawg_options(
+                                return verify_detached_with_cawg_options_and_fragments(
                                     bytes,
                                     input.data,
                                     input.mime,
                                     input,
+                                    fragments,
+                                    expected_seek_positions,
                                     cawg_inputs,
                                 );
                             }
@@ -1707,6 +1709,27 @@ pub(crate) fn verify_detached_with_cawg_options<'a>(
     input: &VerifyInput<'a>,
     cawg_inputs: CawgTrustInputs<'_>,
 ) -> Result<VerifyOutput, ValidateError> {
+    verify_detached_with_cawg_options_and_fragments(
+        manifest_store,
+        content,
+        content_mime,
+        input,
+        &[],
+        &[],
+        cawg_inputs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_detached_with_cawg_options_and_fragments<'a>(
+    manifest_store: &'a [u8],
+    content: &'a [u8],
+    content_mime: &'a str,
+    input: &VerifyInput<'a>,
+    fragments: &[&[u8]],
+    expected_seek_positions: &[usize],
+    cawg_inputs: CawgTrustInputs<'_>,
+) -> Result<VerifyOutput, ValidateError> {
     // A separately supplied store binds any bytes through its ordinary hard
     // binding (Cryptography, Hard bindings: a byte-range binding applies to
     // any asset type), so a media type with no standardized embedding is read
@@ -1766,7 +1789,7 @@ pub(crate) fn verify_detached_with_cawg_options<'a>(
             prehashed_digest: None,
             detached: spec25::applies(input.profile),
         },
-        &[],
+        fragments,
         cawg_inputs,
         &mut report_decode_nodes,
         None,
@@ -1787,6 +1810,14 @@ pub(crate) fn verify_detached_with_cawg_options<'a>(
         out.crjson = Some(crjson);
     }
     stamp_profile(&mut out, input.profile);
+    stream::require_fragments_bound(&mut out, manifest, fragments, input.profile);
+    stream::validate_fragment_sequence(
+        &mut out,
+        manifest,
+        fragments,
+        expected_seek_positions,
+        input.profile,
+    );
     Ok(out)
 }
 
@@ -16041,6 +16072,187 @@ mod tests {
             "{:?}",
             tampered.results.failure
         );
+    }
+
+    const BMFF_XMP_UUID: [u8; 16] = [
+        0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf,
+        0xac,
+    ];
+
+    fn remote_bmff_init(uri: &str) -> Vec<u8> {
+        let packet = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:dcterms="http://purl.org/dc/terms/" dcterms:provenance="{uri}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut xmp = BMFF_XMP_UUID.to_vec();
+        xmp.extend_from_slice(packet.as_bytes());
+        let mut init = test_box(b"ftyp", b"isom");
+        init.extend_from_slice(&test_box(b"uuid", &xmp));
+        init
+    }
+
+    fn remote_fragment(location: usize, media: &[u8]) -> Vec<u8> {
+        let mut fragment = test_box(b"moof", &[]);
+        fragment.extend_from_slice(&mdat(media));
+        fragment.extend_from_slice(&auxiliary_merkle_box(7, 9, location, Vec::new()));
+        fragment
+    }
+
+    fn remote_fragment_store(init: &[u8], fragment: &[u8]) -> Vec<u8> {
+        let exclusions = [crate::c2pa_formats::BmffExclusionMap {
+            xpath: "/free".to_string(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version: None,
+            flags: None,
+            exact: true,
+        }];
+        let init_hash =
+            crate::c2pa_formats::bmff_hash_with_exclusions(init, "sha256", &exclusions).unwrap();
+        let leaf =
+            crate::c2pa_formats::bmff_fragment_leaf_hash(fragment, "sha256", &exclusions).unwrap();
+        let binding = enc(&vmap(vec![
+            ("alg", Value::Text("sha256".into())),
+            (
+                "exclusions",
+                Value::Array(vec![vmap(vec![("xpath", Value::Text("/free".into()))])]),
+            ),
+            (
+                "merkle",
+                Value::Array(vec![vmap(vec![
+                    ("uniqueId", Value::Integer(7)),
+                    ("localId", Value::Integer(9)),
+                    ("count", Value::Integer(1)),
+                    ("hashes", Value::Array(vec![Value::Bytes(leaf)])),
+                    ("initHash", Value::Bytes(init_hash)),
+                ])]),
+            ),
+        ]));
+        let actions = enc(&vmap(vec![(
+            "actions",
+            Value::Array(vec![vmap(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ])]),
+        )]));
+        let declarations = [
+            ("c2pa.hash.bmff.v3", binding.as_slice()),
+            ("c2pa.actions.v2", actions.as_slice()),
+        ];
+        let boxes: Vec<Vec<u8>> = declarations
+            .iter()
+            .map(|(label, payload)| crate::c2pa_core::jumbf::assertion_box(label, payload, None))
+            .collect();
+        let claim = enc(&vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:remote-fragments".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("Encypher Test".into()))]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(
+                    declarations
+                        .iter()
+                        .zip(&boxes)
+                        .map(|((label, _), assertion_box)| {
+                            vmap(vec![
+                                (
+                                    "url",
+                                    Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                                ),
+                                ("alg", Value::Text("sha256".into())),
+                                (
+                                    "hash",
+                                    Value::Bytes(
+                                        Sha256::digest(
+                                            superbox_content(assertion_box)
+                                                .expect("assertion superbox content"),
+                                        )
+                                        .to_vec(),
+                                    ),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+        ]));
+        let signer = signature_conformance_tests::Signer::conformant();
+        let manifest = build_manifest(
+            "urn:c2pa:test:remote-fragments",
+            &boxes,
+            &claim,
+            &signer.sign(&claim),
+        );
+        build_manifest_store(&[manifest])
+    }
+
+    fn verify_remote_fragments(
+        init: &[u8],
+        store: Vec<u8>,
+        fragments: &[&[u8]],
+        expected_seek_positions: &[usize],
+    ) -> VerifyOutput {
+        let provider = RootBytes(store);
+        let input = regular_input(init, "video/mp4", SpecVersion::V2_5);
+        verify_with_fragments_and_expected_seeks(
+            &input,
+            fragments,
+            expected_seek_positions,
+            CawgTrustInputs {
+                graph_inputs: ingredient_graph::GraphInputs {
+                    external: Some(&provider),
+                    limits: ingredient_graph::GraphLimits::default(),
+                },
+                ..CawgTrustInputs::default()
+            },
+        )
+        .expect("remote fragmented verification produces a report")
+    }
+
+    #[test]
+    fn exact_v2_5_remote_root_verifies_and_rejects_fragment_bytes() {
+        let init = remote_bmff_init("https://store.test/fragmented.c2pa");
+        let fragment = remote_fragment(0, b"media");
+        let store = remote_fragment_store(&init, &fragment);
+        let valid = verify_remote_fragments(&init, store.clone(), &[fragment.as_slice()], &[]);
+        assert!(
+            valid.results.has_success(ASSERTION_BMFF_HASH_MATCH),
+            "{:?}",
+            valid.results
+        );
+
+        let mut tampered = fragment.clone();
+        tampered[16] ^= 0x01;
+        let invalid = verify_remote_fragments(&init, store, &[tampered.as_slice()], &[]);
+        assert!(invalid.results.has_failure(ASSERTION_BMFF_HASH_MISMATCH));
+        assert!(!invalid.results.has_success(ASSERTION_BMFF_HASH_MATCH));
+    }
+
+    #[test]
+    fn exact_v2_5_remote_root_preserves_expected_seek_boundaries() {
+        let init = remote_bmff_init("https://store.test/fragmented.c2pa");
+        let fragment = remote_fragment(0, b"media");
+        let store = remote_fragment_store(&init, &fragment);
+        let fragments = [fragment.as_slice(), fragment.as_slice()];
+        let unexpected = verify_remote_fragments(&init, store.clone(), &fragments, &[]);
+        assert!(unexpected.results.failure.iter().any(|status| {
+            status.code == ASSERTION_BMFF_HASH_MISMATCH
+                && status.explanation.contains("unexpected discontinuity")
+        }));
+
+        let expected = verify_remote_fragments(&init, store, &fragments, &[1]);
+        assert!(!expected.results.failure.iter().any(|status| {
+            status.code == ASSERTION_BMFF_HASH_MISMATCH
+                && status.explanation.contains("unexpected discontinuity")
+        }));
     }
 
     /// The remote declaration is only consulted when no store is embedded, so

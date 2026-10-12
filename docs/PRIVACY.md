@@ -8,7 +8,7 @@ When they are allowed, exactly four kinds of request can be made, and only when 
 
 | Request | What the host learns |
 |---|---|
-| GET the manifest store an asset names in its XMP `dcterms:provenance` | that somebody is checking a file that points at that URL |
+| GET a manifest store referenced by the asset or its checkpoint chain | that somebody is checking a file that references that store |
 | POST an OCSP request for a claim-signer or CAWG identity certificate | that somebody is checking a file signed with that certificate; the request carries the certificate serial number and hashes of the issuer name and key, nothing else |
 | GET the `did:web` document of an identity issuer | that somebody is checking a file naming that issuer |
 | GET content an assertion stores outside the asset | that somebody is checking a file that references that content |
@@ -31,6 +31,15 @@ limited to 256 KiB. Caller-supplied bodies, explicit unreachable outcomes and
 pinned DID documents are not retried. The browser's own network policy still
 applies; script cannot inspect the address to which a DNS name resolves.
 Default 2.4 and explicit 2.2 retain their existing browser transport behavior.
+
+Explicit C2PA 2.5 native verification discovers referenced resources before
+the authoritative graph pass. Terminal stores, predecessor stores, external
+content, DID documents and subsequent certificate OCSP checks share 16 HTTP
+requests and 64 MiB of received-body bytes, including failed reads. Native
+transport refuses redirects and pins connections to filtered DNS results.
+Caller evidence and pinned DID documents are not retried. OCSP outcomes can
+require a final evidence re-evaluation; discovery itself checks no signatures
+or asset hashes. Default 2.4 and explicit 2.2 keep their prior native behavior.
 
 ## Update check
 

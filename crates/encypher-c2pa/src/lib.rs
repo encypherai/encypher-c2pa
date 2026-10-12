@@ -74,6 +74,7 @@ pub use c2pa_validate::refs::{ExternalResource, ExternalResources};
 mod config_dir;
 mod default_trust;
 mod ertmp;
+mod native_online;
 mod online;
 mod online_consent;
 pub use ertmp::{
@@ -822,6 +823,10 @@ fn verify_with_manifest_store_inner(
 ) -> Result<VerificationReport, Error> {
     let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
     let mime = resolve_detached_mime(mime_type, profile)?;
+    if profile.version == SpecVersion::V2_5 {
+        let resolved = ResolvedOptions::resolve(options)?;
+        return verify_detached_online_v25(asset, manifest_store, &mime, options, resolved);
+    }
     let (mut report, needs, _) = detached_pass(
         asset,
         manifest_store,
@@ -853,6 +858,26 @@ fn detached_pass(
     graph_inputs: GraphInputs<'_>,
 ) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     let resolved = ResolvedOptions::resolve(options)?;
+    detached_pass_resolved(
+        asset,
+        manifest_store,
+        mime,
+        options,
+        &resolved,
+        options.cawg_did_documents.as_ref(),
+        graph_inputs,
+    )
+}
+
+fn detached_pass_resolved(
+    asset: &[u8],
+    manifest_store: &[u8],
+    mime: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+    did_documents: Option<&HashMap<String, Value>>,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
     if manifest_store.is_empty() {
         return Err(Error::Verification("manifest store is empty".into()));
     }
@@ -870,7 +895,7 @@ fn detached_pass(
         resolved.cawg_trust(),
         resolved.cawg_allowed_certs(),
         resolved.cawg_document_signing_require_anchor,
-        options.cawg_did_documents.as_ref(),
+        did_documents,
         options.cawg_ica_trusted_issuers.as_deref(),
         options.cawg_ica_trust_anchors.as_deref(),
         options.cawg_ica_status_lists.as_ref(),
@@ -880,7 +905,7 @@ fn detached_pass(
     let needs = online::network_needs(&output);
     let capture = PassCapture::take(&mut output);
     Ok((
-        report_from_output(output, mime.to_string(), &resolved),
+        report_from_output(output, mime.to_string(), resolved),
         needs,
         capture,
     ))
@@ -1008,7 +1033,7 @@ pub fn verify_with_options(
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
     let resolved = ResolvedOptions::resolve(options)?;
-    verify_with_resolved_options(data, None, mime_type, options, &resolved)
+    verify_with_resolved_options(data, None, mime_type, options, resolved)
 }
 
 /// Verify asset bytes exactly as [`verify_with_options`] does and return the
@@ -1027,7 +1052,7 @@ pub fn local_evidence_with_options(
     let resolved = ResolvedOptions::resolve(options)?;
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let (result, capture) =
-        match verify_with_options_inner(data, None, mime_type, options, &resolved) {
+        match verify_with_options_inner(data, None, mime_type, options, resolved) {
             Ok((report, capture)) => (Ok(report), capture),
             Err(error) => (Err(error), PassCapture::default()),
         };
@@ -1062,7 +1087,7 @@ fn verify_with_resolved_options(
     fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
-    resolved: &ResolvedOptions,
+    resolved: ResolvedOptions,
 ) -> Result<VerificationReport, Error> {
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let result = verify_with_options_inner(data, fragments, mime_type, options, resolved)
@@ -1106,7 +1131,7 @@ pub fn verify_fragmented_with_options(
     let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
         == Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
-        verify_with_options_inner(init_segment, Some(fragments), &mime, options, &resolved)
+        verify_with_options_inner(init_segment, Some(fragments), &mime, options, resolved)
             .map(|(report, _)| report)
     } else {
         Err(Error::UnsupportedMime(mime))
@@ -1274,6 +1299,25 @@ impl ResolvedOptions {
                 .clone()
                 .unwrap_or_default(),
         })
+    }
+
+    fn take_external_data(&mut self) -> ValidatedExternalData {
+        ValidatedExternalData {
+            data: std::mem::take(&mut self.external_data),
+            media_types: std::mem::take(&mut self.external_data_media_types),
+            unreachable: std::mem::take(&mut self.external_data_unreachable),
+        }
+    }
+
+    fn apply_ocsp_update(&mut self, update: native_online::OcspUpdate) {
+        for (certificate, response) in update.responses {
+            self.ocsp_responses.entry(certificate).or_insert(response);
+        }
+        for certificate in update.unreachable {
+            if !self.ocsp_unreachable.contains(&certificate) {
+                self.ocsp_unreachable.push(certificate);
+            }
+        }
     }
 
     pub(crate) fn input<'a>(&'a self, data: &'a [u8], mime: &'a str) -> VerifyInput<'a> {
@@ -1517,12 +1561,16 @@ fn verify_with_options_inner(
     fragments: Option<&[&[u8]]>,
     mime_type: &str,
     options: &VerifyOptions,
-    resolved: &ResolvedOptions,
+    resolved: ResolvedOptions,
 ) -> Result<(VerificationReport, PassCapture), Error> {
     let mime = resolve_mime(mime_type, resolved.profile)?;
     require_embedded_mime(&mime, resolved.profile)?;
+    if resolved.profile.version == SpecVersion::V2_5 {
+        return verify_embedded_online_v25(data, fragments, &mime, options, resolved);
+    }
+
     let (mut report, needs, capture) =
-        embedded_pass_resolved(data, fragments, &mime, options, resolved)?;
+        embedded_pass_resolved(data, fragments, &mime, options, &resolved)?;
     let (mut network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
         report.network = network;
@@ -1541,15 +1589,167 @@ fn verify_with_options_inner(
             second.network = network;
             Ok((second, second_capture))
         }
-        // What the server returned is not a manifest store this asset can be
-        // verified against. That is an answer about the file, not a failure of
-        // this SDK, so the offline verdict stands and the reason is recorded.
+        // Legacy policies preserve their established fallback when a remote
+        // body is not a usable store. Exact 2.5 never takes this route.
         Err(error) => {
             network.mark_unusable("remote_manifest", error.to_string());
             report.network = network;
             Ok((report, capture))
         }
     }
+}
+
+fn merged_did_documents(
+    pinned: Option<&HashMap<String, Value>>,
+    fetched: HashMap<String, Value>,
+) -> Option<HashMap<String, Value>> {
+    if fetched.is_empty() {
+        return None;
+    }
+    let mut merged = pinned.cloned().unwrap_or_default();
+    for (did, document) in fetched {
+        merged.entry(did).or_insert(document);
+    }
+    Some(merged)
+}
+
+fn verify_embedded_online_v25(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime: &str,
+    options: &VerifyOptions,
+    mut resolved: ResolvedOptions,
+) -> Result<(VerificationReport, PassCapture), Error> {
+    let mut plan = locate_external_resources(data, mime, options, GraphLimits::default())?;
+    let terminal_uri = (!plan.manifest_store_present)
+        .then(|| {
+            plan.resources
+                .iter()
+                .find(|request| request.kind == ExternalResourceKind::SegmentManifestStore)
+                .map(|request| request.uri.clone())
+        })
+        .flatten();
+    let mut online = native_online::NativeOnline::new(resolved.take_external_data(), options);
+
+    while !plan.resources.is_empty() {
+        let frontier = plan.resources.clone();
+        for request in &frontier {
+            online.ensure_graph_resource(
+                options,
+                request,
+                terminal_uri.as_deref() == Some(request.uri.as_str()),
+            );
+        }
+        plan.continue_with(online.resources())?;
+    }
+    online.mark_discovery_stop(plan.stop_reason.as_ref());
+
+    let fetched_dids = online.resolve_did_documents(
+        options,
+        plan.did_documents(),
+        options.cawg_did_documents.as_ref(),
+    );
+    let merged_dids = merged_did_documents(options.cawg_did_documents.as_ref(), fetched_dids);
+    let did_documents = merged_dids.as_ref().or(options.cawg_did_documents.as_ref());
+    let graph_inputs = GraphInputs {
+        external: Some(online.resources()),
+        limits: GraphLimits::default(),
+    };
+    let (mut report, mut needs, mut capture) = embedded_graph_pass_resolved(
+        data,
+        fragments,
+        mime,
+        options,
+        &resolved,
+        did_documents,
+        graph_inputs,
+    )?;
+
+    let ocsp = online.fetch_ocsp(options, &needs);
+    if ocsp.has_evidence() {
+        resolved.apply_ocsp_update(ocsp);
+        let graph_inputs = GraphInputs {
+            external: Some(online.resources()),
+            limits: GraphLimits::default(),
+        };
+        (report, needs, capture) = embedded_graph_pass_resolved(
+            data,
+            fragments,
+            mime,
+            options,
+            &resolved,
+            did_documents,
+            graph_inputs,
+        )?;
+    }
+    report.network = online.finish(&needs);
+    Ok((report, capture))
+}
+
+fn verify_detached_online_v25(
+    asset: &[u8],
+    manifest_store: &[u8],
+    mime: &str,
+    options: &VerifyOptions,
+    mut resolved: ResolvedOptions,
+) -> Result<VerificationReport, Error> {
+    let mut plan = locate_external_resources_with_manifest_store(
+        asset,
+        manifest_store,
+        mime,
+        options,
+        GraphLimits::default(),
+    )?;
+    let mut online = native_online::NativeOnline::new(resolved.take_external_data(), options);
+    while !plan.resources.is_empty() {
+        let frontier = plan.resources.clone();
+        for request in &frontier {
+            online.ensure_graph_resource(options, request, false);
+        }
+        plan.continue_with(online.resources())?;
+    }
+    online.mark_discovery_stop(plan.stop_reason.as_ref());
+
+    let fetched_dids = online.resolve_did_documents(
+        options,
+        plan.did_documents(),
+        options.cawg_did_documents.as_ref(),
+    );
+    let merged_dids = merged_did_documents(options.cawg_did_documents.as_ref(), fetched_dids);
+    let did_documents = merged_dids.as_ref().or(options.cawg_did_documents.as_ref());
+    let graph_inputs = GraphInputs {
+        external: Some(online.resources()),
+        limits: GraphLimits::default(),
+    };
+    let (mut report, mut needs, _) = detached_pass_resolved(
+        asset,
+        manifest_store,
+        mime,
+        options,
+        &resolved,
+        did_documents,
+        graph_inputs,
+    )?;
+
+    let ocsp = online.fetch_ocsp(options, &needs);
+    if ocsp.has_evidence() {
+        resolved.apply_ocsp_update(ocsp);
+        let graph_inputs = GraphInputs {
+            external: Some(online.resources()),
+            limits: GraphLimits::default(),
+        };
+        (report, needs, _) = detached_pass_resolved(
+            asset,
+            manifest_store,
+            mime,
+            options,
+            &resolved,
+            did_documents,
+            graph_inputs,
+        )?;
+    }
+    report.network = online.finish(&needs);
+    Ok(report)
 }
 
 /// One offline verification of an asset's own bytes, with the network needs it
@@ -1617,8 +1817,30 @@ fn embedded_graph_pass(
 ) -> Result<VerificationReport, Error> {
     let mime = resolve_mime(mime_type, resolved.profile)?;
     require_embedded_mime(&mime, resolved.profile)?;
-    let input = resolved.input(data, &mime);
-    let output = match fragments {
+    embedded_graph_pass_resolved(
+        data,
+        fragments,
+        &mime,
+        options,
+        resolved,
+        options.cawg_did_documents.as_ref(),
+        graph_inputs,
+    )
+    .map(|(report, _, _)| report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn embedded_graph_pass_resolved(
+    data: &[u8],
+    fragments: Option<&[&[u8]]>,
+    mime: &str,
+    options: &VerifyOptions,
+    resolved: &ResolvedOptions,
+    did_documents: Option<&HashMap<String, Value>>,
+    graph_inputs: GraphInputs<'_>,
+) -> Result<(VerificationReport, Vec<online::NetworkNeed>, PassCapture), Error> {
+    let input = resolved.input(data, mime);
+    let mut output = match fragments {
         Some(fragments) => verify_fragmented_safe(
             &input,
             fragments,
@@ -1626,7 +1848,7 @@ fn embedded_graph_pass(
             resolved.cawg_trust(),
             resolved.cawg_allowed_certs(),
             resolved.cawg_document_signing_require_anchor,
-            options.cawg_did_documents.as_ref(),
+            did_documents,
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),
             options.cawg_ica_status_lists.as_ref(),
@@ -1637,7 +1859,7 @@ fn embedded_graph_pass(
             resolved.cawg_trust(),
             resolved.cawg_allowed_certs(),
             resolved.cawg_document_signing_require_anchor,
-            options.cawg_did_documents.as_ref(),
+            did_documents,
             options.cawg_ica_trusted_issuers.as_deref(),
             options.cawg_ica_trust_anchors.as_deref(),
             options.cawg_ica_status_lists.as_ref(),
@@ -1645,7 +1867,13 @@ fn embedded_graph_pass(
         ),
     }
     .map_err(map_validate_error)?;
-    Ok(report_from_output(output, mime, resolved))
+    let needs = online::network_needs(&output);
+    let capture = PassCapture::take(&mut output);
+    Ok((
+        report_from_output(output, mime.to_string(), resolved),
+        needs,
+        capture,
+    ))
 }
 
 /// Read and verify one local asset.
@@ -1666,7 +1894,7 @@ pub fn verify_file(
             .to_string(),
     };
     let data = read_path_asset(path, MAX_PATH_ASSET_BYTES)?;
-    verify_with_resolved_options(&data, None, &mime, options, &resolved)
+    verify_with_resolved_options(&data, None, &mime, options, resolved)
 }
 
 fn read_path_asset(path: &Path, limit: u64) -> io::Result<Vec<u8>> {

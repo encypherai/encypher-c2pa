@@ -27,6 +27,7 @@ All notable changes to this project are recorded here.
 - Exact 2.5 browser `verifyOnline` resolves terminal stores, predecessor chains, opaque resources and ICA DID documents through parse-only discovery before one final verification. It preserves caller evidence, refuses redirects and credentials, and shares 16 URI attempts and a 64 MiB received-evidence budget across successful and failed reads. DID documents retain a 256 KiB limit. Older policy paths are unchanged.
 - `ExternalDidDocumentRequest`, `ExternalResourcePlan::did_documents`, `ValidatedExternalData` and `VerifyOptions::validate_with_external_data` support verification-only host adapters without repeated external-body decoding.
 - Exact 2.5 graph verification consumes provider evidence for declared remote roots. Explicit unavailable outcomes carry `details.retrieval: "unavailable"` without a fresh network need; not-attempted outcomes remain discoverable. Root selection never falls back to a predecessor.
+- Exact 2.5 native verification resolves terminal and predecessor stores, external content and unpinned DID documents through parse-only discovery, with one shared 16-request/64 MiB received-body budget. Caller evidence remains authoritative; cached DID bodies retain their size cap. Actual OCSP success and failure evidence reaches the final validation pass. Offline verification allocates no HTTP client. Remote-root fragmented verification preserves fragment bytes and expected seek boundaries. Default 2.4 and explicit 2.2 keep their previous flow and budgets.
 
 ### Changed
 

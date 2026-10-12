@@ -1027,6 +1027,9 @@ fn fetch_transport(
             accept: Some(request.accept),
             limit: request.max_response_bytes,
             allow_http,
+            // This legacy transport refuses redirects independently of the
+            // exact-2.5 graph session's cumulative request budget.
+            remaining_requests: usize::MAX,
         })
         .map(|response| response.bytes)
         .map_err(|error| {
