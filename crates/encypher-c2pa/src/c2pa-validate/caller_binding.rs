@@ -27,14 +27,14 @@ use sha2::{Digest, Sha256};
 
 use super::{
     assertion_label_for_manifest, base_assertion_label, bmff_exclusion_maps,
-    bmff_has_additional_exclusions, canonical_collection_uri_member, decode, exclusions,
-    inherited_hard_binding, is_allowed_hash_algorithm, is_supported_bmff_hash_label,
-    resolved_hash_algorithm, segment_hash, spec25, versions, AssetFormat, ClaimAssertionReference,
-    ClaimAssertionRefs, EngineProfile, ManifestKind, ParsedManifest, StoreContext,
-    ValidationResults, Value, ALGORITHM_UNSUPPORTED,
-    ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT, ASSERTION_BMFF_HASH_MALFORMED,
-    ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH, ASSERTION_BOXES_HASH_MALFORMED,
-    ASSERTION_BOXES_HASH_MATCH, ASSERTION_BOXES_HASH_MISMATCH,
+    bmff_has_additional_exclusions, canonical_collection_uri_member,
+    canonical_collection_uri_member_for_policy, decode, exclusions, inherited_hard_binding,
+    is_allowed_hash_algorithm, is_supported_bmff_hash_label, resolved_hash_algorithm, segment_hash,
+    spec25, versions, AssetFormat, ClaimAssertionReference, ClaimAssertionRefs, EngineProfile,
+    ManifestKind, ParsedManifest, SpecVersion, StoreContext, ValidationResults, Value,
+    ALGORITHM_UNSUPPORTED, ASSERTION_BMFF_HASH_ADDITIONAL_EXCLUSIONS_PRESENT,
+    ASSERTION_BMFF_HASH_MALFORMED, ASSERTION_BMFF_HASH_MATCH, ASSERTION_BMFF_HASH_MISMATCH,
+    ASSERTION_BOXES_HASH_MALFORMED, ASSERTION_BOXES_HASH_MATCH, ASSERTION_BOXES_HASH_MISMATCH,
     ASSERTION_COLLECTION_HASH_INVALID_URI, ASSERTION_COLLECTION_HASH_MALFORMED,
     ASSERTION_COLLECTION_HASH_MATCH, ASSERTION_COLLECTION_HASH_MISMATCH,
     ASSERTION_COMPOUND_CONTENT_MALFORMED, ASSERTION_COMPOUND_CONTENT_MATCH,
@@ -262,6 +262,9 @@ fn schema_defect(
                             || uri.contains('?')
                             || uri.split('/').any(|s| s == "." || s == "..")
                     }
+                    Some(AssetFormat::Zip) if profile.version == SpecVersion::V2_5 => {
+                        canonical_collection_uri_member_for_policy(uri, true).is_none()
+                    }
                     _ => canonical_collection_uri_member(uri).is_none(),
                 };
                 if invalid {
@@ -422,4 +425,65 @@ pub(super) fn record_not_evaluated(
         url,
         "no asset was supplied; the hard binding was not evaluated".into(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::c2pa_core::OperatingMode;
+
+    fn collection_assertion(uri: &str) -> Value {
+        Value::Map(vec![
+            (Value::Text("alg".into()), Value::Text("sha256".into())),
+            (
+                Value::Text("uris".into()),
+                Value::Array(vec![Value::Map(vec![
+                    (Value::Text("uri".into()), Value::Text(uri.into())),
+                    (Value::Text("hash".into()), Value::Bytes(vec![0; 32])),
+                ])]),
+            ),
+            (
+                Value::Text("zip_central_directory_hash".into()),
+                Value::Bytes(vec![0; 32]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn caller_verified_zip_directory_matches_only_at_exact_2_5() {
+        let assertion = collection_assertion("_rels/");
+        let claim = Value::Map(Vec::new());
+        let mut results = ValidationResults::default();
+        let v25 = EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular);
+        assert_eq!(
+            schema_defect(
+                "c2pa.hash.collection.data",
+                Some(&assertion),
+                &claim,
+                Some(AssetFormat::Zip),
+                v25,
+                "self#collection",
+                &mut results,
+            ),
+            None,
+        );
+        assert!(results.failure.is_empty());
+
+        let v24 = EngineProfile::new(SpecVersion::V2_4, OperatingMode::Regular);
+        assert_eq!(
+            schema_defect(
+                "c2pa.hash.collection.data",
+                Some(&assertion),
+                &claim,
+                Some(AssetFormat::Zip),
+                v24,
+                "self#collection",
+                &mut ValidationResults::default(),
+            ),
+            Some((
+                ASSERTION_COLLECTION_HASH_INVALID_URI,
+                "uri '_rels/' is not a valid collection URI".into(),
+            )),
+        );
+    }
 }
