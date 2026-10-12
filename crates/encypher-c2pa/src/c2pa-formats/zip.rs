@@ -663,8 +663,13 @@ struct CdEntry {
     local_offset: u64,
 }
 
-fn find_cd_entry(data: &[u8], eocd: &Eocd, name: &[u8]) -> Result<Option<CdEntry>, FormatError> {
-    Ok(build_zip_index(data, eocd, ZipRules::Legacy)?
+fn find_cd_entry(
+    data: &[u8],
+    eocd: &Eocd,
+    name: &[u8],
+    rules: ZipRules,
+) -> Result<Option<CdEntry>, FormatError> {
+    Ok(build_zip_index(data, eocd, rules)?
         .get(name)
         .map(|member| CdEntry {
             method: member.method,
@@ -745,7 +750,7 @@ pub(crate) fn extract_v2_5(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> 
 
 fn extract_with_rules(data: &[u8], rules: ZipRules) -> Result<Option<Vec<u8>>, FormatError> {
     let eocd = find_eocd(data, rules)?;
-    let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME)? else {
+    let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME, rules)? else {
         return Ok(None);
     };
     if entry.method != METHOD_STORED || entry.flags != 0 {
@@ -796,7 +801,7 @@ fn exclusions_with_rules(
     rules: ZipRules,
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
     let eocd = find_eocd(data, rules)?;
-    let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME)? else {
+    let Some(entry) = find_cd_entry(data, &eocd, ENTRY_NAME, rules)? else {
         return Ok(Vec::new());
     };
     if entry.method != METHOD_STORED || entry.flags != 0 {
@@ -1096,6 +1101,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exact_manifest_readers_reject_local_metadata_mismatch() {
+        let store = dummy_manifest_store();
+        let valid = embed(&tiny_zip(), &store).unwrap();
+        let offset = zip_index_v2_5(&valid)
+            .unwrap()
+            .get(ENTRY_NAME)
+            .unwrap()
+            .hash_span
+            .0;
+        assert_eq!(extract_v2_5(&valid).unwrap(), Some(store.clone()));
+        let expected_exclusions = exclusions_v2_5(&valid).unwrap();
+        for field in [14, 18, 22] {
+            let mut malformed = valid.clone();
+            malformed[offset + field] ^= 1;
+            assert_eq!(extract(&malformed).unwrap(), Some(store.clone()));
+            assert_eq!(exclusions(&malformed).unwrap(), expected_exclusions);
+            assert!(extract_v2_5(&malformed).is_err(), "local field {field}");
+            assert!(exclusions_v2_5(&malformed).is_err(), "local field {field}");
+        }
+    }
+
+    #[test]
     fn zip64_classic_fields_must_equal_resolved_values_when_not_sentinels() {
         let valid = forced_zip64_end_records(tiny_zip());
         assert!(zip_index_v2_5(&valid).is_ok());
@@ -1173,9 +1200,11 @@ pub(crate) mod tests {
         let embedded = embed(&tiny_zip(), &store).unwrap();
         let eocd = find_eocd(&embedded, ZipRules::Legacy).unwrap();
         assert_eq!(eocd.total_entries, 2);
-        assert!(find_cd_entry(&embedded, &eocd, b"mimetype")
-            .unwrap()
-            .is_some());
+        assert!(
+            find_cd_entry(&embedded, &eocd, b"mimetype", ZipRules::Legacy)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1183,7 +1212,7 @@ pub(crate) mod tests {
         let store = dummy_manifest_store();
         let embedded = embed(&tiny_zip(), &store).unwrap();
         let eocd = find_eocd(&embedded, ZipRules::Legacy).unwrap();
-        let entry = find_cd_entry(&embedded, &eocd, ENTRY_NAME)
+        let entry = find_cd_entry(&embedded, &eocd, ENTRY_NAME, ZipRules::Legacy)
             .unwrap()
             .expect("manifest entry");
         let expected_crc = crc32(&store);
