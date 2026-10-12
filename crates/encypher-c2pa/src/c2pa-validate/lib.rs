@@ -9220,9 +9220,9 @@ fn verify_boxes_hash_with_spans(
 
 /// Verify a collection data hash (`c2pa.hash.collection.data`, spec 15.12.5).
 ///
-/// Per-URI hashing primarily covers the exact A.6.2.1 span: the local file
-/// header followed by compressed/encrypted content. The c2pa-org public ZIP
-/// vector's broader local span is accepted as a compatibility convention.
+/// Exact 2.5 hashes each local header, compressed/encrypted content, and the
+/// complete optional data descriptor. Earlier policies retain their payload-span
+/// convention and the c2pa-org public ZIP vector's broader-span compatibility.
 /// URIs with `.`/`..` path segments are rejected (`invalidURI`);
 /// listed-but-absent files are `incorrectFileCount`.
 ///
