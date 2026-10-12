@@ -326,6 +326,21 @@ pub struct VerifyOptions {
     pub online_allow_private_networks: bool,
 }
 
+/// Caller-supplied external resource evidence decoded while validating all
+/// verification options.
+///
+/// Network adapters that retain an owned [`ExternalResources`] provider use
+/// this to avoid decoding large base64 bodies again before final verification.
+#[derive(Debug, Default)]
+pub struct ValidatedExternalData {
+    /// Decoded bodies keyed by the URI declared in signed manifest content.
+    pub data: HashMap<String, Vec<u8>>,
+    /// Observed media types keyed by the same URI.
+    pub media_types: HashMap<String, String>,
+    /// URIs the caller attempted but could not retrieve.
+    pub unreachable: Vec<String>,
+}
+
 impl VerifyOptions {
     /// Resolve and validate every option without reading or parsing an asset.
     ///
@@ -333,6 +348,18 @@ impl VerifyOptions {
     /// trust material and invalid validation instants fail deterministically.
     pub fn validate(&self) -> Result<(), Error> {
         ResolvedOptions::resolve(self).map(|_| ())
+    }
+
+    /// Validate every option and retain decoded external-data evidence.
+    ///
+    /// This has the same error ordering and checks as [`Self::validate`].
+    pub fn validate_with_external_data(&self) -> Result<ValidatedExternalData, Error> {
+        let resolved = ResolvedOptions::resolve(self)?;
+        Ok(ValidatedExternalData {
+            data: resolved.external_data,
+            media_types: resolved.external_data_media_types,
+            unreachable: resolved.external_data_unreachable,
+        })
     }
 }
 

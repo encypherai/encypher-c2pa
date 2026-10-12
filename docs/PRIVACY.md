@@ -23,6 +23,15 @@ Libraries - Rust, Python, Go, C, and the browser - never read the saved answer a
 
 In the browser, `verify` is synchronous and fetches nothing. `verifyOnline` fetches through the page's own `fetch`, so the page's origin, CORS, and Content-Security-Policy rules govern every request. OCSP is not attempted from a browser.
 
+With explicit C2PA 2.5, the browser discovers the resource graph before one
+final verification. It sends HTTPS GET requests without credentials and
+refuses redirects. A call shares 16 unique URI attempts and a 64 MiB streamed
+evidence budget; failed reads consume the budget too. DID documents are
+limited to 256 KiB. Caller-supplied bodies, explicit unreachable outcomes and
+pinned DID documents are not retried. The browser's own network policy still
+applies; script cannot inspect the address to which a DNS name resolves.
+Default 2.4 and explicit 2.2 retain their existing browser transport behavior.
+
 ## Update check
 
 The command line, and only the command line, checks for a newer release once a day when a person is at the terminal. It sends one HTTPS GET to `https://index.crates.io/en/cy/encypher-c2pa-cli` with a `User-Agent` of `encypher-c2pa-cli/<version>`. The request carries no file, filename, path, report, or account or machine identifier; crates.io sees the requesting IP address, as with any request. Runs with no terminal, and runs with `--offline`, send nothing. Turn it off with `encypher-c2pa update-check off`, `{"check": false}` in `update.json`, or `ENCYPHER_C2PA_UPDATE_CHECK=off`. The libraries never make this request.

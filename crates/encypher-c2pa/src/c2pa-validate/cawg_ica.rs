@@ -487,6 +487,54 @@ pub(super) fn locate_did_document(signature: &[u8]) -> Option<(String, String)> 
     Some((primary_did(&credential.issuer).to_string(), url))
 }
 
+#[cfg(test)]
+pub(super) fn did_locator_fixture(issuer: &str) -> Vec<u8> {
+    let signer_payload = Value::Map(vec![
+        (
+            "referenced_assertions".into(),
+            Value::Array(vec![Value::Map(vec![
+                (
+                    "url".into(),
+                    Value::Text("self#jumbf=c2pa.assertions/c2pa.hash.data".into()),
+                ),
+                ("hash".into(), Value::Bytes(vec![0xA7; 32])),
+            ])]),
+        ),
+        (
+            "sig_type".into(),
+            Value::Text("cawg.identity_claims_aggregation".into()),
+        ),
+    ]);
+    let credential = json!({
+        "@context": [VC_CONTEXT_V2, CAWG_ICA_CONTEXT],
+        "type": ["VerifiableCredential", "IdentityClaimsAggregationCredential"],
+        "issuer": issuer,
+        "validFrom": "2025-01-01T00:00:00Z",
+        "credentialSubject": {
+            "verifiedIdentities": [{
+                "type": "cawg.social_media",
+                "username": "user",
+                "verifiedAt": "2024-05-27T08:40:39Z",
+                "provider": {"id": "https://idp.example", "name": "Example IdP"},
+            }],
+            "c2paAsset": super::report::cbor_to_json(&signer_payload),
+        },
+    });
+    encode(
+        &Value::Tag(
+            18,
+            Box::new(Value::Array(vec![
+                Value::Bytes(Vec::new()),
+                Value::Map(Vec::new()),
+                Value::Bytes(serde_json::to_vec(&credential).expect("credential JSON")),
+                Value::Bytes(vec![0]),
+            ])),
+        ),
+        Profile::CanonicalForHashedSubstructures,
+    )
+    .expect("ICA fixture COSE")
+}
+
 fn map_int(entries: &[(Value, Value)], key: i128) -> Option<&Value> {
     entries
         .iter()
@@ -2069,6 +2117,26 @@ mod tests {
             &mut results,
         );
         results
+    }
+
+    #[test]
+    fn parse_only_locator_returns_only_readable_did_web_credentials() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let web = eddsa_cose(
+            &key,
+            &vc_json(json!("did:web:issuer.example:publishers"), false),
+        );
+        assert_eq!(
+            locate_did_document(&web),
+            Some((
+                "did:web:issuer.example:publishers".to_string(),
+                "https://issuer.example/publishers/did.json".to_string(),
+            ))
+        );
+
+        let local = eddsa_cose(&key, &vc_json(json!(did_jwk(&key)), false));
+        assert_eq!(locate_did_document(&local), None);
+        assert_eq!(locate_did_document(b"not cose"), None);
     }
 
     /// No pinned store means the DID document could only come from the network

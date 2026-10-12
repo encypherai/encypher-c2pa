@@ -67,6 +67,12 @@ print(report["integrity"], report["trust"]["status"])
 
 The wheel supports Python 3.9 and later on Linux (glibc and musl, x86_64 and aarch64), macOS, and Windows x64.
 
+`verify` and `verify_stream` accept `external_data` (URI to standard-base64
+body), `external_data_media_types` (URI to observed MIME type), and
+`external_data_unreachable` (URIs already attempted without a usable body).
+These supply evidence, not permission to fetch. Omitted evidence remains
+not-attempted; supplied bytes are still checked against the signed references.
+
 ### Browser JavaScript
 
 ```bash
@@ -284,9 +290,19 @@ report, err := c2pa.Verify(asset, "image/jpeg", &c2pa.Options{Online: &allow})
 
 In the browser, `verify` stays synchronous and offline; `await verifyOnline(bytes, mime, options)` does the same verification and fetches through the page's own `fetch`, so the page's CORS and Content-Security-Policy rules apply.
 
+With explicit `spec_version: "2.5"`, browser verification discovers resources
+without hashing or checking signatures, resolves terminal stores, predecessor
+chains, external assertion content and ICA DID documents, then verifies once.
+Caller evidence and pinned DID documents take precedence. Requests use HTTPS
+GET, omit credentials, refuse redirects and share a 16-URI attempt budget.
+Streamed evidence has a 64 MiB cumulative budget, including bytes consumed by
+failed reads; DID documents also have a 256 KiB limit. An oversized stream is
+canceled; bytes already read remain charged. OCSP remains browser-skipped.
+The default 2.4 and explicit 2.2 paths retain their prior behavior.
+
 What each host learns is one request for one URL: that somebody is checking a file that references it. The SDK never sends asset bytes. An OCSP request carries a certificate serial number and issuer hashes, nothing more. Full detail is in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
 
-The fetcher is narrow on purpose: https only, except OCSP responders, whose answers are signed and verified; at most 3 redirects, each re-checked; 5-second connect and 10-second total timeouts; at most 16 requests per verification; size caps of 64 MiB for a manifest store or external content, 64 KiB for an OCSP response, 256 KiB for a DID document; no cookies, no credentials, a fixed `encypher-c2pa/<version>` user agent. Every hostname is resolved through a filter that refuses loopback, private, link-local (including `169.254.169.254`), carrier-NAT, unique-local, multicast, and documentation addresses, and the connection uses the address that was vetted. Set `--online-allow-private-networks` (`online_allow_private_networks`) for an intranet deployment: that lifts the address filter and accepts plaintext http. Do not set it where files arrive from strangers.
+The native fetcher is narrow on purpose: https only, except OCSP responders, whose answers are signed and verified; at most 3 redirects, each re-checked; 5-second connect and 10-second total timeouts; at most 16 requests per verification; size caps of 64 MiB for a manifest store or external content, 64 KiB for an OCSP response, 256 KiB for a DID document; no cookies, no credentials, a fixed `encypher-c2pa/<version>` user agent. Every hostname is resolved through a filter that refuses loopback, private, link-local (including `169.254.169.254`), carrier-NAT, unique-local, multicast, and documentation addresses, and the connection uses the address that was vetted. Set `--online-allow-private-networks` (`online_allow_private_networks`) for an intranet deployment: that lifts the address filter and accepts plaintext http. Do not set it where files arrive from strangers.
 
 What stays caller-supplied, and why: ICA status-list credentials, because a credential has to be verified as a credential before it can be trusted; trust lists, because their currency is a snapshot policy rather than a fetch; and AIA `caIssuers` chain completion.
 
@@ -328,6 +344,13 @@ Where the two postures differ, the default report says so with an informational 
 Rust callers can use `verify_with_graph_inputs`, `verify_with_manifest_store_and_graph_inputs`, `verify_fragmented_with_graph_inputs`, and `verify_manifest_store_only_with_graph_inputs` to validate ingredient graphs and external references in one bounded pass. The caller-verified-binding feature's whole-verification and evaluator-driven CAWG functions take the same `GraphInputs` as their final argument. `GraphInputs` accepts an `ExternalResources` provider for bytes the caller already holds. One memoized provider path covers generic hashed references, linked-resource integrity, cloud-data and external-reference assertions, and external predecessor stores in a `c2pa.hash.segment` history. The verifier borrows provider bodies, does not open sockets, and asks the provider at most once for each URI during the pass. `OnlineEvidence::external_data` remains authoritative when both inputs name a URI, and an explicit unreachable evidence outcome is never replaced by provider content. Default `GraphLimits` allow 32 ingredient edges, 1,024 distinct manifests, 16,384 references, and 64 MiB of cumulative manifest bytes across the whole pass, including append-history predecessor stores. `GraphLimits::lowered` can reduce those ceilings but cannot raise them. Reaching one records `com.encypher.resource.graphLimitExceeded` and stops that traversal. Store-only verification remains unbound because no content comparison occurs.
 
 Services that resolve external URLs can call `locate_external_resources` or `locate_external_resources_with_manifest_store` before one authoritative verification. The returned `ExternalResourcePlan<A>` owns the caller's asset container and exposes an ordered frontier of typed `Opaque` or `SegmentManifestStore` requests. Root discovery uses the verifier's format-specific remote-manifest locator, including a C2PA 2.5 append-only checkpoint that names an external active store. Under 2.5, a syntactically valid MIME type with no embedded reader returns no store and no request, so the caller can apply an HTTP Link or repository root without inventing an embedded carrier; older policy admission is unchanged. After the caller resolves that frontier into an `ExternalResources` provider, `continue_with` replaces it with the next frontier. The retrieved initial store and append-history predecessor stores are each parsed once. A URI first seen as opaque is promoted and parsed from the already-held provider body without another fetch. `manifest_store_present` is set only when an initial store body is located, before parsing. A malformed embedded store therefore cannot trigger remote fallback; an extraction error remains a typed malformed stop with presence false and also forbids fallback. The supplied-store locator always uses that store even when the asset embeds another, matching the supplied-store verifier. `truncated` carries a typed graph-limit, unavailable-predecessor, or malformed-store reason. Discovery performs no signature, digest, trust, time, or network operation. Final verification remains authoritative.
+
+`ExternalResourcePlan::did_documents()` exposes parse-only ICA DID requests
+from the selected identity scope. `VerifyOptions::validate_with_external_data`
+returns owned, decoded caller evidence for adapters that retain a provider,
+avoiding a second base64 decode. Under exact 2.5, the core also consumes that
+provider for a declared remote root: unavailable and not-attempted remain
+distinct, and a predecessor can never replace the terminal store.
 
 ## Failure telemetry (opt-in)
 

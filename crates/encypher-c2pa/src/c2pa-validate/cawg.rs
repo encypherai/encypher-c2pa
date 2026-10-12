@@ -298,7 +298,10 @@ pub(super) fn locate_identity_did_documents(
 ) -> Vec<(String, String)> {
     let mut documents = Vec::new();
     for reference in claim_refs.references.iter().take(MAX_IDENTITY_ASSERTIONS) {
-        let Some(label) = reference.label.filter(|label| is_identity_assertion_label(label)) else {
+        let Some(label) = reference
+            .label
+            .filter(|label| is_identity_assertion_label(label))
+        else {
             continue;
         };
         let Some(assertion) = claim_refs
@@ -2277,6 +2280,60 @@ pub(crate) mod tests {
                 Value::Array(references),
             ),
         ])
+    }
+
+    #[test]
+    fn did_discovery_is_limited_to_claim_bound_ica_identities() {
+        let binding = hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
+        let signer_payload = Value::Map(vec![
+            (
+                "referenced_assertions".into(),
+                Value::Array(vec![binding.clone()]),
+            ),
+            ("sig_type".into(), Value::Text(CAWG_ICA_COSE.to_string())),
+        ]);
+        let assertion = encode(
+            &Value::Map(vec![
+                ("signer_payload".into(), signer_payload),
+                (
+                    "signature".into(),
+                    Value::Bytes(super::super::cawg_ica::did_locator_fixture(
+                        "did:web:issuer.example:publishers",
+                    )),
+                ),
+                ("pad1".into(), Value::Bytes(Vec::new())),
+            ]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("identity assertion");
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("cawg.identity".into(), assertion.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+
+        let bound = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 0x01),
+            binding.clone(),
+        ]);
+        let bound = ClaimAssertionRefs::build(&manifest, &bound, super::super::ClaimGeneration::V2);
+        assert_eq!(
+            locate_identity_did_documents(&bound),
+            vec![(
+                "did:web:issuer.example:publishers".to_string(),
+                "https://issuer.example/publishers/did.json".to_string(),
+            )]
+        );
+
+        let unbound = claim_with_references(vec![binding]);
+        let unbound =
+            ClaimAssertionRefs::build(&manifest, &unbound, super::super::ClaimGeneration::V2);
+        assert!(locate_identity_did_documents(&unbound).is_empty());
     }
 
     #[test]

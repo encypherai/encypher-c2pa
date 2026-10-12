@@ -1136,20 +1136,56 @@ fn verify_with_fragments_mode_and_expected_seeks(
             // the store itself and re-verify it detached, and as a network
             // need so the SDK can offer to fetch it.
             if let Ok(Some(remote)) = crate::c2pa_formats::remote_manifest_uri(format, input.data) {
+                let retrieval = if spec25::applies(input.profile) {
+                    match cawg_inputs.graph_inputs.external {
+                        Some(provider) => match provider.resolve(&remote.uri) {
+                            refs::ExternalResource::Retrieved { bytes, .. } => {
+                                return verify_detached_with_cawg_options(
+                                    bytes,
+                                    input.data,
+                                    input.mime,
+                                    input,
+                                    cawg_inputs,
+                                );
+                            }
+                            refs::ExternalResource::Unavailable => "unavailable",
+                            refs::ExternalResource::NotAttempted => "not_attempted",
+                        },
+                        None => "not_attempted",
+                    }
+                } else {
+                    "not_attempted"
+                };
+                let explanation = if retrieval == "unavailable" {
+                    "the asset's remote manifest could not be retrieved"
+                } else {
+                    "the asset declares a remote manifest; this verifier does not fetch"
+                };
+                let details = if spec25::applies(input.profile) {
+                    json!({
+                        "remote_manifest_uri": remote.uri,
+                        "declared_in": remote.source,
+                        "retrieval": retrieval,
+                    })
+                } else {
+                    json!({
+                        "remote_manifest_uri": remote.uri,
+                        "declared_in": remote.source,
+                    })
+                };
                 let mut out = failure_only_output_with_details(
                     MANIFEST_INACCESSIBLE,
                     remote.uri.clone(),
-                    "the asset declares a remote manifest; this verifier does not fetch".into(),
-                    Some(json!({
-                        "remote_manifest_uri": remote.uri,
-                        "declared_in": remote.source,
-                    })),
+                    explanation.into(),
+                    Some(details),
                     input.profile,
                 );
-                network_needs::push_unique(
-                    &mut out.network_needs,
-                    NetworkNeed::RemoteManifest { uri: remote.uri },
-                );
+                if retrieval == "not_attempted" {
+                    network_needs::push_unique(
+                        &mut out.network_needs,
+                        NetworkNeed::RemoteManifest { uri: remote.uri },
+                    );
+                }
                 if out_of_scope {
                     note_out_of_scope(&mut out, input.mime, input.profile);
                 }
@@ -15842,6 +15878,19 @@ mod tests {
             "{:?}",
             output.results.failure
         );
+        let legacy = output
+            .results
+            .failure
+            .iter()
+            .find(|status| status.code == MANIFEST_INACCESSIBLE && status.url == uri)
+            .expect("legacy remote-manifest status");
+        assert!(
+            legacy
+                .details
+                .as_ref()
+                .is_none_or(|details| details.get("retrieval").is_none()),
+            "2.4 report shape must remain unchanged"
+        );
         assert_eq!(
             output
                 .network_needs
@@ -15852,6 +15901,145 @@ mod tests {
                 "kind": "remote_manifest",
                 "uri": uri,
             })]
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum RootRetrieval {
+        Unavailable,
+        NotAttempted,
+    }
+
+    struct RootProvider(RootRetrieval);
+
+    impl refs::ExternalResources for RootProvider {
+        fn resolve(&self, _: &str) -> refs::ExternalResource<'_> {
+            match self.0 {
+                RootRetrieval::Unavailable => refs::ExternalResource::Unavailable,
+                RootRetrieval::NotAttempted => refs::ExternalResource::NotAttempted,
+            }
+        }
+    }
+
+    #[test]
+    fn exact_v2_5_remote_root_distinguishes_unavailable_from_not_attempted() {
+        let uri = "https://store.test/active.c2pa";
+        let svg = svg_with_provenance(uri);
+        for (outcome, expected, explanation, expect_need) in [
+            (
+                RootRetrieval::Unavailable,
+                "unavailable",
+                "could not be retrieved",
+                false,
+            ),
+            (
+                RootRetrieval::NotAttempted,
+                "not_attempted",
+                "does not fetch",
+                true,
+            ),
+        ] {
+            let provider = RootProvider(outcome);
+            let input = regular_input(&svg, "image/svg+xml", SpecVersion::V2_5);
+            let output = verify_with_fragments(
+                &input,
+                &[],
+                CawgTrustInputs {
+                    graph_inputs: ingredient_graph::GraphInputs {
+                        external: Some(&provider),
+                        limits: ingredient_graph::GraphLimits::default(),
+                    },
+                    ..CawgTrustInputs::default()
+                },
+            )
+            .expect("remote root outcome is a report");
+            let status = output
+                .results
+                .failure
+                .iter()
+                .find(|status| status.code == MANIFEST_INACCESSIBLE && status.url == uri)
+                .expect("manifest inaccessible status");
+            assert!(
+                status.explanation.contains(explanation),
+                "{}",
+                status.explanation
+            );
+            assert_eq!(
+                status
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("retrieval"))
+                    .and_then(Json::as_str),
+                Some(expected)
+            );
+            assert_eq!(
+                output.network_needs.iter().any(|need| matches!(
+                    need,
+                    NetworkNeed::RemoteManifest { uri: needed } if needed == uri
+                )),
+                expect_need
+            );
+        }
+    }
+
+    struct RootBytes(Vec<u8>);
+
+    impl refs::ExternalResources for RootBytes {
+        fn resolve(&self, _: &str) -> refs::ExternalResource<'_> {
+            refs::ExternalResource::Retrieved {
+                bytes: &self.0,
+                media_type: Some("application/c2pa"),
+            }
+        }
+    }
+
+    #[test]
+    fn exact_v2_5_remote_root_uses_retrieved_bytes_and_surfaces_tampering() {
+        let uri = "https://store.test/active.c2pa";
+        let svg = svg_with_provenance(uri);
+        let assertion = crate::c2pa_core::jumbf::assertion_box("c2pa.actions.v2", &[0xa0], None);
+        let manifest = crate::c2pa_core::jumbf::build_manifest(
+            "urn:c2pa:test:remote",
+            &[assertion],
+            &[0xa0],
+            &[0xd2, 0x84],
+        );
+        let store = crate::c2pa_core::jumbf::build_manifest_store(&[manifest]);
+
+        let verify_root = |bytes: Vec<u8>| {
+            let provider = RootBytes(bytes);
+            let input = regular_input(&svg, "image/svg+xml", SpecVersion::V2_5);
+            verify_with_fragments(
+                &input,
+                &[],
+                CawgTrustInputs {
+                    graph_inputs: ingredient_graph::GraphInputs {
+                        external: Some(&provider),
+                        limits: ingredient_graph::GraphLimits::default(),
+                    },
+                    ..CawgTrustInputs::default()
+                },
+            )
+            .expect("retrieved remote root produces a report")
+        };
+        let retrieved = verify_root(store);
+        assert!(
+            retrieved
+                .results
+                .failure
+                .iter()
+                .all(|status| status.url != uri),
+            "{:?}",
+            retrieved.results.failure
+        );
+
+        let tampered = verify_root(vec![0, 1, 2, 3]);
+        assert!(
+            tampered
+                .results
+                .has_failure(spec25::MANIFEST_INACCESSIBLE_MALFORMED),
+            "{:?}",
+            tampered.results.failure
         );
     }
 

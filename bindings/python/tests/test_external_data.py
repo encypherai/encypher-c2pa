@@ -16,6 +16,11 @@ EXTERNAL_BODY = FIXTURES / "external-body.txt"
 EXTERNAL_URI = "https://e.example/python-external-evidence.txt"
 
 
+@pytest.fixture(autouse=True)
+def _disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENCYPHER_C2PA_TELEMETRY", "off")
+
+
 def _results(report: Mapping[str, Any]) -> Mapping[str, Any]:
     return report["validation_results"]
 
@@ -131,7 +136,7 @@ def test_raw_options_entrypoint_still_accepts_external_evidence_before_path_read
 ) -> None:
     missing = tmp_path / "missing.c2pa"
 
-    with pytest.raises(ValueError, match="not standard base64"):
+    with pytest.raises(ValueError, match=r"^verification_error:"):
         encypher_c2pa.verify_manifest_store_only(
             missing,
             options={"external_data": {EXTERNAL_URI: "not base64"}},
