@@ -2,6 +2,13 @@
 
 All notable changes to this project are recorded here.
 
+## 1.7.1 - 2026-10-18
+
+### Fixed
+
+- A structured-text manifest block appended at the end of a file verifies when its `c2pa.hash.data` exclusion starts at the newline before the block, as C2PA 2.4 A.9.4 requires. The verifier located the block from its comment line, read that newline as asset data inside the manifest exclusion, and failed every conformant Markdown, XML, CSS, YAML, TOML and JavaScript asset with `assertion.dataHash.mismatch`. A block at the start of a file is now located through its trailing line terminator, also per A.9.4. An exclusion that reaches into the host text is still rejected.
+- `rustls` 0.23.46 in the lock file, for RUSTSEC-2026-0346, -0347, -0348 and -0349.
+
 ## 1.7.0 - 2026-10-01
 
 ### Added
