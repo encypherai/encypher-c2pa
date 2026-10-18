@@ -16130,6 +16130,43 @@ mod tests {
         assert!(!results.has_success(ASSERTION_DATA_HASH_MATCH));
     }
 
+    /// C2PA 2.4 A.9.4: a structured-text block appended at the end of the file
+    /// is excluded "from the newline character preceding the manifest block"
+    /// to the end of the file. That newline belongs to the manifest carrier, so
+    /// a conformant exclusion matches; one more byte of the host text does not.
+    #[test]
+    fn an_end_placed_structured_text_block_binds_from_its_preceding_newline() {
+        use c2pa_text::structured::{embed_structured, encode_data_uri, Placement};
+        let format = AssetFormat::TextStructured {
+            comment_prefix: "<!--",
+            comment_suffix: "-->",
+        };
+        let signed = embed_structured(
+            "# Budget\n\nThe committee approved the budget.\n",
+            &encode_data_uri(&[0xAA; 32]),
+            "<!--",
+            "-->",
+            Placement::End,
+            "\n",
+        );
+        let asset = signed.text.as_bytes();
+        let conformant = (signed.exclusion_start, signed.exclusion_length);
+        assert_eq!(asset[conformant.0], b'\n');
+
+        let results = data_hash_binding(format, asset, &[conformant]);
+        assert!(
+            results.has_success(ASSERTION_DATA_HASH_MATCH),
+            "{results:?}"
+        );
+
+        let widened = (conformant.0 - 1, conformant.1 + 1);
+        let results = data_hash_binding(format, asset, &[widened]);
+        assert!(
+            results.has_failure(ASSERTION_DATA_HASH_MISMATCH),
+            "{results:?}"
+        );
+    }
+
     /// Zeroed padding beside the store is explicitly permitted, and metadata
     /// ranges away from the store stay informational rather than fatal.
     #[test]
