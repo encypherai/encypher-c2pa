@@ -16,5 +16,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 encypher-c2pa = { version = "=1.7.1", path = "../../crates/encypher-c2pa" }
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }
 serde_json = { workspace = true }
