@@ -20,6 +20,8 @@
 use thiserror::Error;
 
 mod bmff;
+mod external_media;
+pub(crate) use external_media::canonicalize_detached_mime;
 mod flac;
 mod font;
 mod gif;
@@ -100,6 +102,9 @@ pub enum AssetFormat {
     /// version. `extract` returns the bytes verbatim; `embed` and data-hash
     /// exclusions are not applicable.
     C2paStore,
+    /// Detached-only media: a whole-file data hash, with no embedded carrier.
+    /// Ordinary MIME resolution never selects this variant.
+    ExternalMedia,
 }
 
 /// C2PA user-type UUID for the unique BMFF manifest carrier.
@@ -251,6 +256,22 @@ impl AssetFormat {
                 None => return None,
             },
         })
+    }
+
+    /// Resolve the explicit detached-only media set after checking its bytes.
+    /// Other types retain ordinary resolution; callers retain their profile gate.
+    pub(crate) fn from_detached_content(
+        mime: &str,
+        data: &[u8],
+    ) -> Result<Option<Self>, FormatError> {
+        let canonical = canonicalize_detached_mime(mime);
+        if !external_media::EXTERNAL_MEDIA_MIMES.contains(&canonical.as_str())
+            || (canonical == "audio/aac" && external_media::is_bmff(data))
+        {
+            return Ok(Self::from_mime(&canonical));
+        }
+        external_media::check(&canonical, data)?;
+        Ok(Some(Self::ExternalMedia))
     }
 
     /// Resolve a MIME type to its [`AssetFormat`] **only if the given engine
@@ -604,6 +625,7 @@ pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u
         AssetFormat::TextUnstructured => text::extract(text::TextMethod::Unstructured, data),
         AssetFormat::TextStructured { .. } => text::extract(text::TextMethod::Structured, data),
         AssetFormat::TextHtml => text::extract(text::TextMethod::Html, data),
+        AssetFormat::ExternalMedia => Ok(None),
         // The bytes ARE the manifest store; return verbatim (empty => no manifest).
         AssetFormat::C2paStore => {
             if data.is_empty() {
@@ -654,6 +676,7 @@ pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, Form
         AssetFormat::Flac => flac::strip(asset),
         AssetFormat::Ogg => ogg::strip(asset),
         AssetFormat::Jxl => jxl::strip(asset),
+        AssetFormat::ExternalMedia => Ok(asset.to_vec()),
         AssetFormat::Tiff
         | AssetFormat::Font
         | AssetFormat::Id3
@@ -720,7 +743,9 @@ pub fn embed_manifest(
         } => text::embed_structured(asset, manifest_store, comment_prefix, comment_suffix),
         AssetFormat::TextHtml => text::embed(text::TextMethod::Html, asset, manifest_store),
         // A host-less manifest store has no container to embed into.
-        AssetFormat::C2paStore => Err(FormatError::NotImplemented(AssetFormat::C2paStore)),
+        AssetFormat::C2paStore | AssetFormat::ExternalMedia => {
+            Err(FormatError::NotImplemented(format))
+        }
     }
 }
 
@@ -763,8 +788,8 @@ pub fn compute_data_hash_exclusions(
         AssetFormat::Id3 => id3::exclusions(asset_with_placeholder),
         AssetFormat::Font => font::exclusions(asset_with_placeholder),
         AssetFormat::Jxl => jxl::exclusions(asset_with_placeholder),
-        // No host bytes: a compound store has no data-hash binding.
-        AssetFormat::C2paStore => Ok(Vec::new()),
+        // A host-less store and detached-only media have no embedded carrier.
+        AssetFormat::C2paStore | AssetFormat::ExternalMedia => Ok(Vec::new()),
     }
 }
 

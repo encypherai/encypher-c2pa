@@ -1527,7 +1527,7 @@ pub(crate) fn verify_detached_with_cawg_options<'a>(
     input: &VerifyInput<'a>,
     cawg_inputs: CawgTrustInputs<'_>,
 ) -> Result<VerifyOutput, ValidateError> {
-    let format = AssetFormat::from_mime(content_mime)
+    let format = AssetFormat::from_detached_content(content_mime, content)?
         .ok_or_else(|| ValidateError::UnsupportedMime(content_mime.to_string()))?;
     if format == AssetFormat::C2paStore {
         // The content side cannot itself be a host-less manifest store.
@@ -6232,6 +6232,14 @@ fn verify_data_hash<'index, 'claim>(
     let plan = claim_refs.binding_plan(format == AssetFormat::C2paStore);
     let primary = plan.primary()?;
     let primary_label = primary.label?;
+    if format == AssetFormat::ExternalMedia && primary_label != "c2pa.hash.data" {
+        results.push_failure(
+            ASSERTION_DATA_HASH_MALFORMED,
+            format!("self#jumbf=/c2pa/{label}/c2pa.assertions/{primary_label}"),
+            "detached-only media requires a whole-file data hash".into(),
+        );
+        return None;
+    }
     if primary_label == COMPOUND_CONTENT_LABEL {
         return None;
     }
@@ -6470,6 +6478,14 @@ fn verify_primary_hard_binding(
                 return;
             }
         };
+        if format == AssetFormat::ExternalMedia && !exclusions.is_empty() {
+            results.push_failure(
+                ASSERTION_DATA_HASH_MALFORMED,
+                url,
+                "detached-only media cannot exclude asset bytes".into(),
+            );
+            return;
+        }
         let carrier = crate::c2pa_formats::compute_data_hash_exclusions(format, data).ok();
         // C2PA 2.4, Validating a data hash: an update manifest grows the store
         // the standard claim signed around, so the store exclusion takes the
@@ -11267,7 +11283,8 @@ mod tests {
         results
     }
 
-    fn run_text_data_hash(
+    fn run_asset_data_hash(
+        format: AssetFormat,
         data: &[u8],
         expected: Vec<u8>,
         exclusions: &[(usize, usize)],
@@ -11309,7 +11326,7 @@ mod tests {
             &claim,
             &claim_refs,
             data,
-            AssetFormat::TextUnstructured,
+            format,
             &[],
             update_manifest::StoreRendition::AsSigned,
             "urn:test",
@@ -11320,12 +11337,40 @@ mod tests {
     }
 
     #[test]
+    fn detached_media_whole_file_hash_detects_changed_bytes() {
+        let original = b"opaque media bytes";
+        let valid = run_asset_data_hash(AssetFormat::ExternalMedia, original, sha(original), &[]);
+        assert!(valid.has_success(ASSERTION_DATA_HASH_MATCH));
+        let tampered = run_asset_data_hash(
+            AssetFormat::ExternalMedia,
+            b"opaque media byteS",
+            sha(original),
+            &[],
+        );
+        assert!(tampered.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert!(!tampered.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    #[test]
+    fn detached_media_rejects_excluded_bytes_even_when_digest_matches() {
+        let result = run_asset_data_hash(
+            AssetFormat::ExternalMedia,
+            b"unsigned prefix, signed suffix",
+            sha(b"signed suffix"),
+            &[(0, 17)],
+        );
+        assert!(result.has_failure(ASSERTION_DATA_HASH_MALFORMED));
+        assert!(!result.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    #[test]
     fn unstructured_text_hash_removes_wrapper_then_normalizes_to_nfc() {
         let carrier_nfd = "Cafe\u{301}";
         let wrapper = c2pa_text::encode_wrapper(b"manifest");
         let asset = format!("{carrier_nfd}{wrapper}");
         let expected = sha("Caf\u{e9}".as_bytes());
-        let results = run_text_data_hash(
+        let results = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             asset.as_bytes(),
             expected,
             &[(carrier_nfd.len(), wrapper.len())],
@@ -11340,7 +11385,12 @@ mod tests {
         let carrier = "signed text";
         let wrapper = c2pa_text::encode_wrapper(b"manifest");
         let asset = format!("{carrier}{wrapper}");
-        let results = run_text_data_hash(asset.as_bytes(), sha(carrier.as_bytes()), &[(0, 1)]);
+        let results = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
+            asset.as_bytes(),
+            sha(carrier.as_bytes()),
+            &[(0, 1)],
+        );
 
         assert!(results.has_failure(ASSERTION_DATA_HASH_MALFORMED));
         assert!(!results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
@@ -11352,7 +11402,8 @@ mod tests {
         let second = c2pa_text::encode_wrapper(b"second");
         let asset = format!("signed{first} text{second}");
         let second_start = "signed".len() + first.len() + " text".len();
-        let results = run_text_data_hash(
+        let results = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             asset.as_bytes(),
             sha(b"signed text"),
             &[("signed".len(), first.len()), (second_start, second.len())],

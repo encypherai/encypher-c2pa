@@ -18,6 +18,12 @@ Run `encypher-c2pa formats` to read the canonical MIME types covered by the inst
 
 `application/font-sfnt`, `application/javascript`, `application/json`, `application/toml`, `application/xhtml+xml`, `application/xml`, `application/yaml`, `application/x-font-ttf`, `font/otf`, `font/sfnt`, `font/ttf`, `text/css`, `text/csv`, `text/html`, `text/markdown`, `text/plain`, `text/tab-separated-values`, `text/x-python`, `text/xml`
 
+## Detached-only media
+
+`verify_with_manifest_store` also accepts `video/webm`, `audio/webm`, `image/x-icon`, `image/vnd.microsoft.icon`, `image/bmp`, raw ADTS `audio/aac`, `font/woff`, and `font/woff2`. The caller supplies the manifest store separately; these formats do not gain an embedded carrier or automatic manifest discovery.
+
+The verifier checks the MIME against a bounded file signature, then requires a whole-file `c2pa.hash.data` binding with no exclusions. Claim signatures, ingredient assertions, trust and identity use the normal validation pipeline. The signature check is not a full container or playback check. An MP4-family file labelled `audio/aac` still uses BMFF verification.
+
 ## What coverage means
 
 A listed MIME type has a container reader and a C2PA hard-binding path in this build. The exact binding depends on the format:

@@ -584,6 +584,8 @@ pub fn detached_manifest_evidence(
 ///
 /// `mime_type` describes `asset`, not the store. `application/c2pa` is
 /// rejected: the content side must be a real asset.
+/// WebM, ICO, BMP, raw AAC, and WOFF media are supported only on this explicit
+/// sidecar path, using a whole-file data hash without exclusions.
 pub fn verify_with_manifest_store(
     asset: &[u8],
     manifest_store: &[u8],
@@ -602,7 +604,14 @@ fn verify_with_manifest_store_inner(
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
-    let mime = resolve_mime(mime_type)?;
+    let mime = crate::c2pa_formats::canonicalize_detached_mime(mime_type);
+    let format = crate::c2pa_formats::AssetFormat::from_detached_content(&mime, asset)
+        .map_err(|error| Error::Verification(error.to_string()))?;
+    let mime = if format == Some(crate::c2pa_formats::AssetFormat::ExternalMedia) {
+        mime
+    } else {
+        resolve_mime(mime_type)?
+    };
     let (mut report, needs, _) = detached_pass(asset, manifest_store, &mime, options)?;
     let (network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
