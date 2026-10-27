@@ -167,7 +167,7 @@ enum Command {
         #[arg(long)]
         strict_conformance: bool,
         /// C2PA validation policy: `2.2`, `2.4` (the default and current
-        /// behavior), or `2.5` (the proposed draft). Any other value fails with
+        /// behavior), or `2.5` (the published standard). Any other value fails with
         /// `unsupported_spec_version` before the asset is read.
         #[arg(long, visible_alias = "spec-version", value_name = "2.2|2.4|2.5")]
         spec: Option<String>,

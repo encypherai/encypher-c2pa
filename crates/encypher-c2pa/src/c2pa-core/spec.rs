@@ -5,7 +5,7 @@
 //!
 //! Three orthogonal axes describe how the engine operates:
 //!
-//! - [`SpecVersion`] — which C2PA spec revision (2.2, 2.4, proposed 2.5).
+//! - [`SpecVersion`]: which C2PA spec revision (2.2, 2.4, 2.5).
 //!   Drives the emitted `specVersion` string, the in-scope format set, and
 //!   version-specific rules.
 //! - [`OperatingMode`] — restricted to the certified/conformance-evaluated
@@ -36,8 +36,8 @@
 /// certified set) and [`SpecVersion::V2_4`] (the next application target);
 /// the other revisions exist for *validation* — classifying which spec
 /// revision an in-the-wild manifest conforms to — and have no entries in
-/// [`FORMAT_REGISTRY`]. [`SpecVersion::V2_5`] is the proposed 2.5 draft
-/// (specs-core `cd61a4d1`): it is selectable as an explicit validation policy
+/// [`FORMAT_REGISTRY`]. [`SpecVersion::V2_5`] targets the published 2.5 standard
+/// (specs-core tag `2.5`, `d538a737`): it is selectable as an explicit validation policy
 /// only, carries no certified format scope, and is never a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum SpecVersion {
@@ -55,7 +55,7 @@ pub enum SpecVersion {
     V2_3,
     /// C2PA 2.4 — the next conformance application target (adds text + more).
     V2_4,
-    /// Proposed C2PA 2.5 (draft specs-core `cd61a4d1`). Explicit opt-in only.
+    /// C2PA 2.5 (published specs-core tag `2.5`, `d538a737`). Explicit opt-in only.
     V2_5,
 }
 

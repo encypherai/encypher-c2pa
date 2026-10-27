@@ -27,7 +27,7 @@
 //!
 //! Feature-introduction data is grounded in the C2PA knowledge graph
 //! (entity presence per spec version, KG tags v1.1.4–v1.2.4) and, for 2.5, in
-//! the proposed draft (specs-core `cd61a4d1`):
+//! the published standard (specs-core tag `2.5`, `d538a737`):
 //!
 //! | feature                                    | introduced |
 //! |--------------------------------------------|------------|
@@ -397,7 +397,7 @@ fn is_actions_label(label: &str) -> bool {
     is_actions_v2_label(label) || label == "c2pa.actions" || label.starts_with("c2pa.actions__")
 }
 
-/// Creation rules that first apply in proposed 2.5 and are visible in the
+/// Creation rules that first apply in 2.5 and are visible in the
 /// stored actions assertions.
 ///
 /// Actions, `actions-map-v2`: "The generator shall set the `actions-map-v2`
@@ -592,7 +592,7 @@ pub(crate) fn evaluate_for(
             ));
         }
     }
-    // Creation rules first applying in proposed 2.5, read only when the frame
+    // Creation rules first applying in 2.5, read only when the frame
     // reaches 2.5.
     let (actions_reasons_v2_5, actions_deprecations_v2_5) = if ceiling == SpecVersion::V2_5 {
         actions_creation_findings(manifest)

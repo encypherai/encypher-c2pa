@@ -6005,9 +6005,9 @@ fn verify_ingredient_shapes(
 }
 
 /// 2.5 Ingredient Assertion Validation, `relatedAssertions`: an ingredient may
-/// reference assertions about itself, but not alongside `activeManifest`, not
-/// as an empty list, and only assertions in the same manifest whose label ends
-/// with `.ingredient` and that are neither ingredient nor actions assertions.
+/// reference assertions about itself, including alongside `activeManifest`.
+/// The list must be nonempty and reference only assertions in the same manifest
+/// whose label ends with `.ingredient`, excluding ingredient and actions assertions.
 /// Each violation rejects the ingredient with `assertion.ingredient.malformed`.
 fn verify_ingredient_related_assertions(
     manifest: &ParsedManifest<'_>,
@@ -6039,10 +6039,6 @@ fn verify_ingredient_related_assertions(
         let mut fail = |explanation: String| {
             results.push_failure(ASSERTION_INGREDIENT_MALFORMED, url.clone(), explanation);
         };
-        if ingredient.get("activeManifest").is_some() {
-            fail("ingredient carries both activeManifest and relatedAssertions".into());
-            continue;
-        }
         let Value::Array(entries) = related else {
             fail("ingredient relatedAssertions is not an array".into());
             continue;

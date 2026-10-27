@@ -1150,6 +1150,224 @@ mod tests {
         vec![ingredient_manifest, active_manifest]
     }
 
+    /// Both manifests are signed after all references have been constructed.
+    /// Only the nested ingredient fields supplied by the test may be invalid;
+    /// the claim bindings, signatures and child-manifest link remain intact.
+    fn related_ingredient_store(
+        fields: impl FnOnce(&Assertion, &Assertion, &Assertion) -> Vec<(&'static str, Value)>,
+    ) -> Vec<u8> {
+        let signer = Signer::conformant();
+        let binding = Assertion::new("c2pa.hash.data", &data_hash());
+        let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+        let related = Assertion::new(
+            "com.example.ingredient",
+            &vmap(vec![("description", Value::Text("ingredient metadata".into()))]),
+        );
+        let child_assertions = vec![binding.clone(), actions.clone(), related.clone()];
+        let (child, child_cose) = manifest_box(
+            &signer,
+            INGREDIENT,
+            &child_assertions,
+            child_assertions.iter().map(Assertion::reference).collect(),
+        );
+        let mut link = ingredient(
+            INGREDIENT,
+            &child,
+            &child_cose,
+            "componentOf",
+            Some(recorded_results(vec![])),
+        );
+        let Value::Map(entries) = &mut link else {
+            unreachable!("ingredient is a map");
+        };
+        entries.extend(
+            fields(&related, &actions, &binding)
+                .into_iter()
+                .map(|(key, value)| (Value::Text(key.into()), value)),
+        );
+        let link = Assertion::new("c2pa.ingredient.v3", &link);
+        let assertions = vec![binding, actions, related, link];
+        let (active, _) = manifest_box(
+            &signer,
+            ACTIVE,
+            &assertions,
+            assertions.iter().map(Assertion::reference).collect(),
+        );
+        build_manifest_store(&[child, active])
+    }
+
+    fn verify_related_ingredient_store(
+        store: &[u8],
+        version: &str,
+    ) -> crate::StoreOnlyValidation {
+        crate::verify_manifest_store_only(
+            store,
+            &VerifyOptions {
+                spec_version: Some(version.into()),
+                no_default_trust: true,
+                validation_time: Some("2026-06-01T00:00:00Z".into()),
+                ..VerifyOptions::default()
+            },
+        )
+        .expect("signed ingredient store validation")
+    }
+
+    #[test]
+    fn final_2_5_accepts_signed_active_manifest_with_related_assertions() {
+        let store = related_ingredient_store(|related, _, _| {
+            vec![("relatedAssertions", Value::Array(vec![related.reference()]))]
+        });
+        for version in ["2.2", "2.4", "2.5"] {
+            let validation = verify_related_ingredient_store(&store, version);
+            let results = &validation.report.validation_results;
+            assert!(results.failure.is_empty(), "{version}: {:?}", results.failure);
+            for code in ["claimSignature.validated", "ingredient.manifest.validated"] {
+                assert!(
+                    results.success.iter().any(|status| status.code == code),
+                    "{version}: missing {code}: {:?}",
+                    results.success
+                );
+            }
+            let deltas = validation
+                .report
+                .manifest_report
+                .pointer("/validation_results/ingredientDeltas")
+                .and_then(Json::as_array)
+                .expect("recursive ingredient validation is reported");
+            assert_eq!(deltas.len(), 1, "{version}: {deltas:?}");
+            assert!(
+                delta_codes(&deltas[0], "failure").is_empty(),
+                "{version}: {}",
+                deltas[0]
+            );
+            assert!(
+                delta_codes(&deltas[0], "success").contains(&"claimSignature.validated"),
+                "{version}: child signature must also validate: {}",
+                deltas[0]
+            );
+            assert_eq!(validation.report.hard_binding, "not_evaluated");
+            assert_eq!(validation.report.integrity, "unbound");
+        }
+    }
+
+    #[test]
+    fn final_2_5_rejects_malformed_related_assertions_in_signed_graphs() {
+        for case in [
+            "not-array",
+            "empty",
+            "not-reference",
+            "missing-target",
+            "wrong-hash",
+            "wrong-hash-type",
+            "foreign-manifest",
+            "ineligible-actions",
+            "ineligible-label",
+        ] {
+            let store = related_ingredient_store(|related, actions, binding| {
+                let value = match case {
+                    "not-array" => Value::Text("not an array".into()),
+                    "empty" => Value::Array(vec![]),
+                    "not-reference" => Value::Array(vec![Value::Text("not a hashed URI".into())]),
+                    "ineligible-actions" => Value::Array(vec![actions.reference()]),
+                    _ => {
+                        let mut reference = match case {
+                            "wrong-hash" => related.tampered_reference(),
+                            // This assertion exists and its digest matches, but its label
+                            // does not end with .ingredient.
+                            "ineligible-label" => binding.reference(),
+                            _ => related.reference(),
+                        };
+                        let Value::Map(entries) = &mut reference else {
+                            unreachable!("reference is a map");
+                        };
+                        match case {
+                            "missing-target" | "foreign-manifest" => {
+                                let url = if case == "missing-target" {
+                                    "self#jumbf=c2pa.assertions/com.missing.ingredient".into()
+                                } else {
+                                    format!(
+                                        "self#jumbf=/c2pa/{INGREDIENT}/c2pa.assertions/{}",
+                                        related.label
+                                    )
+                                };
+                                entries
+                                    .iter_mut()
+                                    .find(|(key, _)| key.as_text() == Some("url"))
+                                    .expect("url")
+                                    .1 = Value::Text(url);
+                            }
+                            "wrong-hash-type" => {
+                                entries
+                                    .iter_mut()
+                                    .find(|(key, _)| key.as_text() == Some("hash"))
+                                    .expect("hash")
+                                    .1 = Value::Text("not bytes".into());
+                            }
+                            _ => {}
+                        }
+                        Value::Array(vec![reference])
+                    }
+                };
+                vec![("relatedAssertions", value)]
+            });
+            let validation = verify_related_ingredient_store(&store, "2.5");
+            let results = &validation.report.validation_results;
+            assert!(
+                results.failure.iter().any(|status| {
+                    status.code == "assertion.ingredient.malformed"
+                        && status.url
+                            == format!(
+                                "self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3"
+                            )
+                }),
+                "{case}: {:?}",
+                results.failure
+            );
+            assert!(
+                results.success.iter().any(|status| status.code == "claimSignature.validated"),
+                "{case}: the negative must retain a valid claim signature"
+            );
+            // Earlier policies do not apply the 2.5 relatedAssertions rule.
+            for version in ["2.2", "2.4"] {
+                let legacy = verify_related_ingredient_store(&store, version);
+                assert!(
+                    legacy.report.validation_results.failure.is_empty(),
+                    "{case}, {version}: {:?}",
+                    legacy.report.validation_results.failure
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_2_5_still_rejects_active_manifest_with_digital_source_type() {
+        let store = related_ingredient_store(|related, _, _| {
+            vec![
+                ("relatedAssertions", Value::Array(vec![related.reference()])),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ]
+        });
+        for version in ["2.2", "2.4", "2.5"] {
+            let validation = verify_related_ingredient_store(&store, version);
+            assert!(
+                validation.report.validation_results.failure.iter().any(|status| {
+                    status.code == "assertion.ingredient.malformed"
+                        && status.url
+                            == format!(
+                                "self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3"
+                            )
+                }),
+                "{version}: {:?}",
+                validation.report.validation_results.failure
+            );
+        }
+    }
+
     #[test]
     fn ingredient_manifest_defect_is_reported_as_a_delta_and_not_as_an_active_failure() {
         let out = verify_store(&tampered_ingredient_store());

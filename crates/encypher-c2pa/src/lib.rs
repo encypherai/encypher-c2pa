@@ -166,7 +166,7 @@ pub const REPORT_SCHEMA_VERSION: &str = "1.0";
 pub const C2PA_PROFILE_2_2: &str = "c2pa-2.2";
 /// Report `profile` of the default C2PA 2.4 validation policy.
 pub const C2PA_PROFILE: &str = "c2pa-2.4";
-/// Report `profile` of the explicitly selected proposed C2PA 2.5 policy.
+/// Report `profile` of the explicitly selected C2PA 2.5 policy.
 pub const C2PA_PROFILE_2_5: &str = "c2pa-2.5";
 /// Every value [`VerifyOptions::spec_version`] accepts. `None` means `"2.4"`.
 pub const SPEC_VERSIONS: &[&str] = &SpecVersion::PUBLIC_POLICY_STRINGS;
@@ -274,8 +274,8 @@ pub struct VerifyOptions {
     /// report bytes. The caller selects this policy; a claim's declared
     /// `specVersion` never selects or upgrades it.
     ///
-    /// `"2.5"` validates under the proposed C2PA 2.5 draft (specs-core
-    /// `cd61a4d1`): its text-carrier locating rules, padding admission,
+    /// `"2.5"` validates under the published C2PA 2.5 standard (specs-core
+    /// tag `2.5`, `d538a737`): its text-carrier locating rules, padding admission,
     /// action and assertion-metadata time checks, `relatedAssertions`, linked
     /// resource integrity, `claim.actions.missing`,
     /// `manifest.inaccessible.malformed`, BMFF hash rules, and the ESP claim

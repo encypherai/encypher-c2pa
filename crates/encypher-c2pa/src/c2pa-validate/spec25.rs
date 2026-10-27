@@ -1,9 +1,9 @@
 // Copyright 2026 Encypher Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-//! Validation rules that first apply under the proposed C2PA 2.5 policy.
+//! Validation rules that first apply under the C2PA 2.5 policy.
 //!
-//! The source is the proposed 2.5 draft (specs-core `cd61a4d1`), compared
+//! The source is published C2PA 2.5 (specs-core tag `2.5`, `d538a737`), compared
 //! clause by clause with C2PA 2.4. Every rule here runs only when the caller
 //! explicitly selected the 2.5 policy ([`applies`]); the default 2.4 policy
 //! never reaches this module except through the gate functions, which return
@@ -66,7 +66,7 @@ pub(super) const LINKED_RESOURCE_FORMAT_MISMATCH: &str =
 pub(super) const LINKED_RESOURCE_HASH_MISMATCH: &str =
     "assertion.linkedResourceIntegrity.hashMismatch";
 
-/// Whether the caller selected the proposed 2.5 validation policy.
+/// Whether the caller selected the 2.5 validation policy.
 pub(super) fn applies(profile: EngineProfile) -> bool {
     profile.version == SpecVersion::V2_5
 }

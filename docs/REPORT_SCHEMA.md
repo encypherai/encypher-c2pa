@@ -9,7 +9,7 @@ Additive fields may appear within schema 1.x. A field removal, rename, type chan
 | Field | Type | Meaning |
 |---|---|---|
 | `schema_version` | string | Public report contract version. |
-| `profile` | string | Validation policy that produced the report: `c2pa-2.4` (default, and `spec_version: "2.4"`) or `c2pa-2.5` (`spec_version: "2.5"`, the proposed C2PA 2.5 draft). `manifest_report.engine_profile.spec_version` carries the same choice; under `c2pa-2.5` it is present even when no manifest was located. |
+| `profile` | string | Validation policy that produced the report: `c2pa-2.2` (`spec_version: "2.2"`), `c2pa-2.4` (default, and `spec_version: "2.4"`) or `c2pa-2.5` (`spec_version: "2.5"`, the published C2PA 2.5 standard). `manifest_report.engine_profile.spec_version` carries the same choice; under `c2pa-2.5` it is present even when no manifest was located. |
 | `mime_type` | string | Normalized MIME type used to choose the container reader. |
 | `present` | boolean | A readable active C2PA manifest is present. |
 | `integrity` | string | `valid`, `invalid`, or `absent`. This is not a trust decision. |
