@@ -44,10 +44,10 @@ use crate::c2pa_formats::{
 };
 
 use super::live_video::{
-    validate_emsg_segment, validate_init_segment, validate_live_video_assertion,
-    validate_segment_manifest, validate_session_keys, LiveVideoApplicability,
-    LiveVideoManifestState, LIVEVIDEO_CONTINUITY_METHOD_INVALID, LIVEVIDEO_SEGMENT_INVALID,
-    LIVEVIDEO_SESSION_KEY_INVALID,
+    parse_init_track_timing, validate_emsg_segments, validate_init_segment,
+    validate_live_video_assertion, validate_segment_manifest, validate_session_keys,
+    LiveVideoApplicability, LiveVideoManifestState, LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+    LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSION_KEY_INVALID,
 };
 use super::{
     hash_bytes, CawgTrustInputs, ClaimGeneration, Json, ValidateError, ValidationResults,
@@ -158,6 +158,7 @@ pub fn verify_stream<'a>(
         input,
         init_segment,
         segments,
+        None,
         &[],
         encapsulation,
         method,
@@ -165,15 +166,19 @@ pub fn verify_stream<'a>(
     )
 }
 
+// Eight independently required inputs, matching [`verify_stream_safe_with_expected_seeks`].
+#[allow(clippy::too_many_arguments)]
 fn verify_stream_with_expected_seeks<'a>(
     input: &VerifyInput<'a>,
     init_segment: &'a [u8],
     segments: &[&'a [u8]],
+    presentation_times: Option<&[OffsetDateTime]>,
     expected_seek_positions: &[usize],
     encapsulation: StreamEncapsulation,
     method: StreamMethod,
     cawg_inputs: CawgTrustInputs<'_>,
 ) -> Result<StreamVerifyOutput, ValidateError> {
+    validate_presentation_times(presentation_times, segments.len())?;
     validate_expected_seek_positions(expected_seek_positions, segments.len())?;
     match method {
         StreamMethod::VerifiableSegmentInfo => {
@@ -184,30 +189,70 @@ fn verify_stream_with_expected_seeks<'a>(
                         input,
                         init_segment,
                         segments,
+                        presentation_times,
                         expected_seek_positions,
                         &delivery,
                         cawg_inputs,
                     )
                 }
-                None => verify_fragmented_with_encapsulation_and_expected_seeks(
-                    &input_for(input, init_segment),
-                    segments,
-                    expected_seek_positions,
-                    encapsulation,
-                    cawg_inputs,
-                ),
+                None => {
+                    refuse_presentation_times(presentation_times)?;
+                    verify_fragmented_with_encapsulation_and_expected_seeks(
+                        &input_for(input, init_segment),
+                        segments,
+                        expected_seek_positions,
+                        encapsulation,
+                        cawg_inputs,
+                    )
+                }
             }
             .map(|out| StreamVerifyOutput::VerifiableSegmentInfo(Box::new(out)))
         }
-        StreamMethod::PerSegment => verify_per_segment_with_expected_seeks(
-            input,
-            init_segment,
-            segments,
-            expected_seek_positions,
-            encapsulation,
-            cawg_inputs,
-        )
-        .map(StreamVerifyOutput::PerSegment),
+        StreamMethod::PerSegment => {
+            refuse_presentation_times(presentation_times)?;
+            verify_per_segment_with_expected_seeks(
+                input,
+                init_segment,
+                segments,
+                expected_seek_positions,
+                encapsulation,
+                cawg_inputs,
+            )
+            .map(StreamVerifyOutput::PerSegment)
+        }
+    }
+}
+
+/// Refuse per-segment presentation times whose count is not exactly one per
+/// supplied segment, before any signed byte is evaluated.
+fn validate_presentation_times(
+    presentation_times: Option<&[OffsetDateTime]>,
+    segment_count: usize,
+) -> Result<(), ValidateError> {
+    match presentation_times {
+        Some(times) if times.len() != segment_count => Err(ValidateError::Stream(format!(
+            "{} per-segment presentation times supplied for {segment_count} presented segment(s); \
+             exactly one per segment is required",
+            times.len()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Per-segment presentation times date session-key windows, so only the
+/// session-key lane consumes them. A Merkle or per-segment stream verifies each
+/// manifest at `input.validation_time`; silently dropping times the caller
+/// supplied would let it believe they had been applied.
+fn refuse_presentation_times(
+    presentation_times: Option<&[OffsetDateTime]>,
+) -> Result<(), ValidateError> {
+    match presentation_times {
+        Some(_) => Err(ValidateError::Stream(
+            "per-segment presentation times apply only to session-key live streams; \
+             this stream's manifests are verified at the validation time"
+                .into(),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -236,6 +281,7 @@ pub fn verify_stream_safe<'a>(
         input,
         init_segment,
         segments,
+        None,
         &[],
         encapsulation,
         method,
@@ -249,11 +295,30 @@ pub fn verify_stream_safe<'a>(
     )
 }
 
+/// Panic-contained [`verify_stream`] with caller presentation evidence.
+///
+/// `presentation_times`, when supplied, holds exactly one trusted presentation
+/// time per entry of `segments`, index for index; any other count is refused
+/// before a segment is evaluated. In the session-key lane segment `i`'s key
+/// window is judged at `presentation_times[i]`; without them every segment is
+/// judged at `input.validation_time` (the current time when absent). A signed
+/// `iat` in a segment's message is checked as well, but never stands in for
+/// either, because whoever holds an expired session key can write any `iat`.
+///
+/// The times are the CALLER's evidence. This verifier does not derive them
+/// from signed `iat` values, from the init manifest's time-stamp, or from the
+/// clock: an init time-stamp proves when the init manifest was signed, not when
+/// any later segment was presented. A caller that cannot vouch for a segment's
+/// presentation time should leave these out and accept the validation-time
+/// verdict. The init manifest itself is always verified at
+/// `input.validation_time`. The Merkle lane and [`StreamMethod::PerSegment`]
+/// refuse supplied times, since nothing in them is dated per segment.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_stream_safe_with_expected_seeks<'a>(
     input: &VerifyInput<'a>,
     init_segment: &'a [u8],
     segments: &[&'a [u8]],
+    presentation_times: Option<&[OffsetDateTime]>,
     expected_seek_positions: &[usize],
     encapsulation: StreamEncapsulation,
     method: StreamMethod,
@@ -279,6 +344,7 @@ pub fn verify_stream_safe_with_expected_seeks<'a>(
             input,
             init_segment,
             segments,
+            presentation_times,
             expected_seek_positions,
             encapsulation,
             method,
@@ -307,7 +373,11 @@ pub fn verify_stream_safe_with_expected_seeks<'a>(
 /// 3. every delivered session key proves possession through a `signerBinding`
 ///    over the exact certificate that signed the delivering manifest;
 /// 4. every media segment carries an `emsg` whose signature, active `kid`,
-///    sequence number, `manifestId`, and structural hash all check out.
+///    sequence number, `manifestId`, and structural hash all check out, under a
+///    key whose window contains `input.validation_time` (the current time when
+///    absent). Historical streams whose keys rotated through disjoint windows
+///    need per-segment presentation times; see
+///    [`verify_stream_safe_with_expected_seeks`].
 pub fn verify_live_session(
     input: &VerifyInput<'_>,
     init_segment: &[u8],
@@ -321,15 +391,26 @@ pub fn verify_live_session(
             "init segment delivers no claim-bound session key, so it is not a live session".into(),
         )
     })?;
-    verify_delivered_live_session(input, init_segment, segments, &[], &delivery, cawg_inputs)
+    verify_delivered_live_session(
+        input,
+        init_segment,
+        segments,
+        None,
+        &[],
+        &delivery,
+        cawg_inputs,
+    )
 }
 
 /// [`verify_live_session`] with the delivery already read, so the dispatching
 /// caller in [`verify_stream`] parses the init manifest exactly once.
+/// `presentation_times`, when present, has already been checked to hold one
+/// time per segment.
 fn verify_delivered_live_session(
     input: &VerifyInput<'_>,
     init_segment: &[u8],
     segments: &[&[u8]],
+    presentation_times: Option<&[OffsetDateTime]>,
     expected_seek_positions: &[usize],
     delivery: &SessionKeyDelivery,
     cawg_inputs: CawgTrustInputs<'_>,
@@ -367,39 +448,24 @@ fn verify_delivered_live_session(
         }
     };
 
-    let validation_time = input
-        .validation_time
-        .unwrap_or_else(OffsetDateTime::now_utc);
-    let mut next_sequence_number = Some(1u64);
-    for (index, segment) in segments.iter().enumerate() {
-        let expected_seek = expected_seek_positions.binary_search(&index).is_ok();
-        let expected_sequence_number = if expected_seek {
-            None
-        } else {
-            next_sequence_number
-        };
-        let url = format!("self#segment={}", index + 1);
-        if !expected_seek && expected_sequence_number.is_none() {
-            out.results.push_failure(
-                LIVEVIDEO_SEGMENT_INVALID,
-                url.clone(),
-                "unexpected sequence discontinuity: predecessor sequenceNumber cannot be incremented"
-                    .into(),
-            );
-        }
-        if let Some(info) = validate_emsg_segment(
-            applicability,
-            segment,
-            expected_sequence_number,
-            manifest_id,
-            &keys,
-            validation_time,
-            &mut out.results,
-            &url,
-        ) {
-            next_sequence_number = info.sequence_number.checked_add(1);
-        }
-    }
+    // Section 19.4.2 event timing is judged against the init segment's track
+    // timing, read once from the bytes that were delivered. Each segment's key
+    // window is judged at the caller's trusted presentation time for it, or
+    // else at the one validation time.
+    let init_timing = parse_init_track_timing(init_segment);
+    validate_emsg_segments(
+        applicability,
+        segments,
+        init_timing.as_ref().map_err(|defect| *defect),
+        expected_seek_positions,
+        manifest_id,
+        &keys,
+        input
+            .validation_time
+            .unwrap_or_else(OffsetDateTime::now_utc),
+        presentation_times,
+        &mut out.results,
+    );
     restate_results(&mut out, input.profile);
     Ok(out)
 }

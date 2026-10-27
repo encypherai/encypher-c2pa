@@ -10,9 +10,10 @@ use crate::c2pa_crypto::{
     extract_claim_tsa_tokens, extract_tsa_tokens, timestamp_input, ClaimTimestampVersion, CoseAlg,
 };
 use crate::c2pa_trust::TrustList;
+use ecdsa::signature::hazmat::PrehashVerifier as _;
 use serde_json::{json, Value as Json};
 use sha2::Digest as _;
-use signature::{hazmat::PrehashVerifier as _, Verifier as _};
+use signature::Verifier as _;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::cawg::is_cawg_label;
@@ -1362,7 +1363,6 @@ mod tests {
     use super::*;
     use crate::c2pa_trust::timestamp_fixture::TestTsa;
     use ed25519_dalek::{Signer as _, SigningKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint as _;
     use serde_json::json;
     use time::macros::datetime;
 
@@ -1849,7 +1849,7 @@ mod tests {
     fn es256_ica_credential_validates() {
         use p256::ecdsa::signature::Signer as _;
         let key = p256::ecdsa::SigningKey::from_bytes((&[9_u8; 32]).into()).unwrap();
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let jwk = json!({
             "kty": "EC",
             "crv": "P-256",
@@ -3731,7 +3731,7 @@ mod tests {
         use p384::ecdsa::signature::Signer as _;
 
         let p384_key = p384::ecdsa::SigningKey::from_bytes((&[9_u8; 48]).into()).unwrap();
-        let point = p384_key.verifying_key().to_encoded_point(false);
+        let point = p384_key.verifying_key().to_sec1_point(false);
         assert_algorithm_validates(
             CoseAlg::Es384,
             ec_jwk("P-384", point.x().unwrap(), point.y().unwrap()),
@@ -3744,7 +3744,7 @@ mod tests {
         let mut scalar = [9_u8; 66];
         scalar[0] = 1;
         let p521_key = p521::ecdsa::SigningKey::from_slice(&scalar).unwrap();
-        let point = p521::ecdsa::VerifyingKey::from(&p521_key).to_encoded_point(false);
+        let point = p521::ecdsa::VerifyingKey::from(&p521_key).to_sec1_point(false);
         assert_algorithm_validates(
             CoseAlg::Es512,
             ec_jwk("P-521", point.x().unwrap(), point.y().unwrap()),

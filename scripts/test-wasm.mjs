@@ -343,7 +343,22 @@ const mediaSegments = await Promise.all(
     new Uint8Array(await readFile(resolve(streamDir, file))),
   ),
 );
-const streamOptions = { telemetry: { enabled: false } };
+// segments.json records the trusted instant at which the fixture set was
+// signed and verified. It follows the session key's creation and lies inside
+// its 24-hour window; two days later is past it. Pin to it, not Date.now(), so
+// a regenerated fixture set carries its own anchor.
+const { validation_time: fixtureTime } = JSON.parse(
+  await readFile(resolve(streamDir, "segments.json"), "utf8"),
+);
+assert.equal(typeof fixtureTime, "string", "segments.json records validation_time");
+const fixtureAt = (seconds) =>
+  seconds === 0
+    ? fixtureTime
+    : new Date(Date.parse(fixtureTime) + seconds * 1000).toISOString();
+const streamOptions = {
+  telemetry: { enabled: false },
+  validation_time: fixtureTime,
+};
 const stream = verifyStream(
   initSegment,
   mediaSegments,
@@ -391,6 +406,37 @@ assert.throws(
     verifyStream(initSegment, mediaSegments, "video/mp4", "mpeg-ts", "per-segment", streamOptions),
   /invalid_argument/,
 );
+
+// Trusted per-segment presentation times: an archive check after the key
+// expired verifies only when the caller supplies in-window times, one per
+// segment, and the options object forwards them unchanged.
+const afterExpiry = { ...streamOptions, validation_time: fixtureAt(2 * 86_400) };
+assert.equal(
+  verifyStream(initSegment, mediaSegments, "video/mp4", "fMP4", "verifiable-segment-info", afterExpiry)
+    .integrity,
+  "invalid",
+);
+assert.equal(
+  verifyStream(initSegment, mediaSegments, "video/mp4", "fMP4", "verifiable-segment-info", {
+    ...afterExpiry,
+    stream_presentation_times: [fixtureAt(0), fixtureAt(1), fixtureAt(2)],
+  }).integrity,
+  "valid",
+);
+for (const stream_presentation_times of [
+  [fixtureAt(0)],
+  [],
+  [fixtureAt(0), "not a time", fixtureAt(2)],
+]) {
+  assert.throws(
+    () =>
+      verifyStream(initSegment, mediaSegments, "video/mp4", "fMP4", "verifiable-segment-info", {
+        ...streamOptions,
+        stream_presentation_times,
+      }),
+    /invalid_validation_time/,
+  );
+}
 
 let telemetryRequest;
 const originalFetch = globalThis.fetch;

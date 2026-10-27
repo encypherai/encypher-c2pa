@@ -6217,6 +6217,7 @@ fn is_primary_binding_match(label: &str, status: &StatusCode) -> bool {
 /// fallback, never a peer hard binding: it is evaluated only after an ordinary
 /// byte mismatch. Structural, malformed, missing, and unsupported failures
 /// remain attached to the primary and do not activate the fallback.
+/// Detached-only media never falls back: its whole-file data hash is final.
 #[allow(clippy::too_many_arguments)]
 fn verify_data_hash<'index, 'claim>(
     claim: &Value,
@@ -6261,6 +6262,12 @@ fn verify_data_hash<'index, 'claim>(
         return Some(OperativeBinding::Primary(primary));
     }
 
+    // Detached-only media is bound by one whole-file data hash without
+    // exclusions. A multi-asset part may carry its own exclusions, so a
+    // fallback could accept changed bytes the primary hash rejected.
+    if format == AssetFormat::ExternalMedia {
+        return None;
+    }
     let fallback = plan.multi_asset()?;
     if added_failures.is_empty()
         || !added_failures
@@ -11361,6 +11368,192 @@ mod tests {
         );
         assert!(result.has_failure(ASSERTION_DATA_HASH_MALFORMED));
         assert!(!result.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    /// A signed detached WebM store binds the whole file through
+    /// `c2pa.hash.data` and also declares a multi-asset fallback whose one
+    /// data part excludes the asset's last byte. Changing that byte must keep
+    /// the whole-file mismatch: detached-only media never reaches the
+    /// fallback. The same signed manifest still falls back for an ordinary
+    /// format, which proves the exclusion really hides the changed byte.
+    #[test]
+    fn detached_media_primary_mismatch_never_uses_excluding_multi_asset_fallback() {
+        use crate::c2pa_core::jumbf::assertion_box;
+
+        const LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-0000000000e1";
+        const PART: &str = "c2pa.hash.data.part";
+        let reference = |label: &str, payload: &[u8]| {
+            let stored = assertion_box(label, payload, None);
+            vmap(vec![
+                (
+                    "url",
+                    Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                ),
+                ("alg", Value::Text("sha256".into())),
+                (
+                    "hash",
+                    Value::Bytes(sha(superbox_content(&stored).expect("assertion content"))),
+                ),
+            ])
+        };
+
+        let mut asset = b"\x1a\x45\xdf\xa3\x87\x42\x82\x84webm".to_vec();
+        asset.extend_from_slice(b" cluster payload bound by the whole-file hash");
+        let excluded = asset.len() - 1;
+        let mut tampered = asset.clone();
+        tampered[excluded] ^= 0x01;
+
+        let primary = enc(&vmap(vec![
+            ("exclusions", Value::Array(Vec::new())),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(&asset))),
+        ]));
+        let part = enc(&vmap(vec![
+            (
+                "exclusions",
+                Value::Array(vec![vmap(vec![
+                    ("start", Value::Integer(excluded as i128)),
+                    ("length", Value::Integer(1)),
+                ])]),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(&asset[..excluded]))),
+        ]));
+        let part_reference = reference(PART, &part);
+        let fallback = enc(&vmap(vec![(
+            "parts",
+            Value::Array(vec![vmap(vec![
+                (
+                    "location",
+                    vmap(vec![
+                        ("byteOffset", Value::Integer(0)),
+                        ("length", Value::Integer(asset.len() as i128)),
+                    ]),
+                ),
+                ("hashAssertion", part_reference.clone()),
+                ("optional", Value::Bool(false)),
+            ])]),
+        )]));
+        let actions = enc(&vmap(vec![(
+            "actions",
+            Value::Array(vec![vmap(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ])]),
+        )]));
+        let assertions = [
+            ("c2pa.hash.data", primary),
+            ("c2pa.hash.multi-asset", fallback),
+            (PART, part),
+            ("c2pa.actions.v2", actions),
+        ];
+        let claim = enc(&vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:detached-webm".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("Encypher Fixture".into()))]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(
+                    assertions
+                        .iter()
+                        .map(|(label, payload)| reference(label, payload))
+                        .collect(),
+                ),
+            ),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+        ]));
+        let signer = signature_conformance_tests::Signer::conformant();
+        let signature = signer.sign(&claim);
+        let chain = extract_x5chain(&signature).expect("claim x5chain");
+        let trust = TrustList::from_certificates(
+            crate::c2pa_trust::AnchorPurpose::ClaimSigning,
+            [chain.last().expect("claim root").clone()],
+        );
+        let boxes: Vec<Vec<u8>> = assertions
+            .iter()
+            .map(|(label, payload)| assertion_box(label, payload, None))
+            .collect();
+        let store = build_manifest_store(&[build_manifest(LABEL, &boxes, &claim, &signature)]);
+        let input = VerifyInput {
+            data: &[],
+            mime: "",
+            claim_signer_trust: Some(&trust),
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: Some(
+                OffsetDateTime::from_unix_timestamp(1_811_808_000).expect("2027-06-01 UTC"),
+            ),
+            profile: EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        };
+
+        let intact = verify_detached(&store, &asset, "video/webm", &input).expect("intact report");
+        assert!(
+            intact.results.has_success(CLAIM_SIGNATURE_VALIDATED),
+            "{:#?}",
+            intact.results
+        );
+        assert!(intact.results.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(!intact.results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert_ne!(
+            intact.validation_state,
+            ValidationState::Invalid,
+            "{:#?}",
+            intact.results
+        );
+
+        let changed =
+            verify_detached(&store, &tampered, "video/webm", &input).expect("tampered report");
+        assert!(changed.results.has_success(CLAIM_SIGNATURE_VALIDATED));
+        assert!(changed.results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert!(!changed.results.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(!changed
+            .results
+            .has_success(ASSERTION_MULTI_ASSET_HASH_MATCH));
+        assert_eq!(changed.validation_state, ValidationState::Invalid);
+
+        let parsed = parse_manifest_store(&store).expect("signed store parses");
+        let manifest = &parsed.manifests[0];
+        let claim = decode(manifest.claim_cbor.expect("claim")).expect("claim CBOR");
+        let claim_refs = ClaimAssertionRefs::build(manifest, &claim, ClaimGeneration::V2);
+        let run = |format| {
+            let mut results = ValidationResults::default();
+            let operative = verify_data_hash(
+                &claim,
+                &claim_refs,
+                &tampered,
+                format,
+                &[],
+                update_manifest::StoreRendition::AsSigned,
+                LABEL,
+                EngineProfile::GENEROUS,
+                &mut results,
+            );
+            let kind = match operative {
+                Some(OperativeBinding::Primary(_)) => "primary",
+                Some(OperativeBinding::MultiAsset(_)) => "multi-asset",
+                None => "none",
+            };
+            (kind, results)
+        };
+
+        let (ordinary_kind, ordinary) = run(AssetFormat::Jpeg);
+        assert_eq!(ordinary_kind, "multi-asset", "{ordinary:#?}");
+        assert!(ordinary.has_success(ASSERTION_MULTI_ASSET_HASH_MATCH));
+        assert!(!ordinary.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+
+        let (detached_kind, detached) = run(AssetFormat::ExternalMedia);
+        assert_eq!(detached_kind, "none", "{detached:#?}");
+        assert!(detached.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert!(!detached.has_success(ASSERTION_MULTI_ASSET_HASH_MATCH));
     }
 
     #[test]

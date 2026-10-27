@@ -396,6 +396,11 @@ pub fn verify_fragmented_js(
 /// `"verifiable-segment-info"` or `"per-segment"`, both ASCII
 /// case-insensitive. Which binding a `verifiable-segment-info` stream used is
 /// read from the init manifest, never taken from the caller.
+///
+/// `options.stream_presentation_times` takes one trusted RFC 3339 instant per
+/// segment, in order, for checking each session-key segment's key window.
+/// It is never filled from the browser clock: when absent, every segment is
+/// assessed at `validation_time`, which defaults to `Date` captured here.
 #[wasm_bindgen(js_name = verifyStream)]
 pub fn verify_stream_js(
     init_segment: &[u8],

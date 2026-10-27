@@ -29,7 +29,7 @@ The SDK implements the open standards: [C2PA 2.4](https://spec.c2pa.org/specific
 ### Command line
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.7.1
+cargo install encypher-c2pa-cli --version 1.8.0
 encypher-c2pa verify photo.jpg
 encypher-c2pa verify photo.jpg --json
 encypher-c2pa formats
@@ -41,7 +41,7 @@ The MIME type comes from the file extension; pass `--mime` for a file whose name
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.7.1"
+encypher-c2pa = "1.8.0"
 ```
 
 ```rust
@@ -172,6 +172,17 @@ encypher-c2pa verify init.mp4 --fragment seg-0.m4s --fragment seg-1.m4s \
 
 The stream report carries a top-level `integrity`, the initialization manifest's report, a report per segment, and, for per-segment streams, whether the chain holds.
 
+Session keys expire. Each segment's key is checked at the validation time, which defaults to now, so a recording verified after its keys expired fails unless you say when each segment was presented. Pass one trusted RFC 3339 time per segment, in segment order (`--stream-presentation-time`, `stream_presentation_times`, Go `StreamPresentationTimes`). Each segment's key window is then checked at its own time. Certificates are still checked at the validation time, and sequence continuity is still enforced across the whole run, so a recording that moved to a new key part way through verifies as one stream.
+
+```bash
+encypher-c2pa verify init.mp4 --fragment seg-0.m4s --fragment seg-1.m4s \
+  --mime video/mp4 --encapsulation fmp4 \
+  --stream-presentation-time 2026-10-26T22:30:00Z \
+  --stream-presentation-time 2026-10-26T22:30:02Z --json
+```
+
+The verifier takes these times on your word, so supply them only from a record you control, such as an ingest log. It never reads them from the segments; each segment's signed `iat` remains an extra check inside the key window. A time stamp on the initialization manifest dates that manifest, not the segments after it. A malformed time, or a count that differs from the number of segments, is refused, and Merkle-bound and per-segment streams refuse the option.
+
 ## Trust
 
 Each install carries a pinned trust snapshot dated `2026-09-24`, compiled into every package. Trust material is never fetched: no trust list, no certificate chain, no CRL. With online checks off, which is the default, verification is entirely local and deterministic. Turning them on adds revocation status, a remote manifest store, a DID document, or external content as evidence; the trust snapshot is still the one on disk.
@@ -213,6 +224,7 @@ Your own PEM bundles extend the snapshot. To evaluate only your own material, se
 | `--cawg-ica-status-lists` | `cawg_ica_status_lists` | Revocation status lists, as a JSON map of list URI to base64 bitstring |
 | `--no-default-trust` | `no_default_trust` | Ignore every packaged snapshot |
 | `--time` | `validation_time` | RFC 3339 validation instant |
+| `--stream-presentation-time` | `stream_presentation_times` | Trusted RFC 3339 presentation time per session-key stream segment, one per segment |
 
 Trust flags repeat, and repeated bundles merge. Python keyword arguments and the WebAssembly options object use the same names; Go uses the CamelCase equivalents, such as `NoDefaultTrust`.
 
@@ -297,12 +309,12 @@ Build without the fetcher entirely with `--no-default-features --features teleme
 Each release carries verification fixes and a refreshed trust snapshot, so an old copy judges files against old trust lists. The command line checks for a newer release once a day, when a person is at the terminal, and offers to install it:
 
 ```text
-encypher-c2pa 1.7.2 is available. You have 1.7.1, with trust lists dated 2026-09-24.
+encypher-c2pa 1.8.1 is available. You have 1.8.0, with trust lists dated 2026-09-24.
 Releases carry verification fixes and refreshed trust lists.
 Update now? [y] yes  [N] not now  [s] skip this version  [o] stop checking
 ```
 
-`y` runs `cargo install encypher-c2pa-cli --version 1.7.2 --locked`, then runs your command again on the new version. `s` skips that release; a later one is still offered. `o` turns the check off.
+`y` runs `cargo install encypher-c2pa-cli --version 1.8.1 --locked`, then runs your command again on the new version. `s` skips that release; a later one is still offered. `o` turns the check off.
 
 The check is one request for the crate's public entry in the crates.io index. It carries no file, path, or identifier, gives up after two seconds, and fails silently. Runs with nobody at the terminal (pipes, CI, cron) never check, and `--offline` skips the check for that run. The libraries never check; update them through your package manager.
 

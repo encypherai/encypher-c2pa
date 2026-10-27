@@ -357,7 +357,8 @@ pub(crate) use bmff::{bmff_box_ranges, bmff_exclusion_ranges};
 
 /// Re-export: compute BMFF V2/V3 hard-binding hashes.
 pub(crate) use bmff::{
-    bmff_hash, bmff_hash_with_exclusions, BmffDataMap, BmffExclusionMap, BmffSubsetMap,
+    bmff_excluded_ranges, bmff_hash, bmff_hash_with_exclusions, BmffDataMap, BmffExclusionMap,
+    BmffSubsetMap,
 };
 
 /// Re-export: streaming, bounded-memory BMFF hash for assets too large to hold

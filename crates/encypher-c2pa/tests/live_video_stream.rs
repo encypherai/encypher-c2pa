@@ -43,9 +43,18 @@ const COMBINATIONS: [(&str, StreamEncapsulation, StreamMethod); 4] = [
     ),
 ];
 
+/// The C2PA 2.2 Merkle set predates the fixture index `validation_time` and
+/// carries no session keys, so it keeps the default validation clock.
+const LEGACY_MERKLE: &str = "fmp4-merkle-2.2";
+
 struct Stream {
     init: Vec<u8>,
     segments: Vec<Vec<u8>>,
+    /// The trusted clock the fixture generator recorded in `segments.json`
+    /// after it signed and verified the set. Session keys are dated, so a
+    /// session-key verdict is only reproducible at a known time, never at the
+    /// wall clock.
+    validation_time: Option<String>,
 }
 
 impl Stream {
@@ -56,9 +65,20 @@ impl Stream {
         let read = |file: String| {
             std::fs::read(base.join(&file)).unwrap_or_else(|e| panic!("{name}/{file}: {e}"))
         };
+        let index: serde_json::Value = serde_json::from_slice(&read("segments.json".to_string()))
+            .unwrap_or_else(|e| panic!("{name}/segments.json: {e}"));
+        let validation_time = index
+            .get("validation_time")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        assert!(
+            validation_time.is_some() || name == LEGACY_MERKLE,
+            "{name}/segments.json records no validation_time"
+        );
         Stream {
             init: read("init.mp4".to_string()),
             segments: (0..3).map(|i| read(format!("seg-{i}.m4s"))).collect(),
+            validation_time,
         }
     }
 
@@ -74,23 +94,25 @@ impl Stream {
     fn refs(&self) -> Vec<&[u8]> {
         self.segments.iter().map(Vec::as_slice).collect()
     }
-}
 
-/// Telemetry is pinned off so no case can emit a request.
-fn options() -> VerifyOptions {
-    VerifyOptions {
-        telemetry: TelemetryOptions {
-            enabled: Some(false),
+    /// Telemetry is pinned off so no case can emit a request, and the
+    /// validation time is the fixture's recorded clock.
+    fn options(&self) -> VerifyOptions {
+        VerifyOptions {
+            telemetry: TelemetryOptions {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            validation_time: self.validation_time.clone(),
             ..Default::default()
-        },
-        ..Default::default()
+        }
     }
-}
 
-fn options_with_seeks(expected_seek_positions: Vec<usize>) -> VerifyOptions {
-    VerifyOptions {
-        expected_seek_positions,
-        ..options()
+    fn options_with_seeks(&self, expected_seek_positions: Vec<usize>) -> VerifyOptions {
+        VerifyOptions {
+            expected_seek_positions,
+            ..self.options()
+        }
     }
 }
 
@@ -131,7 +153,7 @@ fn clean_streams_verify_in_every_2_4_combination() {
             "video/mp4",
             encapsulation,
             method,
-            &options(),
+            &stream.options(),
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
 
@@ -171,7 +193,7 @@ fn a_tampered_media_segment_fails_every_2_4_combination() {
             "video/mp4",
             encapsulation,
             method,
-            &options(),
+            &stream.options(),
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
 
@@ -218,7 +240,7 @@ fn fragments_no_binding_can_cover_never_verify() {
             &stream.init,
             &stream.refs(),
             "video/mp4",
-            &options(),
+            &stream.options(),
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
 
@@ -241,7 +263,7 @@ fn a_merkle_stream_still_verifies_and_still_catches_tampering() {
         &clean.init,
         &clean.refs(),
         "video/mp4",
-        &options(),
+        &clean.options(),
     )
     .expect("merkle stream verifies");
     assert_eq!(report.integrity, "valid");
@@ -253,7 +275,7 @@ fn a_merkle_stream_still_verifies_and_still_catches_tampering() {
         &tampered.init,
         &tampered.refs(),
         "video/mp4",
-        &options(),
+        &tampered.options(),
     )
     .expect("tampered merkle stream reports");
     assert_eq!(report.integrity, "invalid");
@@ -292,7 +314,7 @@ fn an_expected_seek_allows_a_verified_sequence_discontinuity() {
             "video/mp4",
             encapsulation,
             method,
-            &options(),
+            &stream.options(),
         )
         .unwrap_or_else(|error| panic!("{name} unexpected discontinuity: {error}"));
         assert_eq!(
@@ -306,7 +328,7 @@ fn an_expected_seek_allows_a_verified_sequence_discontinuity() {
             "video/mp4",
             encapsulation,
             method,
-            &options_with_seeks(vec![1]),
+            &stream.options_with_seeks(vec![1]),
         )
         .unwrap_or_else(|error| panic!("{name} expected seek: {error}"));
         assert_eq!(
@@ -327,7 +349,7 @@ fn an_expected_seek_allows_a_verified_sequence_discontinuity() {
             "video/mp4",
             encapsulation,
             method,
-            &options_with_seeks(vec![1]),
+            &stream.options_with_seeks(vec![1]),
         )
         .unwrap_or_else(|error| panic!("{name} tampered after expected seek: {error}"));
         assert_eq!(
@@ -342,7 +364,7 @@ fn an_expected_seek_allows_a_verified_sequence_discontinuity() {
             "video/mp4",
             encapsulation,
             method,
-            &options(),
+            &stream.options(),
         )
         .unwrap_or_else(|error| panic!("{name} unexpected backwards discontinuity: {error}"));
         assert_eq!(
@@ -355,7 +377,7 @@ fn an_expected_seek_allows_a_verified_sequence_discontinuity() {
             "video/mp4",
             encapsulation,
             method,
-            &options_with_seeks(vec![0, 1]),
+            &stream.options_with_seeks(vec![0, 1]),
         )
         .unwrap_or_else(|error| panic!("{name} expected backwards seek: {error}"));
         assert_eq!(
@@ -375,7 +397,7 @@ fn expected_seek_positions_must_name_unique_presented_segments() {
             "video/mp4",
             StreamEncapsulation::Fmp4,
             StreamMethod::VerifiableSegmentInfo,
-            &options_with_seeks(invalid.to_vec()),
+            &stream.options_with_seeks(invalid.to_vec()),
         )
         .expect_err("invalid expected-seek positions must fail closed");
         assert!(
@@ -393,16 +415,20 @@ fn fragmented_merkle_subsets_enforce_sequence_unless_a_seek_is_expected() {
         &stream.init,
         &leading,
         "video/mp4",
-        &options(),
+        &stream.options(),
     )
     .expect("a leading contiguous run with unavailable trailing fragments verifies");
     assert_eq!(report.integrity, "valid");
     assert!(!failure_codes(&report).contains(&ASSERTION_BMFF_HASH_MISMATCH));
 
     let gap = vec![stream.segments[0].as_slice(), stream.segments[2].as_slice()];
-    let report =
-        encypher_c2pa::verify_fragmented_with_options(&stream.init, &gap, "video/mp4", &options())
-            .expect("an unexpected gap is reported");
+    let report = encypher_c2pa::verify_fragmented_with_options(
+        &stream.init,
+        &gap,
+        "video/mp4",
+        &stream.options(),
+    )
+    .expect("an unexpected gap is reported");
     assert_eq!(report.integrity, "invalid");
     assert!(failure_codes(&report).contains(&ASSERTION_BMFF_HASH_MISMATCH));
 
@@ -410,7 +436,7 @@ fn fragmented_merkle_subsets_enforce_sequence_unless_a_seek_is_expected() {
         &stream.init,
         &gap,
         "video/mp4",
-        &options_with_seeks(vec![1]),
+        &stream.options_with_seeks(vec![1]),
     )
     .expect("an expected gap verifies");
     assert_eq!(report.integrity, "valid");
@@ -421,7 +447,7 @@ fn fragmented_merkle_subsets_enforce_sequence_unless_a_seek_is_expected() {
         &stream.init,
         &reordered,
         "video/mp4",
-        &options(),
+        &stream.options(),
     )
     .expect("reordered fragments are reported");
     assert_eq!(report.integrity, "invalid");
@@ -433,7 +459,7 @@ fn an_unevaluated_merkle_fragment_tree_is_never_reported_as_matched() {
     // PRD 5.9. With no fragments supplied there is nothing to say about the
     // fragment trees, and the report must not say it with the success code.
     let stream = Stream::load("fmp4-merkle-2.2");
-    let report = encypher_c2pa::verify_with_options(&stream.init, "video/mp4", &options())
+    let report = encypher_c2pa::verify_with_options(&stream.init, "video/mp4", &stream.options())
         .expect("init segment verifies alone");
 
     assert!(
@@ -450,6 +476,58 @@ fn an_unevaluated_merkle_fragment_tree_is_never_reported_as_matched() {
     assert!(success_codes(&report).contains(&ASSERTION_BMFF_HASH_MATCH));
 }
 
+/// Byte offset of the `id` field of `segment`'s C2PA `emsg`: after the scheme,
+/// the `fseg` value, and the timescale, delta and duration fields.
+fn c2pa_event_id_offset(segment: &[u8]) -> usize {
+    const PREFIX: &[u8] = b"urn:c2pa:verifiable-segment-info\0fseg\0";
+    segment
+        .windows(PREFIX.len())
+        .position(|bytes| bytes == PREFIX)
+        .expect("segment carries a C2PA emsg")
+        + PREFIX.len()
+        + 12
+}
+
+#[test]
+fn a_reused_event_id_in_a_signed_session_is_refused() {
+    // C2PA 2.4 19.4.2: event ids are unique within the session. The id sits in
+    // the excluded emsg, outside signature and hash, so relabelling segment 2
+    // with segment 1's id leaves every signature and digest intact.
+    let mut stream = Stream::load("fmp4-verifiable-segment-info");
+    let first = c2pa_event_id_offset(&stream.segments[0]);
+    let first_id: [u8; 4] = stream.segments[0][first..first + 4].try_into().unwrap();
+    let second = c2pa_event_id_offset(&stream.segments[1]);
+    assert_ne!(
+        stream.segments[1][second..second + 4],
+        first_id,
+        "fixture ids are distinct"
+    );
+    stream.segments[1][second..second + 4].copy_from_slice(&first_id);
+
+    let report = encypher_c2pa::verify_stream_with_options(
+        &stream.init,
+        &stream.refs(),
+        "video/mp4",
+        StreamEncapsulation::Fmp4,
+        StreamMethod::VerifiableSegmentInfo,
+        &stream.options(),
+    )
+    .expect("a relabelled stream is reported");
+    assert_eq!(report.integrity, "invalid");
+    let stream_report = report.stream.as_ref().expect("stream report");
+    assert!(
+        stream_report
+            .validation_results
+            .failure
+            .iter()
+            .any(
+                |status| status.code == LIVEVIDEO_SEGMENT_INVALID && status.url == "self#segment=2"
+            ),
+        "{:?}",
+        failure_codes(stream_report)
+    );
+}
+
 #[test]
 fn a_stream_presented_under_the_wrong_encapsulation_is_refused() {
     // The brand gate is a Conformance Program 0.2 requirement: an fMP4 stream
@@ -462,7 +540,7 @@ fn a_stream_presented_under_the_wrong_encapsulation_is_refused() {
         "video/mp4",
         StreamEncapsulation::Cmaf,
         StreamMethod::VerifiableSegmentInfo,
-        &options(),
+        &stream.options(),
     )
     .expect_err("fMP4 bytes must not verify as CMAF");
     assert!(
