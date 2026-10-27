@@ -156,6 +156,13 @@ enum Command {
         /// RFC 3339 validation instant (default: current UTC time).
         #[arg(long, visible_alias = "validation-time", value_name = "RFC3339")]
         time: Option<String>,
+        /// Trusted RFC 3339 presentation time of one session-key stream
+        /// segment, in `--fragment` order. Repeat once per `--fragment`, or
+        /// omit to assess every segment's key window at `--time`. Supply only
+        /// times your own records vouch for; segment `iat` is never used
+        /// in their place.
+        #[arg(long, value_name = "RFC3339", requires = "encapsulation")]
+        stream_presentation_time: Vec<String>,
         /// Send anonymous, bounded validation failure codes to Encypher.
         #[arg(long)]
         telemetry: bool,
@@ -269,6 +276,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             cawg_strict_encoding,
             strict_conformance,
             time,
+            stream_presentation_time,
             telemetry,
             no_telemetry,
             telemetry_endpoint,
@@ -331,6 +339,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 cawg_strict_encoding,
                 strict_conformance,
                 validation_time: time,
+                stream_presentation_times: nonempty(stream_presentation_time),
                 telemetry: TelemetryOptions {
                     enabled: explicit_telemetry,
                     endpoint: telemetry_endpoint,

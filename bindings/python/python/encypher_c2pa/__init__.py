@@ -32,7 +32,7 @@ __all__ = [
     "verify",
     "verify_stream",
 ]
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 
 Asset = Union[bytes, bytearray, memoryview, str, Path]
 _MAX_PATH_ASSET_BYTES = 128 * 1024 * 1024
@@ -254,6 +254,7 @@ def verify_stream(
     cawg_strict_encoding: bool = False,
     strict_conformance: bool = False,
     validation_time: Optional[str] = None,
+    stream_presentation_times: Optional[Sequence[str]] = None,
     telemetry: Optional[bool] = None,
     telemetry_endpoint: Optional[str] = None,
     online: Optional[bool] = None,
@@ -275,11 +276,24 @@ def verify_stream(
     ``expected_seek_positions`` contains zero-based indexes into ``segments``
     where the player expects a discontinuity.
 
+    ``stream_presentation_times`` is one trusted RFC 3339 instant per entry in
+    ``segments``, in the same order. Each session-key segment's key window is
+    checked at its own instant instead of ``validation_time``, which still
+    governs certificate trust; sequence continuity is still enforced across
+    segments signed under different keys. The verifier takes these instants on
+    the caller's word and never reads them from the segments, so supply them
+    only from a record you control. ``None`` checks every segment at
+    ``validation_time`` (default now); a time stamp on the init manifest does
+    not date later segments. A malformed instant or a count that differs from
+    ``len(segments)`` raises; Merkle-bound and per-segment streams refuse it.
+
     The returned report carries a top-level ``integrity``, the init manifest's
     report under ``stream``, per-segment reports under ``segments``, and the
     recomputed ``chain_valid`` for per-segment streams. Trust and telemetry
     options behave exactly as in :func:`verify`.
     """
+    if isinstance(stream_presentation_times, (str, bytes)):
+        raise TypeError("stream_presentation_times must be a sequence of RFC 3339 strings")
     options = {
         "trust_pem": trust_pem,
         "tsa_trust_pem": tsa_trust_pem,
@@ -306,6 +320,9 @@ def verify_stream(
         "cawg_strict_encoding": bool(cawg_strict_encoding),
         "strict_conformance": bool(strict_conformance),
         "validation_time": validation_time,
+        "stream_presentation_times": list(stream_presentation_times)
+        if stream_presentation_times is not None
+        else None,
         "online": online,
         "online_allow_private_networks": bool(online_allow_private_networks),
         "telemetry": {

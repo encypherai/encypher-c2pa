@@ -276,14 +276,22 @@ pub(crate) fn verify_signature(
     signature: &[u8],
     cert_der: &[u8],
 ) -> Result<(), CryptoError> {
+    use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+    use p256::pkcs8::DecodePublicKey as _;
     use sha2::Digest as _;
-    use signature::{hazmat::PrehashVerifier as _, Verifier as _};
+    use signature::Verifier as _;
+
+    // The EC stack (ecdsa 0.17, spki 0.8) and the RSA/Ed25519 stack
+    // (signature 2, spki 0.7) report distinct error types; both map to the
+    // same verifier error.
+    fn bad(e: impl std::fmt::Display) -> CryptoError {
+        CryptoError::Verify(e.to_string())
+    }
+    fn key_err<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> CryptoError {
+        move |e| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
+    }
 
     let spki = leaf_spki_der(cert_der)?;
-    let bad = |e: signature::Error| CryptoError::Verify(e.to_string());
-    let key_err = |what: &'static str| {
-        move |e: spki::Error| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
-    };
 
     if matches!(alg, CoseAlg::Es256 | CoseAlg::Es384 | CoseAlg::Es512) {
         let digest = match alg {
@@ -314,13 +322,8 @@ pub(crate) fn verify_signature(
                     .map_err(bad)
             }
             EcCurve::P521 => {
-                use p521::elliptic_curve::sec1::ToEncodedPoint;
-                let public_key =
-                    p521::PublicKey::from_public_key_der(&spki).map_err(key_err("P-521"))?;
-                let verifying_key = p521::ecdsa::VerifyingKey::from_encoded_point(
-                    &public_key.to_encoded_point(false),
-                )
-                .map_err(bad)?;
+                let verifying_key = p521::ecdsa::VerifyingKey::from_public_key_der(&spki)
+                    .map_err(key_err("P-521"))?;
                 let signature = p521::ecdsa::Signature::from_slice(signature)
                     .or_else(|_| p521::ecdsa::Signature::from_der(signature))
                     .map_err(bad)?;

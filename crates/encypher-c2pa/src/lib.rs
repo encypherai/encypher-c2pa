@@ -228,6 +228,32 @@ pub struct VerifyOptions {
     pub cawg_strict_encoding: bool,
     /// RFC 3339 validation instant. Current UTC time is used when omitted.
     pub validation_time: Option<String>,
+    /// Trusted presentation-assessment instants for stream segments, RFC 3339,
+    /// exactly one per supplied segment and in the same order. Entry `i` is
+    /// the instant at which segment `i`'s C2PA 2.4 session-key validity window
+    /// is judged. `validation_time` still governs certificate and trust-list
+    /// evaluation of the init manifest; these instants never move that clock.
+    ///
+    /// The caller vouches for every entry. Supply each from your own trusted
+    /// record of when that segment was presented, such as an ingest log or a
+    /// packager clock you operate. The verifier never derives them from a
+    /// segment's own signed `iat`: that self-asserted time remains an
+    /// additional check inside the key window and never substitutes for the
+    /// caller's instant. `None` assesses every segment at `validation_time`,
+    /// which itself defaults to now. A time stamp on the init manifest proves
+    /// when the init segment was signed; it does not time stamp later
+    /// segments, so a historical archive needs these instants to verify
+    /// segments whose keys have since expired.
+    ///
+    /// Sequence continuity is still enforced across the whole supplied run, so
+    /// segments signed under different session keys, each valid at its own
+    /// instant, verify as one unbroken stream. Applies only to session-key
+    /// live streams verified through [`verify_stream_with_options`]; a
+    /// Merkle-bound or per-segment stream refuses it, as does
+    /// [`verify_fragmented_with_options`]. Single-asset verification ignores
+    /// it. A malformed entry, or a count that differs from the number of
+    /// segments supplied, fails the call before any segment is judged.
+    pub stream_presentation_times: Option<Vec<String>>,
     /// Failure telemetry override. `None` uses the saved per-user preference.
     pub telemetry: TelemetryOptions,
     /// Allow this verification to fetch what the asset references: a manifest
@@ -259,8 +285,14 @@ impl VerifyOptions {
     ///
     /// Path-based adapters call this before opening asset files so malformed
     /// trust material and invalid validation instants fail deterministically.
+    /// The per-segment count of `stream_presentation_times` needs the segments
+    /// and is checked by the stream entry point itself.
     pub fn validate(&self) -> Result<(), Error> {
-        ResolvedOptions::resolve(self).map(|_| ())
+        ResolvedOptions::resolve(self)?;
+        for (index, raw) in self.stream_presentation_times.iter().flatten().enumerate() {
+            parse_stream_presentation_time(raw, index)?;
+        }
+        Ok(())
     }
 }
 
@@ -584,6 +616,8 @@ pub fn detached_manifest_evidence(
 ///
 /// `mime_type` describes `asset`, not the store. `application/c2pa` is
 /// rejected: the content side must be a real asset.
+/// WebM, ICO, BMP, raw AAC, and WOFF media are supported only on this explicit
+/// sidecar path, using a whole-file data hash without exclusions.
 pub fn verify_with_manifest_store(
     asset: &[u8],
     manifest_store: &[u8],
@@ -602,7 +636,14 @@ fn verify_with_manifest_store_inner(
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
-    let mime = resolve_mime(mime_type)?;
+    let mime = crate::c2pa_formats::canonicalize_detached_mime(mime_type);
+    let format = crate::c2pa_formats::AssetFormat::from_detached_content(&mime, asset)
+        .map_err(|error| Error::Verification(error.to_string()))?;
+    let mime = if format == Some(crate::c2pa_formats::AssetFormat::ExternalMedia) {
+        mime
+    } else {
+        resolve_mime(mime_type)?
+    };
     let (mut report, needs, _) = detached_pass(asset, manifest_store, &mime, options)?;
     let (network, evidence) = online::gather(options, &needs);
     if evidence.is_empty() {
@@ -755,6 +796,14 @@ pub fn verify_fragmented_with_options(
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
+    if options.stream_presentation_times.is_some() {
+        return Err(Error::InvalidValidationTime(
+            "stream_presentation_times: per-segment presentation times apply only to \
+             session-key live streams verified with verify_stream_with_options; \
+             Merkle-bound fragments are assessed at validation_time"
+                .into(),
+        ));
+    }
     let resolved = ResolvedOptions::resolve(options)?;
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let mime = canonicalize_mime(mime_type);
@@ -1443,6 +1492,29 @@ fn parse_optional_instant(
         .map(|raw| {
             OffsetDateTime::parse(raw, &Rfc3339)
                 .map_err(|error| Error::InvalidValidationTime(format!("{field}: {error}")))
+        })
+        .transpose()
+}
+
+fn parse_stream_presentation_time(raw: &str, index: usize) -> Result<OffsetDateTime, Error> {
+    OffsetDateTime::parse(raw, &Rfc3339).map_err(|error| {
+        Error::InvalidValidationTime(format!("stream_presentation_times[{index}]: {error}"))
+    })
+}
+
+/// Parse caller-supplied per-segment presentation instants, naming the first
+/// malformed entry by index. `None` stays `None`: the stream is then assessed
+/// at `validation_time`, never at a time read from the segments themselves.
+pub(crate) fn parse_stream_presentation_times(
+    values: Option<&[String]>,
+) -> Result<Option<Vec<OffsetDateTime>>, Error> {
+    values
+        .map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| parse_stream_presentation_time(raw, index))
+                .collect()
         })
         .transpose()
 }

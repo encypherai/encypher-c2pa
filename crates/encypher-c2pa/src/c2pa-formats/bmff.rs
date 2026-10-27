@@ -565,6 +565,11 @@ struct BmffHashPlan {
     roots: Vec<BmffRootContribution>,
 }
 
+/// Box types whose payload opens with the ISO/IEC 14496-12 FullBox
+/// `version`/`flags` word, so 18.6.2 `version` and `flags` exclusion
+/// qualifiers can match them. `emsg` (ISO/IEC 23009-1 event message) is a
+/// FullBox in both versions; without it here, a qualified `/emsg` exclusion
+/// could never match.
 fn is_full_box(box_type: &[u8; 4]) -> bool {
     matches!(
         box_type,
@@ -633,6 +638,7 @@ fn is_full_box(box_type: &[u8; 4]) -> bool {
             | b"sidx"
             | b"ssix"
             | b"prft"
+            | b"emsg"
             | b"srpp"
             | b"vmhd"
             | b"smhd"
@@ -1168,6 +1174,18 @@ pub fn bmff_hash_with_exclusions(
         }
     }
     Ok(hasher.finalize())
+}
+
+/// The byte ranges `exclusions` remove from a BMFF V2/V3 hash of `data`,
+/// sorted and merged, resolved by the same qualified matcher as
+/// [`bmff_hash_with_exclusions`] (nested xpaths, `length`, `version`, `flags`,
+/// box-relative `data` offsets and `subset` maps). A caller that must prove an
+/// exclusion is narrow inspects exactly the bytes the hash will skip.
+pub fn bmff_excluded_ranges(
+    data: &[u8],
+    exclusions: &[BmffExclusionMap],
+) -> Result<Vec<(usize, usize)>, FormatError> {
+    normalized_bmff_ranges(data, exclusions).map(|plan| plan.ranges)
 }
 
 /// Streaming equivalent of [`bmff_hash`] for assets too large to hold in memory.
@@ -2901,5 +2919,75 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// An event message with the given FullBox word, written with the ordinary
+    /// 32-bit header or the 64-bit `largesize` header.
+    fn emsg_box(version: u8, flags: u32, large: bool) -> Vec<u8> {
+        let mut payload = vec![version];
+        payload.extend_from_slice(&flags.to_be_bytes()[1..]);
+        payload.extend_from_slice(b"urn:example:event\0v\0");
+        payload.extend_from_slice(&[0; 20]);
+        if !large {
+            return iso_box(b"emsg", &payload);
+        }
+        let mut boxed = Vec::from(1u32.to_be_bytes());
+        boxed.extend_from_slice(b"emsg");
+        boxed.extend_from_slice(&u64::try_from(16 + payload.len()).unwrap().to_be_bytes());
+        boxed.extend_from_slice(&payload);
+        boxed
+    }
+
+    #[test]
+    fn emsg_version_and_flags_qualifiers_match_in_both_header_forms() {
+        let qualified = |version: Option<u8>, flags: Option<u32>, exact: bool| BmffExclusionMap {
+            xpath: "/emsg".into(),
+            length: None,
+            data: Vec::new(),
+            subset: Vec::new(),
+            version,
+            flags,
+            exact,
+        };
+        for large in [false, true] {
+            let ftyp = iso_box(b"ftyp", b"isom\0\0\0\0isomiso6");
+            let asset = [ftyp.clone(), emsg_box(1, 0x05, large)].concat();
+            let whole = vec![(ftyp.len(), asset.len())];
+            let ranges = |map: BmffExclusionMap| {
+                normalized_bmff_ranges(&asset, std::slice::from_ref(&map))
+                    .unwrap()
+                    .ranges
+            };
+            // Matching qualifiers: the FullBox word is read after the header,
+            // which is 16 bytes long in the largesize form.
+            assert_eq!(
+                ranges(qualified(Some(1), None, false)),
+                whole,
+                "large={large}"
+            );
+            assert_eq!(
+                ranges(qualified(Some(1), Some(0x05), true)),
+                whole,
+                "exact flags, large={large}"
+            );
+            assert_eq!(
+                ranges(qualified(None, Some(0x04), false)),
+                whole,
+                "flag mask, large={large}"
+            );
+            // Mismatching qualifiers select nothing.
+            assert!(
+                ranges(qualified(Some(0), None, false)).is_empty(),
+                "version 0 against a version 1 emsg, large={large}"
+            );
+            assert!(
+                ranges(qualified(Some(1), Some(0x04), true)).is_empty(),
+                "exact flags differ, large={large}"
+            );
+            assert!(
+                ranges(qualified(None, Some(0x08), false)).is_empty(),
+                "flag mask bit absent, large={large}"
+            );
+        }
     }
 }

@@ -79,6 +79,12 @@ char *encypher_c2pa_verify_fragmented(
  *
  * The report carries a top-level integrity, the init manifest report under
  * stream, and, for a per-segment stream, segments plus chain_valid.
+ *
+ * options_json may set "stream_presentation_times": an array of exactly
+ * segment_count trusted RFC 3339 instants, in segment order. Each session-key
+ * segment's key window is then checked at its own instant instead of
+ * "validation_time". A malformed instant or a different count is refused with
+ * invalid_validation_time; Merkle-bound and per-segment streams refuse it.
  */
 char *encypher_c2pa_verify_stream(
     const uint8_t *asset,

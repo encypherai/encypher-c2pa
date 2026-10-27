@@ -86,6 +86,18 @@ type Options struct {
 	ExpectedSeekPositions []int  `json:"expected_seek_positions,omitempty"`
 	StrictConformance     bool   `json:"strict_conformance,omitempty"`
 	ValidationTime        string `json:"validation_time,omitempty"`
+	// StreamPresentationTimes are trusted RFC 3339 presentation instants, one
+	// per segment passed to VerifyStream and in the same order. Each
+	// session-key segment's key window is checked at its own instant;
+	// ValidationTime still governs certificate trust, and sequence continuity
+	// is still enforced across segments signed under different keys. The
+	// verifier takes these instants on the caller's word and never reads them
+	// from the segments, so supply them only from a record you control. Nil
+	// checks every segment at ValidationTime (default now). A non-nil slice
+	// must hold exactly one entry per segment, so an empty non-nil slice is
+	// refused rather than treated as absent. Merkle-bound and per-segment
+	// streams, and VerifyFragmented, refuse it.
+	StreamPresentationTimes []string `json:"stream_presentation_times"`
 	// Online allows this call to fetch what the asset references: a manifest
 	// store held elsewhere, certificate revocation status, a did:web
 	// document, externally stored content. Nil leaves it off unless the
@@ -404,7 +416,8 @@ func VerifyFragmented(initSegment []byte, fragments [][]byte, mimeType string, o
 // segments in playback order. Both files' declared brands are checked against
 // encapsulation, so a stream presented under the wrong one is refused rather
 // than verified.
-// Mark intentional discontinuities in Options.ExpectedSeekPositions.
+// Mark intentional discontinuities in Options.ExpectedSeekPositions, and pass
+// trusted per-segment presentation times in Options.StreamPresentationTimes.
 func VerifyStream(initSegment []byte, segments [][]byte, mimeType string, encapsulation StreamEncapsulation, method StreamMethod, options *Options) (*StreamReport, error) {
 	if mimeType == "" {
 		return nil, errors.New("mime type is required")
