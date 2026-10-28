@@ -44,7 +44,7 @@ __all__ = [
     "verify_with_caller_verified_binding",
     "verify_stream",
 ]
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 Asset = Union[bytes, bytearray, memoryview, str, Path]
 _MAX_PATH_ASSET_BYTES = 128 * 1024 * 1024
