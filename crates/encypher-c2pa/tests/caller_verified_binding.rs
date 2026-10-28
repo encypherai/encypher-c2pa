@@ -346,6 +346,190 @@ fn caller_built_cawg_and_binding_share_the_supplied_graph_budget() {
 }
 
 #[test]
+fn evaluator_driven_strict_verification_emits_genuine_content_credentials() {
+    let asset = vector(ES256_JPEG);
+    let store = store_of(&asset, "image/jpeg");
+    for version in ["2.2", "2.4", "2.5"] {
+        let profile =
+            CawgProfile::new(version, true, version != "2.5").expect("matching strict posture");
+        let evaluator = CawgEvaluator::new(&es256_options(), &profile).expect("evaluator");
+        let options = offline(VerifyOptions {
+            spec_version: Some(version.into()),
+            strict_conformance: true,
+            allowed_list_pem: Some(text("generated/identity-1.2/trust/claim-allowed.pem")),
+            validation_time: Some("2026-08-06T00:00:00Z".into()),
+            ..VerifyOptions::default()
+        });
+        let embedded = verify_with_cawg(
+            &asset,
+            "image/jpeg",
+            &options,
+            &evaluator,
+            GraphInputs::default(),
+        )
+        .expect("strict evaluator-driven verification");
+        let direct = verify_with_options(
+            &asset,
+            "image/jpeg",
+            &VerifyOptions {
+                spec_version: Some(version.into()),
+                strict_conformance: true,
+                ..es256_options()
+            },
+        )
+        .expect("strict direct verification");
+        assert!(embedded.content_credentials.is_some(), "{version}");
+        assert_eq!(
+            embedded.content_credentials, direct.content_credentials,
+            "{version}: genuine kernel diagnostics match direct verification",
+        );
+
+        let target = binding_target(&store, CawgStoreHost::Asset, &options)
+            .expect("binding target")
+            .expect("unique binding");
+        let evidence = CallerBindingEvidence::new(
+            target,
+            CallerBindingVerdict::Match,
+            "strict diagnostics regression",
+        )
+        .expect("caller evidence");
+        let bound = verify_with_caller_verified_binding_and_cawg(
+            &store,
+            "image/jpeg",
+            CawgStoreHost::Asset,
+            &evidence,
+            &options,
+            &evaluator,
+            GraphInputs::default(),
+        )
+        .expect("strict caller-bound verification");
+        if version == "2.5" {
+            assert_eq!(bound.integrity, "valid");
+            assert!(bound
+                .validation_results
+                .informational
+                .iter()
+                .any(|status| status.code == "com.encypher.hardBinding.callerVerified"));
+        } else {
+            // The retained program profiles reject this fixture's non-SemVer
+            // declaration before accepting caller proof.
+            assert!(!bound.validation_results.failure.is_empty(), "{version}");
+        }
+        let crjson = bound
+            .content_credentials
+            .expect("caller-bound kernel crJSON");
+        assert_eq!(
+            crjson["manifests"][0]["label"], bound.manifest_report["active_manifest"],
+            "{version}: diagnostics describe the verified active manifest",
+        );
+        for bucket in ["success", "informational", "failure"] {
+            let actual = bound.manifest_report["validation_results"]["activeManifest"][bucket]
+                .as_array()
+                .expect("actual status group");
+            let expected: Vec<serde_json::Value> = actual
+                .iter()
+                .map(|status| {
+                    let mut projected = serde_json::Map::new();
+                    for key in ["code", "url", "explanation"] {
+                        if let Some(value) = status.get(key) {
+                            projected.insert(key.into(), value.clone());
+                        }
+                    }
+                    serde_json::Value::Object(projected)
+                })
+                .collect();
+            assert_eq!(
+                crjson["manifests"][0]["validationResults"][bucket],
+                serde_json::Value::Array(expected),
+                "{version}: {bucket} diagnostics must exactly retain the actual verdict",
+            );
+        }
+    }
+}
+
+#[test]
+fn evaluator_driven_regular_verification_preserves_default_reports() {
+    let asset = vector(ES256_JPEG);
+    for version in [None, Some("2.2"), Some("2.4"), Some("2.5")] {
+        let profile =
+            CawgProfile::new(version.unwrap_or("2.4"), false, false).expect("regular core posture");
+        let evaluator = CawgEvaluator::new(&es256_options(), &profile).expect("evaluator");
+        let options = offline(VerifyOptions {
+            spec_version: version.map(str::to_owned),
+            allowed_list_pem: Some(text("generated/identity-1.2/trust/claim-allowed.pem")),
+            validation_time: Some("2026-08-06T00:00:00Z".into()),
+            ..VerifyOptions::default()
+        });
+        let evaluated = verify_with_cawg(
+            &asset,
+            "image/jpeg",
+            &options,
+            &evaluator,
+            GraphInputs::default(),
+        )
+        .expect("regular evaluator-driven verification");
+        let direct = verify_with_options(
+            &asset,
+            "image/jpeg",
+            &VerifyOptions {
+                spec_version: version.map(str::to_owned),
+                ..es256_options()
+            },
+        )
+        .expect("regular direct verification");
+        assert!(evaluated.content_credentials.is_none(), "{version:?}");
+        assert_eq!(
+            serde_json::to_value(&evaluated).expect("evaluated report"),
+            serde_json::to_value(&direct).expect("direct report"),
+            "{version:?}: regular and default reports remain unchanged",
+        );
+    }
+}
+
+#[test]
+fn admissible_regular_caller_binding_preserves_real_results_without_crjson() {
+    let asset = vector(ES256_JPEG);
+    let store = store_of(&asset, "image/jpeg");
+    let evaluator = CawgEvaluator::new(&es256_options(), &generous()).expect("evaluator");
+    let options = offline(VerifyOptions {
+        allowed_list_pem: Some(text("generated/identity-1.2/trust/claim-allowed.pem")),
+        validation_time: Some("2026-08-06T00:00:00Z".into()),
+        ..VerifyOptions::default()
+    });
+    let target = binding_target(&store, CawgStoreHost::Asset, &options)
+        .expect("binding target")
+        .expect("unique binding");
+    let evidence = CallerBindingEvidence::new(
+        target,
+        CallerBindingVerdict::Match,
+        "regular diagnostics regression",
+    )
+    .expect("caller evidence");
+    let report = verify_with_caller_verified_binding_and_cawg(
+        &store,
+        "image/jpeg",
+        CawgStoreHost::Asset,
+        &evidence,
+        &options,
+        &evaluator,
+        GraphInputs::default(),
+    )
+    .expect("admissible regular caller binding");
+    assert_eq!(report.integrity, "valid", "{report:?}");
+    assert!(report
+        .validation_results
+        .success
+        .iter()
+        .any(|status| status.code == "assertion.dataHash.match"));
+    assert!(report
+        .validation_results
+        .informational
+        .iter()
+        .any(|status| status.code == "com.encypher.hardBinding.callerVerified"));
+    assert!(report.content_credentials.is_none());
+}
+
+#[test]
 fn unknown_spec_versions_are_rejected() {
     for version in ["2.6", "9.9", "2.5.0", ""] {
         let error = CawgProfile::new(version, false, false).expect_err(version);

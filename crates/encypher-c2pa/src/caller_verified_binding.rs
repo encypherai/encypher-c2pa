@@ -365,7 +365,10 @@ impl CawgEvaluator {
             ..options.clone()
         };
         let mut resolved = ResolvedOptions::resolve(&c2pa_only)?;
-        resolved.profile = profile;
+        // Posture remains the evaluator's authority. The compatible strict
+        // request above also asks for diagnostics; installing its profile must
+        // not discard that request merely because CawgProfile has no debug knob.
+        resolved.profile = profile.with_debug(profile.debug || options.strict_conformance);
         resolved.validation_time = self.resolved.validation_time;
         resolved.validation_time_text = self.resolved.validation_time_text.clone();
         resolved.cawg_strict_encoding = self.resolved.cawg_strict_encoding;

@@ -42,6 +42,10 @@ All notable changes to this project are recorded here.
 - Exact 2.5 ZIP verification checks local CRC and sizes against the central directory, resolves local ZIP64 size fields, rejects inconsistent classic/ZIP64 end records and nonzero disk starts, and consumes ZIP64 extra fields exactly. Earlier policies remain unchanged.
 - Exact 2.5 ZIP extraction and verification use the same structural rules, including complete ZIP64 descriptors when only the local header uses ZIP64. ZIP assets require a collection primary binding; a single prehashed digest is insufficient. Empty collections are malformed under exact 2.5, including caller-verified evidence.
 
+### Fixed
+
+- Evaluator-driven strict verification retains the caller's diagnostic request and emits the kernel's Content Credentials JSON, including caller-verified-binding results. The evaluator still owns the selected revision, compliance posture, CAWG inputs and validation instant. Regular and default verification keep their existing report behavior.
+
 ## 1.7.0 - 2026-10-01
 
 ### Added
