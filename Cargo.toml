@@ -43,6 +43,9 @@ signature = "2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 cms = "0.2.3"
 x509-tsp = "0.1.0"
+# 0.1.1 or later: earlier releases carry RUSTSEC-2025-0144 and
+# GHSA-5x2r-hc65-25f9 / GHSA-h37v-hp6w-2pp8 verification defects.
+ml-dsa = { version = "0.1.1", default-features = false }
 ureq = { version = "2.12.1", default-features = false, features = ["json", "tls"] }
 
 [profile.release]

@@ -11,11 +11,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use encypher_c2pa::{
-    allow_interactive_online_consent, detached_manifest_evidence, mime_from_path,
-    online_preference, set_online_preference, set_telemetry_enabled, supported_mime_types,
-    telemetry_preference, verify_file, verify_fragmented_with_options, verify_stream_with_options,
-    verify_with_manifest_store, verify_with_options, CawgTrustConfiguration, Error,
-    OnlinePreference, StreamEncapsulation, StreamMethod, TelemetryOptions, VerifyOptions,
+    allow_interactive_online_consent, binding_target, detached_manifest_evidence_with_options,
+    mime_from_path, online_preference, request_soft_binding_receipt_verification,
+    resolve_soft_binding, set_online_preference, set_telemetry_enabled, supported_mime_types_for,
+    telemetry_preference, verify_ertmp_with_options, verify_file, verify_fragmented_with_options,
+    verify_manifest_store_only, verify_stream_with_options, verify_with_caller_verified_binding,
+    verify_with_manifest_store, verify_with_options, CallerBindingEvidence, CallerBindingVerdict,
+    CawgStoreHost, CawgTrustConfiguration, Error, ErtmpInput, GraphInputs, ManifestBindingTarget,
+    OnlinePreference, SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation,
+    StreamMethod, TelemetryOptions, TrustListSource, VerifyOptions,
 };
 
 mod encypher_api;
@@ -103,9 +107,17 @@ enum Command {
         /// Claim-signer trust anchors (PEM bundle). Repeatable; bundles merge.
         #[arg(long, value_name = "PEM")]
         trust: Vec<PathBuf>,
+        /// Claim trust sources with crJSON provenance. Each file is a JSON
+        /// array of `{uri,type,identifier?,certificates_pem}` entries.
+        #[arg(long, value_name = "JSON")]
+        claim_trust_sources: Vec<PathBuf>,
         /// Timestamp-authority trust anchors (PEM bundle). Repeatable.
         #[arg(long, value_name = "PEM")]
         tsa_trust: Vec<PathBuf>,
+        /// TSA trust sources with crJSON provenance. Each file is a JSON array
+        /// of `{uri,type,identifier?,certificates_pem}` entries.
+        #[arg(long, value_name = "JSON")]
+        tsa_trust_sources: Vec<PathBuf>,
         /// Directly allowed end-entity certificates (PEM bundle). Repeatable.
         #[arg(long, visible_alias = "allowed-certs", value_name = "PEM")]
         allowed: Vec<PathBuf>,
@@ -148,11 +160,17 @@ enum Command {
         /// without the rest of the conformance posture.
         #[arg(long)]
         cawg_strict_encoding: bool,
-        /// Apply the C2PA 2.4 Conformance Program posture: SHOULD requirements
-        /// the program raises become failures, and CAWG signer payloads must
-        /// use CAWG Identity 1.3 deterministic CBOR.
+        /// Apply strict technical validation. With C2PA 2.4 this is the
+        /// published Conformance Program posture. With 2.5 it is conformance
+        /// mode under the core-spec bar, not certified scope or an unpublished
+        /// program profile.
         #[arg(long)]
         strict_conformance: bool,
+        /// C2PA validation policy: `2.2`, `2.4` (the default and current
+        /// behavior), or `2.5` (the published standard). Any other value fails with
+        /// `unsupported_spec_version` before the asset is read.
+        #[arg(long, visible_alias = "spec-version", value_name = "2.2|2.4|2.5")]
+        spec: Option<String>,
         /// RFC 3339 validation instant (default: current UTC time).
         #[arg(long, visible_alias = "validation-time", value_name = "RFC3339")]
         time: Option<String>,
@@ -199,6 +217,104 @@ enum Command {
         #[arg(long, value_name = "URL", hide = true)]
         encypher_api_endpoint: Option<String>,
     },
+    /// Validate a C2PA Manifest Store without claiming an asset-content match.
+    VerifyStore {
+        manifest: PathBuf,
+        /// JSON file matching VerifyOptions.
+        #[arg(long, value_name = "JSON")]
+        options: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Derive the exact hard-binding target a trusted caller must compare.
+    BindingTarget {
+        manifest: PathBuf,
+        #[arg(long)]
+        hostless: bool,
+        #[arg(long, value_name = "JSON")]
+        options: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a store using an asset comparison made by a trusted caller.
+    VerifyCallerBinding {
+        manifest: PathBuf,
+        #[arg(long, value_name = "MIME")]
+        mime: String,
+        /// JSON target emitted by `binding-target`.
+        #[arg(long, value_name = "JSON")]
+        target: PathBuf,
+        #[arg(long)]
+        engine: String,
+        #[arg(long)]
+        hostless: bool,
+        #[arg(long, conflicts_with = "mismatch")]
+        matched: bool,
+        #[arg(long, value_name = "EXPLANATION", conflicts_with = "matched")]
+        mismatch: Option<String>,
+        #[arg(long, value_name = "JSON")]
+        options: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify caller-parsed Enhanced RTMP events in exact transmission order.
+    VerifyErtmp {
+        /// JSON file containing bilateral capsEx, objectEncoding and events.
+        input: PathBuf,
+        /// JSON file matching VerifyOptions. Omission selects C2PA 2.5.
+        #[arg(long, value_name = "JSON")]
+        options: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recover and verify manifests through an explicitly allowlisted service.
+    ResolveSoftBinding {
+        asset: PathBuf,
+        #[arg(long)]
+        mime: Option<String>,
+        /// Service origin or base URL hosting the well-known discovery document.
+        #[arg(long, value_name = "URL")]
+        service_root: String,
+        /// JSON file containing one explicitly tagged query route.
+        #[arg(long, value_name = "JSON")]
+        query: PathBuf,
+        /// Exact allowed endpoint origin (`scheme://host[:port]`). Repeat for
+        /// every discovery, federation, or repository origin.
+        #[arg(long, value_name = "ORIGIN", required = true)]
+        allowed_origin: Vec<String>,
+        /// Permit explicitly allowlisted private destinations and plaintext HTTP.
+        #[arg(long)]
+        allow_private_networks: bool,
+        /// Maximum matches requested from the service (1-100; default 10).
+        #[arg(long, default_value_t = 10)]
+        max_results: u16,
+        /// Fetch the service's optional status document as operational evidence.
+        #[arg(long)]
+        fetch_status: bool,
+        /// Fetch repository-reported receipt evidence for recovered manifests.
+        #[arg(long)]
+        fetch_receipts: bool,
+        /// JSON file matching VerifyOptions. The service cannot select policy.
+        #[arg(long, value_name = "JSON")]
+        options: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a repository to report whether a caller-supplied receipt verifies.
+    VerifySoftBindingReceipt {
+        #[arg(long, value_name = "URL")]
+        service_root: String,
+        #[arg(long)]
+        manifest_id: String,
+        #[arg(long, value_name = "JSON")]
+        receipt: PathBuf,
+        #[arg(long, value_name = "ORIGIN", required = true)]
+        allowed_origin: Vec<String>,
+        #[arg(long)]
+        allow_private_networks: bool,
+        #[arg(long, value_name = "JSON")]
+        options: Option<PathBuf>,
+    },
     /// Read or change the saved failure telemetry preference.
     Telemetry {
         #[arg(value_enum)]
@@ -216,8 +332,11 @@ enum Command {
         #[arg(value_enum)]
         setting: UpdateCheckSetting,
     },
-    /// List canonical MIME types covered by the C2PA 2.4 profile.
+    /// List canonical MIME types readable under a caller-selected policy.
     Formats {
+        /// C2PA policy. Omission is exactly 2.4.
+        #[arg(long, visible_alias = "spec-version", value_name = "2.2|2.4|2.5")]
+        spec: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -244,7 +363,15 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     // skip it, so turning the check off never starts with an update prompt.
     if matches!(
         cli.command,
-        Command::Verify { .. } | Command::Formats { .. } | Command::Explain { .. }
+        Command::Verify { .. }
+            | Command::VerifyStore { .. }
+            | Command::BindingTarget { .. }
+            | Command::VerifyCallerBinding { .. }
+            | Command::VerifyErtmp { .. }
+            | Command::ResolveSoftBinding { .. }
+            | Command::VerifySoftBindingReceipt { .. }
+            | Command::Formats { .. }
+            | Command::Explain { .. }
     ) {
         let offline = matches!(cli.command, Command::Verify { offline: true, .. });
         if let Some(code) = update::check_on_start(offline) {
@@ -261,7 +388,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             encapsulation,
             segment_mode,
             trust,
+            claim_trust_sources,
             tsa_trust,
+            tsa_trust_sources,
             allowed,
             cawg_trust,
             cawg_allowed,
@@ -275,6 +404,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             cawg_ica_status_lists,
             cawg_strict_encoding,
             strict_conformance,
+            spec,
             time,
             stream_presentation_time,
             telemetry,
@@ -312,7 +442,15 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             allow_interactive_online_consent();
             let options = VerifyOptions {
                 trust_pem: read_merged_pem(&trust)?,
+                claim_trust_sources: read_trust_list_sources(
+                    &claim_trust_sources,
+                    "claim trust sources",
+                )?,
                 tsa_trust_pem: read_merged_pem(&tsa_trust)?,
+                tsa_trust_sources: read_trust_list_sources(
+                    &tsa_trust_sources,
+                    "TSA trust sources",
+                )?,
                 allowed_list_pem: read_merged_pem(&allowed)?,
                 cawg_trust_pem: read_merged_pem(&cawg_trust)?,
                 cawg_allowed_certs_pem: read_merged_pem(&cawg_allowed)?,
@@ -335,9 +473,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 ocsp_responses: None,
                 ocsp_unreachable: None,
                 external_data: None,
+                external_data_media_types: None,
+                external_data_unreachable: None,
                 expected_seek_positions: expected_seek,
                 cawg_strict_encoding,
                 strict_conformance,
+                spec_version: spec,
                 validation_time: time,
                 stream_presentation_times: nonempty(stream_presentation_time),
                 telemetry: TelemetryOptions {
@@ -382,7 +523,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 };
                 let bytes = read_path_asset(&asset)?;
                 let report = verify_with_options(&bytes, &mime, &options)?;
-                let evidence = detached_manifest_evidence(&bytes, &mime)?;
+                let evidence = detached_manifest_evidence_with_options(&bytes, &mime, &options)?;
                 let endpoint = encypher_api_endpoint
                     .unwrap_or_else(|| encypher_api::DEFAULT_ENDPOINT.to_string());
                 let api_key = std::env::var("ENCYPHER_API_KEY")
@@ -474,6 +615,304 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 ExitCode::from(2)
             })
         }
+        Command::VerifyStore {
+            manifest,
+            options,
+            json,
+        } => {
+            let store = read_path_asset(&manifest)?;
+            let options = if let Some(path) = options {
+                let bytes = read_path_asset(&path)?;
+                serde_json::from_slice::<VerifyOptions>(&bytes).map_err(|error| {
+                    Error::Verification(format!(
+                        "store verification options {}: {error}",
+                        path.display()
+                    ))
+                })?
+            } else {
+                VerifyOptions::default()
+            };
+            let result = verify_manifest_store_only(&store, &options)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(Error::Serialize)?
+                );
+            } else {
+                println!("store integrity: {}", result.report.integrity);
+                println!(
+                    "active manifest: {}",
+                    result.active_manifest_label.as_deref().unwrap_or("none")
+                );
+                println!("manifests: {}", result.store_manifests.len());
+                println!("hard binding: not evaluated");
+            }
+            Ok(if result.report.integrity == "invalid" {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Command::BindingTarget {
+            manifest,
+            hostless,
+            options,
+            json,
+        } => {
+            let store = read_path_asset(&manifest)?;
+            let options = read_verify_options_file(options.as_deref(), "binding target")?;
+            let target = binding_target(
+                &store,
+                if hostless {
+                    CawgStoreHost::HostLess
+                } else {
+                    CawgStoreHost::Asset
+                },
+                &options,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&target).map_err(Error::Serialize)?
+                );
+            } else if let Some(target) = target {
+                println!("active manifest: {}", target.active_manifest_label);
+                println!("binding manifest: {}", target.binding_manifest_label);
+                println!("binding assertion: {}", target.binding_assertion_label);
+                println!(
+                    "manifest store SHA-256: {}",
+                    hex::encode(target.manifest_store_sha256)
+                );
+            } else {
+                println!("no unique operative hard binding");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::VerifyCallerBinding {
+            manifest,
+            mime,
+            target,
+            engine,
+            hostless,
+            matched,
+            mismatch,
+            options,
+            json,
+        } => {
+            let store = read_path_asset(&manifest)?;
+            let target_bytes = read_path_asset(&target)?;
+            let target: ManifestBindingTarget =
+                serde_json::from_slice(&target_bytes).map_err(|error| {
+                    Error::Verification(format!("binding target {}: {error}", target.display()))
+                })?;
+            let verdict = match (matched, mismatch) {
+                (true, None) => CallerBindingVerdict::Match,
+                (false, Some(explanation)) if !explanation.is_empty() => {
+                    serde_json::from_value(serde_json::json!({
+                        "Mismatch": { "explanation": explanation }
+                    }))
+                    .map_err(Error::Serialize)?
+                }
+                _ => {
+                    return Err(Error::Verification(
+                        "select exactly one of --matched or --mismatch EXPLANATION".into(),
+                    ))
+                }
+            };
+            let evidence = CallerBindingEvidence::new(target, verdict, &engine)?;
+            let options = read_verify_options_file(options.as_deref(), "caller binding")?;
+            let report = verify_with_caller_verified_binding(
+                &store,
+                &mime,
+                if hostless {
+                    CawgStoreHost::HostLess
+                } else {
+                    CawgStoreHost::Asset
+                },
+                &evidence,
+                &options,
+                GraphInputs::default(),
+            )?;
+            if json {
+                println!("{}", report.to_pretty_json()?);
+            } else {
+                println!("integrity: {}", report.integrity);
+                println!("hard binding: {}", report.hard_binding);
+                println!("signature: {}", report.signature);
+            }
+            Ok(if report.integrity == "valid" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            })
+        }
+        Command::VerifyErtmp {
+            input,
+            options,
+            json,
+        } => {
+            let input_bytes = read_path_asset(&input)?;
+            let input: ErtmpInput = serde_json::from_slice(&input_bytes).map_err(|error| {
+                Error::Verification(format!("E-RTMP input {}: {error}", input.display()))
+            })?;
+            let options = if let Some(path) = options {
+                let bytes = read_path_asset(&path)?;
+                serde_json::from_slice::<VerifyOptions>(&bytes).map_err(|error| {
+                    Error::Verification(format!(
+                        "E-RTMP verification options {}: {error}",
+                        path.display()
+                    ))
+                })?
+            } else {
+                VerifyOptions {
+                    spec_version: Some("2.5".into()),
+                    ..VerifyOptions::default()
+                }
+            };
+            options.validate()?;
+            let report = verify_ertmp_with_options(&input, &options)?;
+            if json {
+                println!("{}", report.to_pretty_json()?);
+            } else {
+                println!(
+                    "E-RTMP integrity: {} ({} segments, {} manifests)",
+                    report.integrity,
+                    report.segments.len(),
+                    report.manifests.len()
+                );
+                for failure in &report.failures {
+                    println!("failure: {failure}");
+                }
+            }
+            Ok(if report.integrity == "valid" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            })
+        }
+        Command::ResolveSoftBinding {
+            asset,
+            mime,
+            service_root,
+            query,
+            allowed_origin,
+            allow_private_networks,
+            max_results,
+            fetch_status,
+            fetch_receipts,
+            options,
+            json,
+        } => {
+            let asset_bytes = read_path_asset(&asset)?;
+            let mime = match mime {
+                Some(value) => value,
+                None => mime_from_path(&asset)
+                    .ok_or_else(|| Error::UnsupportedMime(asset.display().to_string()))?
+                    .to_string(),
+            };
+            let query_bytes = read_path_asset(&query)?;
+            let query: SoftBindingQuery =
+                serde_json::from_slice(&query_bytes).map_err(|error| {
+                    Error::Verification(format!("soft-binding query {}: {error}", query.display()))
+                })?;
+            let mut options = if let Some(path) = options {
+                let bytes = read_path_asset(&path)?;
+                serde_json::from_slice::<VerifyOptions>(&bytes).map_err(|error| {
+                    Error::Verification(format!(
+                        "soft-binding verification options {}: {error}",
+                        path.display()
+                    ))
+                })?
+            } else {
+                VerifyOptions::default()
+            };
+            // Invoking this network-specific command is explicit authorization.
+            // A supplied `online: false` remains an explicit refusal.
+            if options.online.is_none() {
+                options.online = Some(true);
+            }
+            let resolver_options = SoftBindingResolverOptions {
+                allowed_origins: allowed_origin,
+                allow_private_networks,
+                max_results,
+                fetch_status,
+                fetch_receipts,
+            };
+            let resolution = resolve_soft_binding(
+                &asset_bytes,
+                &mime,
+                &service_root,
+                &query,
+                &options,
+                &resolver_options,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resolution).map_err(Error::Serialize)?
+                );
+            } else {
+                println!(
+                    "soft-binding service {} recovered and verified {} manifest store(s)",
+                    resolution.discovery.api_endpoint,
+                    resolution.recovered.len()
+                );
+                for recovered in &resolution.recovered {
+                    println!(
+                        "{}: {}",
+                        recovered.matched.manifest_id, recovered.report.integrity
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::VerifySoftBindingReceipt {
+            service_root,
+            manifest_id,
+            receipt,
+            allowed_origin,
+            allow_private_networks,
+            options,
+        } => {
+            let receipt_bytes = read_path_asset(&receipt)?;
+            let receipt = serde_json::from_slice(&receipt_bytes).map_err(|error| {
+                Error::Verification(format!(
+                    "soft-binding receipt {}: {error}",
+                    receipt.display()
+                ))
+            })?;
+            let mut options = if let Some(path) = options {
+                let bytes = read_path_asset(&path)?;
+                serde_json::from_slice::<VerifyOptions>(&bytes).map_err(|error| {
+                    Error::Verification(format!(
+                        "soft-binding verification options {}: {error}",
+                        path.display()
+                    ))
+                })?
+            } else {
+                VerifyOptions::default()
+            };
+            if options.online.is_none() {
+                options.online = Some(true);
+            }
+            let resolver_options = SoftBindingResolverOptions {
+                allowed_origins: allowed_origin,
+                allow_private_networks,
+                ..SoftBindingResolverOptions::default()
+            };
+            let evidence = request_soft_binding_receipt_verification(
+                &service_root,
+                &manifest_id,
+                receipt,
+                &options,
+                &resolver_options,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&evidence).map_err(Error::Serialize)?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Telemetry { setting } => {
             match setting {
                 TelemetrySetting::On => {
@@ -523,8 +962,8 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             UpdateCheckSetting::Off => Some(false),
             UpdateCheckSetting::Status => None,
         })),
-        Command::Formats { json } => {
-            let formats = supported_mime_types();
+        Command::Formats { spec, json } => {
+            let formats = supported_mime_types_for(spec.as_deref())?;
             if json {
                 println!(
                     "{}",
@@ -688,6 +1127,16 @@ fn read_merged_pem(paths: &[PathBuf]) -> Result<Option<String>, Error> {
     Ok(Some(pem))
 }
 
+fn read_verify_options_file(path: Option<&Path>, purpose: &str) -> Result<VerifyOptions, Error> {
+    let Some(path) = path else {
+        return Ok(VerifyOptions::default());
+    };
+    let bytes = read_path_asset(path)?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        Error::Verification(format!("{purpose} options {}: {error}", path.display()))
+    })
+}
+
 fn read_path_asset(path: &Path) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -820,6 +1269,24 @@ fn read_trust_configurations(
         configurations.extend(entries);
     }
     Ok(Some(configurations))
+}
+
+fn read_trust_list_sources(
+    paths: &[PathBuf],
+    label: &str,
+) -> Result<Option<Vec<TrustListSource>>, Error> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut sources = Vec::new();
+    for path in paths {
+        let entries: Vec<TrustListSource> = serde_json::from_str(&fs::read_to_string(path)?)
+            .map_err(|error| {
+                Error::Verification(format!("{label}: {}: {error}", path.display()))
+            })?;
+        sources.extend(entries);
+    }
+    Ok(Some(sources))
 }
 
 fn read_string_map(

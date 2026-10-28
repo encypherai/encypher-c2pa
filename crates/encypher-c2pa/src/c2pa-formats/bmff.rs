@@ -44,6 +44,53 @@ fn is_c2pa_uuid(data: &[u8], b: &IsoBox) -> bool {
         && data[b.payload_start..b.payload_start + 16] == crate::c2pa_formats::C2PA_BMFF_UUID
 }
 
+/// C2PA 2.5 Box Containing the Manifest: a `manifest`/`original` box follows
+/// `ftyp` and, in an asset with a `moov` box, appears "either before the first
+/// 'mdat' or 'moov' box, or adjacent to the 'moov' box"; without `moov` it
+/// appears before the first `mdat`. An `update` box is the last top-level box.
+/// (2.4 required the box before any `moov` and `mdat`.)
+pub(crate) fn placement_error_v2_5(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    check_bmff(data)?;
+    let mut boxes = Vec::new();
+    walk_iso_boxes(data, FMT, |box_| {
+        let purpose = is_c2pa_uuid(data, box_)
+            .then(|| data.get(box_.payload_start + 16..box_.end))
+            .flatten()
+            .and_then(c2pa_box_purpose)
+            .and_then(|(label, _)| std::str::from_utf8(label).ok());
+        boxes.push((box_.box_type, purpose));
+    })?;
+    let first_ftyp = boxes.iter().position(|(box_type, _)| box_type == TYPE_FTYP);
+    let first_media = boxes
+        .iter()
+        .position(|(box_type, _)| box_type == b"mdat" || box_type == b"moov");
+    let is_moov = |index: Option<usize>| {
+        index
+            .and_then(|index| boxes.get(index))
+            .is_some_and(|(box_type, _)| box_type == b"moov")
+    };
+    for (index, (_, purpose)) in boxes.iter().enumerate() {
+        match *purpose {
+            Some("manifest" | "original") => {
+                let after_ftyp = first_ftyp.is_some_and(|ftyp| index > ftyp);
+                let before_media = first_media.is_none_or(|media| index < media);
+                let adjacent_to_moov =
+                    is_moov(index.checked_sub(1)) || is_moov(index.checked_add(1));
+                if !after_ftyp || !(before_media || adjacent_to_moov) {
+                    return Ok(Some(
+                        "BMFF manifest carrier is not after ftyp and before the first mdat/moov or adjacent to moov",
+                    ));
+                }
+            }
+            Some("update") if index + 1 != boxes.len() => {
+                return Ok(Some("BMFF update manifest carrier is not the last box"));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn placement_error(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
     check_bmff(data)?;
     let mut boxes = Vec::new();

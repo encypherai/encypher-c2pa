@@ -26,16 +26,20 @@ pub(crate) use ocsp::online::{
     OnlineVerdict as OnlineOcspVerdict,
 };
 pub(crate) use ocsp::{
-    evaluate_verified as evaluate_ocsp_verified, OcspStatus, MAX_OCSP_RESPONSE_BYTES,
+    evaluate_verified as evaluate_ocsp_verified,
+    evaluate_verified_with as evaluate_ocsp_verified_with, OcspStatus, MAX_OCSP_RESPONSE_BYTES,
 };
 mod timestamp;
 /// Test-only RFC 3161 fixture minting. Compiled out of the published library.
 #[cfg(test)]
 pub(crate) mod timestamp_fixture;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 pub(crate) use timestamp::{
     describe_timestamp_token, inspect_timestamp_token, token_from_timestamp_response,
-    verify_timestamp_token, TimestampResult, TokenDescription,
+    verify_timestamp_token, verify_timestamp_token_with, TimestampResult, TokenDescription,
 };
 
 use const_oid::ObjectIdentifier;
@@ -99,6 +103,27 @@ const MAX_CHAIN_DEPTH: usize = 20;
 /// Maximum issuer candidates expanded across the whole path search, bounding
 /// the work an adversarial bag of cross-signed intermediates can force.
 const MAX_PATH_NODES: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Certificate profile revision
+// ---------------------------------------------------------------------------
+
+/// Which C2PA revision's certificate and PKIX signature rules apply.
+///
+/// The unsuffixed entry points preserve the established C2PA 2.4 behavior.
+/// Their `_with` variants require an explicit profile, so an untrusted claim's
+/// declared revision can never select a more permissive algorithm set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateProfile {
+    /// The C2PA 2.2 trust behavior.
+    V2_2,
+    /// The established C2PA 2.4 trust behavior.
+    V2_4,
+    /// C2PA 2.5, including RSASSA-PSS and ML-DSA-44/65/87 certificate, OCSP,
+    /// and CMS signature verification. The 2.5 claim-credential algorithm
+    /// restrictions do not apply to TSA, OCSP responder, or CA certificates.
+    V2_5,
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -196,6 +221,39 @@ impl CawgTrustSource {
     }
 }
 
+/// Provenance for the trust list that supplied an anchor configuration.
+///
+/// `source_type` uses the C2PA entity-specific namespace syntax, for example
+/// `c2pa.trustList` for claim-signing anchors or `c2pa.tsaTrustList` for TSA
+/// anchors. `identifier` names a specific list snapshot when one is known.
+/// For ETSI TS 119 602/612 lists it is the decimal `LoTESequenceNumber`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustSource {
+    /// URI identifying the trust list. It need not be network-retrievable.
+    pub uri: String,
+    /// Namespaced trust-list type.
+    pub source_type: String,
+    /// Optional identifier for the exact trust-list instance.
+    pub identifier: Option<String>,
+}
+
+impl TrustSource {
+    /// Describe a trust list without a snapshot identifier.
+    pub fn new(uri: impl Into<String>, source_type: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            source_type: source_type.into(),
+            identifier: None,
+        }
+    }
+
+    /// Attach the identifier of the exact trust-list instance.
+    pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
+        self.identifier = Some(identifier.into());
+        self
+    }
+}
+
 /// One trust-anchor configuration: the anchor certificate plus the window in
 /// which the configuration is trusted and the purpose it authorizes.
 ///
@@ -217,6 +275,9 @@ pub struct TrustAnchor {
     /// The CAWG trust configuration entry that supplied this anchor. Read only
     /// for [`AnchorPurpose::CawgIdentity`].
     pub cawg_source: CawgTrustSource,
+    /// The trust list that supplied this configuration, when known. Lists
+    /// parsed from one source share this allocation across all their anchors.
+    pub source: Option<Arc<TrustSource>>,
 }
 
 impl TrustAnchor {
@@ -228,7 +289,14 @@ impl TrustAnchor {
             not_before: None,
             not_after: None,
             cawg_source: CawgTrustSource::SmimeInterim,
+            source: None,
         }
+    }
+
+    /// Associate this anchor configuration with its supplying trust list.
+    pub fn with_source(mut self, source: TrustSource) -> Self {
+        self.source = Some(Arc::new(source));
+        self
     }
 
     /// Lowercase hex SHA-256 of the anchor certificate's DER.
@@ -321,6 +389,19 @@ impl TrustList {
     pub fn with_cawg_source(mut self, source: CawgTrustSource) -> Self {
         for anchor in &mut self.anchors {
             anchor.cawg_source = source;
+        }
+        self
+    }
+
+    /// Associate every anchor in this list with the same supplying trust list.
+    ///
+    /// This is intended for lists parsed from one fetched or bundled source.
+    /// Lists assembled from several sources should set each anchor's
+    /// [`TrustAnchor::source`] separately.
+    pub fn with_source(mut self, source: TrustSource) -> Self {
+        let source = Arc::new(source);
+        for anchor in &mut self.anchors {
+            anchor.source = Some(Arc::clone(&source));
         }
         self
     }
@@ -546,6 +627,39 @@ impl ChainResult {
     pub fn terminating_anchor<'a>(&self, trust: &'a TrustList) -> Option<&'a TrustAnchor> {
         trust.anchors.get(self.anchor?)
     }
+
+    /// Trust-list sources containing the anchor that terminated this path.
+    ///
+    /// Results are limited to configurations with the terminating anchor's
+    /// exact DER and purpose that were active at `validated_at`. This keeps
+    /// claim-signing and TSA provenance separate even when the same
+    /// certificate was configured for both purposes. Duplicate source metadata
+    /// is returned once, in trust-list configuration order.
+    ///
+    /// This helper describes results from [`validate_chain`] and
+    /// [`validate_chain_with`]. Callers using [`validate_chain_admitting`] must
+    /// apply the same admission predicate before reporting duplicate
+    /// configurations because an opaque predicate cannot be replayed here.
+    pub fn matching_anchor_sources<'a>(&self, trust: &'a TrustList) -> Vec<&'a TrustSource> {
+        let Some(terminating) = self.terminating_anchor(trust) else {
+            return Vec::new();
+        };
+        let mut sources = Vec::new();
+        for anchor in &trust.anchors {
+            if anchor.purpose != terminating.purpose
+                || anchor.certificate != terminating.certificate
+                || !anchor.active_at(self.validated_at)
+            {
+                continue;
+            }
+            if let Some(source) = anchor.source.as_deref() {
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
+        sources
+    }
 }
 
 /// How a candidate certification path ended.
@@ -589,12 +703,32 @@ pub fn validate_chain(
     purpose: AnchorPurpose,
     validation_time: Option<OffsetDateTime>,
 ) -> ChainResult {
-    validate_chain_admitting(
+    validate_chain_with(
         leaf_der,
         intermediates_der,
         trust,
         purpose,
         validation_time,
+        CertificateProfile::V2_4,
+    )
+}
+
+/// [`validate_chain`] under an explicit certificate profile.
+pub fn validate_chain_with(
+    leaf_der: &[u8],
+    intermediates_der: &[Vec<u8>],
+    trust: &TrustList,
+    purpose: AnchorPurpose,
+    validation_time: Option<OffsetDateTime>,
+    profile: CertificateProfile,
+) -> ChainResult {
+    validate_chain_admitting_with(
+        leaf_der,
+        intermediates_der,
+        trust,
+        purpose,
+        validation_time,
+        profile,
         |_| true,
     )
 }
@@ -612,6 +746,27 @@ pub fn validate_chain_admitting(
     validation_time: Option<OffsetDateTime>,
     admit: impl Fn(&TrustAnchor) -> bool,
 ) -> ChainResult {
+    validate_chain_admitting_with(
+        leaf_der,
+        intermediates_der,
+        trust,
+        purpose,
+        validation_time,
+        CertificateProfile::V2_4,
+        admit,
+    )
+}
+
+/// [`validate_chain_admitting`] under an explicit certificate profile.
+pub fn validate_chain_admitting_with(
+    leaf_der: &[u8],
+    intermediates_der: &[Vec<u8>],
+    trust: &TrustList,
+    purpose: AnchorPurpose,
+    validation_time: Option<OffsetDateTime>,
+    profile: CertificateProfile,
+    admit: impl Fn(&TrustAnchor) -> bool,
+) -> ChainResult {
     let at = validation_time.unwrap_or_else(OffsetDateTime::now_utc);
 
     let leaf = match Certificate::from_der(leaf_der) {
@@ -623,7 +778,7 @@ pub fn validate_chain_admitting(
     // a permitted claim-signing EKU. Independent of trust-anchor chaining — an
     // otherwise-trusted chain with an unacceptable leaf is still not a valid
     // claim signer.
-    let leaf_acceptable = leaf_is_acceptable_claim_signer(&leaf);
+    let leaf_acceptable = leaf_is_acceptable_claim_signer_with(&leaf, profile);
 
     // Every in-force certificate configured for this purpose can bridge a
     // path. Only an anchor accepted by `admit` may terminate it. Keeping those
@@ -653,15 +808,14 @@ pub fn validate_chain_admitting(
     let mut seen: HashSet<String> = HashSet::from([fingerprint_hex(leaf_der)]);
     let mut budget = MAX_PATH_NODES;
     let mut anchor = None;
-    let outcome = extend_path(
-        &mut path,
-        &candidates,
-        &anchor_indices,
+    let search = PathSearchContext {
+        candidates: &candidates,
+        anchor_indices: &anchor_indices,
         at,
-        &mut seen,
-        &mut budget,
-        &mut anchor,
-    );
+        profile,
+        rules: profile::ProfileRules::for_purpose(profile, purpose),
+    };
+    let outcome = extend_path(&mut path, &search, &mut seen, &mut budget, &mut anchor);
 
     let (trusted, chain_validity_ok, reason) = match outcome {
         PathOutcome::Trusted => (true, true, None),
@@ -687,6 +841,19 @@ pub fn validate_chain_admitting(
     }
 }
 
+/// Immutable inputs shared by every recursive step of one path search.
+///
+/// Keeping these borrowed inputs together makes the mutable DFS state
+/// (`path`, `seen`, `budget`, and `anchor`) explicit without copying the
+/// candidate bag or changing its iteration order.
+struct PathSearchContext<'a> {
+    candidates: &'a [Certificate],
+    anchor_indices: &'a HashMap<String, usize>,
+    at: OffsetDateTime,
+    profile: CertificateProfile,
+    rules: profile::ProfileRules,
+}
+
 /// Depth-first path building from `path.last()` towards an in-force anchor.
 ///
 /// Subject names are not unique and trust stores routinely hold cross-signed
@@ -701,9 +868,7 @@ pub fn validate_chain_admitting(
 /// by a later, worse one.
 fn extend_path(
     path: &mut Vec<Certificate>,
-    candidates: &[Certificate],
-    anchor_indices: &HashMap<String, usize>,
-    at: OffsetDateTime,
+    search: &PathSearchContext<'_>,
     seen: &mut HashSet<String>,
     budget: &mut usize,
     anchor: &mut Option<usize>,
@@ -712,28 +877,30 @@ fn extend_path(
     let Ok(current_der) = current.to_der() else {
         return PathOutcome::NoPath;
     };
-    if let Some(&index) = anchor_indices.get(&fingerprint_hex(&current_der)) {
-        let outcome = evaluate_path(path, at);
+    if let Some(&index) = search.anchor_indices.get(&fingerprint_hex(&current_der)) {
+        let outcome = evaluate_path(path, search.at, search.rules, search.profile);
         if outcome == PathOutcome::Trusted {
             *anchor = Some(index);
         }
         return outcome;
     }
     if path.len() >= MAX_CHAIN_DEPTH
-        || current.tbs_certificate.subject == current.tbs_certificate.issuer
+        || (search.profile != CertificateProfile::V2_5
+            && current.tbs_certificate.subject == current.tbs_certificate.issuer)
     {
-        // A self-signed certificate that is not an anchor terminates the path
-        // without reaching one.
+        // Exact 2.5 may continue through a self-issued rollover certificate
+        // when a distinct previous-key issuer actually verifies it. Older
+        // profiles retain their established self-issued termination behavior.
         return PathOutcome::NoPath;
     }
 
     let mut best = PathOutcome::NoPath;
-    for candidate in candidates {
+    for candidate in search.candidates {
         if *budget == 0 {
             break;
         }
         if candidate.tbs_certificate.subject != current.tbs_certificate.issuer
-            || !verify_signature(&current, candidate)
+            || !verify_signature_with(&current, candidate, search.profile)
         {
             continue;
         }
@@ -746,7 +913,7 @@ fn extend_path(
         }
         *budget -= 1;
         path.push(candidate.clone());
-        let outcome = extend_path(path, candidates, anchor_indices, at, seen, budget, anchor);
+        let outcome = extend_path(path, search, seen, budget, anchor);
         path.pop();
         seen.remove(&fingerprint);
         best = best.max(outcome);
@@ -757,12 +924,22 @@ fn extend_path(
     best
 }
 
-/// Check a complete path, end entity first and anchor last.
-fn evaluate_path(path: &[Certificate], at: OffsetDateTime) -> PathOutcome {
-    if let Some(reason) = profile::path_violation(path) {
+/// Check a complete path, end entity first and selected anchor last.
+fn evaluate_path(
+    path: &[Certificate],
+    at: OffsetDateTime,
+    rules: profile::ProfileRules,
+    certificate_profile: CertificateProfile,
+) -> PathOutcome {
+    if let Some(reason) = profile::path_violation(path, rules) {
         return PathOutcome::Rejected(reason);
     }
-    if path.iter().any(|cert| !valid_at(cert, at)) {
+    let validity_path = if certificate_profile == CertificateProfile::V2_5 {
+        &path[..path.len().saturating_sub(1)]
+    } else {
+        path
+    };
+    if validity_path.iter().any(|cert| !valid_at(cert, at)) {
         return PathOutcome::OutsideValidity;
     }
     PathOutcome::Trusted
@@ -784,6 +961,15 @@ pub fn resolve_issuer<'a>(
     leaf_der: &[u8],
     candidates: impl IntoIterator<Item = &'a [u8]>,
 ) -> Option<&'a [u8]> {
+    resolve_issuer_with(leaf_der, candidates, CertificateProfile::V2_4)
+}
+
+/// [`resolve_issuer`] under an explicit certificate profile.
+pub fn resolve_issuer_with<'a>(
+    leaf_der: &[u8],
+    candidates: impl IntoIterator<Item = &'a [u8]>,
+    profile: CertificateProfile,
+) -> Option<&'a [u8]> {
     let leaf = Certificate::from_der(leaf_der).ok()?;
     let leaf_issuer_dn = leaf.tbs_certificate.issuer.to_der().ok()?;
     for cand_der in candidates {
@@ -793,7 +979,7 @@ pub fn resolve_issuer<'a>(
         let Ok(cand_subject_dn) = cand.tbs_certificate.subject.to_der() else {
             continue;
         };
-        if cand_subject_dn == leaf_issuer_dn && verify_signature(&leaf, &cand) {
+        if cand_subject_dn == leaf_issuer_dn && verify_signature_with(&leaf, &cand, profile) {
             return Some(cand_der);
         }
     }
@@ -988,8 +1174,19 @@ fn allows_digital_signature(cert: &Certificate) -> bool {
 /// (IETF document signing and interim S/MIME email protection), so it uses
 /// this predicate before applying its own EKU policy.
 pub fn leaf_profile_acceptable_der(leaf_der: &[u8]) -> bool {
-    Certificate::from_der(leaf_der)
-        .is_ok_and(|leaf| profile::profile_violation(&leaf, profile::CertRole::EndEntity).is_none())
+    leaf_profile_acceptable_der_with(leaf_der, CertificateProfile::V2_4)
+}
+
+/// [`leaf_profile_acceptable_der`] under an explicit certificate profile.
+pub fn leaf_profile_acceptable_der_with(leaf_der: &[u8], profile: CertificateProfile) -> bool {
+    Certificate::from_der(leaf_der).is_ok_and(|leaf| {
+        profile::profile_violation_with(
+            &leaf,
+            profile::CertRole::EndEntity,
+            profile::ProfileRules::for_purpose(profile, AnchorPurpose::ClaimSigning),
+        )
+        .is_none()
+    })
 }
 
 /// True when `leaf` is an acceptable C2PA claim-signing certificate.
@@ -1004,7 +1201,12 @@ pub fn leaf_profile_acceptable_der(leaf_der: &[u8]) -> bool {
 ///   purposes a claim signer is never authorized for;
 /// - carry at least one permitted claim-signing EKU ([`EkuPolicy::default`]).
 fn leaf_is_acceptable_claim_signer(leaf: &Certificate) -> bool {
-    if profile::profile_violation(leaf, profile::CertRole::EndEntity).is_some() {
+    leaf_is_acceptable_claim_signer_with(leaf, CertificateProfile::V2_4)
+}
+
+fn leaf_is_acceptable_claim_signer_with(leaf: &Certificate, profile: CertificateProfile) -> bool {
+    let rules = profile::ProfileRules::for_purpose(profile, AnchorPurpose::ClaimSigning);
+    if profile::profile_violation_with(leaf, profile::CertRole::EndEntity, rules).is_some() {
         return false;
     }
     let Some(ekus) = certificate_eku_oids(leaf) else {
@@ -1031,8 +1233,13 @@ fn leaf_is_acceptable_claim_signer(leaf: &Certificate) -> bool {
 /// callers that trust the certificate directly (allowed list) and therefore
 /// never run a chain evaluation. Unparseable certificates are unacceptable.
 pub fn leaf_acceptable_der(leaf_der: &[u8]) -> bool {
+    leaf_acceptable_der_with(leaf_der, CertificateProfile::V2_4)
+}
+
+/// [`leaf_acceptable_der`] under an explicit certificate profile.
+pub fn leaf_acceptable_der_with(leaf_der: &[u8], profile: CertificateProfile) -> bool {
     Certificate::from_der(leaf_der)
-        .map(|c| leaf_is_acceptable_claim_signer(&c))
+        .map(|certificate| leaf_is_acceptable_claim_signer_with(&certificate, profile))
         .unwrap_or(false)
 }
 
@@ -1082,6 +1289,28 @@ fn verify_signature(subject: &Certificate, issuer: &Certificate) -> bool {
     } else {
         false
     }
+}
+/// [`verify_signature`] under an explicit certificate profile.
+fn verify_signature_with(
+    subject: &Certificate,
+    issuer: &Certificate,
+    profile: CertificateProfile,
+) -> bool {
+    if matches!(profile, CertificateProfile::V2_2 | CertificateProfile::V2_4) {
+        return verify_signature(subject, issuer);
+    }
+    if subject.signature_algorithm != subject.tbs_certificate.signature {
+        return false;
+    }
+    let (Ok(spki), Ok(algorithm), Ok(tbs), Some(signature)) = (
+        issuer.tbs_certificate.subject_public_key_info.to_der(),
+        subject.signature_algorithm.to_der(),
+        subject.tbs_certificate.to_der(),
+        subject.signature.as_bytes(),
+    ) else {
+        return false;
+    };
+    crate::c2pa_crypto::verify_x509_signature(&spki, &algorithm, &tbs, signature).is_ok()
 }
 
 fn verify_ecdsa(

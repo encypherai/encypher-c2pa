@@ -249,6 +249,15 @@ func TestVerifyStreamChecksEachSessionKeySegmentAtItsPresentationTime(t *testing
 func TestVerifyStreamRefusesMalformedOrMiscountedPresentationTimes(t *testing.T) {
 	in := fixtureValidationTime(t, sessionKeyStream).inWindow()
 	init, segments := liveVideoStream(t, sessionKeyStream, false)
+	// Exercise nil through the actual C JSON bridge: it means absent and
+	// must verify, while the explicitly empty slice below must be refused.
+	report, err := VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, &Options{
+		ValidationTime:          in,
+		StreamPresentationTimes: nil,
+	})
+	if err != nil || report.Integrity != "valid" {
+		t.Fatalf("nil presentation times must retain validation-time verification: report=%+v err=%v", report, err)
+	}
 	for name, times := range map[string][]string{
 		"too few":   {in, in},
 		"too many":  {in, in, in, in},
@@ -470,5 +479,45 @@ func TestVerifyFileRejectsFIFOWithoutBlocking(t *testing.T) {
 		}
 		<-result
 		t.Fatal("VerifyFile blocked while opening a FIFO")
+	}
+}
+
+func TestSpecVersionSelectsThePolicyAndRejectsUnknownValues(t *testing.T) {
+	asset, err := os.ReadFile(filepath.Join("..", "..", "tests", "fixtures", "signed_test.jpg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		spec    string
+		strict  bool
+		profile string
+	}{
+		{"", false, "c2pa-2.4"},
+		{"2.4", false, "c2pa-2.4"},
+		{"2.5", false, "c2pa-2.5"},
+		{"2.5", true, "c2pa-2.5"},
+	} {
+		report, err := Verify(asset, "image/jpeg", &Options{
+			SpecVersion:       tc.spec,
+			StrictConformance: tc.strict,
+			ValidationTime:    "2026-01-01T00:00:00Z",
+		})
+		if err != nil {
+			t.Fatalf("spec %q strict=%v: %v", tc.spec, tc.strict, err)
+		}
+		if report.Profile != tc.profile {
+			t.Fatalf("spec %q strict=%v reported profile %q, want %q", tc.spec, tc.strict, report.Profile, tc.profile)
+		}
+	}
+	missing := filepath.Join(t.TempDir(), "missing.jpg")
+	for _, options := range []*Options{
+		{SpecVersion: "2.6"},
+		{SpecVersion: "9.9"},
+		{SpecVersion: "2.5.0"},
+	} {
+		_, err := VerifyFile(missing, "image/jpeg", options)
+		if err == nil || !strings.Contains(err.Error(), "unsupported_spec_version") {
+			t.Fatalf("%+v: expected unsupported_spec_version before asset I/O, got %v", options, err)
+		}
 	}
 }

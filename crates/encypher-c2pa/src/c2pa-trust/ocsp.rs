@@ -22,6 +22,8 @@ use time::OffsetDateTime;
 use x509_cert::ext::pkix::ExtendedKeyUsage;
 use x509_cert::Certificate;
 
+use super::CertificateProfile;
+
 /// Test-only RFC 6960 response minting. Compiled out of the published library.
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -252,7 +254,30 @@ pub fn evaluate_verified(
     signed_at: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
 ) -> Option<OcspStatus> {
-    let accepted = accept(der, issuer_der, subject_der, verification_time)?;
+    evaluate_verified_with(
+        der,
+        issuer_der,
+        subject_der,
+        signed_at,
+        verification_time,
+        CertificateProfile::V2_4,
+    )
+}
+
+/// [`evaluate_verified`] under an explicit certificate profile.
+///
+/// C2PA 2.5 adds cryptographic verification of RSASSA-PSS and ML-DSA
+/// responder-certificate and response signatures. Its claim-credential
+/// algorithm allow list is not applied to an OCSP responder.
+pub fn evaluate_verified_with(
+    der: &[u8],
+    issuer_der: &[u8],
+    subject_der: &[u8],
+    signed_at: Option<OffsetDateTime>,
+    verification_time: OffsetDateTime,
+    profile: CertificateProfile,
+) -> Option<OcspStatus> {
+    let accepted = accept_with(der, issuer_der, subject_der, verification_time, profile)?;
     matching_single_response_status(
         accepted.responses,
         &accepted.issuer,
@@ -278,12 +303,30 @@ pub(crate) struct AcceptedResponse<'a> {
     pub(crate) subject: Certificate,
 }
 
-/// Parse a DER `OCSPResponse` and apply {6960} section 3.2 requirements 1-4.
+/// Parse a DER `OCSPResponse` and apply {6960} section 3.2 requirements 1-4
+/// under the established C2PA 2.4 signature behavior.
 pub(crate) fn accept<'a>(
     der: &'a [u8],
     issuer_der: &[u8],
     subject_der: &[u8],
     verification_time: OffsetDateTime,
+) -> Option<AcceptedResponse<'a>> {
+    accept_with(
+        der,
+        issuer_der,
+        subject_der,
+        verification_time,
+        CertificateProfile::V2_4,
+    )
+}
+
+/// [`accept`] under an explicit certificate profile.
+pub(crate) fn accept_with<'a>(
+    der: &'a [u8],
+    issuer_der: &[u8],
+    subject_der: &[u8],
+    verification_time: OffsetDateTime,
+    profile: CertificateProfile,
 ) -> Option<AcceptedResponse<'a>> {
     if der.len() > MAX_OCSP_RESPONSE_BYTES {
         return None;
@@ -324,6 +367,7 @@ pub(crate) fn accept<'a>(
     let mut b = Der::new(basic_inner);
     let tbs_tlv = b.peek_tlv_bytes()?;
     let tbs_inner = b.sequence()?;
+    let sig_alg_tlv = b.peek_tlv_bytes()?;
     let sig_alg_inner = b.sequence()?;
     let sig_alg_oid = Der::new(sig_alg_inner).object_identifier()?;
     let signature = b.bit_string()?;
@@ -350,9 +394,11 @@ pub(crate) fn accept<'a>(
         &issuer_cert,
         responder_id,
         produced_at,
+        sig_alg_tlv,
         sig_alg_oid,
         signature,
         tbs_tlv,
+        profile,
     ) {
         return None;
     }
@@ -404,9 +450,11 @@ fn authorized_response_signer(
     issuer_cert: &Certificate,
     responder_id: ResponderId<'_>,
     produced_at: OffsetDateTime,
+    signature_algorithm_der: &[u8],
     signature_algorithm: ObjectIdentifier,
     signature: &[u8],
     signed_response_data: &[u8],
+    profile: CertificateProfile,
 ) -> bool {
     let issuer_spki = issuer_cert
         .tbs_certificate
@@ -422,11 +470,13 @@ fn authorized_response_signer(
             continue;
         };
         if !responder_id_matches(responder_id, &responder_cert)
-            || !verify_message(
+            || !verify_message_with(
                 &responder_cert,
+                signature_algorithm_der,
                 signature_algorithm,
                 signature,
                 signed_response_data,
+                profile,
             )
         {
             continue;
@@ -442,9 +492,19 @@ fn authorized_response_signer(
                     .as_ref()
                     == Some(issuer_spki)
             });
+        let responder_profile_ok =
+            matches!(profile, CertificateProfile::V2_2 | CertificateProfile::V2_4)
+                || responder_is_issuer
+                || super::profile::profile_violation_with(
+                    &responder_cert,
+                    super::profile::CertRole::EndEntity,
+                    super::profile::ProfileRules::exempt_end_entity(profile),
+                )
+                .is_none();
         if valid_at(&responder_cert, produced_at)
+            && responder_profile_ok
             && (responder_is_issuer
-                || (cert_signed_by(&responder_cert, issuer_cert)
+                || (cert_signed_by_with(&responder_cert, issuer_cert, profile)
                     && has_ocsp_signing_eku(&responder_cert)))
         {
             return true;
@@ -686,6 +746,55 @@ fn cert_signed_by(subject: &Certificate, issuer: &Certificate) -> bool {
         return false;
     };
     verify_message(issuer, subject.signature_algorithm.oid, sig, &tbs)
+}
+
+/// [`cert_signed_by`] under an explicit certificate profile.
+fn cert_signed_by_with(
+    subject: &Certificate,
+    issuer: &Certificate,
+    profile: CertificateProfile,
+) -> bool {
+    if matches!(profile, CertificateProfile::V2_2 | CertificateProfile::V2_4) {
+        return cert_signed_by(subject, issuer);
+    }
+    if subject.signature_algorithm != subject.tbs_certificate.signature {
+        return false;
+    }
+    let (Ok(key), Ok(algorithm), Ok(tbs), Some(signature)) = (
+        issuer.tbs_certificate.subject_public_key_info.to_der(),
+        subject.signature_algorithm.to_der(),
+        subject.tbs_certificate.to_der(),
+        subject.signature.as_bytes(),
+    ) else {
+        return false;
+    };
+    crate::c2pa_crypto::verify_x509_signature(&key, &algorithm, &tbs, signature).is_ok()
+}
+
+fn verify_message_with(
+    signer: &Certificate,
+    signature_algorithm_der: &[u8],
+    signature_algorithm: ObjectIdentifier,
+    signature: &[u8],
+    message: &[u8],
+    profile: CertificateProfile,
+) -> bool {
+    if matches!(profile, CertificateProfile::V2_2 | CertificateProfile::V2_4) {
+        return verify_message(signer, signature_algorithm, signature, message);
+    }
+    signer
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .is_ok_and(|key| {
+            crate::c2pa_crypto::verify_x509_signature(
+                &key,
+                signature_algorithm_der,
+                message,
+                signature,
+            )
+            .is_ok()
+        })
 }
 
 /// Verify `signature` over `message` under `signer`'s public key, selecting the
@@ -1901,5 +2010,55 @@ mod tests {
             true,
         );
         assert!(evaluate_verified(&response, &issuer_der, &responder_der, AT).is_none());
+    }
+    #[test]
+    fn v2_5_ocsp_signature_dispatch_accepts_pss_and_mldsa_without_fallback() {
+        use der::{Decode as _, Encode as _};
+
+        let certificates: [&[u8]; 4] = [
+            include_bytes!("../c2pa-crypto/fixtures/pss_spki_cert.der"),
+            include_bytes!("../c2pa-crypto/fixtures/ml_dsa_44_rfc9881_cert.der"),
+            include_bytes!("../c2pa-crypto/fixtures/ml_dsa_65_rfc9881_cert.der"),
+            include_bytes!("../c2pa-crypto/fixtures/ml_dsa_87_rfc9881_cert.der"),
+        ];
+        for certificate_der in certificates {
+            let certificate = Certificate::from_der(certificate_der).expect("certificate");
+            let algorithm = certificate
+                .signature_algorithm
+                .to_der()
+                .expect("signature algorithm");
+            let message = certificate
+                .tbs_certificate
+                .to_der()
+                .expect("signed message");
+            let signature = certificate.signature.as_bytes().expect("signature");
+            assert!(verify_message_with(
+                &certificate,
+                &algorithm,
+                certificate.signature_algorithm.oid,
+                signature,
+                &message,
+                CertificateProfile::V2_5,
+            ));
+            assert!(!verify_message_with(
+                &certificate,
+                &algorithm,
+                certificate.signature_algorithm.oid,
+                signature,
+                &message,
+                CertificateProfile::V2_4,
+            ));
+
+            let mut tampered = message;
+            *tampered.last_mut().expect("message") ^= 0x01;
+            assert!(!verify_message_with(
+                &certificate,
+                &algorithm,
+                certificate.signature_algorithm.oid,
+                signature,
+                &tampered,
+                CertificateProfile::V2_5,
+            ));
+        }
     }
 }

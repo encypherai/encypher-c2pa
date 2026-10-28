@@ -10,7 +10,9 @@
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::c2pa_cbor::{decode, encode, Profile, Value};
-use crate::c2pa_crypto::{cose_key_id, protected_iat, verify_with_cose_key};
+use crate::c2pa_crypto::{
+    cose_key_id, protected_iat, verify_with_cose_key_with, ClaimAlgorithmList,
+};
 use crate::c2pa_formats::StreamMethod;
 
 use super::ValidationResults;
@@ -101,10 +103,14 @@ pub struct ValidatedSessionKey {
 /// Every accepted key proves possession through `signerBinding`, whose payload
 /// must equal the exact DER end-entity certificate that signed the delivering
 /// manifest. Invalid entries do not become candidates for segment validation.
-pub fn validate_session_keys(
+///
+/// Session keys follow the explicit claim-signature algorithm list selected by
+/// the caller's C2PA revision.
+pub fn validate_session_keys_with(
     applicability: LiveVideoApplicability,
     assertion_cbor: &[u8],
     signer_chain_der: &[Vec<u8>],
+    algorithms: ClaimAlgorithmList,
     results: &mut ValidationResults,
     url: &str,
 ) -> Vec<ValidatedSessionKey> {
@@ -160,7 +166,7 @@ pub fn validate_session_keys(
     let mut validated = Vec::with_capacity(keys.len());
     let mut any_invalid = false;
     for entry in keys {
-        match validate_session_key(entry, signer_leaf, signer_chain_der) {
+        match validate_session_key(entry, signer_leaf, signer_chain_der, algorithms) {
             Ok(key)
                 if !validated
                     .iter()
@@ -186,6 +192,7 @@ fn validate_session_key(
     entry: &Value,
     signer_leaf: &[u8],
     signer_chain_der: &[Vec<u8>],
+    algorithms: ClaimAlgorithmList,
 ) -> Result<ValidatedSessionKey, ()> {
     let map = entry.as_map().ok_or(())?;
     if map.len() != 5 {
@@ -210,7 +217,7 @@ fn validate_session_key(
     let key_id = cose_key_id(&cose_key).map_err(|_| ())?;
     let binding =
         encode(signer_binding, Profile::CanonicalForHashedSubstructures).map_err(|_| ())?;
-    let verified = verify_with_cose_key(&binding, &cose_key).map_err(|_| ())?;
+    let verified = verify_with_cose_key_with(&binding, &cose_key, algorithms).map_err(|_| ())?;
     if verified.payload != signer_leaf {
         return Err(());
     }
@@ -413,7 +420,7 @@ pub struct VerifiedSegmentInfo {
 ///
 /// C2PA event `id`s must be unique within the session (C2PA 2.4 section
 /// 19.4.2); one [`SessionEventIds`] ledger spans every supplied segment.
-// Nine independently required inputs; see [`validate_emsg_segment`].
+// Independently required inputs; see [`validate_emsg_segment_with`].
 #[allow(clippy::too_many_arguments)]
 pub fn validate_emsg_segments(
     applicability: LiveVideoApplicability,
@@ -424,6 +431,7 @@ pub fn validate_emsg_segments(
     session_keys: &[ValidatedSessionKey],
     common_time: OffsetDateTime,
     presentation_times: Option<&[OffsetDateTime]>,
+    algorithms: ClaimAlgorithmList,
     results: &mut ValidationResults,
 ) {
     if presentation_times.is_some_and(|times| times.len() != segments.len()) {
@@ -460,7 +468,7 @@ pub fn validate_emsg_segments(
                     .into(),
             );
         }
-        if let Some(info) = validate_emsg_segment(
+        if let Some(info) = validate_emsg_segment_with(
             applicability,
             segment,
             index,
@@ -470,6 +478,7 @@ pub fn validate_emsg_segments(
             expected_manifest_id,
             session_keys,
             assessment_time,
+            algorithms,
             results,
             &url,
         ) {
@@ -571,13 +580,16 @@ impl<'a> SessionEventIds<'a> {
 /// `assessment_time` is the trusted instant at which the segment is judged to
 /// have been presented. A signed `iat` never replaces it: a holder of an
 /// expired session key can write any `iat` it likes.
+///
+/// `algorithms` is the claim-signature algorithm list selected by the caller's
+/// C2PA revision.
 // The segment bytes and its position, the session event ledger, the init
 // timing, the two bindings it must satisfy, the key set, the assessment
 // instant, and the two reporting sinks are each independently required, and
 // grouping them would move the same arity behind a struct every caller has to
 // build anyway.
 #[allow(clippy::too_many_arguments)]
-pub fn validate_emsg_segment<'a>(
+pub fn validate_emsg_segment_with<'a>(
     applicability: LiveVideoApplicability,
     segment: &'a [u8],
     segment_index: usize,
@@ -587,6 +599,7 @@ pub fn validate_emsg_segment<'a>(
     expected_manifest_id: &str,
     session_keys: &[ValidatedSessionKey],
     assessment_time: OffsetDateTime,
+    algorithms: ClaimAlgorithmList,
     results: &mut ValidationResults,
     url: &str,
 ) -> Option<VerifiedSegmentInfo> {
@@ -655,6 +668,7 @@ pub fn validate_emsg_segment<'a>(
             expected_manifest_id,
             session_keys,
             assessment_time,
+            algorithms,
         )?;
         if expected_sequence_number.is_none_or(|expected| candidate.sequence_number == expected) {
             verified = Some(candidate);
@@ -747,6 +761,7 @@ fn authenticate_segment_info(
     expected_manifest_id: &str,
     session_keys: &[ValidatedSessionKey],
     assessment_time: OffsetDateTime,
+    algorithms: ClaimAlgorithmList,
 ) -> Option<VerifiedSegmentInfo> {
     let in_window = |key: &ValidatedSessionKey, at: OffsetDateTime| {
         (key.created_at..=key.expires_at).contains(&at)
@@ -755,7 +770,7 @@ fn authenticate_segment_info(
         if !in_window(key, assessment_time) {
             continue;
         }
-        let Ok(verified) = verify_with_cose_key(message, &key.cose_key) else {
+        let Ok(verified) = verify_with_cose_key_with(message, &key.cose_key, algorithms) else {
             continue;
         };
         if verified.key_id.as_deref() != Some(key.key_id.as_slice()) {
@@ -1914,6 +1929,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct TestKey {
         seed: u8,
+        algorithm: i128,
         kid: &'static [u8],
         created_at: OffsetDateTime,
     }
@@ -1921,6 +1937,7 @@ mod tests {
     /// Key A, valid 12:00 to 13:00 on the test day.
     const KEY_A: TestKey = TestKey {
         seed: 7,
+        algorithm: -7,
         kid: b"session-key-1",
         created_at: datetime!(2026-10-26 12:00 UTC),
     };
@@ -1928,6 +1945,7 @@ mod tests {
     /// Key B, valid 14:00 to 15:00: disjoint from key A's window.
     const KEY_B: TestKey = TestKey {
         seed: 9,
+        algorithm: -7,
         kid: b"session-key-2",
         created_at: datetime!(2026-10-26 14:00 UTC),
     };
@@ -1956,7 +1974,7 @@ mod tests {
                 &Value::Map(vec![
                     (Value::Integer(1), Value::Integer(2)),
                     (Value::Integer(2), Value::Bytes(self.kid.to_vec())),
-                    (Value::Integer(3), Value::Integer(-7)),
+                    (Value::Integer(3), Value::Integer(self.algorithm)),
                     (Value::Integer(-1), Value::Integer(1)),
                     (
                         Value::Integer(-2),
@@ -1981,7 +1999,7 @@ mod tests {
 
         /// COSE_Sign1 over `payload`, with a protected `iat` when one is given.
         fn sign(self, payload: &[u8], iat: Option<OffsetDateTime>) -> Vec<u8> {
-            let mut header = vec![(Value::Integer(1), Value::Integer(-7))];
+            let mut header = vec![(Value::Integer(1), Value::Integer(self.algorithm))];
             if let Some(iat) = iat {
                 header.push((
                     Value::Integer(6),
@@ -2173,7 +2191,7 @@ mod tests {
     ) -> (Option<VerifiedSegmentInfo>, ValidationResults) {
         let timing = parse_init_track_timing(init);
         let mut results = ValidationResults::default();
-        let verified = validate_emsg_segment(
+        let verified = validate_emsg_segment_with(
             LiveVideoApplicability::new(StreamMethod::VerifiableSegmentInfo),
             segment,
             0,
@@ -2183,6 +2201,7 @@ mod tests {
             MANIFEST_ID,
             keys,
             assessment_time,
+            ClaimAlgorithmList::V2_4,
             &mut results,
             "self#segment=1",
         );
@@ -2531,9 +2550,49 @@ mod tests {
             keys,
             common_time,
             presentation_times,
+            ClaimAlgorithmList::V2_4,
             &mut results,
         );
         results
+    }
+
+    #[test]
+    fn collection_threads_the_explicit_algorithm_policy_to_every_segment() {
+        let esp_key = TestKey {
+            algorithm: -9,
+            ..KEY_A
+        };
+        let segments: Vec<Vec<u8>> = (1..=2)
+            .map(|sequence_number| {
+                Case {
+                    key: esp_key,
+                    sequence_number,
+                    ..Case::default()
+                }
+                .segment()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = segments.iter().map(Vec::as_slice).collect();
+        let timing = parse_init_track_timing(&init_segment()).unwrap();
+        for (algorithms, accepted) in [
+            (ClaimAlgorithmList::V2_4, false),
+            (ClaimAlgorithmList::V2_5, true),
+        ] {
+            let mut results = ValidationResults::default();
+            validate_emsg_segments(
+                LiveVideoApplicability::new(StreamMethod::VerifiableSegmentInfo),
+                &refs,
+                Ok(&timing),
+                &[],
+                MANIFEST_ID,
+                &[esp_key.session_key()],
+                AFTER_BOTH,
+                Some(&[ASSESSED, ASSESSED]),
+                algorithms,
+                &mut results,
+            );
+            assert_eq!(results.failure.is_empty(), accepted, "{results:?}");
+        }
     }
 
     /// Key-A segments validated as one stream with expected seeks at `seeks`.
@@ -2550,6 +2609,7 @@ mod tests {
             &[KEY_A.session_key()],
             ASSESSED,
             None,
+            ClaimAlgorithmList::V2_4,
             &mut results,
         );
         results

@@ -46,8 +46,12 @@ const MAX_OCSP_BYTES: usize = 64 * 1024;
 const MAX_DID_DOCUMENT_BYTES: usize = 256 * 1024;
 /// Externally stored assertion content, bounded like a manifest store.
 const MAX_EXTERNAL_DATA_BYTES: usize = 64 * 1024 * 1024;
-/// Total HTTP requests one verification may make, redirects included.
+/// Total HTTP requests one verification may make.
 const MAX_REQUESTS: usize = 16;
+/// Aggregate response bytes one verification may receive across every
+/// frontier. A response that is later rejected or fails while being read still
+/// spends this budget.
+const MAX_RECEIVED_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) use crate::c2pa_validate::{NetworkNeed, OcspPurpose};
 
@@ -95,8 +99,8 @@ pub struct NetworkRequest {
     pub url: String,
     /// `fetched`, `failed`, `blocked`, or `skipped`.
     ///
-    /// `blocked` means this SDK refused: a forbidden address, a plaintext URL,
-    /// an oversized body, too many redirects. `failed` means the server or the
+    /// `blocked` means this SDK refused: a forbidden address, plaintext URL,
+    /// redirect response, or oversized body. `failed` means the server or the
     /// network did not deliver. `skipped` means the request was never made.
     pub outcome: String,
     /// Why, in one line.
@@ -118,6 +122,10 @@ pub(crate) struct OnlineEvidence {
     pub(crate) ocsp_unreachable: Vec<String>,
     /// Need URI -> base64 content bytes.
     pub(crate) external_data: HashMap<String, String>,
+    /// Need URI -> response media type (without parameters).
+    pub(crate) external_data_media_types: HashMap<String, String>,
+    /// External-data URIs whose retrieval was attempted without a usable body.
+    pub(crate) external_data_unreachable: Vec<String>,
     /// Primary DID -> DID document.
     pub(crate) did_documents: HashMap<String, Value>,
 }
@@ -128,6 +136,8 @@ impl OnlineEvidence {
             && self.ocsp_responses.is_empty()
             && self.ocsp_unreachable.is_empty()
             && self.external_data.is_empty()
+            && self.external_data_media_types.is_empty()
+            && self.external_data_unreachable.is_empty()
             && self.did_documents.is_empty()
     }
 }
@@ -218,7 +228,16 @@ pub(crate) fn gather(
     )
 }
 
-fn resolve_online(options: &VerifyOptions, needs: &[NetworkNeed]) -> bool {
+/// Whether an explicitly networked operation may start.
+///
+/// Library surfaces honor only the per-call option and operator environment
+/// override. Terminal prompting requires concrete resource needs and remains
+/// in [`gather`].
+pub(crate) fn online_enabled(options: &VerifyOptions) -> bool {
+    resolve_online(options, &[])
+}
+
+pub(crate) fn resolve_online(options: &VerifyOptions, needs: &[NetworkNeed]) -> bool {
     if let Some(explicit) = options.online {
         return explicit;
     }
@@ -278,6 +297,16 @@ pub(crate) fn apply_evidence(options: &VerifyOptions, evidence: &OnlineEvidence)
         data.extend(evidence.external_data.clone());
         next.external_data = Some(data);
     }
+    if !evidence.external_data_media_types.is_empty() {
+        let mut media_types = next.external_data_media_types.unwrap_or_default();
+        media_types.extend(evidence.external_data_media_types.clone());
+        next.external_data_media_types = Some(media_types);
+    }
+    if !evidence.external_data_unreachable.is_empty() {
+        let mut unreachable = next.external_data_unreachable.unwrap_or_default();
+        unreachable.extend(evidence.external_data_unreachable.iter().cloned());
+        next.external_data_unreachable = Some(unreachable);
+    }
     next
 }
 
@@ -306,11 +335,16 @@ pub(crate) struct FetchRequest<'a> {
     pub(crate) limit: usize,
     /// True only for OCSP, whose responses are signed and verified.
     pub(crate) allow_http: bool,
+    /// HTTP requests still available to this operation, including the initial
+    /// request. A transport that follows redirects must refuse a hop before it
+    /// would exceed this number.
+    pub(crate) remaining_requests: usize,
 }
 
 #[derive(Debug)]
 pub(crate) struct FetchOk {
     pub(crate) bytes: Vec<u8>,
+    pub(crate) media_type: Option<String>,
     pub(crate) requests_used: usize,
 }
 
@@ -318,11 +352,14 @@ pub(crate) struct FetchOk {
 pub(crate) struct FetchErr {
     /// True when this SDK refused, false when the network or server did.
     pub(crate) blocked: bool,
-    /// True when a response body arrived but was discarded before it could be
-    /// carried to pass two. Currently this is the oversized-body case.
+    /// True only for an oversized response body that arrived but was discarded
+    /// before it could be carried to legacy pass-two verification.
     pub(crate) received_response: bool,
     pub(crate) detail: String,
     pub(crate) requests_used: usize,
+    /// Body bytes actually read before this failure, including the sentinel
+    /// byte used to detect an oversized body.
+    pub(crate) received_bytes: usize,
 }
 
 pub(crate) type FetchResult = Result<FetchOk, FetchErr>;
@@ -337,7 +374,185 @@ fn blocked(detail: impl Into<String>, requests_used: usize) -> FetchErr {
         received_response: false,
         detail: detail.into(),
         requests_used,
+        received_bytes: 0,
     }
+}
+
+#[derive(Debug)]
+struct FetchBudget {
+    requests: usize,
+    received_bytes: usize,
+}
+
+impl Default for FetchBudget {
+    fn default() -> Self {
+        Self {
+            requests: MAX_REQUESTS,
+            received_bytes: MAX_RECEIVED_BYTES,
+        }
+    }
+}
+
+/// A verification-scoped native fetch session.
+///
+/// The session persists the HTTP-request and received-body budgets across
+/// discovery frontiers. It deliberately does not deduplicate needs: the
+/// facade owns resource identity and reuse because OCSP identity is not the
+/// responder URL alone.
+pub(crate) struct FetchSession {
+    /// Constructing a native HTTP agent allocates connection-pool and TLS
+    /// state. Keep it absent until an allowed need actually reaches transport.
+    fetcher: Option<Box<dyn Fetcher>>,
+    allow_private_networks: bool,
+    budget: FetchBudget,
+}
+
+impl FetchSession {
+    pub(crate) fn new(allow_private_networks: bool) -> Self {
+        Self {
+            fetcher: None,
+            allow_private_networks,
+            budget: FetchBudget::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fetcher(fetcher: Box<dyn Fetcher>) -> Self {
+        Self {
+            fetcher: Some(fetcher),
+            allow_private_networks: false,
+            budget: FetchBudget::default(),
+        }
+    }
+
+    pub(crate) fn fetch(&mut self, need: &NetworkNeed) -> (NetworkRequest, FetchResult) {
+        if let Some(exhausted) = budget_exhaustion(&self.budget, need) {
+            return exhausted;
+        }
+        let allow_private_networks = self.allow_private_networks;
+        let fetcher = self
+            .fetcher
+            .get_or_insert_with(|| new_fetcher(allow_private_networks));
+        fetch_one(fetcher.as_ref(), &mut self.budget, need)
+    }
+}
+
+fn request_for_need<'a>(
+    need: &'a NetworkNeed,
+    remaining_requests: usize,
+    remaining_bytes: usize,
+) -> FetchRequest<'a> {
+    match need {
+        NetworkNeed::RemoteManifest { uri } => FetchRequest {
+            url: uri,
+            method: FetchMethod::Get,
+            body: None,
+            content_type: None,
+            accept: Some("application/c2pa"),
+            limit: MAX_MANIFEST_BYTES.min(remaining_bytes),
+            allow_http: false,
+            remaining_requests,
+        },
+        NetworkNeed::Ocsp {
+            responder_url,
+            request_der,
+            ..
+        } => FetchRequest {
+            url: responder_url,
+            method: FetchMethod::Post,
+            body: Some(request_der),
+            content_type: Some("application/ocsp-request"),
+            accept: Some("application/ocsp-response"),
+            limit: MAX_OCSP_BYTES.min(remaining_bytes),
+            // RFC 6960 responders are reached over plain HTTP by design: the
+            // response is signed and verified before the answer counts.
+            allow_http: true,
+            remaining_requests,
+        },
+        NetworkNeed::DidDocument { url, .. } => FetchRequest {
+            url,
+            method: FetchMethod::Get,
+            body: None,
+            content_type: None,
+            accept: Some("application/did+json, application/json"),
+            limit: MAX_DID_DOCUMENT_BYTES.min(remaining_bytes),
+            allow_http: false,
+            remaining_requests,
+        },
+        NetworkNeed::ExternalData { uri, .. } => FetchRequest {
+            url: uri,
+            method: FetchMethod::Get,
+            body: None,
+            content_type: None,
+            accept: None,
+            limit: MAX_EXTERNAL_DATA_BYTES.min(remaining_bytes),
+            allow_http: false,
+            remaining_requests,
+        },
+    }
+}
+
+fn budget_exhaustion(
+    budget: &FetchBudget,
+    need: &NetworkNeed,
+) -> Option<(NetworkRequest, FetchResult)> {
+    let detail = if budget.requests == 0 {
+        format!("the {MAX_REQUESTS} request budget for one verification is spent")
+    } else if budget.received_bytes == 0 {
+        format!("the {MAX_RECEIVED_BYTES} byte response budget for one verification is spent")
+    } else {
+        return None;
+    };
+    Some((
+        NetworkRequest {
+            purpose: need.purpose_token().to_string(),
+            url: need.url().to_string(),
+            outcome: "skipped".to_string(),
+            detail: detail.clone(),
+        },
+        Err(blocked(detail, 0)),
+    ))
+}
+
+fn fetch_one(
+    fetcher: &dyn Fetcher,
+    budget: &mut FetchBudget,
+    need: &NetworkNeed,
+) -> (NetworkRequest, FetchResult) {
+    if let Some(exhausted) = budget_exhaustion(budget, need) {
+        return exhausted;
+    }
+    let purpose = need.purpose_token().to_string();
+    let url = need.url().to_string();
+
+    let request = request_for_need(need, budget.requests, budget.received_bytes);
+    let result = fetcher.fetch(&request);
+    let (requests_used, received_bytes, outcome, detail) = match &result {
+        Ok(response) => (
+            response.requests_used,
+            response.bytes.len(),
+            "fetched",
+            format!("{} bytes", response.bytes.len()),
+        ),
+        Err(error) => (
+            error.requests_used,
+            error.received_bytes,
+            if error.blocked { "blocked" } else { "failed" },
+            error.detail.clone(),
+        ),
+    };
+    budget.requests = budget.requests.saturating_sub(requests_used);
+    budget.received_bytes = budget.received_bytes.saturating_sub(received_bytes);
+
+    (
+        NetworkRequest {
+            purpose,
+            url,
+            outcome: outcome.to_string(),
+            detail,
+        },
+        result,
+    )
 }
 
 /// Run every need through `fetcher`, within the request budget.
@@ -371,6 +586,7 @@ pub(crate) fn fetch_all(
                 accept: Some("application/c2pa"),
                 limit: MAX_MANIFEST_BYTES,
                 allow_http: false,
+                remaining_requests: usize::MAX,
             },
             NetworkNeed::Ocsp {
                 responder_url,
@@ -387,6 +603,7 @@ pub(crate) fn fetch_all(
                 // the response is signed, and this SDK verifies that signature
                 // before the answer counts for anything.
                 allow_http: true,
+                remaining_requests: usize::MAX,
             },
             NetworkNeed::DidDocument { url, .. } => FetchRequest {
                 url,
@@ -396,6 +613,7 @@ pub(crate) fn fetch_all(
                 accept: Some("application/did+json, application/json"),
                 limit: MAX_DID_DOCUMENT_BYTES,
                 allow_http: false,
+                remaining_requests: usize::MAX,
             },
             NetworkNeed::ExternalData { uri, .. } => FetchRequest {
                 url: uri,
@@ -405,22 +623,25 @@ pub(crate) fn fetch_all(
                 accept: None,
                 limit: MAX_EXTERNAL_DATA_BYTES,
                 allow_http: false,
+                remaining_requests: usize::MAX,
             },
         };
 
         let (outcome, detail) = match fetcher.fetch(&request) {
             Ok(FetchOk {
                 bytes,
+                media_type,
                 requests_used,
             }) => {
                 budget = budget.saturating_sub(requests_used.max(1));
-                accept_evidence(&mut evidence, need, bytes)
+                accept_evidence(&mut evidence, need, bytes, media_type)
             }
             Err(FetchErr {
                 blocked,
                 received_response,
                 detail,
                 requests_used,
+                ..
             }) => {
                 budget = budget.saturating_sub(requests_used.max(1));
                 if let NetworkNeed::Ocsp {
@@ -434,6 +655,15 @@ pub(crate) fn fetch_all(
                             .insert(certificate_sha256_hex.clone(), String::new());
                     } else if !blocked {
                         push_unreachable(&mut evidence, certificate_sha256_hex);
+                    }
+                }
+                if let NetworkNeed::ExternalData { uri, .. } = need {
+                    if !evidence
+                        .external_data_unreachable
+                        .iter()
+                        .any(|existing| existing == uri)
+                    {
+                        evidence.external_data_unreachable.push(uri.clone());
                     }
                 }
                 (
@@ -470,6 +700,7 @@ fn accept_evidence(
     evidence: &mut OnlineEvidence,
     need: &NetworkNeed,
     bytes: Vec<u8>,
+    media_type: Option<String>,
 ) -> (String, String) {
     let length = bytes.len();
     match need {
@@ -500,6 +731,11 @@ fn accept_evidence(
             evidence
                 .external_data
                 .insert(uri.clone(), base64_encode(&bytes));
+            if let Some(media_type) = media_type {
+                evidence
+                    .external_data_media_types
+                    .insert(uri.clone(), media_type);
+            }
             ("fetched".to_string(), format!("{length} bytes"))
         }
     }
@@ -576,12 +812,12 @@ fn base64_encode(input: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "online")]
-fn new_fetcher(allow_private_networks: bool) -> Box<dyn Fetcher> {
+pub(crate) fn new_fetcher(allow_private_networks: bool) -> Box<dyn Fetcher> {
     Box::new(native::NativeFetcher::new(allow_private_networks))
 }
 
 #[cfg(not(feature = "online"))]
-fn new_fetcher(_allow_private_networks: bool) -> Box<dyn Fetcher> {
+pub(crate) fn new_fetcher(_allow_private_networks: bool) -> Box<dyn Fetcher> {
     Box::new(DisabledFetcher)
 }
 
@@ -611,8 +847,6 @@ pub(crate) mod native {
         blocked, split_url, FetchErr, FetchMethod, FetchOk, FetchRequest, FetchResult, Fetcher,
     };
 
-    /// Redirect hops allowed per request. Every hop is re-checked.
-    const MAX_REDIRECTS: usize = 3;
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
     const USER_AGENT: &str = concat!("encypher-c2pa/", env!("CARGO_PKG_VERSION"));
@@ -620,21 +854,29 @@ pub(crate) mod native {
     /// by policy from a name that simply does not resolve.
     const BLOCKED_ADDRESS_MARKER: &str = "address is not permitted";
 
-    fn failed(detail: impl Into<String>, requests_used: usize) -> FetchErr {
+    fn failed(detail: impl Into<String>, requests_used: usize, received_bytes: usize) -> FetchErr {
         FetchErr {
             blocked: false,
+            // Preserve legacy OCSP classification: a failed read is
+            // unreachable, while only an oversized body is unusable.
             received_response: false,
             detail: detail.into(),
             requests_used,
+            received_bytes,
         }
     }
 
-    fn oversized(detail: impl Into<String>, requests_used: usize) -> FetchErr {
+    fn oversized(
+        detail: impl Into<String>,
+        requests_used: usize,
+        received_bytes: usize,
+    ) -> FetchErr {
         FetchErr {
             blocked: true,
             received_response: true,
             detail: detail.into(),
             requests_used,
+            received_bytes,
         }
     }
 
@@ -716,27 +958,6 @@ pub(crate) mod native {
         None
     }
 
-    /// Resolve a `Location` header against the URL that produced it.
-    pub(crate) fn join_redirect(base: &str, location: &str) -> Option<String> {
-        let location = location.trim();
-        if location.is_empty() {
-            return None;
-        }
-        if location.contains("://") {
-            return Some(location.to_string());
-        }
-        let (scheme, authority, rest) = split_url(base)?;
-        if let Some(network_path) = location.strip_prefix("//") {
-            return Some(format!("{scheme}://{network_path}"));
-        }
-        if location.starts_with('/') {
-            return Some(format!("{scheme}://{authority}{location}"));
-        }
-        let path = rest.split(['?', '#']).next().unwrap_or("");
-        let directory = path.rfind('/').map_or("/", |index| &path[..=index]);
-        Some(format!("{scheme}://{authority}{directory}{location}"))
-    }
-
     /// Resolves names and drops every address this SDK must not contact.
     ///
     /// The filter sits in the resolver rather than in front of it, so the
@@ -792,8 +1013,9 @@ pub(crate) mod native {
                 agent: ureq::AgentBuilder::new()
                     .timeout_connect(CONNECT_TIMEOUT)
                     .timeout(REQUEST_TIMEOUT)
-                    // Redirects are followed here, one hop at a time, so that
-                    // every hop's scheme and address are checked afresh.
+                    // Redirects are refused. A manifest controls every URL in
+                    // this fetcher; following Location would expand that
+                    // authority to a second endpoint.
                     .redirects(0)
                     .user_agent(USER_AGENT)
                     .resolver(FilteringResolver {
@@ -807,94 +1029,106 @@ pub(crate) mod native {
 
     impl Fetcher for NativeFetcher {
         fn fetch(&self, request: &FetchRequest<'_>) -> FetchResult {
-            let mut url = request.url.to_string();
-            let mut used = 0;
-
-            for hop in 0..=MAX_REDIRECTS {
-                match split_url(&url) {
-                    None => return Err(blocked(format!("{url} is not an absolute URL"), used)),
-                    Some((scheme, _, _)) if scheme.eq_ignore_ascii_case("https") => {}
-                    Some((scheme, _, _))
-                        if (request.allow_http || self.intranet)
-                            && scheme.eq_ignore_ascii_case("http") => {}
-                    Some((scheme, _, _)) => {
-                        return Err(blocked(
-                            format!("{scheme} is not allowed for this request; https is required"),
-                            used,
-                        ))
-                    }
-                }
-
-                used += 1;
-                let mut call = match request.method {
-                    FetchMethod::Get => self.agent.get(&url),
-                    FetchMethod::Post => self.agent.post(&url),
-                };
-                if let Some(content_type) = request.content_type {
-                    call = call.set("content-type", content_type);
-                }
-                if let Some(accept) = request.accept {
-                    call = call.set("accept", accept);
-                }
-                let response = match request.body {
-                    Some(body) => call.send_bytes(body),
-                    None => call.call(),
-                };
-                let response = match response {
-                    Ok(response) => response,
-                    Err(ureq::Error::Status(status, _)) => {
-                        return Err(failed(format!("the server answered HTTP {status}"), used))
-                    }
-                    Err(ureq::Error::Transport(transport)) => {
-                        let detail = transport.to_string();
-                        return Err(if detail.contains(BLOCKED_ADDRESS_MARKER) {
-                            blocked(detail, used)
-                        } else {
-                            failed(detail, used)
-                        });
-                    }
-                };
-
-                if (300..400).contains(&response.status()) {
-                    if hop == MAX_REDIRECTS {
-                        return Err(blocked(
-                            format!("more than {MAX_REDIRECTS} redirects"),
-                            used,
-                        ));
-                    }
-                    let Some(location) = response.header("location") else {
-                        return Err(failed("a redirect carried no location", used));
-                    };
-                    let Some(next) = join_redirect(&url, location) else {
-                        return Err(failed(format!("unusable redirect to {location}"), used));
-                    };
-                    url = next;
-                    continue;
-                }
-
-                return read_body(response, request.limit, used);
+            if request.remaining_requests == 0 {
+                return Err(blocked(
+                    "the request budget is spent before this request",
+                    0,
+                ));
             }
-            Err(blocked(
-                format!("more than {MAX_REDIRECTS} redirects"),
-                used,
-            ))
+            let url = request.url;
+            match split_url(url) {
+                None => return Err(blocked(format!("{url} is not an absolute URL"), 0)),
+                Some((scheme, _, _)) if scheme.eq_ignore_ascii_case("https") => {}
+                Some((scheme, _, _))
+                    if (request.allow_http || self.intranet)
+                        && scheme.eq_ignore_ascii_case("http") => {}
+                Some((scheme, _, _)) => {
+                    return Err(blocked(
+                        format!("{scheme} is not allowed for this request; https is required"),
+                        0,
+                    ))
+                }
+            }
+
+            let used = 1;
+            let mut call = match request.method {
+                FetchMethod::Get => self.agent.get(url),
+                FetchMethod::Post => self.agent.post(url),
+            };
+            if let Some(content_type) = request.content_type {
+                call = call.set("content-type", content_type);
+            }
+            if let Some(accept) = request.accept {
+                call = call.set("accept", accept);
+            }
+            let response = match request.body {
+                Some(body) => call.send_bytes(body),
+                None => call.call(),
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(ureq::Error::Status(status, response)) if (300..400).contains(&status) => {
+                    let location = response.header("location").unwrap_or("<missing>");
+                    let detail = if request.remaining_requests <= used {
+                        format!("redirect to {location} refused: the request budget is spent")
+                    } else {
+                        format!("redirect to {location} refused")
+                    };
+                    return Err(blocked(detail, used));
+                }
+                Err(ureq::Error::Status(status, _)) => {
+                    return Err(failed(
+                        format!("the server answered HTTP {status}"),
+                        used,
+                        0,
+                    ))
+                }
+                Err(ureq::Error::Transport(transport)) => {
+                    let detail = transport.to_string();
+                    return Err(if detail.contains(BLOCKED_ADDRESS_MARKER) {
+                        blocked(detail, used)
+                    } else {
+                        failed(detail, used, 0)
+                    });
+                }
+            };
+            if (300..400).contains(&response.status()) {
+                let location = response.header("location").unwrap_or("<missing>");
+                let detail = if request.remaining_requests <= used {
+                    format!("redirect to {location} refused: the request budget is spent")
+                } else {
+                    format!("redirect to {location} refused")
+                };
+                return Err(blocked(detail, used));
+            }
+            read_body(response, request.limit, used)
         }
     }
 
     fn read_body(response: ureq::Response, limit: usize, used: usize) -> FetchResult {
+        let media_type = response
+            .header("content-type")
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
         let mut bytes = Vec::new();
         let capped = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
         if let Err(error) = response.into_reader().take(capped).read_to_end(&mut bytes) {
-            return Err(failed(error.to_string(), used));
+            let received_bytes = bytes.len();
+            return Err(failed(error.to_string(), used, received_bytes));
         }
         if bytes.len() > limit {
+            let received_bytes = bytes.len();
             return Err(oversized(
                 format!("the response is larger than the {limit} byte limit"),
                 used,
+                received_bytes,
             ));
         }
         Ok(FetchOk {
             bytes,
+            media_type,
             requests_used: used,
         })
     }

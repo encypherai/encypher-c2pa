@@ -1,34 +1,22 @@
 // Copyright 2026 Encypher Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-//! PDF: C2PA manifests are carried as an embedded file stream (Subtype
-//! `application/c2pa`, `AFRelationship` `C2PA_Manifest`).
+//! PDF C2PA manifest discovery.
 //!
-//! Embedding uses a PDF *incremental update*: the original bytes are preserved
-//! verbatim and the manifest store is appended as an uncompressed
-//! `/EmbeddedFile` stream, referenced from a `/Filespec` (`AFRelationship`
-//! `C2PA_Manifest`) that is attached to the document catalog via its `/AF`
-//! array. A fresh classic `xref` section plus a `trailer` carrying `/Prev`
-//! (chained to the prior cross-reference section), the updated `/Root`, and the
-//! original `/ID` (when present) complete the update, followed by
-//! `startxref`/`%%EOF`. The test-only writer rejects source PDFs that use
-//! cross-reference streams; the verification reader supports both classic
-//! xref tables and xref streams.
+//! Document-level extraction follows the catalog `/AF` association. Retained
+//! stores are enumerated through classic or stream cross-reference history.
+//! Embedded-file streams may use an indirect `/Length`, `/FlateDecode`, and
+//! the `/Crypt` filter with `/Name /Identity` required for encrypted PDFs.
+//! Object-level `/AF` associations are inventoried separately so an embedded
+//! image or font can never be mistaken for the document-level credential.
 //!
-//! Extraction resolves the manifest the way the PDF spec declares it: the
-//! newest xref table trailer or xref-stream dictionary `/Root` -> newest
-//! catalog definition -> `/AF` array -> `/Filespec` with
-//! `AFRelationship /C2PA_Manifest` -> `/EF /F`
-//! embedded-file stream. The store is then sliced by its own JUMBF `LBox`
-//! (legacy signers zero-pad the stream past the store). A raw JUMBF byte-scan
-//! is deliberately NOT used: a PDF whose *embedded images* carry their own
-//! C2PA manifests (e.g. an AI-generated JPEG inside the page content) must not
-//! have an image's manifest reported as the document's. An `/AF`-declared
-//! manifest stream that is compressed (`/Filter`) or has an indirect `/Length`
-//! is reported as [`FormatError::UnsupportedVariant`] rather than silently
-//! skipped.
+//! The production crate is verification-only. Its test-only writer emits a
+//! conservative uncompressed incremental update for regression fixtures.
 
-use std::ops::Range;
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use crate::c2pa_core::jumbf::UUID_MANIFEST_STORE;
 use crate::c2pa_formats::{AssetFormat, DataHashExclusion, FormatError};
@@ -38,17 +26,38 @@ const MAX_PDF_REVISIONS: usize = 64;
 const MAX_AF_ENTRIES: usize = 4_096;
 const DUPLICATE_STORES: &str = "PDF update section contains more than one C2PA Manifest Store";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocatedStore {
+    raw_span: (usize, usize),
+    store_span: Option<(usize, usize)>,
+    decoded_store: Option<Vec<u8>>,
+}
+
+impl LocatedStore {
+    fn bytes<'a>(&'a self, asset: &'a [u8]) -> Option<&'a [u8]> {
+        if let Some(decoded) = &self.decoded_store {
+            return Some(decoded);
+        }
+        let (start, length) = self.store_span?;
+        asset.get(start..start.checked_add(length)?)
+    }
+}
+
 /// One C2PA Manifest Store introduced by a PDF incremental update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PdfManifestStoreSection {
     pub section_index: usize,
     pub section_end: usize,
     store_span: Option<(usize, usize)>,
+    decoded_store: Option<Vec<u8>>,
     pub defect: Option<&'static str>,
 }
 
 impl PdfManifestStoreSection {
-    pub fn store<'a>(&self, asset: &'a [u8]) -> Option<&'a [u8]> {
+    pub fn store<'a>(&'a self, asset: &'a [u8]) -> Option<&'a [u8]> {
+        if let Some(decoded) = &self.decoded_store {
+            return Some(decoded);
+        }
         let (start, length) = self.store_span?;
         asset.get(start..start.checked_add(length)?)
     }
@@ -73,12 +82,13 @@ pub(crate) fn manifest_store_sections(
         let section = previous_end..section_end;
         previous_end = section_end;
         match locate_store_in_section(rendition, section) {
-            Ok(Some(span)) if !seen.contains(&span) => {
-                seen.push(span);
+            Ok(Some(store)) if !seen.contains(&store.raw_span) => {
+                seen.push(store.raw_span);
                 sections.push(PdfManifestStoreSection {
                     section_index,
                     section_end,
-                    store_span: Some(span),
+                    store_span: store.store_span,
+                    decoded_store: store.decoded_store,
                     defect: None,
                 });
             }
@@ -87,6 +97,7 @@ pub(crate) fn manifest_store_sections(
                 section_index,
                 section_end,
                 store_span: None,
+                decoded_store: None,
                 defect: Some(defect_detail(&error)),
             }),
         }
@@ -97,39 +108,38 @@ pub(crate) fn manifest_store_sections(
 /// Extract the C2PA manifest store declared by the document catalog's `/AF`
 /// entry, if any.
 pub(crate) fn extract(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
-    Ok(locate_store_span(data)?.map(|(start, length)| data[start..start + length].to_vec()))
+    Ok(locate_store(data)?.and_then(|store| store.bytes(data).map(<[u8]>::to_vec)))
 }
 
 /// The embedded manifest-store `jumb` superbox span as a `c2pa.hash.data`
-/// exclusion. The incremental-update xref/trailer appended after it are PDF
-/// structural bytes the data hash covers; only the manifest store is excluded.
+/// exclusion. A decoded Flate stream has no byte-for-byte position in the PDF,
+/// so no unsafe decoded offset is ever reported.
 pub(crate) fn exclusions(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatError> {
-    Ok(locate_store_span(data)?
-        .map(|(start, length)| vec![DataHashExclusion { start, length }])
-        .unwrap_or_default())
+    let Some(store) = locate_store(data)? else {
+        return Ok(Vec::new());
+    };
+    let Some((start, length)) = store.store_span else {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "compressed C2PA manifest stream has no byte range to exclude",
+        });
+    };
+    Ok(vec![DataHashExclusion { start, length }])
 }
 
-/// Resolve the `(start, length)` span of the document's C2PA manifest store by
-/// walking the spec-declared path: xref trailer `/Root` -> catalog `/AF` ->
-/// `/Filespec` (`AFRelationship /C2PA_Manifest`) -> `/EF /F` stream.
-///
-/// Returns `Ok(None)` when the document declares no `/Root`, `/AF`, or C2PA
-/// filespec. Embedded images with their own manifests are invisible to this
-/// resolver by design. Malformed xref streams and declared manifests that
-/// cannot be read fail closed.
-fn locate_store_span(data: &[u8]) -> Result<Option<(usize, usize)>, FormatError> {
+/// Resolve the document-level manifest while leaving object-level associations
+/// to [`object_manifest_stores`].
+fn locate_store(data: &[u8]) -> Result<Option<LocatedStore>, FormatError> {
     if find_root(data)?.is_none() {
         return Ok(None);
     }
-    // Active extraction preserves the existing tolerant reader behavior. The
-    // incremental-history path separately uses xref-defined section ranges.
     locate_store_in_section(data, 0..data.len())
 }
 
 fn locate_store_in_section(
     data: &[u8],
     section: Range<usize>,
-) -> Result<Option<(usize, usize)>, FormatError> {
+) -> Result<Option<LocatedStore>, FormatError> {
     let Some((root_num, root_gen)) = find_root(data)? else {
         return Ok(None);
     };
@@ -186,16 +196,15 @@ fn locate_store_in_section(
             format: FMT,
             detail: "C2PA filespec references a missing stream object",
         })?;
-        match manifest_stream_span(data, num, generation) {
-            Ok(span) => stores.push(span),
+        match manifest_stream(data, num, generation) {
+            Ok(store) => stores.push(store),
             Err(error) if section.contains(&object) => return Err(error),
             Err(_) => continue,
         }
     }
     let introduced: Vec<_> = stores
         .iter()
-        .copied()
-        .filter(|(start, _)| section.contains(start))
+        .filter(|store| section.contains(&store.raw_span.0))
         .collect();
     if introduced.len() > 1 {
         return Err(FormatError::InvalidStructure {
@@ -205,8 +214,8 @@ fn locate_store_in_section(
     }
     Ok(introduced
         .first()
-        .copied()
-        .or_else(|| stores.last().copied()))
+        .map(|store| (*store).clone())
+        .or_else(|| stores.last().cloned()))
 }
 
 fn defect_detail(error: &FormatError) -> &'static str {
@@ -217,11 +226,10 @@ fn defect_detail(error: &FormatError) -> &'static str {
     }
 }
 
-/// The `(start, length)` of the manifest store inside the embedded-file stream
-/// object `snum sgen obj`. The store is sliced by its own JUMBF `LBox`: legacy
-/// two-pass signers write the store into a larger zero-padded placeholder, so
-/// the stream `/Length` is an upper bound, not the store size.
-fn manifest_stream_span(data: &[u8], snum: u64, sgen: u64) -> Result<(usize, usize), FormatError> {
+/// Resolve and decode a C2PA embedded-file stream. `/Crypt` is accepted only
+/// with the standard `/Identity` crypt filter; it is therefore byte-preserving.
+/// Flate decoding is bounded by the public manifest-store size ceiling.
+fn manifest_stream(data: &[u8], snum: u64, sgen: u64) -> Result<LocatedStore, FormatError> {
     let obj_pos = find_obj_last(data, snum, sgen).ok_or(FormatError::InvalidStructure {
         format: FMT,
         detail: "C2PA filespec references a missing stream object",
@@ -231,64 +239,1523 @@ fn manifest_stream_span(data: &[u8], snum: u64, sgen: u64) -> Result<(usize, usi
         detail: "C2PA stream object has no dictionary",
     })?;
     let d = &data[o..c];
-    if find_name(d, b"/Filter").is_some() {
-        return Err(FormatError::UnsupportedVariant {
+    if !has_name_value(d, b"/Subtype", b"/application#2Fc2pa") {
+        return Err(FormatError::InvalidStructure {
             format: FMT,
-            detail: "compressed (filtered) C2PA manifest stream is not supported",
+            detail: "C2PA embedded-file stream has no application/c2pa subtype",
         });
     }
     let l_pos = find_name(d, b"/Length").ok_or(FormatError::InvalidStructure {
         format: FMT,
         detail: "C2PA stream object has no /Length",
     })?;
-    if read_ref(d, l_pos + 7).is_some() {
-        return Err(FormatError::UnsupportedVariant {
-            format: FMT,
-            detail: "indirect /Length on the C2PA manifest stream is not supported",
-        });
-    }
-    let (stream_len, _) = read_uint(d, l_pos + 7).ok_or(FormatError::InvalidStructure {
+    let stream_len = if let Some((num, generation, _)) = read_ref(d, l_pos + 7) {
+        let length_object =
+            find_obj_last(data, num, generation).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "indirect C2PA stream /Length object is missing",
+            })?;
+        let marker =
+            find_from(data, b"obj", length_object).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "indirect C2PA stream /Length object is malformed",
+            })?;
+        read_uint(data, marker + 3).map(|(value, _)| value).ok_or(
+            FormatError::InvalidStructure {
+                format: FMT,
+                detail: "indirect C2PA stream /Length is not a number",
+            },
+        )?
+    } else {
+        read_uint(d, l_pos + 7)
+            .map(|(value, _)| value)
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "C2PA stream /Length is not a number",
+            })?
+    };
+    let stream_len = usize::try_from(stream_len).map_err(|_| FormatError::InvalidStructure {
         format: FMT,
-        detail: "C2PA stream /Length is not a number",
+        detail: "C2PA stream length is out of range",
     })?;
-    // The `stream` keyword follows the dictionary; data begins after its EOL
-    // (CRLF or LF per PDF 32000-1 7.3.8.1).
     let kw = find_from(data, b"stream", c).ok_or(FormatError::InvalidStructure {
         format: FMT,
         detail: "C2PA stream object has no stream data",
     })?;
-    let mut s = kw + 6;
-    if data.get(s) == Some(&b'\r') {
-        s += 1;
+    let object_end = find_from(data, b"endobj", c).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "C2PA stream object has no endobj",
+    })?;
+    if kw >= object_end {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "C2PA stream object has no stream data",
+        });
     }
-    if data.get(s) == Some(&b'\n') {
-        s += 1;
+    let mut stream_start = kw + 6;
+    match data.get(stream_start..stream_start.saturating_add(2)) {
+        Some(b"\r\n") => stream_start += 2,
+        _ if data.get(stream_start) == Some(&b'\n') => stream_start += 1,
+        _ if data.get(stream_start) == Some(&b'\r') => stream_start += 1,
+        _ => {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF stream keyword is not followed by an end-of-line marker",
+            })
+        }
     }
-    let stream_end = s
-        .checked_add(stream_len as usize)
-        .filter(|&e| e <= data.len())
+    let stream_end = stream_start
+        .checked_add(stream_len)
+        .filter(|end| *end <= object_end)
         .ok_or(FormatError::InvalidStructure {
             format: FMT,
             detail: "C2PA stream length is out of range",
         })?;
-    // Validate and bound the store by its own JUMBF framing.
-    let lbox = data
-        .get(s..s + 4)
+    let filters = pdf_filter_names(d)?;
+    let crypt = filters.iter().any(|filter| matches!(*filter, b"/Crypt"));
+    if crypt && !has_name_value(d, b"/Name", b"/Identity") {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "encrypted C2PA stream does not use the Identity crypt filter",
+        });
+    }
+    let mut decoded = data[stream_start..stream_end].to_vec();
+    let mut compressed = false;
+    for filter in filters {
+        match filter {
+            b"/Crypt" => {}
+            b"/FlateDecode" | b"/Fl" => {
+                compressed = true;
+                decoded = inflate_pdf_stream(&decoded)?;
+            }
+            _ => {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "unsupported C2PA manifest stream filter",
+                })
+            }
+        }
+    }
+    let length = manifest_store_length(&decoded)?;
+    decoded.truncate(length);
+    Ok(LocatedStore {
+        raw_span: (stream_start, stream_len),
+        store_span: (!compressed).then_some((stream_start, length)),
+        decoded_store: compressed.then_some(decoded),
+    })
+}
+
+fn manifest_store_length(bytes: &[u8]) -> Result<usize, FormatError> {
+    let lbox = bytes
+        .get(..4)
         .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
         .ok_or(FormatError::InvalidStructure {
             format: FMT,
             detail: "C2PA stream too short for a JUMBF box",
         })?;
-    let is_store = data.get(s + 4..s + 8) == Some(b"jumb")
-        && data.get(s + 12..s + 16) == Some(b"jumd")
-        && data.get(s + 16..s + 32) == Some(&UUID_MANIFEST_STORE[..]);
-    if !is_store || lbox < 8 || s + lbox > stream_end {
+    let is_store = bytes.get(4..8) == Some(b"jumb")
+        && bytes.get(12..16) == Some(b"jumd")
+        && bytes.get(16..32) == Some(&UUID_MANIFEST_STORE[..]);
+    if !is_store || lbox < 8 || lbox > bytes.len() {
         return Err(FormatError::InvalidStructure {
             format: FMT,
             detail: "declared C2PA stream does not hold a manifest store",
         });
     }
-    Ok((s, lbox))
+    Ok(lbox)
+}
+
+fn pdf_filter_names(dict: &[u8]) -> Result<Vec<&[u8]>, FormatError> {
+    let Some(at) = find_name(dict, b"/Filter") else {
+        return Ok(Vec::new());
+    };
+    let mut cursor = at + b"/Filter".len();
+    while dict.get(cursor).is_some_and(|byte| is_ws(*byte)) {
+        cursor += 1;
+    }
+    let array = dict.get(cursor) == Some(&b'[');
+    if array {
+        cursor += 1;
+    }
+    let mut names = Vec::new();
+    loop {
+        while dict.get(cursor).is_some_and(|byte| is_ws(*byte)) {
+            cursor += 1;
+        }
+        if array && dict.get(cursor) == Some(&b']') {
+            break;
+        }
+        if dict.get(cursor) != Some(&b'/') {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF stream /Filter is not a name or name array",
+            });
+        }
+        let start = cursor;
+        cursor += 1;
+        while dict
+            .get(cursor)
+            .is_some_and(|byte| !is_ws(*byte) && !is_delim(*byte))
+        {
+            cursor += 1;
+        }
+        names.push(&dict[start..cursor]);
+        if !array {
+            break;
+        }
+    }
+    Ok(names)
+}
+
+fn inflate_pdf_stream(raw: &[u8]) -> Result<Vec<u8>, FormatError> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::{decompress_to_vec_with_limit, decompress_to_vec_zlib_with_limit};
+
+    let limit = crate::MAX_MANIFEST_STORE_BYTES;
+    match decompress_to_vec_zlib_with_limit(raw, limit) {
+        Ok(out) => Ok(out),
+        Err(error) if error.status == TINFLStatus::HasMoreOutput => {
+            Err(FormatError::ManifestTooLarge {
+                format: FMT,
+                max: limit,
+                got: limit + 1,
+            })
+        }
+        Err(_) => decompress_to_vec_with_limit(raw, limit).map_err(|error| {
+            if error.status == TINFLStatus::HasMoreOutput {
+                FormatError::ManifestTooLarge {
+                    format: FMT,
+                    max: limit,
+                    got: limit + 1,
+                }
+            } else {
+                FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "C2PA manifest stream is not valid Flate data",
+                }
+            }
+        }),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuthSlot {
+    Free,
+    Offset { offset: usize, generation: u64 },
+    InStream { stream: u64, index: usize },
+}
+
+struct AuthSection {
+    entries: Vec<(u64, AuthSlot)>,
+    previous: Option<usize>,
+    supplemental: Option<usize>,
+    root: Option<(u64, u64)>,
+}
+
+struct AuthOwned {
+    text: Vec<u8>,
+    dictionary: Option<(usize, usize)>,
+    stream: Option<(usize, usize)>,
+}
+
+impl AuthOwned {
+    fn dict(&self) -> Option<&[u8]> {
+        self.dictionary.map(|(start, end)| &self.text[start..end])
+    }
+}
+
+struct AuthObjectStream {
+    data: Vec<u8>,
+    first: usize,
+    offsets: Vec<(u64, usize)>,
+}
+
+/// Read-only PDF resolver used by the C2PA 2.5 catalog and object paths.
+///
+/// Cross-reference slots are authoritative. It resolves classic tables,
+/// xref streams, hybrid `/XRefStm` sections and compressed object streams;
+/// bytes that merely resemble objects are never discovered.
+struct AuthDocument<'a> {
+    data: &'a [u8],
+    slots: HashMap<u64, AuthSlot>,
+    object_streams: HashMap<u64, AuthObjectStream>,
+    root: Option<(u64, u64)>,
+}
+
+impl<'a> AuthDocument<'a> {
+    fn parse(data: &'a [u8]) -> Result<Self, FormatError> {
+        let startxref = rfind(data, b"startxref").ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF is missing startxref",
+        })?;
+        let latest = read_uint(data, startxref + b"startxref".len())
+            .and_then(|(offset, _)| usize::try_from(offset).ok())
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF startxref offset is invalid",
+            })?;
+        let mut document = Self {
+            data,
+            slots: HashMap::new(),
+            object_streams: HashMap::new(),
+            root: None,
+        };
+        let mut next = Some(latest);
+        let mut visited = HashSet::new();
+        while let Some(offset) = next {
+            if !visited.insert(offset) {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF cross-reference chain contains a cycle",
+                });
+            }
+            if visited.len() > MAX_PDF_REVISIONS {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "PDF has too many cross-reference revisions",
+                });
+            }
+            let section = auth_section(data, offset)?;
+            if document.root.is_none() {
+                document.root = section.root;
+            }
+            if let Some(supplemental) = section.supplemental {
+                if !visited.insert(supplemental) {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF hybrid cross-reference chain contains a cycle",
+                    });
+                }
+                let stream = auth_xref_stream(data, supplemental)?;
+                if document.root.is_none() {
+                    document.root = stream.root;
+                }
+                for (number, slot) in stream.entries {
+                    document.slots.entry(number).or_insert(slot);
+                }
+            }
+            for (number, slot) in section.entries {
+                document.slots.entry(number).or_insert(slot);
+            }
+            if document.slots.len() > (1 << 21) {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "PDF cross-reference table is too large",
+                });
+            }
+            next = section.previous;
+        }
+        Ok(document)
+    }
+
+    fn references(&self) -> Vec<(u64, u64)> {
+        let mut references: Vec<_> = self
+            .slots
+            .iter()
+            .filter_map(|(&number, slot)| match slot {
+                AuthSlot::Free => None,
+                AuthSlot::Offset { generation, .. } => Some((number, *generation)),
+                AuthSlot::InStream { .. } => Some((number, 0)),
+            })
+            .collect();
+        references.sort_unstable();
+        references
+    }
+
+    fn fetch(
+        &mut self,
+        number: u64,
+        generation: u64,
+        depth: usize,
+    ) -> Result<AuthOwned, FormatError> {
+        if depth >= 16 {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF object resolution is too deep",
+            });
+        }
+        let slot = self
+            .slots
+            .get(&number)
+            .copied()
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF reference names a missing object",
+            })?;
+        match slot {
+            AuthSlot::Free => Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF reference names a deleted object",
+            }),
+            AuthSlot::Offset {
+                offset,
+                generation: expected_generation,
+            } => {
+                if generation != expected_generation {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF reference generation does not match cross-reference entry",
+                    });
+                }
+                self.fetch_offset(number, generation, offset, depth)
+            }
+            AuthSlot::InStream { stream, index } => {
+                if generation != 0 {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "compressed PDF object has a nonzero generation",
+                    });
+                }
+                self.fetch_compressed(number, stream, index, depth)
+            }
+        }
+    }
+
+    fn fetch_offset(
+        &mut self,
+        expected_number: u64,
+        expected_generation: u64,
+        offset: usize,
+        depth: usize,
+    ) -> Result<AuthOwned, FormatError> {
+        let (number, after_number) =
+            read_uint(self.data, offset).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference offset has no object",
+            })?;
+        let (generation, mut cursor) =
+            read_uint(self.data, after_number).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF object has no generation",
+            })?;
+        cursor = skip_pdf_ws(self.data, cursor);
+        if number != expected_number
+            || generation != expected_generation
+            || self.data.get(cursor..cursor + 3) != Some(b"obj")
+        {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF object header disagrees with cross-reference entry",
+            });
+        }
+        let value = skip_pdf_ws(self.data, cursor + 3);
+        let Some((open, close)) = direct_dict_span(self.data, value) else {
+            let marker =
+                find_from(self.data, b"endobj", value).ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF indirect object has no endobj",
+                })?;
+            let mut end = marker;
+            while end > value && is_ws(self.data[end - 1]) {
+                end -= 1;
+            }
+            if end == value {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF indirect object has no value",
+                });
+            }
+            return Ok(AuthOwned {
+                text: self.data[value..end].to_vec(),
+                dictionary: None,
+                stream: None,
+            });
+        };
+        let dictionary = self.data[open..close].to_vec();
+        let mut after = skip_pdf_ws(self.data, close);
+        let stream = if self.data.get(after..after + 6) == Some(b"stream")
+            && self.data.get(after + 6).is_some_and(|byte| is_ws(*byte))
+        {
+            after += 6;
+            match self.data.get(after..after.saturating_add(2)) {
+                Some(b"\r\n") => after += 2,
+                _ if self.data.get(after) == Some(&b'\n')
+                    || self.data.get(after) == Some(&b'\r') =>
+                {
+                    after += 1
+                }
+                _ => {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF stream keyword is not followed by an end-of-line marker",
+                    })
+                }
+            }
+            let length_at =
+                find_name(&dictionary, b"/Length").ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF stream has no /Length",
+                })?;
+            let length = if let Some((length_number, length_generation, _)) =
+                read_ref(&dictionary, length_at + b"/Length".len())
+            {
+                let length = self.fetch(length_number, length_generation, depth + 1)?;
+                read_uint(&length.text, 0).map(|(value, _)| value).ok_or(
+                    FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF indirect stream /Length is not an integer",
+                    },
+                )?
+            } else {
+                read_uint(&dictionary, length_at + b"/Length".len())
+                    .map(|(value, _)| value)
+                    .ok_or(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF stream /Length is not an integer",
+                    })?
+            };
+            let length = usize::try_from(length).map_err(|_| FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF stream length is out of range",
+            })?;
+            let end = after
+                .checked_add(length)
+                .filter(|&end| end <= self.data.len())
+                .ok_or(FormatError::Truncated(FMT))?;
+            let terminator = skip_pdf_ws(self.data, end);
+            if self.data.get(terminator..terminator + 9) != Some(b"endstream") {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF stream length does not reach endstream",
+                });
+            }
+            let object_end = skip_pdf_ws(self.data, terminator + 9);
+            if self.data.get(object_end..object_end + 6) != Some(b"endobj") {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF stream object has no endobj",
+                });
+            }
+            Some((after, length))
+        } else {
+            if self.data.get(after..after + 6) != Some(b"endobj") {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF indirect object has no endobj",
+                });
+            }
+            None
+        };
+        let length = dictionary.len();
+        Ok(AuthOwned {
+            text: dictionary,
+            dictionary: Some((0, length)),
+            stream,
+        })
+    }
+
+    fn fetch_compressed(
+        &mut self,
+        number: u64,
+        stream_number: u64,
+        index: usize,
+        depth: usize,
+    ) -> Result<AuthOwned, FormatError> {
+        if !self.object_streams.contains_key(&stream_number) {
+            let stream = self.fetch(stream_number, 0, depth + 1)?;
+            let dict = stream.dict().ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF object stream has no dictionary",
+            })?;
+            if !has_name_value(dict, b"/Type", b"/ObjStm") {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF compressed object points outside an object stream",
+                });
+            }
+            let count = dict_uint(dict, b"/N")?;
+            let first = usize::try_from(dict_uint(dict, b"/First")?).map_err(|_| {
+                FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF object-stream /First is out of range",
+                }
+            })?;
+            if count > 65_536 {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "PDF object stream contains too many objects",
+                });
+            }
+            let (start, length) = stream.stream.ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF object stream has no stream payload",
+            })?;
+            let data = decode_auth_stream(dict, &self.data[start..start + length])?;
+            if first > data.len() {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF object-stream /First exceeds decoded data",
+                });
+            }
+            let mut cursor = 0usize;
+            let mut offsets = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let (object_number, after_number) =
+                    read_uint(&data, cursor).ok_or(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF object-stream header is truncated",
+                    })?;
+                let (relative, after_relative) =
+                    read_uint(&data, after_number).ok_or(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF object-stream header is truncated",
+                    })?;
+                let relative =
+                    usize::try_from(relative).map_err(|_| FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF object-stream offset is out of range",
+                    })?;
+                offsets.push((object_number, relative));
+                cursor = after_relative;
+            }
+            self.object_streams.insert(
+                stream_number,
+                AuthObjectStream {
+                    data,
+                    first,
+                    offsets,
+                },
+            );
+        }
+        let stream = self
+            .object_streams
+            .get(&stream_number)
+            .expect("inserted above");
+        let &(found, relative) =
+            stream
+                .offsets
+                .get(index)
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF compressed-object index is out of range",
+                })?;
+        if found != number {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF object-stream index names a different object",
+            });
+        }
+        let start = stream
+            .first
+            .checked_add(relative)
+            .filter(|&start| start <= stream.data.len())
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF compressed-object offset is out of range",
+            })?;
+        let end = stream
+            .offsets
+            .get(index + 1)
+            .map_or(stream.data.len(), |next| {
+                stream.first.saturating_add(next.1)
+            });
+        if end < start || end > stream.data.len() {
+            return Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF compressed-object bounds are invalid",
+            });
+        }
+        let text = stream.data[start..end].to_vec();
+        let dictionary = direct_dict_span(&text, 0);
+        Ok(AuthOwned {
+            text,
+            dictionary,
+            stream: None,
+        })
+    }
+}
+
+fn direct_dict_span(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let open = skip_pdf_ws(data, from);
+    if data.get(open..open + 2) != Some(b"<<") {
+        return None;
+    }
+    dict_span(data, open).filter(|(found, _)| *found == open)
+}
+fn skip_pdf_ws(data: &[u8], mut cursor: usize) -> usize {
+    while data.get(cursor).is_some_and(|byte| is_ws(*byte)) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn dict_uint(dict: &[u8], key: &[u8]) -> Result<u64, FormatError> {
+    let at = find_name(dict, key).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF dictionary is missing a required integer",
+    })?;
+    read_uint(dict, at + key.len())
+        .map(|(value, _)| value)
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF dictionary value is not an integer",
+        })
+}
+
+fn dict_uint_array(dict: &[u8], key: &[u8]) -> Result<Vec<u64>, FormatError> {
+    let at = find_name(dict, key).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF dictionary is missing a required integer array",
+    })?;
+    let mut cursor = skip_pdf_ws(dict, at + key.len());
+    if dict.get(cursor) != Some(&b'[') {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF dictionary value is not an integer array",
+        });
+    }
+    cursor += 1;
+    let mut values = Vec::new();
+    loop {
+        cursor = skip_pdf_ws(dict, cursor);
+        if dict.get(cursor) == Some(&b']') {
+            return Ok(values);
+        }
+        let (value, end) = read_uint(dict, cursor).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF integer array is malformed",
+        })?;
+        values.push(value);
+        cursor = end;
+    }
+}
+
+fn auth_section(data: &[u8], offset: usize) -> Result<AuthSection, FormatError> {
+    if data.get(offset..offset.saturating_add(4)) != Some(b"xref") {
+        return auth_xref_stream(data, offset);
+    }
+    let mut cursor = offset + 4;
+    let mut entries = Vec::new();
+    loop {
+        cursor = skip_pdf_ws(data, cursor);
+        if data.get(cursor..cursor.saturating_add(7)) == Some(b"trailer") {
+            cursor += 7;
+            break;
+        }
+        let (first, after_first) =
+            read_uint(data, cursor).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF xref subsection header is malformed",
+            })?;
+        let (count, after_count) =
+            read_uint(data, after_first).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF xref subsection count is malformed",
+            })?;
+        if count > (1 << 21) {
+            return Err(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF xref subsection is too large",
+            });
+        }
+        cursor = after_count;
+        for index in 0..count {
+            let (field, after_field) =
+                read_uint(data, cursor).ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF xref entry is malformed",
+                })?;
+            let (generation, after_generation) =
+                read_uint(data, after_field).ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF xref entry is malformed",
+                })?;
+            cursor = skip_pdf_ws(data, after_generation);
+            let kind = *data.get(cursor).ok_or(FormatError::Truncated(FMT))?;
+            cursor += 1;
+            let number = first
+                .checked_add(index)
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF xref object number overflows",
+                })?;
+            let slot = match kind {
+                b'f' => AuthSlot::Free,
+                b'n' => AuthSlot::Offset {
+                    offset: usize::try_from(field).map_err(|_| FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF xref object offset is out of range",
+                    })?,
+                    generation,
+                },
+                _ => {
+                    return Err(FormatError::InvalidStructure {
+                        format: FMT,
+                        detail: "PDF xref entry has an invalid type",
+                    })
+                }
+            };
+            entries.push((number, slot));
+        }
+    }
+    let (open, close) = direct_dict_span(data, cursor).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF trailer has no dictionary",
+    })?;
+    let trailer = &data[open..close];
+    Ok(AuthSection {
+        entries,
+        previous: dict_optional_offset(trailer, b"/Prev")?,
+        supplemental: dict_optional_offset(trailer, b"/XRefStm")?,
+        root: find_name(trailer, b"/Root")
+            .and_then(|at| read_ref(trailer, at + b"/Root".len()))
+            .map(|(number, generation, _)| (number, generation)),
+    })
+}
+
+fn dict_optional_offset(dict: &[u8], key: &[u8]) -> Result<Option<usize>, FormatError> {
+    let Some(at) = find_name(dict, key) else {
+        return Ok(None);
+    };
+    let value = read_uint(dict, at + key.len())
+        .and_then(|(value, _)| usize::try_from(value).ok())
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF cross-reference offset is invalid",
+        })?;
+    Ok(Some(value))
+}
+
+fn auth_xref_stream(data: &[u8], offset: usize) -> Result<AuthSection, FormatError> {
+    let (_, after_number) = read_uint(data, offset).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF xref stream has no object header",
+    })?;
+    let (_, mut cursor) = read_uint(data, after_number).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF xref stream has no generation",
+    })?;
+    cursor = skip_pdf_ws(data, cursor);
+    if data.get(cursor..cursor + 3) != Some(b"obj") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no object marker",
+        });
+    }
+    let (open, close) =
+        direct_dict_span(data, cursor + 3).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no dictionary",
+        })?;
+    let dict = &data[open..close];
+    if !has_name_value(dict, b"/Type", b"/XRef") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF startxref target is not an xref section",
+        });
+    }
+    let widths = dict_uint_array(dict, b"/W")?;
+    if widths.len() != 3 {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref-stream /W must have three integers",
+        });
+    }
+    let length = usize::try_from(dict_uint(dict, b"/Length")?).map_err(|_| {
+        FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref-stream length is out of range",
+        }
+    })?;
+    let keyword = skip_pdf_ws(data, close);
+    if data.get(keyword..keyword + 6) != Some(b"stream") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no stream payload",
+        });
+    }
+    let mut start = keyword + 6;
+    match data.get(start..start.saturating_add(2)) {
+        Some(b"\r\n") => start += 2,
+        _ if data.get(start) == Some(&b'\n') || data.get(start) == Some(&b'\r') => start += 1,
+        _ => return Err(FormatError::Truncated(FMT)),
+    }
+    let end = start
+        .checked_add(length)
+        .filter(|&end| end <= data.len())
+        .ok_or(FormatError::Truncated(FMT))?;
+    let endstream = skip_pdf_ws(data, end);
+    if data.get(endstream..endstream + 9) != Some(b"endstream") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref-stream length does not reach endstream",
+        });
+    }
+    let endobj = skip_pdf_ws(data, endstream + 9);
+    if data.get(endobj..endobj + 6) != Some(b"endobj") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no endobj",
+        });
+    }
+    let decoded = decode_auth_stream(dict, &data[start..end])?;
+    let indices = match find_name(dict, b"/Index") {
+        Some(_) => dict_uint_array(dict, b"/Index")?,
+        None => vec![0, dict_uint(dict, b"/Size")?],
+    };
+    if indices.len() % 2 != 0 {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref-stream /Index is malformed",
+        });
+    }
+    let widths: Vec<usize> = widths
+        .into_iter()
+        .map(|width| usize::try_from(width).unwrap_or(usize::MAX))
+        .collect();
+    if widths.iter().any(|&width| width > 8) {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "PDF xref-stream field width is unsupported",
+        });
+    }
+    let row = widths.iter().sum::<usize>();
+    if row == 0 {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref-stream row is empty",
+        });
+    }
+    let mut payload = 0usize;
+    let mut entries = Vec::new();
+    for pair in indices.chunks_exact(2) {
+        for number in pair[0]
+            ..pair[0]
+                .checked_add(pair[1])
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF xref-stream range overflows",
+                })?
+        {
+            let end = payload
+                .checked_add(row)
+                .filter(|&end| end <= decoded.len())
+                .ok_or(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF xref-stream payload is truncated",
+                })?;
+            let mut at = payload;
+            let mut fields = [0u64; 3];
+            for (field, &width) in fields.iter_mut().zip(&widths) {
+                for &byte in &decoded[at..at + width] {
+                    *field = (*field << 8) | u64::from(byte);
+                }
+                at += width;
+            }
+            if widths[0] == 0 {
+                fields[0] = 1;
+            }
+            let slot = match fields[0] {
+                0 => AuthSlot::Free,
+                1 => AuthSlot::Offset {
+                    offset: usize::try_from(fields[1]).map_err(|_| {
+                        FormatError::InvalidStructure {
+                            format: FMT,
+                            detail: "PDF xref-stream object offset is out of range",
+                        }
+                    })?,
+                    generation: fields[2],
+                },
+                2 => AuthSlot::InStream {
+                    stream: fields[1],
+                    index: usize::try_from(fields[2]).map_err(|_| {
+                        FormatError::InvalidStructure {
+                            format: FMT,
+                            detail: "PDF compressed-object index is out of range",
+                        }
+                    })?,
+                },
+                _ => {
+                    payload = end;
+                    continue;
+                }
+            };
+            entries.push((number, slot));
+            payload = end;
+        }
+    }
+    if payload != decoded.len() {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref-stream payload has trailing entries",
+        });
+    }
+    Ok(AuthSection {
+        entries,
+        previous: dict_optional_offset(dict, b"/Prev")?,
+        supplemental: None,
+        root: find_name(dict, b"/Root")
+            .and_then(|at| read_ref(dict, at + b"/Root".len()))
+            .map(|(number, generation, _)| (number, generation)),
+    })
+}
+
+fn decode_auth_stream(dict: &[u8], raw: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let filters = pdf_filter_names(dict)?;
+    let filter_count = filters.len();
+    let mut decoded = raw.to_vec();
+    for (filter_index, filter) in filters.into_iter().enumerate() {
+        match filter {
+            b"/FlateDecode" | b"/Fl" => {
+                decoded = inflate_pdf_stream(&decoded)?;
+                decoded = apply_auth_predictor(dict, decoded, filter_count)?;
+            }
+            b"/Crypt" if auth_crypt_identity(dict, filter_index, filter_count)? => {}
+            _ => {
+                return Err(FormatError::UnsupportedVariant {
+                    format: FMT,
+                    detail: "unsupported PDF structural stream filter",
+                })
+            }
+        }
+    }
+    Ok(decoded)
+}
+
+fn auth_crypt_identity(
+    stream_dict: &[u8],
+    filter_index: usize,
+    filter_count: usize,
+) -> Result<bool, FormatError> {
+    let Some(at) = find_name(stream_dict, b"/DecodeParms") else {
+        return Ok(false);
+    };
+    let mut cursor = skip_pdf_ws(stream_dict, at + b"/DecodeParms".len());
+    if filter_count == 1 {
+        let (open, close) =
+            direct_dict_span(stream_dict, cursor).ok_or(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF /Crypt filter has no parameter dictionary",
+            })?;
+        return Ok(has_name_value(
+            &stream_dict[open..close],
+            b"/Name",
+            b"/Identity",
+        ));
+    }
+    if stream_dict.get(cursor) != Some(&b'[') {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "PDF filter array has no matching /DecodeParms array",
+        });
+    }
+    cursor += 1;
+    for index in 0..filter_count {
+        cursor = skip_pdf_ws(stream_dict, cursor);
+        if stream_dict.get(cursor..cursor + 4) == Some(b"null") {
+            if index == filter_index {
+                return Ok(false);
+            }
+            cursor += 4;
+            continue;
+        }
+        let (open, close) =
+            direct_dict_span(stream_dict, cursor).ok_or(FormatError::UnsupportedVariant {
+                format: FMT,
+                detail: "PDF /DecodeParms array entry is not a dictionary",
+            })?;
+        if index == filter_index {
+            return Ok(has_name_value(
+                &stream_dict[open..close],
+                b"/Name",
+                b"/Identity",
+            ));
+        }
+        cursor = close;
+    }
+    Ok(false)
+}
+
+fn apply_auth_predictor(
+    stream_dict: &[u8],
+    data: Vec<u8>,
+    filter_count: usize,
+) -> Result<Vec<u8>, FormatError> {
+    let Some(at) = find_name(stream_dict, b"/DecodeParms") else {
+        return Ok(data);
+    };
+    if filter_count != 1 {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "PDF structural stream has ambiguous /DecodeParms",
+        });
+    }
+    let (open, close) = direct_dict_span(stream_dict, at + b"/DecodeParms".len()).ok_or(
+        FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "PDF structural stream /DecodeParms is not a dictionary",
+        },
+    )?;
+    let parameters = &stream_dict[open..close];
+    let predictor = find_name(parameters, b"/Predictor")
+        .and_then(|at| read_uint(parameters, at + b"/Predictor".len()))
+        .map_or(1, |(value, _)| value);
+    if predictor <= 1 {
+        return Ok(data);
+    }
+    if !(10..=15).contains(&predictor) {
+        return Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "PDF structural stream predictor is unsupported",
+        });
+    }
+    let parameter = |name: &[u8], default| {
+        find_name(parameters, name)
+            .and_then(|at| read_uint(parameters, at + name.len()))
+            .map_or(default, |(value, _)| value)
+    };
+    let colors = parameter(b"/Colors", 1);
+    let bits = parameter(b"/BitsPerComponent", 8);
+    let columns = parameter(b"/Columns", 1);
+    if colors == 0 || bits == 0 || columns == 0 || colors > 32 || bits > 16 {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF predictor parameters are out of range",
+        });
+    }
+    let pixel_bits = colors
+        .checked_mul(bits)
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF predictor pixel width overflows",
+        })?;
+    let row = columns
+        .checked_mul(pixel_bits)
+        .and_then(|value| value.checked_add(7))
+        .and_then(|value| usize::try_from(value / 8).ok())
+        .filter(|&value| value > 0)
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF predictor row width is invalid",
+        })?;
+    let pixel = usize::try_from(pixel_bits.div_ceil(8)).unwrap_or(1).max(1);
+    let mut output = Vec::with_capacity(data.len());
+    let mut previous = vec![0u8; row];
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        let kind = data[cursor];
+        cursor += 1;
+        let end = cursor
+            .checked_add(row)
+            .filter(|&end| end <= data.len())
+            .ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF predictor row is truncated",
+            })?;
+        let mut current = data[cursor..end].to_vec();
+        cursor = end;
+        match kind {
+            0 => {}
+            1 => {
+                for index in pixel..row {
+                    current[index] = current[index].wrapping_add(current[index - pixel]);
+                }
+            }
+            2 => {
+                for index in 0..row {
+                    current[index] = current[index].wrapping_add(previous[index]);
+                }
+            }
+            3 => {
+                for index in 0..row {
+                    let left = if index >= pixel {
+                        current[index - pixel]
+                    } else {
+                        0
+                    };
+                    current[index] = current[index]
+                        .wrapping_add(((u16::from(left) + u16::from(previous[index])) / 2) as u8);
+                }
+            }
+            4 => {
+                for index in 0..row {
+                    let left = if index >= pixel {
+                        current[index - pixel]
+                    } else {
+                        0
+                    };
+                    let above_left = if index >= pixel {
+                        previous[index - pixel]
+                    } else {
+                        0
+                    };
+                    current[index] =
+                        current[index].wrapping_add(paeth(left, previous[index], above_left));
+                }
+            }
+            _ => {
+                return Err(FormatError::InvalidStructure {
+                    format: FMT,
+                    detail: "PDF predictor row has an invalid filter",
+                })
+            }
+        }
+        output.extend_from_slice(&current);
+        previous = current;
+    }
+    Ok(output)
+}
+
+fn paeth(left: u8, above: u8, above_left: u8) -> u8 {
+    let left = i32::from(left);
+    let above = i32::from(above);
+    let above_left = i32::from(above_left);
+    let estimate = left + above - above_left;
+    let left_distance = (estimate - left).abs();
+    let above_distance = (estimate - above).abs();
+    let diagonal_distance = (estimate - above_left).abs();
+    if left_distance <= above_distance && left_distance <= diagonal_distance {
+        left as u8
+    } else if above_distance <= diagonal_distance {
+        above as u8
+    } else {
+        above_left as u8
+    }
+}
+/// An object-level `/AF` association and the exact bytes of the owning PDF
+/// information resource against which its manifest must be verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdfObjectManifestStore {
+    pub owner_number: u64,
+    pub owner_generation: u64,
+    coverage_span: Option<(usize, usize)>,
+    coverage_bytes: Vec<u8>,
+    store_span: Option<(usize, usize)>,
+    decoded_store: Option<Vec<u8>>,
+    pub defect: Option<&'static str>,
+}
+
+impl PdfObjectManifestStore {
+    pub fn coverage<'a>(&'a self, asset: &'a [u8]) -> Option<&'a [u8]> {
+        match self.coverage_span {
+            Some((start, length)) => asset.get(start..start + length),
+            None => Some(&self.coverage_bytes),
+        }
+    }
+
+    pub fn store<'a>(&'a self, asset: &'a [u8]) -> Option<&'a [u8]> {
+        if let Some(decoded) = &self.decoded_store {
+            return Some(decoded);
+        }
+        let (start, length) = self.store_span?;
+        asset.get(start..start + length)
+    }
+}
+
+/// Enumerate object-level C2PA associations without changing document-level
+/// extraction. Cross-reference resolution is authoritative: superseded or
+/// unreferenced object-shaped bytes are ignored, while compressed owners in
+/// object streams are resolved.
+pub(crate) fn object_manifest_stores(
+    data: &[u8],
+) -> Result<Vec<PdfObjectManifestStore>, FormatError> {
+    let mut document = AuthDocument::parse(data)?;
+    let root = document.root.ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF trailer has no /Root",
+    })?;
+    let catalog = document.fetch(root.0, root.1, 0)?;
+    if !catalog
+        .dict()
+        .is_some_and(|dict| has_name_value(dict, b"/Type", b"/Catalog"))
+    {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF /Root does not resolve to the authoritative catalog",
+        });
+    }
+    let references = document.references();
+    let mut out = Vec::new();
+    for (number, generation) in references {
+        if root == (number, generation) {
+            continue;
+        }
+        let owner = document.fetch(number, generation, 0)?;
+        let Some(dict) = owner.dict() else {
+            continue;
+        };
+        let Some(af_at) = find_name(dict, b"/AF") else {
+            continue;
+        };
+        let (coverage_span, coverage_bytes) = match owner.stream {
+            Some(span) => (Some(span), Vec::new()),
+            None => (None, dict.to_vec()),
+        };
+        let refs = match auth_association_references(&mut document, dict, af_at) {
+            Ok(refs) => refs,
+            Err(error) => {
+                out.push(PdfObjectManifestStore {
+                    owner_number: number,
+                    owner_generation: generation,
+                    coverage_span,
+                    coverage_bytes,
+                    store_span: None,
+                    decoded_store: None,
+                    defect: Some(defect_detail(&error)),
+                });
+                continue;
+            }
+        };
+        if refs.is_empty() {
+            out.push(PdfObjectManifestStore {
+                owner_number: number,
+                owner_generation: generation,
+                coverage_span,
+                coverage_bytes,
+                store_span: None,
+                decoded_store: None,
+                defect: Some("object-level PDF /AF is not a file specification"),
+            });
+            continue;
+        }
+        let mut stores = Vec::new();
+        let mut malformed = None;
+        for (spec_number, spec_generation) in refs {
+            match auth_filespec_store(&mut document, spec_number, spec_generation) {
+                Ok(Some(store)) => stores.push(store),
+                Ok(None) => {}
+                Err(error) => malformed = Some(defect_detail(&error)),
+            }
+        }
+        if stores.len() != 1 {
+            out.push(PdfObjectManifestStore {
+                owner_number: number,
+                owner_generation: generation,
+                coverage_span,
+                coverage_bytes,
+                store_span: None,
+                decoded_store: None,
+                defect: Some(if stores.len() > 1 {
+                    "object-level PDF /AF associates more than one C2PA Manifest Store"
+                } else {
+                    malformed.unwrap_or("object-level PDF /AF has no C2PA Manifest Store")
+                }),
+            });
+            continue;
+        }
+        let store = stores.pop().expect("length checked");
+        out.push(PdfObjectManifestStore {
+            owner_number: number,
+            owner_generation: generation,
+            coverage_span,
+            coverage_bytes,
+            store_span: store.store_span,
+            decoded_store: store.decoded_store,
+            defect: malformed,
+        });
+    }
+    Ok(out)
+}
+
+fn auth_association_references(
+    document: &mut AuthDocument<'_>,
+    owner_dict: &[u8],
+    af_at: usize,
+) -> Result<Vec<(u64, u64)>, FormatError> {
+    let value = skip_pdf_ws(owner_dict, af_at + b"/AF".len());
+    if owner_dict.get(value) == Some(&b'[') {
+        return Ok(parse_ref_array(owner_dict, value));
+    }
+    let (number, generation, _) =
+        read_ref(owner_dict, value).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "object-level PDF /AF is not an indirect reference or array",
+        })?;
+    let target = document.fetch(number, generation, 0)?;
+    if target.dict().is_some() {
+        Ok(vec![(number, generation)])
+    } else {
+        let references = parse_ref_array(&target.text, 0);
+        if references.is_empty() {
+            Err(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "object-level PDF /AF reference is not an array",
+            })
+        } else {
+            Ok(references)
+        }
+    }
+}
+
+fn auth_filespec_store(
+    document: &mut AuthDocument<'_>,
+    number: u64,
+    generation: u64,
+) -> Result<Option<LocatedStore>, FormatError> {
+    let spec = document.fetch(number, generation, 0)?;
+    let dict = spec.dict().ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "object-level PDF /AF file specification is malformed",
+    })?;
+    if !has_name_value(dict, b"/AFRelationship", b"/C2PA_Manifest") {
+        return Ok(None);
+    }
+    let ef_at = find_name(dict, b"/EF").ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "object-level C2PA file specification has no /EF",
+    })?;
+    let value = skip_pdf_ws(dict, ef_at + b"/EF".len());
+    let ef_owned;
+    let ef = if let Some((ef_number, ef_generation, _)) = read_ref(dict, value) {
+        ef_owned = document.fetch(ef_number, ef_generation, 0)?;
+        ef_owned.dict().ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "object-level C2PA /EF reference is not a dictionary",
+        })?
+    } else {
+        let (open, close) = direct_dict_span(dict, value).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "object-level C2PA /EF is not a dictionary",
+        })?;
+        &dict[open..close]
+    };
+    let file_at = find_name(ef, b"/F")
+        .or_else(|| find_name(ef, b"/UF"))
+        .ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "object-level C2PA /EF names no embedded file",
+        })?;
+    let (stream_number, stream_generation, _) =
+        read_ref(ef, file_at + 2).ok_or(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "object-level C2PA /EF is not an indirect reference",
+        })?;
+    auth_manifest_stream(document, stream_number, stream_generation).map(Some)
+}
+
+fn auth_manifest_stream(
+    document: &mut AuthDocument<'_>,
+    number: u64,
+    generation: u64,
+) -> Result<LocatedStore, FormatError> {
+    let stream = document.fetch(number, generation, 0)?;
+    let dict = stream.dict().ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "C2PA stream object has no dictionary",
+    })?;
+    if !has_name_value(dict, b"/Subtype", b"/application#2Fc2pa") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "C2PA embedded-file stream has no application/c2pa subtype",
+        });
+    }
+    let (start, raw_length) = stream.stream.ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "C2PA embedded file is not a stream",
+    })?;
+    let raw = document
+        .data
+        .get(start..start + raw_length)
+        .ok_or(FormatError::Truncated(FMT))?;
+    let filters = pdf_filter_names(dict)?;
+    let transforms = filters.iter().any(|filter| *filter != b"/Crypt");
+    let decoded = decode_auth_stream(dict, raw)?;
+    let length = manifest_store_length(&decoded)?;
+    if transforms {
+        let mut decoded = decoded;
+        decoded.truncate(length);
+        Ok(LocatedStore {
+            raw_span: (start, raw_length),
+            store_span: None,
+            decoded_store: Some(decoded),
+        })
+    } else {
+        Ok(LocatedStore {
+            raw_span: (start, raw_length),
+            store_span: Some((start, length)),
+            decoded_store: None,
+        })
+    }
+}
+
+fn auth_catalog_store(data: &[u8]) -> Result<Option<LocatedStore>, FormatError> {
+    let mut document = AuthDocument::parse(data)?;
+    let root = document.root.ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF trailer has no /Root",
+    })?;
+    let catalog = document.fetch(root.0, root.1, 0)?;
+    let dict = catalog.dict().ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF /Root is not a catalog dictionary",
+    })?;
+    if !has_name_value(dict, b"/Type", b"/Catalog") {
+        return Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF /Root is not the catalog",
+        });
+    }
+    let Some(af_at) = find_name(dict, b"/AF") else {
+        return Ok(None);
+    };
+    let references = auth_association_references(&mut document, dict, af_at)?;
+    let mut stores = Vec::new();
+    for (number, generation) in references {
+        if let Some(store) = auth_filespec_store(&mut document, number, generation)? {
+            stores.push(store);
+        }
+    }
+    match stores.len() {
+        0 => Ok(None),
+        1 => Ok(stores.pop()),
+        _ => Err(FormatError::InvalidStructure {
+            format: FMT,
+            detail: DUPLICATE_STORES,
+        }),
+    }
+}
+
+/// C2PA 2.5 catalog extraction through authoritative PDF object resolution.
+pub(crate) fn extract_v2_5(data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    Ok(auth_catalog_store(data)?.and_then(|store| store.bytes(data).map(<[u8]>::to_vec)))
+}
+
+/// C2PA 2.5 data-hash exclusion through authoritative PDF object resolution.
+pub(crate) fn exclusions_v2_5(data: &[u8]) -> Result<Vec<DataHashExclusion>, FormatError> {
+    let Some(store) = auth_catalog_store(data)? else {
+        return Ok(Vec::new());
+    };
+    match store.store_span {
+        Some((start, length)) => Ok(vec![DataHashExclusion { start, length }]),
+        None => Err(FormatError::UnsupportedVariant {
+            format: FMT,
+            detail: "compressed C2PA manifest stream has no byte range to exclude",
+        }),
+    }
+}
+
+/// C2PA 2.5 retained catalog stores, each resolved in its historical rendition
+/// through that rendition's authoritative cross-reference map.
+pub(crate) fn manifest_store_sections_v2_5(
+    data: &[u8],
+) -> Result<Vec<PdfManifestStoreSection>, FormatError> {
+    let ends = revision_ends(data)?;
+    let mut sections = Vec::new();
+    let mut seen = Vec::new();
+    for (section_index, section_end) in ends.into_iter().enumerate() {
+        let rendition = &data[..section_end];
+        match auth_catalog_store(rendition) {
+            Ok(Some(store)) if !seen.contains(&store.raw_span) => {
+                seen.push(store.raw_span);
+                sections.push(PdfManifestStoreSection {
+                    section_index,
+                    section_end,
+                    store_span: store.store_span,
+                    decoded_store: store.decoded_store,
+                    defect: None,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => sections.push(PdfManifestStoreSection {
+                section_index,
+                section_end,
+                store_span: None,
+                decoded_store: None,
+                defect: Some(defect_detail(&error)),
+            }),
+        }
+    }
+    Ok(sections)
 }
 
 /// Historical rendition ends, oldest first, from the classic `/Prev` chain.
@@ -326,22 +1793,8 @@ fn revision_ends(data: &[u8]) -> Result<Vec<usize>, FormatError> {
                 detail: "PDF has too many incremental update sections",
             });
         }
-        if data.get(offset..offset.saturating_add(4)) != Some(b"xref") {
-            return Err(FormatError::UnsupportedVariant {
-                format: FMT,
-                detail: "cross-reference streams are not supported",
-            });
-        }
-        let trailer =
-            find_from(data, b"trailer", offset + 4).ok_or(FormatError::InvalidStructure {
-                format: FMT,
-                detail: "PDF cross-reference table has no trailer",
-            })?;
-        let (open, close) = dict_span(data, trailer).ok_or(FormatError::InvalidStructure {
-            format: FMT,
-            detail: "PDF trailer has no dictionary",
-        })?;
-        let dict = &data[open..close];
+        let dict = xref_dictionary(data, offset)?;
+        let section_end = xref_structure_end(data, offset)?;
         let previous = find_name(dict, b"/Prev")
             .map(|position| {
                 read_uint(dict, position + 5)
@@ -359,7 +1812,7 @@ fn revision_ends(data: &[u8]) -> Result<Vec<usize>, FormatError> {
             });
         }
         let keyword =
-            find_from(data, b"startxref", close).ok_or(FormatError::InvalidStructure {
+            find_from(data, b"startxref", section_end).ok_or(FormatError::InvalidStructure {
                 format: FMT,
                 detail: "PDF revision has no startxref",
             })?;
@@ -398,6 +1851,46 @@ fn revision_ends(data: &[u8]) -> Result<Vec<usize>, FormatError> {
         });
     }
     Ok(ends)
+}
+
+/// Byte immediately after a classic trailer dictionary or xref-stream
+/// `endobj`. Searching for the revision's `startxref` begins here, never in
+/// arbitrary compressed xref payload bytes.
+fn xref_structure_end(data: &[u8], offset: usize) -> Result<usize, FormatError> {
+    if data.get(offset..offset.saturating_add(4)) == Some(b"xref") {
+        let trailer =
+            find_from(data, b"trailer", offset + 4).ok_or(FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF cross-reference table has no trailer",
+            })?;
+        return dict_span(data, trailer).map(|(_, close)| close).ok_or(
+            FormatError::InvalidStructure {
+                format: FMT,
+                detail: "PDF trailer has no dictionary",
+            },
+        );
+    }
+    let (_, close) = dict_span(data, offset).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF xref stream has no dictionary",
+    })?;
+    let stream = find_from(data, b"stream", close).ok_or(FormatError::InvalidStructure {
+        format: FMT,
+        detail: "PDF xref stream has no stream body",
+    })?;
+    let endstream = find_from(data, b"endstream", stream + b"stream".len()).ok_or(
+        FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no endstream marker",
+        },
+    )?;
+    let endobj = find_from(data, b"endobj", endstream + b"endstream".len()).ok_or(
+        FormatError::InvalidStructure {
+            format: FMT,
+            detail: "PDF xref stream has no endobj marker",
+        },
+    )?;
+    Ok(endobj + b"endobj".len())
 }
 
 /// Return the trailer dictionary at an exact `startxref` target.
@@ -1241,7 +2734,7 @@ mod tests {
             let stream_offset = pdf.len();
             pdf.extend_from_slice(
                 format!(
-                    "{stream_number} 0 obj\n<< /Type /EmbeddedFile /Length {} >>\nstream\n",
+                    "{stream_number} 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fc2pa /Length {} >>\nstream\n",
                     store.len()
                 )
                 .as_bytes(),
@@ -1342,5 +2835,230 @@ mod tests {
         );
         let got = extract(&padded).unwrap().expect("store found");
         assert_eq!(got, store, "store must be sliced by its own LBox");
+    }
+
+    fn pdf_with_custom_store(stream_dictionary: &str, payload: &[u8], encrypted: bool) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 6];
+        offsets[1] = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /AF [2 0 R] >>\nendobj\n");
+        offsets[2] = pdf.len();
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 3 0 R >> >>\nendobj\n",
+        );
+        offsets[3] = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fc2pa {stream_dictionary} >>\nstream\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(payload);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets[4] = pdf.len();
+        pdf.extend_from_slice(format!("4 0 obj\n{}\nendobj\n", payload.len()).as_bytes());
+        offsets[5] = pdf.len();
+        pdf.extend_from_slice(b"5 0 obj\n<< /Filter /Standard /V 4 >>\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in &offsets[1..] {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        let encrypt = if encrypted { " /Encrypt 5 0 R" } else { "" };
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R{encrypt} >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn filtered_identity_and_indirect_length_streams_are_read() {
+        let store = dummy_manifest_store();
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&store, 6);
+        let flate = pdf_with_custom_store("/Length 4 0 R /Filter /FlateDecode", &compressed, false);
+        assert_eq!(extract(&flate).unwrap(), Some(store.clone()));
+        assert!(matches!(
+            exclusions(&flate),
+            Err(FormatError::UnsupportedVariant { .. })
+        ));
+
+        let identity = pdf_with_custom_store(
+            "/Length 4 0 R /Filter /Crypt /DecodeParms << /Name /Identity >>",
+            &store,
+            true,
+        );
+        assert_eq!(extract(&identity).unwrap(), Some(store.clone()));
+        let spans = exclusions(&identity).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            &identity[spans[0].start..spans[0].start + spans[0].length],
+            store.as_slice()
+        );
+
+        let non_identity = pdf_with_custom_store(
+            "/Length 4 0 R /Filter /Crypt /DecodeParms << /Name /StdCF >>",
+            &store,
+            true,
+        );
+        assert!(matches!(
+            extract(&non_identity),
+            Err(FormatError::UnsupportedVariant { .. })
+        ));
+    }
+
+    #[test]
+    fn xref_stream_revision_history_keeps_its_store() {
+        let store = dummy_manifest_store();
+        let pdf = pdf_with_xref_stream(&store);
+        let history = manifest_store_sections(&pdf).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].section_end, pdf.len());
+        assert_eq!(history[0].store(&pdf), Some(store.as_slice()));
+    }
+
+    #[test]
+    fn object_level_af_has_independent_exact_coverage() {
+        let store = dummy_manifest_store();
+        let resource = b"object-level-image-bytes";
+        let mut pdf = b"%PDF-2.0\n".to_vec();
+        let mut offsets = [0usize; 7];
+        offsets[1] = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets[2] = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets[3] = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 4 0 R >> >> >>\nendobj\n");
+        offsets[4] = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /XObject /Subtype /Image /AF [6 0 R] /Length {} >>\nstream\n",
+                resource.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(resource);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets[5] = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fc2pa /Length {} >>\nstream\n",
+                store.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&store);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets[6] = pdf.len();
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 5 0 R >> >>\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in &offsets[1..] {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        assert_eq!(extract(&pdf).unwrap(), None);
+        let objects = object_manifest_stores(&pdf).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].owner_number, 4);
+        assert_eq!(objects[0].coverage(&pdf), Some(resource.as_slice()));
+        assert_eq!(objects[0].store(&pdf), Some(store.as_slice()));
+        assert_eq!(objects[0].defect, None);
+
+        let mut decoy = pdf.clone();
+        decoy.extend_from_slice(b"4 0 obj\n<< /Type /XObject /AF [999 0 R] >>\nendobj\n");
+        let authoritative = object_manifest_stores(&decoy).unwrap();
+        assert_eq!(authoritative.len(), 1);
+        assert_eq!(
+            authoritative[0].coverage(&decoy),
+            Some(resource.as_slice()),
+            "an unreferenced duplicate object cannot supersede the xref-selected owner"
+        );
+
+        let mut malformed = pdf.clone();
+        let offset_field = malformed[xref..]
+            .windows(10)
+            .position(|window| window == format!("{:010}", offsets[4]).as_bytes())
+            .map(|relative| xref + relative)
+            .unwrap();
+        malformed[offset_field..offset_field + 10]
+            .copy_from_slice(format!("{:010}", offsets[4] + 1).as_bytes());
+        assert!(object_manifest_stores(&malformed).is_err());
+    }
+
+    #[test]
+    fn compressed_object_owner_is_resolved_from_xref_stream() {
+        let store = dummy_manifest_store();
+        let owner = b"<< /Type /XObject /Subtype /Image /AF [6 0 R] >>";
+        let mut object_stream_data = b"4 0 ".to_vec();
+        object_stream_data.extend_from_slice(owner);
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&object_stream_data, 6);
+
+        let mut pdf = b"%PDF-2.0\n".to_vec();
+        let mut offsets = [0usize; 8];
+        offsets[1] = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        offsets[2] = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "2 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length {} >>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets[5] = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fc2pa /Length {} >>\nstream\n",
+                store.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&store);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets[6] = pdf.len();
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 5 0 R >> >>\nendobj\n",
+        );
+        offsets[7] = pdf.len();
+
+        let mut xref_data = Vec::new();
+        for (kind, field1, field2) in [
+            (0u8, 0u32, u16::MAX),
+            (1, offsets[1] as u32, 0),
+            (1, offsets[2] as u32, 0),
+            (0, 0, 0),
+            (2, 2, 0),
+            (1, offsets[5] as u32, 0),
+            (1, offsets[6] as u32, 0),
+            (1, offsets[7] as u32, 0),
+        ] {
+            xref_data.push(kind);
+            xref_data.extend_from_slice(&field1.to_be_bytes());
+            xref_data.extend_from_slice(&field2.to_be_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /XRef /Size 8 /Root 1 0 R /W [1 4 2] /Length {} >>\nstream\n",
+                xref_data.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&xref_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{}\n%%EOF\n", offsets[7]).as_bytes());
+
+        let objects = object_manifest_stores(&pdf).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].owner_number, 4);
+        assert_eq!(objects[0].coverage(&pdf), Some(owner.as_slice()));
+        assert_eq!(objects[0].store(&pdf), Some(store.as_slice()));
     }
 }

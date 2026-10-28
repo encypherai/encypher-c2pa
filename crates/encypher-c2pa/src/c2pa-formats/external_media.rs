@@ -183,16 +183,19 @@ pub(super) fn check(canonical_mime: &str, data: &[u8]) -> Result<(), FormatError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::c2pa_core::{EngineProfile, OperatingMode, SpecVersion};
 
     #[test]
     fn external_media_rejects_wrong_signatures_and_truncated_headers() {
+        let profile = EngineProfile::new(SpecVersion::V2_4, OperatingMode::Regular);
         for mime in EXTERNAL_MEDIA_MIMES {
             assert!(
-                AssetFormat::from_detached_content(mime, b"\xff\xd8JPEG").is_err(),
+                AssetFormat::from_detached_content_for_profile(mime, b"\xff\xd8JPEG", profile)
+                    .is_err(),
                 "{mime}"
             );
             assert!(
-                AssetFormat::from_detached_content(mime, &[]).is_err(),
+                AssetFormat::from_detached_content_for_profile(mime, &[], profile).is_err(),
                 "{mime}"
             );
         }
@@ -202,20 +205,31 @@ mod tests {
 
     #[test]
     fn external_media_aac_dispatch_preserves_legacy_bmff() {
+        let profile = EngineProfile::new(SpecVersion::V2_4, OperatingMode::Regular);
         assert_eq!(
-            AssetFormat::from_detached_content("audio/aac", b"\0\0\0\x18ftypmp42").unwrap(),
+            AssetFormat::from_detached_content_for_profile(
+                "audio/aac",
+                b"\0\0\0\x18ftypmp42",
+                profile,
+            )
+            .unwrap(),
             Some(AssetFormat::Bmff)
         );
         let adts = [0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc];
         assert_eq!(
-            AssetFormat::from_detached_content("AUDIO/AAC; codecs=aac", &adts).unwrap(),
+            AssetFormat::from_detached_content_for_profile(
+                &crate::resolve_detached_mime("AUDIO/AAC; codecs=aac", profile).unwrap(),
+                &adts,
+                profile,
+            )
+            .unwrap(),
             Some(FMT)
         );
         let mut tagged = b"ID3\x04\0\x10\0\0\0\0".to_vec();
         tagged.extend_from_slice(&[0; 10]);
         tagged.extend_from_slice(&adts);
         assert_eq!(
-            AssetFormat::from_detached_content("audio/aac", &tagged).unwrap(),
+            AssetFormat::from_detached_content_for_profile("audio/aac", &tagged, profile).unwrap(),
             Some(FMT)
         );
     }
@@ -223,8 +237,9 @@ mod tests {
     #[test]
     fn external_media_webm_requires_finite_header_and_webm_doctype() {
         let webm = b"\x1a\x45\xdf\xa3\x87\x42\x82\x84webm";
+        let profile = EngineProfile::new(SpecVersion::V2_4, OperatingMode::Regular);
         assert_eq!(
-            AssetFormat::from_detached_content("video/webm", webm).unwrap(),
+            AssetFormat::from_detached_content_for_profile("video/webm", webm, profile).unwrap(),
             Some(FMT)
         );
         assert!(check("video/webm", b"\x1a\x45\xdf\xa3\xff").is_err());

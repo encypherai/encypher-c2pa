@@ -36,12 +36,13 @@
 //!
 //! ## Ceilings
 //!
-//! A manifest store is attacker-supplied. The walk is bounded on depth and on
-//! the number of manifests validated, and it never re-enters a manifest it has
-//! already reached, so a cycle terminates. Exhausting a ceiling stops the walk
-//! and records `com.encypher.ingredient.graphLimitExceeded` as informational:
-//! running out of budget says nothing about authenticity and must never be
-//! confusable with a hash or signature failure.
+//! A manifest store is attacker-supplied. One shared budget bounds depth,
+//! distinct manifests, hashed-URI references, and cumulative manifest bytes.
+//! The walk never re-enters a manifest it has already reached, so a cycle
+//! terminates. Exhausting a ceiling stops the walk and records
+//! `com.encypher.resource.graphLimitExceeded` as informational: running out of
+//! budget says nothing about authenticity and cannot become a validation
+//! failure.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -56,16 +57,218 @@ use super::{
 };
 use crate::c2pa_cbor::Value;
 use crate::c2pa_core::jumbf::ParsedManifest;
-use crate::c2pa_crypto::{extract_x5chain, verify_claim, CryptoError};
+use crate::c2pa_crypto::{extract_x5chain, verify_claim_with, CryptoError};
 
-/// Maximum ingredient edges followed away from the active manifest.
-const MAX_DEPTH: usize = 16;
-/// Maximum manifests validated in one walk, the active manifest included.
-const MAX_MANIFESTS: usize = 64;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resource ceilings for one verification graph.
+pub struct GraphLimits {
+    /// Maximum graph edges followed from the active manifest.
+    pub max_depth: usize,
+    /// Maximum distinct manifests visited, including append-history stores.
+    pub max_nodes: usize,
+    /// Maximum references examined across the pass.
+    pub max_references: usize,
+    /// Maximum cumulative JUMBF bytes of visited manifests and predecessor stores.
+    pub max_bytes: usize,
+}
 
-/// Informational: a ceiling stopped the ingredient walk. Entity-namespaced
+impl GraphLimits {
+    /// Engine ceilings used when the caller supplies no lower limits.
+    pub const DEFAULT: Self = Self {
+        max_depth: 32,
+        max_nodes: 1_024,
+        max_references: 16_384,
+        max_bytes: 64 * 1024 * 1024,
+    };
+
+    /// Construct caller-requested limits, clamped so no engine ceiling rises.
+    pub fn lowered(
+        max_depth: usize,
+        max_nodes: usize,
+        max_references: usize,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            max_depth: max_depth.min(Self::DEFAULT.max_depth),
+            max_nodes: max_nodes.min(Self::DEFAULT.max_nodes),
+            max_references: max_references.min(Self::DEFAULT.max_references),
+            max_bytes: max_bytes.min(Self::DEFAULT.max_bytes),
+        }
+    }
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+/// Caller-supplied resource provider and ceilings for graph validation.
+pub struct GraphInputs<'a> {
+    /// Network-free source of external bytes already held by the caller.
+    pub external: Option<&'a dyn super::refs::ExternalResources>,
+    /// Resource ceilings shared by the complete verification pass.
+    pub limits: GraphLimits,
+}
+
+#[derive(Clone, Copy)]
+enum Ceiling {
+    Depth = 0,
+    Nodes = 1,
+    References = 2,
+    Bytes = 3,
+}
+
+impl Ceiling {
+    const ALL: [Self; 4] = [Self::Depth, Self::Nodes, Self::References, Self::Bytes];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Depth => "depth",
+            Self::Nodes => "nodes",
+            Self::References => "references",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+pub(super) struct Budget {
+    limits: GraphLimits,
+    nodes: usize,
+    references: usize,
+    bytes: usize,
+    exhausted: [Option<usize>; 4],
+    reported: [bool; 4],
+}
+
+impl Budget {
+    pub(super) fn new(limits: GraphLimits) -> Self {
+        Self {
+            limits: GraphLimits::lowered(
+                limits.max_depth,
+                limits.max_nodes,
+                limits.max_references,
+                limits.max_bytes,
+            ),
+            nodes: 0,
+            references: 0,
+            bytes: 0,
+            exhausted: [None; 4],
+            reported: [false; 4],
+        }
+    }
+
+    fn note(&mut self, ceiling: Ceiling, observed: usize) {
+        let slot = &mut self.exhausted[ceiling as usize];
+        if slot.is_none() {
+            *slot = Some(observed);
+        }
+    }
+
+    fn node(&mut self) -> bool {
+        if self.nodes >= self.limits.max_nodes {
+            self.note(Ceiling::Nodes, self.nodes.saturating_add(1));
+            return false;
+        }
+        self.nodes += 1;
+        true
+    }
+
+    fn bytes(&mut self, bytes: usize) -> bool {
+        let total = self.bytes.saturating_add(bytes);
+        if total > self.limits.max_bytes {
+            self.note(Ceiling::Bytes, total);
+            return false;
+        }
+        self.bytes = total;
+        true
+    }
+
+    pub(super) fn references_left(&self) -> usize {
+        self.limits.max_references.saturating_sub(self.references)
+    }
+
+    pub(super) fn references(&mut self, count: usize) -> bool {
+        let total = self.references.saturating_add(count);
+        if total > self.limits.max_references {
+            self.note(Ceiling::References, total);
+            self.references = self.limits.max_references;
+            return false;
+        }
+        self.references = total;
+        true
+    }
+
+    pub(super) fn exhaust_references(&mut self) {
+        self.note(
+            Ceiling::References,
+            self.limits.max_references.saturating_add(1),
+        );
+    }
+
+    fn depth(&mut self, depth: usize) -> bool {
+        if depth > self.limits.max_depth {
+            self.note(Ceiling::Depth, depth);
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn resource_edge(&mut self, depth: usize) -> bool {
+        let references = self.references(1);
+        let depth = self.depth(depth);
+        let nodes = self.node();
+        references && depth && nodes
+    }
+
+    pub(super) fn resource_bytes(&mut self, bytes: usize) -> bool {
+        self.bytes(bytes)
+    }
+
+    pub(super) fn report(&mut self, active_label: &str, results: &mut ValidationResults) {
+        for ceiling in Ceiling::ALL {
+            if self.reported[ceiling as usize] {
+                continue;
+            }
+            let Some(observed) = self.exhausted[ceiling as usize] else {
+                continue;
+            };
+            self.reported[ceiling as usize] = true;
+            let limit = match ceiling {
+                Ceiling::Depth => self.limits.max_depth,
+                Ceiling::Nodes => self.limits.max_nodes,
+                Ceiling::References => self.limits.max_references,
+                Ceiling::Bytes => self.limits.max_bytes,
+            };
+            let name = ceiling.as_str();
+            if results.informational.iter().any(|status| {
+                status.code == GRAPH_LIMIT_EXCEEDED
+                    && status
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("limit"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(name)
+            }) {
+                continue;
+            }
+            results.informational.push(StatusCode {
+                code: GRAPH_LIMIT_EXCEEDED.into(),
+                url: format!("self#jumbf=/c2pa/{active_label}"),
+                explanation: format!(
+                    "verification graph {name} ceiling reached ({limit}); traversal stopped. \
+                     This is a resource outcome and does not affect manifest validity."
+                ),
+                details: Some(json!({ "limit": name, "ceiling": limit, "observed": observed })),
+            });
+        }
+    }
+}
+
+/// Informational: a ceiling stopped the verification graph. Entity-namespaced
 /// because it is a resource outcome, not a C2PA validation outcome.
-pub(super) const GRAPH_LIMIT_EXCEEDED: &str = "com.encypher.ingredient.graphLimitExceeded";
+pub(super) const GRAPH_LIMIT_EXCEEDED: &str = "com.encypher.resource.graphLimitExceeded";
 
 /// One `validation_results.ingredientDeltas` entry.
 pub(super) struct IngredientDelta {
@@ -113,6 +316,8 @@ pub(super) fn build<'a>(
     active_label: &str,
     store: StoreContext<'a>,
     profile: EngineProfile,
+    budget: &mut Budget,
+    resources: &mut super::refs::ResourceCache<'_>,
 ) -> IngredientGraph {
     let mut graph = IngredientGraph {
         active: ValidationResults::default(),
@@ -142,16 +347,16 @@ pub(super) fn build<'a>(
         .collect();
     let mut reached: Vec<bool> = vec![false; store.manifests.len()];
     let mut pending: Vec<(usize, Edge)> = Vec::new();
-    let mut cache = IngredientManifestDigestCache::new(store);
+    let mut cache = IngredientManifestDigestCache::new(store, profile);
     let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
-    let mut visited = 0usize;
-    let mut limits: HashSet<&'static str> = HashSet::new();
 
     queue.push_back((active, 0));
     reached[active] = true;
-    while let Some((index, depth)) = queue.pop_front() {
-        visited += 1;
+    'walk: while let Some((index, depth)) = queue.pop_front() {
         let manifest = &store.manifests[index];
+        if !budget.node() || !budget.bytes(manifest.manifest_jumbf.len()) {
+            break;
+        }
         let is_active = index == active;
         let Some(claim) = claims[index].as_ref() else {
             if !is_active {
@@ -176,14 +381,38 @@ pub(super) fn build<'a>(
                 profile,
                 &mut results[index],
             );
+            let walked = super::refs::verify_assertion_references(
+                super::refs::AssertionReferenceContext {
+                    claim,
+                    claim_refs: &claim_refs,
+                    generation,
+                    profile,
+                    manifest_label: &manifest.label,
+                    manifests: store.manifests,
+                    budget: budget.references_left(),
+                },
+                resources,
+                &mut results[index],
+            );
+            if !budget.references(walked.examined) {
+                break;
+            }
+            if walked.truncated {
+                budget.exhaust_references();
+                break;
+            }
         }
-        for edge in edges(
+        let graph_edges = edges(
             manifest,
             &claim_refs,
             generation,
             profile,
             &mut results[index],
-        ) {
+        );
+        if !budget.references(graph_edges.len()) {
+            break;
+        }
+        for edge in graph_edges {
             let Some(target) = index_of.get(edge.target.as_str()).copied() else {
                 // The link named a manifest the store does not carry;
                 // `verify_ingredient_references` already reported it.
@@ -196,34 +425,14 @@ pub(super) fn build<'a>(
                 // manifest is validated once and the walk does not re-enter it.
                 continue;
             }
-            if depth + 1 > MAX_DEPTH {
-                limits.insert("depth");
-                continue;
-            }
-            if visited + queue.len() >= MAX_MANIFESTS {
-                limits.insert("manifests");
-                continue;
+            if !budget.depth(depth + 1) {
+                break 'walk;
             }
             reached[target] = true;
             queue.push_back((target, depth + 1));
         }
     }
-    for limit in limits {
-        let ceiling = if limit == "depth" {
-            MAX_DEPTH
-        } else {
-            MAX_MANIFESTS
-        };
-        graph.active.informational.push(StatusCode {
-            code: GRAPH_LIMIT_EXCEEDED.into(),
-            url: format!("self#jumbf=/c2pa/{active_label}"),
-            explanation: format!(
-                "ingredient graph {limit} ceiling reached ({ceiling}); traversal stopped there. \
-                 This is a resource outcome and does not affect manifest validity."
-            ),
-            details: Some(json!({ "limit": limit, "ceiling": ceiling })),
-        });
-    }
+    budget.report(active_label, &mut graph.active);
 
     // Deltas last: both sides of every edge are computed by now.
     for (target, edge) in pending {
@@ -317,7 +526,7 @@ fn record_missing_claim(manifest: &ParsedManifest<'_>, results: &mut ValidationR
 
 /// A time-stamp manifest carries a time-stamp assertion and ingredient
 /// assertions, and nothing else.
-fn is_time_stamp_manifest(claim_refs: &ClaimAssertionRefs<'_>) -> bool {
+pub(super) fn is_time_stamp_manifest(claim_refs: &ClaimAssertionRefs<'_>) -> bool {
     let mut timestamps = false;
     for label in &claim_refs.declaration_labels {
         let base = label.split("__").next().unwrap_or(label);
@@ -378,7 +587,12 @@ fn validate_reached_manifest<'a>(
         );
         return;
     };
-    match verify_claim(cose, claim_cbor, &leaf) {
+    match verify_claim_with(
+        cose,
+        claim_cbor,
+        &leaf,
+        super::spec25::claim_algorithms(profile),
+    ) {
         Ok(()) => results.push_success(
             CLAIM_SIGNATURE_VALIDATED,
             sig_url,
@@ -570,6 +784,7 @@ fn collect_recorded(codes: Option<&Value>, into: &mut Vec<(&'static str, StatusC
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use sha2::{Digest, Sha256};
@@ -589,6 +804,7 @@ mod tests {
     };
     use crate::c2pa_core::EngineProfile;
     use crate::c2pa_formats::AssetFormat;
+    use crate::{ExternalResource, ExternalResources, GraphInputs, GraphLimits, VerifyOptions};
     use serde_json::Value as Json;
 
     const INGREDIENT: &str = "urn:c2pa:00000000-0000-4000-8000-000000000001";
@@ -934,6 +1150,236 @@ mod tests {
         vec![ingredient_manifest, active_manifest]
     }
 
+    /// Both manifests are signed after all references have been constructed.
+    /// Only the nested ingredient fields supplied by the test may be invalid;
+    /// the claim bindings, signatures and child-manifest link remain intact.
+    fn related_ingredient_store(
+        fields: impl FnOnce(&Assertion, &Assertion, &Assertion) -> Vec<(&'static str, Value)>,
+    ) -> Vec<u8> {
+        let signer = Signer::conformant();
+        let binding = Assertion::new("c2pa.hash.data", &data_hash());
+        let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+        let related = Assertion::new(
+            "com.example.ingredient",
+            &vmap(vec![(
+                "description",
+                Value::Text("ingredient metadata".into()),
+            )]),
+        );
+        let child_assertions = vec![binding.clone(), actions.clone(), related.clone()];
+        let (child, child_cose) = manifest_box(
+            &signer,
+            INGREDIENT,
+            &child_assertions,
+            child_assertions.iter().map(Assertion::reference).collect(),
+        );
+        let mut link = ingredient(
+            INGREDIENT,
+            &child,
+            &child_cose,
+            "componentOf",
+            Some(recorded_results(vec![])),
+        );
+        let Value::Map(entries) = &mut link else {
+            unreachable!("ingredient is a map");
+        };
+        entries.extend(
+            fields(&related, &actions, &binding)
+                .into_iter()
+                .map(|(key, value)| (Value::Text(key.into()), value)),
+        );
+        let link = Assertion::new("c2pa.ingredient.v3", &link);
+        let assertions = vec![binding, actions, related, link];
+        let (active, _) = manifest_box(
+            &signer,
+            ACTIVE,
+            &assertions,
+            assertions.iter().map(Assertion::reference).collect(),
+        );
+        build_manifest_store(&[child, active])
+    }
+
+    fn verify_related_ingredient_store(store: &[u8], version: &str) -> crate::StoreOnlyValidation {
+        crate::verify_manifest_store_only(
+            store,
+            &VerifyOptions {
+                spec_version: Some(version.into()),
+                no_default_trust: true,
+                validation_time: Some("2026-06-01T00:00:00Z".into()),
+                ..VerifyOptions::default()
+            },
+        )
+        .expect("signed ingredient store validation")
+    }
+
+    #[test]
+    fn final_2_5_accepts_signed_active_manifest_with_related_assertions() {
+        let store = related_ingredient_store(|related, _, _| {
+            vec![("relatedAssertions", Value::Array(vec![related.reference()]))]
+        });
+        for version in ["2.2", "2.4", "2.5"] {
+            let validation = verify_related_ingredient_store(&store, version);
+            let results = &validation.report.validation_results;
+            assert!(
+                results.failure.is_empty(),
+                "{version}: {:?}",
+                results.failure
+            );
+            for code in ["claimSignature.validated", "ingredient.manifest.validated"] {
+                assert!(
+                    results.success.iter().any(|status| status.code == code),
+                    "{version}: missing {code}: {:?}",
+                    results.success
+                );
+            }
+            let deltas = validation
+                .report
+                .manifest_report
+                .pointer("/validation_results/ingredientDeltas")
+                .and_then(Json::as_array)
+                .expect("recursive ingredient validation is reported");
+            assert_eq!(deltas.len(), 1, "{version}: {deltas:?}");
+            assert!(
+                delta_codes(&deltas[0], "failure").is_empty(),
+                "{version}: {}",
+                deltas[0]
+            );
+            assert!(
+                delta_codes(&deltas[0], "success").contains(&"claimSignature.validated"),
+                "{version}: child signature must also validate: {}",
+                deltas[0]
+            );
+            assert_eq!(validation.report.hard_binding, "not_evaluated");
+            assert_eq!(validation.report.integrity, "unbound");
+        }
+    }
+
+    #[test]
+    fn final_2_5_rejects_malformed_related_assertions_in_signed_graphs() {
+        for case in [
+            "not-array",
+            "empty",
+            "not-reference",
+            "missing-target",
+            "wrong-hash",
+            "wrong-hash-type",
+            "foreign-manifest",
+            "ineligible-actions",
+            "ineligible-label",
+        ] {
+            let store = related_ingredient_store(|related, actions, binding| {
+                let value = match case {
+                    "not-array" => Value::Text("not an array".into()),
+                    "empty" => Value::Array(vec![]),
+                    "not-reference" => Value::Array(vec![Value::Text("not a hashed URI".into())]),
+                    "ineligible-actions" => Value::Array(vec![actions.reference()]),
+                    _ => {
+                        let mut reference = match case {
+                            "wrong-hash" => related.tampered_reference(),
+                            // This assertion exists and its digest matches, but its label
+                            // does not end with .ingredient.
+                            "ineligible-label" => binding.reference(),
+                            _ => related.reference(),
+                        };
+                        let Value::Map(entries) = &mut reference else {
+                            unreachable!("reference is a map");
+                        };
+                        match case {
+                            "missing-target" | "foreign-manifest" => {
+                                let url = if case == "missing-target" {
+                                    "self#jumbf=c2pa.assertions/com.missing.ingredient".into()
+                                } else {
+                                    format!(
+                                        "self#jumbf=/c2pa/{INGREDIENT}/c2pa.assertions/{}",
+                                        related.label
+                                    )
+                                };
+                                entries
+                                    .iter_mut()
+                                    .find(|(key, _)| key.as_text() == Some("url"))
+                                    .expect("url")
+                                    .1 = Value::Text(url);
+                            }
+                            "wrong-hash-type" => {
+                                entries
+                                    .iter_mut()
+                                    .find(|(key, _)| key.as_text() == Some("hash"))
+                                    .expect("hash")
+                                    .1 = Value::Text("not bytes".into());
+                            }
+                            _ => {}
+                        }
+                        Value::Array(vec![reference])
+                    }
+                };
+                vec![("relatedAssertions", value)]
+            });
+            let validation = verify_related_ingredient_store(&store, "2.5");
+            let results = &validation.report.validation_results;
+            assert!(
+                results.failure.iter().any(|status| {
+                    status.code == "assertion.ingredient.malformed"
+                        && status.url
+                            == format!(
+                                "self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3"
+                            )
+                }),
+                "{case}: {:?}",
+                results.failure
+            );
+            assert!(
+                results
+                    .success
+                    .iter()
+                    .any(|status| status.code == "claimSignature.validated"),
+                "{case}: the negative must retain a valid claim signature"
+            );
+            // Earlier policies do not apply the 2.5 relatedAssertions rule.
+            for version in ["2.2", "2.4"] {
+                let legacy = verify_related_ingredient_store(&store, version);
+                assert!(
+                    legacy.report.validation_results.failure.is_empty(),
+                    "{case}, {version}: {:?}",
+                    legacy.report.validation_results.failure
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_2_5_still_rejects_active_manifest_with_digital_source_type() {
+        let store = related_ingredient_store(|related, _, _| {
+            vec![
+                ("relatedAssertions", Value::Array(vec![related.reference()])),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ]
+        });
+        for version in ["2.2", "2.4", "2.5"] {
+            let validation = verify_related_ingredient_store(&store, version);
+            assert!(
+                validation
+                    .report
+                    .validation_results
+                    .failure
+                    .iter()
+                    .any(|status| {
+                        status.code == "assertion.ingredient.malformed"
+                            && status.url
+                                == format!(
+                                    "self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3"
+                                )
+                    }),
+                "{version}: {:?}",
+                validation.report.validation_results.failure
+            );
+        }
+    }
+
     #[test]
     fn ingredient_manifest_defect_is_reported_as_a_delta_and_not_as_an_active_failure() {
         let out = verify_store(&tampered_ingredient_store());
@@ -1088,6 +1534,8 @@ mod tests {
                 report: &out.report_json,
                 validation_time: NOW,
                 profile: EngineProfile::GENEROUS,
+                trust_list_sources: &[],
+                compressed_manifests: Vec::new(),
             },
         );
 
@@ -1238,7 +1686,7 @@ mod tests {
     #[test]
     fn a_chain_deeper_than_the_ceiling_stops_and_reports_the_limit() {
         let signer = Signer::conformant();
-        let depth = super::MAX_DEPTH + 2;
+        let depth = super::GraphLimits::DEFAULT.max_depth + 2;
         let mut boxes: Vec<Vec<u8>> = Vec::with_capacity(depth);
         let mut previous: Option<(String, Vec<u8>, Vec<u8>)> = None;
         for index in 0..depth {
@@ -1272,7 +1720,7 @@ mod tests {
             .results
             .informational
             .iter()
-            .find(|status| status.code == "com.encypher.ingredient.graphLimitExceeded")
+            .find(|status| status.code == "com.encypher.resource.graphLimitExceeded")
             .expect("graph ceiling reported");
         assert_eq!(
             limit
@@ -1287,5 +1735,140 @@ mod tests {
             .failure
             .iter()
             .any(|status| status.code.starts_with("com.encypher.ingredient.")));
+    }
+
+    #[test]
+    fn store_only_graph_inputs_share_provider_and_budget_without_binding_content() {
+        const URL: &str = "https://example.test/icon.png";
+        const ICON: &[u8] = b"caller-held icon bytes";
+
+        let external_icon = || {
+            vmap(vec![
+                ("url", Value::Text(URL.into())),
+                ("alg", Value::Text("sha256".into())),
+                ("hash", Value::Bytes(Sha256::digest(ICON).to_vec())),
+                ("dc:format", Value::Text("image/png".into())),
+            ])
+        };
+        let actions = Assertion::new(
+            "c2pa.actions.v2",
+            &vmap(vec![
+                (
+                    "actions",
+                    Value::Array(vec![vmap(vec![
+                        ("action", Value::Text("c2pa.created".into())),
+                        (
+                            "digitalSourceType",
+                            Value::Text(
+                                "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture"
+                                    .into(),
+                            ),
+                        ),
+                    ])]),
+                ),
+                (
+                    "softwareAgents",
+                    Value::Array(vec![
+                        vmap(vec![
+                            ("name", Value::Text("agent one".into())),
+                            ("icon", external_icon()),
+                        ]),
+                        vmap(vec![
+                            ("name", Value::Text("agent two".into())),
+                            ("icon", external_icon()),
+                        ]),
+                    ]),
+                ),
+            ]),
+        );
+        let binding = Assertion::new("c2pa.hash.data", &data_hash());
+        let signer = Signer::conformant();
+        let (manifest, _) = manifest_box(
+            &signer,
+            ACTIVE,
+            &[binding.clone(), actions.clone()],
+            vec![binding.reference(), actions.reference()],
+        );
+        let store = build_manifest_store(&[manifest]);
+        let options = VerifyOptions {
+            no_default_trust: true,
+            validation_time: Some("2026-06-01T00:00:00Z".into()),
+            ..VerifyOptions::default()
+        };
+
+        struct Provider {
+            calls: Cell<usize>,
+        }
+
+        impl ExternalResources for Provider {
+            fn resolve(&self, url: &str) -> ExternalResource<'_> {
+                assert_eq!(url, URL);
+                self.calls.set(self.calls.get() + 1);
+                ExternalResource::Retrieved {
+                    bytes: ICON,
+                    media_type: Some("image/png"),
+                }
+            }
+        }
+
+        let provider = Provider {
+            calls: Cell::new(0),
+        };
+        let validation = crate::verify_manifest_store_only_with_graph_inputs(
+            &store,
+            &options,
+            GraphInputs {
+                external: Some(&provider),
+                limits: GraphLimits::default(),
+            },
+        )
+        .expect("store-only graph validation");
+        assert_eq!(provider.calls.get(), 1, "one URI is resolved once");
+        assert_eq!(validation.report.hard_binding, "not_evaluated");
+        assert_eq!(validation.report.integrity, "unbound");
+        assert_eq!(
+            validation
+                .report
+                .validation_results
+                .success
+                .iter()
+                .filter(|status| {
+                    status.code == "assertion.hashedURI.match" && status.url == URL
+                })
+                .count(),
+            2
+        );
+
+        let limited_provider = Provider {
+            calls: Cell::new(0),
+        };
+        let limited = crate::verify_manifest_store_only_with_graph_inputs(
+            &store,
+            &options,
+            GraphInputs {
+                external: Some(&limited_provider),
+                limits: GraphLimits::lowered(32, 1_024, 1, 64 * 1024 * 1024),
+            },
+        )
+        .expect("budget-limited store-only graph validation");
+        assert_eq!(limited.report.hard_binding, "not_evaluated");
+        assert!(
+            limited
+                .report
+                .validation_results
+                .informational
+                .iter()
+                .any(|status| {
+                    status.code == "com.encypher.resource.graphLimitExceeded"
+                        && status
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("limit"))
+                            .and_then(Json::as_str)
+                            == Some("references")
+                }),
+            "{:?}",
+            limited.report.validation_results.informational
+        );
     }
 }

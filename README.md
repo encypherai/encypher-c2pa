@@ -22,7 +22,7 @@ Check the Content Credentials on a file without sending the file anywhere. Encyp
 
 Verification runs on your machine. It needs no account, and verifying a file makes no network request unless you allow online checks. The command line also checks once a day for a newer release, which you can turn off (see [Updates](#updates)). Teams that mark AI-generated output for the EU AI Act (Article 50) or the California AI Transparency Act can use it to confirm that what they ship still verifies after it leaves their systems.
 
-The SDK implements the open standards: [C2PA 2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html) manifests and [CAWG Identity 1.3](https://cawg.io/identity/1.3/) assertions. One Rust core serves the command line, Rust, Python, browser JavaScript, Go, and C.
+The SDK verifies manifests under caller-selected [C2PA 2.2](https://spec.c2pa.org/specifications/specifications/2.2/index.html), [2.4](https://spec.c2pa.org/specifications/specifications/2.4/index.html), and [2.5](https://spec.c2pa.org/specifications/specifications/2.5/index.html) policies, plus [CAWG Identity 1.3](https://cawg.io/identity/1.3/) assertions. C2PA 2.4 remains the default. One Rust core serves the command line, Rust, Python, browser JavaScript, Go, and C.
 
 ## Quick start
 
@@ -66,6 +66,12 @@ print(report["integrity"], report["trust"]["status"])
 ```
 
 The wheel supports Python 3.9 and later on Linux (glibc and musl, x86_64 and aarch64), macOS, and Windows x64.
+
+`verify` and `verify_stream` accept `external_data` (URI to standard-base64
+body), `external_data_media_types` (URI to observed MIME type), and
+`external_data_unreachable` (URIs already attempted without a usable body).
+These supply evidence, not permission to fetch. Omitted evidence remains
+not-attempted; supplied bytes are still checked against the signed references.
 
 ### Browser JavaScript
 
@@ -137,7 +143,7 @@ The report schema is `1.0` and stable. See [Report schema](https://github.com/en
 
 ## What it verifies
 
-- Manifest stores embedded in 71 media types across images, video, audio, documents, archives, fonts, and structured text, including Brotli-compressed stores and update manifests.
+- Embedded manifest readers for 73 canonical MIME types under the default C2PA 2.4 policy, 18 under 2.2, and 99 under 2.5, across images, video, audio, documents, archives, fonts, and text. These inventories include Brotli-compressed stores and update manifests; they do not enumerate every supported open MIME-family member.
 - Claim signatures, including RFC 3161 timestamps and OCSP responses stapled into the manifest. Signing, timestamp, and CAWG certificates are checked against the C2PA certificate profile and an RFC 5280 path to a trusted anchor.
 - Hashed references from the claim to each assertion, and the ingredient links that tie a manifest to the ones before it.
 - Hard bindings: data hash, BMFF hash (including Merkle trees for fragmented MP4), general box hash, ZIP collection hash, and multi-asset hash.
@@ -145,7 +151,7 @@ The report schema is `1.0` and stable. See [Report schema](https://github.com/en
 - Every manifest in a PDF's incremental-update history, each against the version of the file that introduced it.
 - CAWG identity assertions signed with X.509 certificates or identity claims aggregation credentials, with `did:jwk` resolution and `did:web` documents you pin or, with online checks allowed, fetch. X.509 identity signatures report the registered CAWG Identity 1.3 `cawg.x509.*` codes. CAWG results apply to the identity assertion only; they never change the C2PA integrity verdict.
 
-`encypher-c2pa formats` prints the supported MIME types. [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md) lists them with the binding each uses. Text support covers every method C2PA 2.4 defines (plain-text wrapper, structured-text comment block, and HTML script element) through the [`c2pa-text`](https://crates.io/crates/c2pa-text) crate.
+`encypher-c2pa formats` prints the default 2.4 inventory; `encypher-c2pa formats --spec 2.5` prints the 2.5 inventory. [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md) provides the policy support matrix, carrier and binding rules, detached-only formats, and limitations. Text support includes the 2.4 plain-text wrapper, structured-text comment block, and HTML script element, plus 2.5 append-only text and JSON Lines checkpoints.
 
 ### Video streams
 
@@ -296,9 +302,21 @@ report, err := c2pa.Verify(asset, "image/jpeg", &c2pa.Options{Online: &allow})
 
 In the browser, `verify` stays synchronous and offline; `await verifyOnline(bytes, mime, options)` does the same verification and fetches through the page's own `fetch`, so the page's CORS and Content-Security-Policy rules apply.
 
+With explicit `spec_version: "2.5"`, browser verification discovers resources
+without hashing or checking signatures, resolves terminal stores, predecessor
+chains, external assertion content and ICA DID documents, then verifies once.
+Caller evidence and pinned DID documents take precedence. Requests use HTTPS
+GET, omit credentials, refuse redirects and share a 16-URI attempt budget.
+Streamed evidence has a 64 MiB cumulative budget, including bytes consumed by
+failed reads; DID documents also have a 256 KiB limit. An oversized stream is
+canceled; bytes already read remain charged. OCSP remains browser-skipped.
+The default 2.4 and explicit 2.2 paths retain their prior behavior.
+
 What each host learns is one request for one URL: that somebody is checking a file that references it. The SDK never sends asset bytes. An OCSP request carries a certificate serial number and issuer hashes, nothing more. Full detail is in [Privacy](https://github.com/encypherai/encypher-c2pa/blob/main/docs/PRIVACY.md).
 
-The fetcher is narrow on purpose: https only, except OCSP responders, whose answers are signed and verified; at most 3 redirects, each re-checked; 5-second connect and 10-second total timeouts; at most 16 requests per verification; size caps of 64 MiB for a manifest store or external content, 64 KiB for an OCSP response, 256 KiB for a DID document; no cookies, no credentials, a fixed `encypher-c2pa/<version>` user agent. Every hostname is resolved through a filter that refuses loopback, private, link-local (including `169.254.169.254`), carrier-NAT, unique-local, multicast, and documentation addresses, and the connection uses the address that was vetted. Set `--online-allow-private-networks` (`online_allow_private_networks`) for an intranet deployment: that lifts the address filter and accepts plaintext http. Do not set it where files arrive from strangers.
+The native fetcher uses HTTPS, except for OCSP responders, whose answers are signed and verified. It refuses redirects, uses 5-second connect and 10-second total timeouts, and sends no cookies or credentials. Its user agent is `encypher-c2pa/<version>`. Per-response caps are 64 MiB for manifest stores or external content, 64 KiB for OCSP, and 256 KiB for DID documents. Every hostname is resolved through a filter that refuses loopback, private, link-local (including `169.254.169.254`), carrier-NAT, unique-local, multicast, and documentation addresses; the connection uses the vetted address. Set `--online-allow-private-networks` (`online_allow_private_networks`) for an intranet deployment: that lifts the address filter and accepts plaintext HTTP. Do not set it where files arrive from strangers.
+
+With explicit `spec_version: "2.5"`, native verification uses parse-only discovery to resolve terminal stores, predecessor chains, external content and unpinned ICA DID documents before the authoritative graph pass. Caller evidence takes precedence and GET resources are fetched once per URI. All frontiers and validation-dependent OCSP requests share 16 HTTP requests and 64 MiB of received-body bytes, including failed and oversized reads. Reusing cached content as a DID document still enforces the DID size cap. Actual OCSP response or unreachable evidence can require a final evidence re-evaluation; discovery never performs an extra signature or asset-hash pass. Offline and caller-evidence-only paths allocate no HTTP client. Default 2.4 and explicit 2.2 retain their existing verification and budgeting behavior.
 
 What stays caller-supplied, and why: ICA status-list credentials, because a credential has to be verified as a credential before it can be trusted; trust lists, because their currency is a snapshot policy rather than a fetch; and AIA `caIssuers` chain completion.
 
@@ -329,9 +347,24 @@ The setting is saved in `update.json` in the configuration directory (`~/.config
 
 By default the verifier applies the C2PA 2.4 validation rules. A few rules that content written under C2PA 1.x could not have followed, such as the links from an action to its ingredients, apply to that content only in strict mode.
 
-Set `strict_conformance` (`--strict-conformance`) to apply the C2PA Conformance Program as well. Strict mode turns the program's additional requirements into failures, such as a trusted timestamp and usable revocation information, and requires CAWG Identity 1.3 deterministic encoding of identity signatures. It also adds the report's Content Credentials JSON (`content_credentials`), the form conformance rubrics evaluate.
+Set `strict_conformance` (`--strict-conformance`) to apply strict validation. With the 2.2 or 2.4 policy, strict mode selects that revision's published C2PA Conformance Program posture. It turns additional program requirements into failures, such as a trusted timestamp and usable revocation information, and requires CAWG Identity 1.3 deterministic encoding of identity signatures. It also adds the report's Content Credentials JSON (`content_credentials`), the form conformance rubrics evaluate.
+
+Set `spec_version` (`--spec`) to `"2.2"`, `"2.4"`, or `"2.5"` to select the validation policy. The default, and `"2.4"`, keep the 2.4 rules and produce identical reports. The 2.2 option applies the older policy. The 2.5 option targets the published C2PA 2.5 standard (specs-core tag `2.5`, commit `d538a73795b64f2c9d0c1a332b7ae38728070413`). Under 2.5, `strict_conformance` enables strict core-spec diagnostics; it does not claim a C2PA Conformance Program scope or certification. Any other value fails with `unsupported_spec_version` before the asset is read. Reports name the selected policy in `profile` (`c2pa-2.2`, `c2pa-2.4`, or `c2pa-2.5`). The policy is chosen by the caller, never by what a manifest declares. See [docs/FORMATS.md](docs/FORMATS.md) for the format-level differences.
 
 Where the two postures differ, the default report says so with an informational status. For example, an identity signature over the CAWG 1.1 field order, which c2pa-rs still writes, verifies by default with `com.encypher.cawg.legacyProfile`. To refuse that encoding without taking on the rest of strict mode, set `cawg_strict_encoding` (`--cawg-strict-encoding`).
+
+## Ingredient graphs and external resources
+
+Rust callers can use `verify_with_graph_inputs`, `verify_with_manifest_store_and_graph_inputs`, `verify_fragmented_with_graph_inputs`, and `verify_manifest_store_only_with_graph_inputs` to validate ingredient graphs and external references in one bounded pass. The caller-verified-binding feature's whole-verification and evaluator-driven CAWG functions take the same `GraphInputs` as their final argument. `GraphInputs` accepts an `ExternalResources` provider for bytes the caller already holds. One memoized provider path covers generic hashed references, linked-resource integrity, cloud-data and external-reference assertions, and external predecessor stores in a `c2pa.hash.segment` history. The verifier borrows provider bodies, does not open sockets, and asks the provider at most once for each URI during the pass. `OnlineEvidence::external_data` remains authoritative when both inputs name a URI, and an explicit unreachable evidence outcome is never replaced by provider content. Default `GraphLimits` allow 32 ingredient edges, 1,024 distinct manifests, 16,384 references, and 64 MiB of cumulative manifest bytes across the whole pass, including append-history predecessor stores. `GraphLimits::lowered` can reduce those ceilings but cannot raise them. Reaching one records `com.encypher.resource.graphLimitExceeded` and stops that traversal. Store-only verification remains unbound because no content comparison occurs.
+
+Services that resolve external URLs can call `locate_external_resources` or `locate_external_resources_with_manifest_store` before one authoritative verification. The returned `ExternalResourcePlan<A>` owns the caller's asset container and exposes an ordered frontier of typed `Opaque` or `SegmentManifestStore` requests. Root discovery uses the verifier's format-specific remote-manifest locator, including a C2PA 2.5 append-only checkpoint that names an external active store. Under 2.5, a syntactically valid MIME type with no embedded reader returns no store and no request, so the caller can apply an HTTP Link or repository root without inventing an embedded carrier; older policy admission is unchanged. After the caller resolves that frontier into an `ExternalResources` provider, `continue_with` replaces it with the next frontier. The retrieved initial store and append-history predecessor stores are each parsed once. A URI first seen as opaque is promoted and parsed from the already-held provider body without another fetch. `manifest_store_present` is set only when an initial store body is located, before parsing. A malformed embedded store therefore cannot trigger remote fallback; an extraction error remains a typed malformed stop with presence false and also forbids fallback. The supplied-store locator always uses that store even when the asset embeds another, matching the supplied-store verifier. `truncated` carries a typed graph-limit, unavailable-predecessor, or malformed-store reason. Discovery performs no signature, digest, trust, time, or network operation. Final verification remains authoritative.
+
+`ExternalResourcePlan::did_documents()` exposes parse-only ICA DID requests
+from the selected identity scope. `VerifyOptions::validate_with_external_data`
+returns owned, decoded caller evidence for adapters that retain a provider,
+avoiding a second base64 decode. Under exact 2.5, the core also consumes that
+provider for a declared remote root: unavailable and not-attempted remain
+distinct, and a predecessor can never replace the terminal store.
 
 ## Failure telemetry (opt-in)
 
@@ -361,13 +394,13 @@ The answer is attached under `encypher_api` and never changes the local verdict 
 
 This SDK verifies open-standard Content Credentials. It does not sign media, build manifests, or write into files, and the published API has no path that could. [Verification boundary](https://github.com/encypherai/encypher-c2pa/blob/main/docs/VERIFICATION_BOUNDARY.md) describes the three CI controls that enforce this.
 
-It also does not read Encypher's proprietary provenance markers, such as sentence-level text provenance or durable soft bindings. Content that carries them verifies here as ordinary C2PA content. Signing, marker detection, hosted trust policy, and durable receipts are available through the [Encypher API](https://api.encypher.com/docs).
+The SDK does not detect Encypher's proprietary sentence-level or durable markers. It can consume a caller-extracted registered soft binding through the C2PA 2.5 Soft Binding Resolution API, then verify each recovered manifest locally. Every endpoint origin must be allowlisted, redirects are refused, and each manifest ID is encoded as one repository URL path segment. Asset upload and reference disclosure require explicit route-specific consent, and network access remains opt-in. Signing, proprietary marker detection, hosted trust policy, and durable receipt issuance are available through the [Encypher API](https://api.encypher.com/docs).
 
 ## Standards status
 
-The verifier shares no code with other C2PA implementations. Interoperability is tested offline against pinned vectors: core media from `contentauth/c2pa-rs`, the CAWG identity corpus, and generated conformance vectors. Expected results come from the C2PA 2.4 status-code definitions, not from another implementation's output.
+The verifier shares no code with other C2PA implementations. Interoperability is tested offline against pinned vectors: core media from `contentauth/c2pa-rs`, the CAWG identity corpus, and generated conformance vectors. Expected results come from the status-code definitions for the selected C2PA policy, not from another implementation's output.
 
-The C2PA 2.4 and CAWG Identity 1.3 labels describe what the verifier targets. They are not a conformance certification. C2PA and Content Credentials are marks of their respective owners.
+The C2PA 2.2, 2.4, and 2.5 labels and the CAWG Identity 1.3 label describe what the verifier targets. They are not a conformance certification. C2PA and Content Credentials are marks of their respective owners.
 
 ## Build from source
 

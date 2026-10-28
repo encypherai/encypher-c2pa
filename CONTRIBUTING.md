@@ -15,7 +15,7 @@ Good contributions include:
 
 ## Development
 
-Install Rust 1.85 or later.
+Install Rust 1.88 or later, matching the workspace `rust-version` in [Cargo.toml](Cargo.toml).
 
 ```bash
 cargo test --workspace
@@ -44,8 +44,10 @@ For Go:
 ```bash
 cargo build -p encypher-c2pa-ffi --release
 cd bindings/go
-go test ./...
+go test -a -count=1 ./...
 ```
+
+Force recompilation because Go's build cache does not track changes to the Rust archive linked through cgo.
 
 ## Tests
 

@@ -32,7 +32,9 @@ use crate::c2pa_crypto::{
     parse_timestamp_header, protected_iat, timestamp_assertion_input, TimestampHeaderEvidence,
     TimestampHeaderVersion,
 };
-use crate::c2pa_trust::{certificate_valid_at, verify_timestamp_token, TrustList};
+use crate::c2pa_trust::{
+    certificate_valid_at, verify_timestamp_token_with, CertificateProfile, TrustList,
+};
 
 /// A `c2pa.time-stamp` assertion is not a single non-empty map of manifest
 /// identifiers to non-empty tokens (VAL-TIME-0006/0007).
@@ -227,6 +229,7 @@ pub fn validate_timestamp_evidence(
     assertions: &TimestampAssertionIndex,
     tsa_trust: Option<&TrustList>,
     verification_time: OffsetDateTime,
+    profile: CertificateProfile,
     results: &mut ValidationResults,
     url: &str,
 ) -> Option<TrustedTimestamp> {
@@ -255,9 +258,13 @@ pub fn validate_timestamp_evidence(
                 &header.message_imprint_input,
                 tsa_trust,
                 verification_time,
+                profile,
             ) {
-                TokenOutcome::Trusted(generated_at) => {
+                TokenOutcome::Trusted(generated_at, trust_sources) => {
                     report_trusted(results, url);
+                    if profile == CertificateProfile::V2_5 {
+                        results.trust_list_sources.extend(trust_sources);
+                    }
                     if header.version == TimestampHeaderVersion::SigTst {
                         results.push_informational(
                             TIMESTAMP_V1_SIGNATURE_UNBOUND,
@@ -283,9 +290,18 @@ pub fn validate_timestamp_evidence(
         if let Ok(assertion_input) = timestamp_assertion_input(cose_sign1) {
             let mut assertion_failure = None;
             for token in candidates {
-                match validate_token(token, &assertion_input, tsa_trust, verification_time) {
-                    TokenOutcome::Trusted(generated_at) => {
+                match validate_token(
+                    token,
+                    &assertion_input,
+                    tsa_trust,
+                    verification_time,
+                    profile,
+                ) {
+                    TokenOutcome::Trusted(generated_at, trust_sources) => {
                         report_trusted(results, url);
+                        if profile == CertificateProfile::V2_5 {
+                            results.trust_list_sources.extend(trust_sources);
+                        }
                         return Some(TrustedTimestamp {
                             generated_at,
                             source: TimestampSource::TimeStampAssertion,
@@ -368,7 +384,7 @@ pub(super) fn numeric_date_to_time(seconds: f64) -> Option<OffsetDateTime> {
 }
 
 pub(super) enum TokenOutcome {
-    Trusted(OffsetDateTime),
+    Trusted(OffsetDateTime, Vec<crate::c2pa_trust::TrustSource>),
     Failed(TokenFailure, &'static str),
 }
 
@@ -396,20 +412,22 @@ pub(super) fn validate_token(
     message_imprint_input: &[u8],
     trust: Option<&TrustList>,
     verification_time: OffsetDateTime,
+    profile: CertificateProfile,
 ) -> TokenOutcome {
     // An empty trust list still runs every structural and cryptographic check;
     // only the final anchor lookup reports `no_tsa_anchors`. That ordering is
     // what lets a caller with no TSA configuration still see a malformed or
     // mismatched token for what it is.
     let empty = TrustList::default();
-    let verified = verify_timestamp_token(
+    let verified = verify_timestamp_token_with(
         token_der,
         message_imprint_input,
         trust.unwrap_or(&empty),
         verification_time,
+        profile,
     );
     if let (true, Some(generated_at)) = (verified.verified, verified.time) {
-        return TokenOutcome::Trusted(generated_at);
+        return TokenOutcome::Trusted(generated_at, verified.trust_sources);
     }
     let reason = verified.error.unwrap_or("timestamp_parse_error");
     TokenOutcome::Failed(classify(reason), reason)
@@ -586,6 +604,7 @@ mod tests {
             index,
             trust,
             now,
+            CertificateProfile::V2_4,
             &mut results,
             URL,
         );

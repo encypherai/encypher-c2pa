@@ -70,6 +70,22 @@ fn walk_chunks(data: &[u8], mut f: impl FnMut(&Chunk)) -> Result<(), FormatError
     Ok(())
 }
 
+/// C2PA 2.5 Embedding manifests into PNG: "The `'caBX'` chunk shall precede
+/// the `'IDAT'` chunks." (2.4 only recommended it.) A `caBX` chunk after the
+/// first `IDAT` is a placement defect.
+pub(crate) fn placement_error_v2_5(data: &[u8]) -> Result<Option<&'static str>, FormatError> {
+    let mut seen_idat = false;
+    let mut late_cabx = false;
+    walk_chunks(data, |chunk| {
+        if &chunk.type_code == b"IDAT" {
+            seen_idat = true;
+        } else if &chunk.type_code == TYPE_CABX && seen_idat {
+            late_cabx = true;
+        }
+    })?;
+    Ok(late_cabx.then_some("PNG caBX chunk does not precede the IDAT chunks"))
+}
+
 /// Segment the whole PNG into named spans for `c2pa.hash.boxes` (spec 18.4
 /// PNG convention): the 8-byte signature is `PNGh`, every chunk is named by
 /// its type code, and the `caBX` chunk carrying the C2PA Manifest Store is
@@ -330,5 +346,26 @@ mod tests {
             extract(b"\x00\x01\x02\x03\x04\x05\x06\x07"),
             Err(FormatError::InvalidStructure { .. })
         ));
+    }
+
+    #[test]
+    fn v2_5_requires_cabx_before_idat() {
+        // The 2.4-era writer here places caBX before IEND, after IDAT.
+        let late = embed(&tiny_png(), &dummy_manifest_store()).unwrap();
+        assert!(placement_error_v2_5(&late).unwrap().is_some());
+
+        let mut early = Vec::from(SIGNATURE);
+        early.extend_from_slice(&build_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0],
+        ));
+        early.extend_from_slice(&build_cabx_chunk(&dummy_manifest_store()));
+        early.extend_from_slice(&build_chunk(
+            b"IDAT",
+            &[0x78, 0x9C, 0x63, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01],
+        ));
+        early.extend_from_slice(&build_chunk(b"IEND", &[]));
+        assert_eq!(placement_error_v2_5(&early).unwrap(), None);
+        assert_eq!(placement_error_v2_5(&tiny_png()).unwrap(), None);
     }
 }

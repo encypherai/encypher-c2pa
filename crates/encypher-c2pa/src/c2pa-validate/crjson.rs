@@ -20,8 +20,8 @@
 //! produced only in strict-conformance (debug) mode.
 
 use crate::c2pa_cbor::{decode, Value};
-use crate::c2pa_core::jumbf::{AssertionContentType, ParsedManifest, ParsedStore};
-use crate::c2pa_core::EngineProfile;
+use crate::c2pa_core::jumbf::{AssertionContentType, ManifestKind, ParsedManifest, ParsedStore};
+use crate::c2pa_core::{EngineProfile, SpecVersion};
 use crate::c2pa_crypto::{
     extract_claim_tsa_tokens, extract_cose_alg, extract_x5chain, CryptoError,
 };
@@ -85,6 +85,11 @@ pub(crate) struct CrjsonContext<'a> {
     pub validation_time: OffsetDateTime,
     /// Engine profile, which names the spec revision validation ran under.
     pub profile: EngineProfile,
+    /// Per manifest, in store order: whether it was stored compressed.
+    pub compressed_manifests: Vec<bool>,
+    /// Claim/TSA trust-list sources whose anchors actually accepted the active
+    /// manifest's signing evidence.
+    pub trust_list_sources: &'a [crate::c2pa_trust::TrustSource],
 }
 
 /// Render a parsed manifest store as Content Credentials JSON.
@@ -110,7 +115,7 @@ pub(crate) fn to_crjson(store: &ParsedStore, context: &CrjsonContext) -> Json {
     };
 
     let mut manifests = Vec::with_capacity(store.manifests.len());
-    for manifest in store.manifests.iter().rev() {
+    for (index, manifest) in store.manifests.iter().enumerate().rev() {
         let label = manifest.label.as_str();
         let codes = if active_label == Some(label) {
             active_results.clone()
@@ -127,9 +132,40 @@ pub(crate) fn to_crjson(store: &ParsedStore, context: &CrjsonContext) -> Json {
         let (claim_key, claim) = claim(manifest);
         entry.insert(claim_key.into(), claim);
         entry.insert("signature".into(), signature(manifest));
+        // 2.5 crJSON: every manifest states whether it is an update manifest
+        // and whether it was stored compressed (`isUpdateManifest`,
+        // `isCompressedManifest`, both required). The 2.4 document keeps its
+        // published shape.
+        if context.profile.version == SpecVersion::V2_5 {
+            entry.insert(
+                "isUpdateManifest".into(),
+                Json::Bool(manifest.kind() == ManifestKind::Update),
+            );
+            entry.insert(
+                "isCompressedManifest".into(),
+                Json::Bool(
+                    context
+                        .compressed_manifests
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false),
+                ),
+            );
+        }
+        let trust_sources = if active_label == Some(label) {
+            context.trust_list_sources
+        } else {
+            &[]
+        };
         entry.insert(
             "validationResults".into(),
-            validation_results(codes, &validation_time, &spec_version),
+            validation_results(
+                codes,
+                &validation_time,
+                &spec_version,
+                trust_sources,
+                context.profile.version == SpecVersion::V2_5,
+            ),
         );
         let owned_deltas: Vec<Json> = deltas
             .iter()
@@ -402,6 +438,12 @@ fn alg_name(alg: crate::c2pa_crypto::CoseAlg) -> String {
         CoseAlg::Ps384 => "PS384",
         CoseAlg::Ps512 => "PS512",
         CoseAlg::EdDsa => "Ed25519",
+        CoseAlg::Esp256 => "ESP256",
+        CoseAlg::Esp384 => "ESP384",
+        CoseAlg::Esp512 => "ESP512",
+        CoseAlg::MlDsa44 => "ML-DSA-44",
+        CoseAlg::MlDsa65 => "ML-DSA-65",
+        CoseAlg::MlDsa87 => "ML-DSA-87",
     }
     .to_string()
 }
@@ -572,15 +614,50 @@ fn validation_results(
     codes: Option<StatusCodes>,
     validation_time: &str,
     spec_version: &str,
+    trust_sources: &[crate::c2pa_trust::TrustSource],
+    include_trust_sources: bool,
 ) -> Json {
     let codes = codes.unwrap_or_default();
-    json!({
+    let mut output = json!({
         "success": codes.success,
         "informational": codes.informational,
         "failure": codes.failure,
         "specVersion": spec_version,
         "validationTime": validation_time,
-    })
+    });
+    if include_trust_sources && !trust_sources.is_empty() {
+        let mut seen = Vec::new();
+        let entries: Vec<Json> = trust_sources
+            .iter()
+            .filter(|source| {
+                let key = (
+                    source.uri.as_str(),
+                    source.source_type.as_str(),
+                    source.identifier.as_deref(),
+                );
+                if seen.contains(&key) {
+                    false
+                } else {
+                    seen.push(key);
+                    true
+                }
+            })
+            .map(|source| {
+                let mut entry = Map::new();
+                entry.insert("uri".into(), Json::String(source.uri.clone()));
+                entry.insert("type".into(), Json::String(source.source_type.clone()));
+                if let Some(identifier) = &source.identifier {
+                    entry.insert("identifier".into(), Json::String(identifier.clone()));
+                }
+                Json::Object(entry)
+            })
+            .collect();
+        output
+            .as_object_mut()
+            .expect("validationResults is an object")
+            .insert("trustListUris".into(), Json::Array(entries));
+    }
+    output
 }
 
 /// Read `validation_results.ingredientDeltas` as `(assertion URI, status codes)`
@@ -768,6 +845,8 @@ mod tests {
             report,
             validation_time: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
             profile: EngineProfile::strict(SpecVersion::V2_4),
+            trust_list_sources: &[],
+            compressed_manifests: Vec::new(),
         }
     }
 
@@ -872,6 +951,60 @@ mod tests {
             cr["manifests"][1]["validationResults"]["success"],
             json!([]),
             "a manifest with no assessment still carries empty groups"
+        );
+    }
+
+    #[test]
+    fn trust_list_uris_are_exactly_a_v2_5_active_manifest_field() {
+        let claim = claim_cbor(generator_array(), Vec::new());
+        let bytes =
+            build_manifest_store(&[manifest_bytes("urn:c2pa:active", "c2pa.claim.v2", &claim)]);
+        let store = parse_manifest_store(&bytes).unwrap();
+        let report = empty_report();
+        let sources = [
+            crate::c2pa_trust::TrustSource::new(
+                "urn:example:claim-trust",
+                "http://example.org/trust-list",
+            )
+            .with_identifier("claim-roots"),
+            crate::c2pa_trust::TrustSource::new(
+                "urn:example:tsa-trust",
+                "http://example.org/trust-list",
+            ),
+        ];
+        let v2_5_context = CrjsonContext {
+            report: &report,
+            validation_time: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            profile: EngineProfile::strict(SpecVersion::V2_5),
+            compressed_manifests: Vec::new(),
+            trust_list_sources: &sources,
+        };
+        let v2_5 = to_crjson(&store, &v2_5_context);
+        assert_eq!(
+            v2_5["manifests"][0]["validationResults"]["trustListUris"],
+            json!([
+                {
+                    "uri": "urn:example:claim-trust",
+                    "type": "http://example.org/trust-list",
+                    "identifier": "claim-roots"
+                },
+                {
+                    "uri": "urn:example:tsa-trust",
+                    "type": "http://example.org/trust-list"
+                }
+            ])
+        );
+
+        let v2_4_context = CrjsonContext {
+            profile: EngineProfile::strict(SpecVersion::V2_4),
+            ..v2_5_context
+        };
+        let v2_4 = to_crjson(&store, &v2_4_context);
+        assert!(
+            v2_4["manifests"][0]["validationResults"]
+                .get("trustListUris")
+                .is_none(),
+            "2.4 serialization must remain unchanged"
         );
     }
 

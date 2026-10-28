@@ -13,12 +13,18 @@
 //! only.
 //!
 //! Supported readers cover JPEG, PNG, BMFF, FLAC, RIFF, GIF, SVG, JXL, ZIP,
-//! ID3, TIFF/DNG, Font/SFNT, PDF, Ogg, and C2PA text wrappers.
+//! ID3, TIFF/DNG, Font/SFNT, PDF, Ogg, and C2PA text wrappers, plus the
+//! carriers C2PA 2.5 adds: Standard MIDI Files, TTML, ONNX, SafeTensors,
+//! Parquet, BlockFact, WARC, and append-only text checkpoints.
 
 #![forbid(unsafe_code)]
 
+use crate::c2pa_core::SpecVersion;
+
 use thiserror::Error;
 
+mod append_text;
+mod blockfact;
 mod bmff;
 mod external_media;
 pub(crate) use external_media::canonicalize_detached_mime;
@@ -28,19 +34,37 @@ mod gif;
 mod id3;
 mod jpeg;
 mod jxl;
+mod midi;
 mod ogg;
+mod onnx;
+mod parquet;
 mod pdf;
 mod png;
 mod riff;
+mod safetensors;
 mod svg;
 mod text;
 pub(crate) mod text_standard;
 mod tiff;
+mod ttml;
 pub(crate) mod util;
+mod warc;
 pub(crate) mod xmp;
 mod zip;
+pub(crate) use append_text::AppendOnlyFlavor;
+pub(crate) use append_text::{
+    declares_checkpoints, locate_active as locate_active_checkpoint,
+    sentinel_at as checkpoint_sentinel_at, Located as CheckpointLocated,
+    Sentinel as CheckpointSentinel, SentinelReference as CheckpointReference,
+};
 pub(crate) use pdf::{
-    manifest_store_sections as pdf_manifest_store_sections, PdfManifestStoreSection,
+    manifest_store_sections as pdf_manifest_store_sections,
+    manifest_store_sections_v2_5 as pdf_manifest_store_sections_v2_5,
+    object_manifest_stores as pdf_object_manifest_stores, PdfManifestStoreSection,
+    PdfObjectManifestStore,
+};
+pub(crate) use warc::{
+    verify_collection as warc_verify_collection, WarcArchive, WarcCollectionFailure,
 };
 
 /// A C2PA-carrying asset container format.
@@ -63,9 +87,9 @@ pub enum AssetFormat {
     Tiff,
     /// GIF: JUMBF in an Application Extension block.
     Gif,
-    /// SVG: JUMBF base64-encoded in an XML processing instruction.
+    /// SVG: JUMBF base64-encoded in a `c2pa:manifest` metadata element.
     Svg,
-    /// PDF: embedded file stream. Not yet implemented.
+    /// PDF: embedded file stream referenced from the catalog `AF` array.
     Pdf,
     /// ZIP/OPC family (EPUB, OOXML, OpenDocument, OpenXPS): JUMBF in entry
     /// `META-INF/content_credential.c2pa`.
@@ -102,6 +126,37 @@ pub enum AssetFormat {
     /// version. `extract` returns the bytes verbatim; `embed` and data-hash
     /// exclusions are not applicable.
     C2paStore,
+    /// Standard MIDI File (C2PA 2.5): JUMBF in a Sequencer-Specific Meta
+    /// Event (`FF 7F 00 43 32`) before End of Track in the designated track.
+    Midi,
+    /// Standalone TTML (C2PA 2.5): Base64 JUMBF in
+    /// `/tt:tt/tt:head/tt:metadata/c2pa:manifest`.
+    Ttml,
+    /// ONNX (C2PA 2.5): Base64 JUMBF as the `c2pa:manifest` value in
+    /// `ModelProto.metadata_props`.
+    Onnx,
+    /// SafeTensors (C2PA 2.5): Base64 JUMBF as `__metadata__.c2pa:manifest`
+    /// in the JSON header.
+    SafeTensors,
+    /// Apache Parquet (C2PA 2.5): Base64 JUMBF as the `c2pa:manifest`
+    /// `KeyValue` in the footer's `key_value_metadata`.
+    Parquet,
+    /// BlockFact `.facti`/`.facta`/`.factv` (C2PA 2.5): JUMBF as the data of
+    /// the `C2PA` extension block.
+    BlockFact,
+    /// WARC 1.1 (C2PA 2.5): JUMBF as the block of the last
+    /// `c2pa-provenance` record; bound by a collection data hash.
+    Warc,
+    /// Append-only plain text or JSON Lines (C2PA 2.5): checkpoint sentinel
+    /// lines; bound by `c2pa.hash.segment`.
+    AppendOnlyText {
+        /// The sentinel-line grammar.
+        flavor: AppendOnlyFlavor,
+    },
+    /// Bytes with no standardized embedding. Only a separately supplied
+    /// (external) manifest store can bind them; [`AssetFormat::from_mime`]
+    /// never returns it.
+    Opaque,
     /// Detached-only media: a whole-file data hash, with no embedded carrier.
     /// Ordinary MIME resolution never selects this variant.
     ExternalMedia,
@@ -162,7 +217,12 @@ impl AssetFormat {
         // aliased input resolves to the same format — and signs to the same
         // bytes — as its canonical form.
         let canon = crate::c2pa_core::spec::canonicalize_mime(mime);
-        Some(match canon.as_str() {
+        Self::from_canonical_mime(&canon)
+    }
+
+    /// Resolve an already canonicalized MIME without allocating.
+    pub(crate) fn from_canonical_mime(mime: &str) -> Option<Self> {
+        Some(match mime {
             "image/jpeg" => Self::Jpeg,
             "image/png" => Self::Png,
             "image/webp" => Self::Riff,
@@ -171,7 +231,7 @@ impl AssetFormat {
             // verification. They are deliberately absent from FORMAT_REGISTRY, so
             // the profile-gated signing resolver refuses them (read-only),
             // matching c2pa-rs's TiffIO raw handling.
-            "image/x-sony-arw" | "image/x-nikon-nef" => Self::Tiff,
+            "image/x-sony-arw" | "image/x-nikon-nef" | "image/x-tiff-based" => Self::Tiff,
             "image/avif"
             | "image/heic"
             | "image/heic-sequence"
@@ -181,11 +241,13 @@ impl AssetFormat {
             | "video/quicktime"
             | "audio/mp4"
             | "video/x-m4v"
-            | "application/mp4" => Self::Bmff,
+            | "application/mp4"
+            | "video/x-bmff-based" => Self::Bmff,
             "image/gif" => Self::Gif,
             "image/svg+xml" => Self::Svg,
             "image/jxl" => Self::Jxl,
-            "video/x-msvideo" | "audio/wav" => Self::Riff,
+            "video/x-msvideo" | "audio/wav" | "image/x-riff-based" | "video/x-riff-based"
+            | "audio/x-riff-based" => Self::Riff,
             "audio/mpeg" => Self::Id3,
             "audio/flac" => Self::Flac,
             "audio/ogg" => Self::Ogg,
@@ -193,6 +255,14 @@ impl AssetFormat {
             "application/zip"
             | "application/x-zip-based"
             | "application/epub+zip"
+            | "application/vnd.apple.keynote"
+            | "application/vnd.apple.pages"
+            | "application/vnd.apple.numbers"
+            | "application/x-krita"
+            | "image/openraster"
+            | "application/vnd.adobe.indesign-idml-package"
+            | "application/vnd.google-earth.kmz"
+            | "model/3mf"
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
             | "application/vnd.ms-word.document.macroenabled.12"
@@ -248,30 +318,96 @@ impl AssetFormat {
             },
             // EXPERIMENTAL: host-less compound manifest store (PR #2058).
             "application/c2pa" => Self::C2paStore,
+            // ---- Carriers C2PA 2.5 adds. The registry decides which policy
+            // may read them; routing is policy-independent. ----
+            "audio/midi" => Self::Midi,
+            "application/ttml+xml" => Self::Ttml,
+            // ONNX and SafeTensors have no registered media type; these are
+            // the documented non-normative spellings (`c2pa_core::spec`).
+            "application/onnx" => Self::Onnx,
+            "application/safetensors" => Self::SafeTensors,
+            "application/vnd.apache.parquet" => Self::Parquet,
+            "image/vnd.blockfact.facti"
+            | "audio/vnd.blockfact.facta"
+            | "video/vnd.blockfact.factv" => Self::BlockFact,
+            "application/warc" => Self::Warc,
+            // JSON Lines has no registered media type either; a JSONL stream
+            // is only ever an append-only checkpoint carrier.
+            "application/jsonl" => Self::AppendOnlyText {
+                flavor: AppendOnlyFlavor::JsonLines,
+            },
+            // WebVTT: the structured-text block is a `NOTE` comment block
+            // after the `WEBVTT` header (2.5 Structured Text examples).
+            "text/vtt" => Self::TextStructured {
+                comment_prefix: "NOTE",
+                comment_suffix: "",
+            },
+            // Textual application types with a comment convention, which the
+            // 2.5 structured-text applicability clause names by example.
+            "application/sql" => Self::TextStructured {
+                comment_prefix: "--",
+                comment_suffix: "",
+            },
+            "application/x-sh" => Self::TextStructured {
+                comment_prefix: "#",
+                comment_suffix: "",
+            },
+            "application/postscript" | "application/x-tex" | "application/x-latex" => {
+                Self::TextStructured {
+                    comment_prefix: "%",
+                    comment_suffix: "",
+                }
+            }
+            other if crate::c2pa_core::spec::is_open_document_family(other) => Self::Zip,
             other => match c2pa_text::structured::comment_syntax(other) {
                 Some((comment_prefix, comment_suffix)) => Self::TextStructured {
                     comment_prefix,
                     comment_suffix,
+                },
+                // Every other `text/*` type (source code, INI, AsciiDoc, ...)
+                // and every XML-derived `+xml` type without its own carrier
+                // falls under the structured-text applicability clause. The
+                // locator finds the armour delimiters without knowing the host
+                // comment syntax, so the delimiters here are informational.
+                None if other.starts_with("text/") => Self::TextStructured {
+                    comment_prefix: "",
+                    comment_suffix: "",
+                },
+                None if other.ends_with("+xml") => Self::TextStructured {
+                    comment_prefix: "<!--",
+                    comment_suffix: "-->",
                 },
                 None => return None,
             },
         })
     }
 
-    /// Resolve the explicit detached-only media set after checking its bytes.
-    /// Other types retain ordinary resolution; callers retain their profile gate.
-    pub(crate) fn from_detached_content(
+    /// Classify detached bytes for an already canonicalized detached MIME.
+    /// Malformed designated media never becomes opaque through a MIME fallback.
+    pub(crate) fn from_detached_content_for_profile(
         mime: &str,
         data: &[u8],
+        profile: crate::c2pa_core::EngineProfile,
     ) -> Result<Option<Self>, FormatError> {
-        let canonical = canonicalize_detached_mime(mime);
-        if !external_media::EXTERNAL_MEDIA_MIMES.contains(&canonical.as_str())
-            || (canonical == "audio/aac" && external_media::is_bmff(data))
-        {
-            return Ok(Self::from_mime(&canonical));
+        if !detached_mime_permitted(mime, profile.version) {
+            return Ok(None);
         }
-        external_media::check(&canonical, data)?;
-        Ok(Some(Self::ExternalMedia))
+        if external_media::EXTERNAL_MEDIA_MIMES.contains(&mime) {
+            // Detached normalization preserves raw AAC's spelling. BMFF bytes
+            // still take the ordinary AAC-to-MP4 reader route.
+            if mime == "audio/aac" && external_media::is_bmff(data) {
+                return Ok(Some(Self::Bmff));
+            }
+            external_media::check(mime, data)?;
+            return Ok(Some(Self::ExternalMedia));
+        }
+        let format = Self::from_canonical_mime(mime);
+        Ok(match format {
+            Some(Self::C2paStore) => None,
+            ordinary if crate::c2pa_core::spec::reader_permits(mime, profile.version) => ordinary,
+            _ if profile.version == SpecVersion::V2_5 => Some(Self::Opaque),
+            _ => None,
+        })
     }
 
     /// Resolve a MIME type to its [`AssetFormat`] **only if the given engine
@@ -292,6 +428,23 @@ impl AssetFormat {
         }
         Self::from_mime(mime)
     }
+}
+
+/// MIME admission shared by the facade and detached byte classification.
+pub(crate) fn detached_mime_permitted(mime: &str, version: SpecVersion) -> bool {
+    let token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&byte))
+    };
+    mime != "application/c2pa"
+        && mime
+            .split_once('/')
+            .is_some_and(|(kind, subtype)| token(kind) && token(subtype))
+        && (external_media::EXTERNAL_MEDIA_MIMES.contains(&mime)
+            || crate::c2pa_core::spec::reader_permits(mime, version)
+            || version == SpecVersion::V2_5)
 }
 
 /// A contiguous byte range to exclude from a `c2pa.hash.data` hash binding.
@@ -488,15 +641,21 @@ pub(crate) use {
 /// Re-export ZIP collection helpers for `c2pa.hash.collection.data`.
 pub(crate) use zip::{
     zip_central_directory_hash_parts, zip_entry_data, zip_entry_hash_span, zip_entry_local_span,
-    zip_entry_names, zip_index,
+    zip_entry_names, zip_index, zip_index_v2_5,
 };
+
+#[cfg(test)]
+pub(crate) use zip::tests::zip64_with_manifest_and_descriptor as zip64_test_asset;
 
 /// Re-export: the payload spans of every top-level `mdat` box, in file order
 /// (monolithic chunked-mdat merkle validation).
 pub(crate) use bmff::bmff_mdat_payloads;
 
+pub(crate) use text::TextLocatorRules;
+
 /// Return a registered text-container failure when an embedded wrapper or
-/// structured-text reference is present but unusable.
+/// structured-text reference is present but unusable (C2PA 2.4 locator only;
+/// the 2.5 locator treats every such defect as no manifest located).
 pub(crate) fn text_diagnostic(format: AssetFormat, data: &[u8]) -> Option<text::TextDiagnostic> {
     match format {
         AssetFormat::TextUnstructured => text::diagnostic(text::TextMethod::Unstructured, data),
@@ -507,8 +666,9 @@ pub(crate) fn text_diagnostic(format: AssetFormat, data: &[u8]) -> Option<text::
 
 pub(crate) fn unstructured_text_wrapper_spans(
     data: &[u8],
+    rules: TextLocatorRules,
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
-    text::unstructured_wrapper_spans(data)
+    text::unstructured_wrapper_spans(data, rules)
 }
 
 /// A remote C2PA Manifest Store declaration read out of the asset's bytes.
@@ -521,6 +681,16 @@ pub(crate) struct RemoteManifestRef {
     pub uri: String,
     /// Where the declaration was read from, for the status `details`.
     pub source: &'static str,
+}
+
+/// Format-owned result of locating an asset's remote active manifest.
+pub(crate) enum RemoteManifestLocation {
+    /// No remote active manifest is declared.
+    Absent,
+    /// The authoritative append-only checkpoint is malformed.
+    Malformed,
+    /// The authoritative active manifest is external.
+    Remote(RemoteManifestRef),
 }
 
 /// Read a documented remote-manifest declaration from `data`.
@@ -536,20 +706,52 @@ pub(crate) fn remote_manifest_uri(
     format: AssetFormat,
     data: &[u8],
 ) -> Result<Option<RemoteManifestRef>, FormatError> {
+    Ok(match locate_remote_manifest(format, data)? {
+        RemoteManifestLocation::Remote(remote) => Some(remote),
+        RemoteManifestLocation::Absent | RemoteManifestLocation::Malformed => None,
+    })
+}
+
+/// Locate a remote active manifest without flattening a malformed terminal
+/// append-only checkpoint into ordinary absence.
+pub(crate) fn locate_remote_manifest(
+    format: AssetFormat,
+    data: &[u8],
+) -> Result<RemoteManifestLocation, FormatError> {
+    // An append-only file's terminal checkpoint is authoritative. An inline or
+    // malformed terminal checkpoint never falls back to an older external one.
+    if let AssetFormat::AppendOnlyText { flavor } = format {
+        return Ok(match append_text::locate_active(data, flavor) {
+            append_text::Located::Active(append_text::Sentinel {
+                reference: append_text::SentinelReference::External(uri),
+                ..
+            }) => RemoteManifestLocation::Remote(RemoteManifestRef {
+                uri,
+                source: "append_only_text.checkpoint",
+            }),
+            append_text::Located::Malformed => RemoteManifestLocation::Malformed,
+            append_text::Located::Active(_) | append_text::Located::None => {
+                RemoteManifestLocation::Absent
+            }
+        });
+    }
     if format == AssetFormat::Font {
-        if let Some(uri) = font::remote_manifest_uri(data)? {
-            return Ok(Some(RemoteManifestRef {
+        return Ok(match font::remote_manifest_uri(data)? {
+            Some(uri) => RemoteManifestLocation::Remote(RemoteManifestRef {
                 uri: uri.to_string(),
                 source: "font.C2PA.activeManifestUri",
-            }));
-        }
-        return Ok(None);
+            }),
+            None => RemoteManifestLocation::Absent,
+        });
     }
     Ok(
-        xmp::provenance_uri(format, data).map(|uri| RemoteManifestRef {
+        match xmp::provenance_uri(format, data).map(|uri| RemoteManifestRef {
             uri,
             source: "xmp.dcterms:provenance",
-        }),
+        }) {
+            Some(remote) => RemoteManifestLocation::Remote(remote),
+            None => RemoteManifestLocation::Absent,
+        },
     )
 }
 
@@ -562,6 +764,24 @@ pub(crate) fn carrier_placement_error(
         AssetFormat::Tiff => tiff::placement_error(data),
         AssetFormat::Svg => svg::placement_error(data),
         AssetFormat::Bmff => bmff::placement_error(data),
+        _ => Ok(None),
+    }
+}
+
+/// Placement rules that are new or changed in C2PA 2.5 and that a validator
+/// can observe: PNG `caBX` before `IDAT` (a "shall" in 2.5, a recommendation
+/// in 2.4), the 2.5 BMFF manifest-box positions (adjacent to `moov` allowed),
+/// and the 2.5 TIFF locator (first or last IFD). Rules unchanged from 2.4 keep
+/// their 2.4 scope in [`carrier_placement_error`].
+pub(crate) fn carrier_placement_error_v2_5(
+    format: AssetFormat,
+    data: &[u8],
+) -> Result<Option<&'static str>, FormatError> {
+    match format {
+        AssetFormat::Png => png::placement_error_v2_5(data),
+        AssetFormat::Tiff => tiff::placement_error_v2_5(data),
+        AssetFormat::Warc => warc::placement_error(data),
+        AssetFormat::Bmff => bmff::placement_error_v2_5(data),
         _ => Ok(None),
     }
 }
@@ -602,12 +822,35 @@ fn logical_manifest_store(data: &[u8]) -> &[u8] {
     }
 }
 
-/// Extract the raw JUMBF manifest-store bytes from `data`.
+fn text_locator_rules(spec_version: SpecVersion) -> TextLocatorRules {
+    match spec_version {
+        SpecVersion::V1_4
+        | SpecVersion::V2_0
+        | SpecVersion::V2_1
+        | SpecVersion::V2_2
+        | SpecVersion::V2_3
+        | SpecVersion::V2_4 => TextLocatorRules::V2_4,
+        SpecVersion::V2_5 => TextLocatorRules::V2_5,
+    }
+}
+
+/// Extract the raw JUMBF manifest-store bytes from `data` under the C2PA 2.4
+/// text locator (the signer's and every default reader's rules).
 ///
 /// Returns `Ok(Some(bytes))` with the manifest-store superbox (suitable for
 /// [`crate::c2pa_core::jumbf::parse_manifest_store`]), `Ok(None)` if the asset is valid
 /// but has no manifest, or `Err` if the container is malformed.
 pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+    extract_manifest_for_spec(format, data, SpecVersion::V2_4)
+}
+
+/// [`extract_manifest`] under an explicit caller-selected specification.
+pub(crate) fn extract_manifest_for_spec(
+    format: AssetFormat,
+    data: &[u8],
+    spec_version: SpecVersion,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    let rules = text_locator_rules(spec_version);
     let manifest = match format {
         AssetFormat::Jpeg => jpeg::extract(data),
         AssetFormat::Png => png::extract(data),
@@ -616,16 +859,20 @@ pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u
         AssetFormat::Tiff => tiff::extract(data),
         AssetFormat::Gif => gif::extract(data),
         AssetFormat::Svg => svg::extract(data),
+        AssetFormat::Pdf if rules == TextLocatorRules::V2_5 => pdf::extract_v2_5(data),
         AssetFormat::Pdf => pdf::extract(data),
+        AssetFormat::Zip if spec_version == SpecVersion::V2_5 => zip::extract_v2_5(data),
         AssetFormat::Zip => zip::extract(data),
         AssetFormat::Id3 => id3::extract(data),
         AssetFormat::Flac => flac::extract(data),
         AssetFormat::Ogg => ogg::extract(data),
         AssetFormat::Font => font::extract(data),
         AssetFormat::Jxl => jxl::extract(data),
-        AssetFormat::TextUnstructured => text::extract(text::TextMethod::Unstructured, data),
-        AssetFormat::TextStructured { .. } => text::extract(text::TextMethod::Structured, data),
-        AssetFormat::TextHtml => text::extract(text::TextMethod::Html, data),
+        AssetFormat::TextUnstructured => text::extract(text::TextMethod::Unstructured, data, rules),
+        AssetFormat::TextStructured { .. } => {
+            text::extract(text::TextMethod::Structured, data, rules)
+        }
+        AssetFormat::TextHtml => text::extract(text::TextMethod::Html, data, rules),
         AssetFormat::ExternalMedia => Ok(None),
         // The bytes ARE the manifest store; return verbatim (empty => no manifest).
         AssetFormat::C2paStore => {
@@ -636,6 +883,16 @@ pub fn extract_manifest(format: AssetFormat, data: &[u8]) -> Result<Option<Vec<u
                 Ok(Some(data.to_vec()))
             }
         }
+        AssetFormat::Midi => midi::extract(data),
+        AssetFormat::Ttml => ttml::extract(data),
+        AssetFormat::Onnx => onnx::extract(data),
+        AssetFormat::SafeTensors => safetensors::extract(data),
+        AssetFormat::Parquet => parquet::extract(data),
+        AssetFormat::BlockFact => blockfact::extract(data),
+        AssetFormat::Warc => warc::extract(data),
+        AssetFormat::AppendOnlyText { flavor } => append_text::extract(data, flavor),
+        // No standardized embedding: only an external store binds these bytes.
+        AssetFormat::Opaque => Ok(None),
     }?;
     if let Some(store) = &manifest {
         ensure_manifest_store_size(format, store.len())?;
@@ -685,7 +942,16 @@ pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, Form
         | AssetFormat::TextUnstructured
         | AssetFormat::TextStructured { .. }
         | AssetFormat::TextHtml
-        | AssetFormat::C2paStore => Ok(asset.to_vec()),
+        | AssetFormat::C2paStore
+        | AssetFormat::Midi
+        | AssetFormat::Ttml
+        | AssetFormat::Onnx
+        | AssetFormat::SafeTensors
+        | AssetFormat::Parquet
+        | AssetFormat::BlockFact
+        | AssetFormat::Warc
+        | AssetFormat::AppendOnlyText { .. }
+        | AssetFormat::Opaque => Ok(asset.to_vec()),
     }
 }
 
@@ -743,10 +1009,18 @@ pub fn embed_manifest(
             comment_suffix,
         } => text::embed_structured(asset, manifest_store, comment_prefix, comment_suffix),
         AssetFormat::TextHtml => text::embed(text::TextMethod::Html, asset, manifest_store),
-        // A host-less manifest store has no container to embed into.
-        AssetFormat::C2paStore | AssetFormat::ExternalMedia => {
-            Err(FormatError::NotImplemented(format))
-        }
+        // These formats have no fixture writer through this helper.
+        other @ (AssetFormat::C2paStore
+        | AssetFormat::ExternalMedia
+        | AssetFormat::Midi
+        | AssetFormat::Ttml
+        | AssetFormat::Onnx
+        | AssetFormat::SafeTensors
+        | AssetFormat::Parquet
+        | AssetFormat::BlockFact
+        | AssetFormat::Warc
+        | AssetFormat::AppendOnlyText { .. }
+        | AssetFormat::Opaque) => Err(FormatError::NotImplemented(other)),
     }
 }
 
@@ -767,6 +1041,17 @@ pub fn compute_data_hash_exclusions(
     format: AssetFormat,
     asset_with_placeholder: &[u8],
 ) -> Result<Vec<DataHashExclusion>, FormatError> {
+    compute_data_hash_exclusions_for_spec(format, asset_with_placeholder, SpecVersion::V2_4)
+}
+
+/// [`compute_data_hash_exclusions`] under an explicit caller-selected
+/// specification, so verification measures the carrier its own locator read.
+pub(crate) fn compute_data_hash_exclusions_for_spec(
+    format: AssetFormat,
+    asset_with_placeholder: &[u8],
+    spec_version: SpecVersion,
+) -> Result<Vec<DataHashExclusion>, FormatError> {
+    let rules = text_locator_rules(spec_version);
     match format {
         AssetFormat::Jpeg => jpeg::exclusions(asset_with_placeholder),
         AssetFormat::Png => png::exclusions(asset_with_placeholder),
@@ -774,29 +1059,99 @@ pub fn compute_data_hash_exclusions(
         AssetFormat::Riff => riff::exclusions(asset_with_placeholder),
         AssetFormat::Flac => flac::exclusions(asset_with_placeholder),
         AssetFormat::Ogg => ogg::exclusions(asset_with_placeholder),
-        AssetFormat::TextUnstructured => {
-            text::exclusions(text::TextMethod::Unstructured, asset_with_placeholder)
-        }
+        AssetFormat::TextUnstructured => text::exclusions(
+            text::TextMethod::Unstructured,
+            asset_with_placeholder,
+            rules,
+        ),
         AssetFormat::TextStructured { .. } => {
-            text::exclusions(text::TextMethod::Structured, asset_with_placeholder)
+            text::exclusions(text::TextMethod::Structured, asset_with_placeholder, rules)
         }
-        AssetFormat::TextHtml => text::exclusions(text::TextMethod::Html, asset_with_placeholder),
+        AssetFormat::TextHtml => {
+            text::exclusions(text::TextMethod::Html, asset_with_placeholder, rules)
+        }
         AssetFormat::Tiff => tiff::exclusions(asset_with_placeholder),
         AssetFormat::Gif => gif::exclusions(asset_with_placeholder),
         AssetFormat::Svg => svg::exclusions(asset_with_placeholder),
+        AssetFormat::Pdf if rules == TextLocatorRules::V2_5 => {
+            pdf::exclusions_v2_5(asset_with_placeholder)
+        }
         AssetFormat::Pdf => pdf::exclusions(asset_with_placeholder),
+        AssetFormat::Zip if spec_version == SpecVersion::V2_5 => {
+            zip::exclusions_v2_5(asset_with_placeholder)
+        }
         AssetFormat::Zip => zip::exclusions(asset_with_placeholder),
         AssetFormat::Id3 => id3::exclusions(asset_with_placeholder),
         AssetFormat::Font => font::exclusions(asset_with_placeholder),
         AssetFormat::Jxl => jxl::exclusions(asset_with_placeholder),
-        // A host-less store and detached-only media have no embedded carrier.
-        AssetFormat::C2paStore | AssetFormat::ExternalMedia => Ok(Vec::new()),
+        // No host bytes: a compound store has no data-hash binding.
+        AssetFormat::C2paStore => Ok(Vec::new()),
+        AssetFormat::Midi => midi::exclusions(asset_with_placeholder),
+        AssetFormat::Ttml => ttml::exclusions(asset_with_placeholder),
+        AssetFormat::Onnx => onnx::exclusions(asset_with_placeholder),
+        AssetFormat::SafeTensors => safetensors::exclusions(asset_with_placeholder),
+        AssetFormat::Parquet => parquet::exclusions(asset_with_placeholder),
+        AssetFormat::BlockFact => blockfact::exclusions(asset_with_placeholder),
+        AssetFormat::Warc => warc::exclusions(asset_with_placeholder),
+        AssetFormat::AppendOnlyText { flavor } => {
+            append_text::exclusions(asset_with_placeholder, flavor)
+        }
+        AssetFormat::Opaque => Ok(Vec::new()),
+        AssetFormat::ExternalMedia => Ok(Vec::new()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_profile_admission_preserves_aac_and_unknown_boundaries() {
+        use crate::c2pa_core::{EngineProfile, OperatingMode};
+        for version in [SpecVersion::V2_2, SpecVersion::V2_4, SpecVersion::V2_5] {
+            let profile = EngineProfile::new(version, OperatingMode::Regular);
+            assert_eq!(
+                AssetFormat::from_detached_content_for_profile(
+                    &crate::resolve_detached_mime("AUDIO/AAC; codecs=aac", profile).unwrap(),
+                    b"\0\0\0\x18ftypmp42",
+                    profile,
+                )
+                .unwrap(),
+                Some(AssetFormat::Bmff),
+            );
+            assert_eq!(
+                AssetFormat::from_detached_content_for_profile(
+                    &crate::resolve_detached_mime("AUDIO/AAC", profile).unwrap(),
+                    &[0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc],
+                    profile,
+                )
+                .unwrap(),
+                Some(AssetFormat::ExternalMedia),
+            );
+            assert!(AssetFormat::from_detached_content_for_profile(
+                "audio/aac",
+                b"not AAC",
+                profile,
+            )
+            .is_err());
+            assert_eq!(
+                AssetFormat::from_detached_content_for_profile(
+                    "application/x-private-asset",
+                    b"unknown bytes",
+                    profile,
+                )
+                .unwrap(),
+                (version == SpecVersion::V2_5).then_some(AssetFormat::Opaque),
+            );
+            for mime in ["bad mime", "application/c2pa", "text/invalid/subtype"] {
+                assert_eq!(
+                    AssetFormat::from_detached_content_for_profile(mime, b"anything", profile,)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+    }
 
     /// Build a small but structurally valid manifest store for round-trip tests.
     pub(crate) fn dummy_manifest_store() -> Vec<u8> {
@@ -886,6 +1241,35 @@ mod tests {
                 AssetFormat::from_mime(mime).is_some(),
                 "v2.4 registry MIME has no format implementation: {mime}"
             );
+        }
+    }
+
+    #[test]
+    fn v2_5_additional_standard_containers_route_to_their_family_readers() {
+        let cases = [
+            ("application/vnd.apple.keynote", AssetFormat::Zip),
+            ("application/vnd.apple.pages", AssetFormat::Zip),
+            ("application/vnd.apple.numbers", AssetFormat::Zip),
+            ("application/x-krita", AssetFormat::Zip),
+            ("image/openraster", AssetFormat::Zip),
+            (
+                "application/vnd.adobe.indesign-idml-package",
+                AssetFormat::Zip,
+            ),
+            ("application/vnd.google-earth.kmz", AssetFormat::Zip),
+            ("model/3mf", AssetFormat::Zip),
+            ("image/x-tiff-based", AssetFormat::Tiff),
+            ("image/x-riff-based", AssetFormat::Riff),
+            ("video/x-riff-based", AssetFormat::Riff),
+            ("audio/x-riff-based", AssetFormat::Riff),
+            ("video/x-bmff-based", AssetFormat::Bmff),
+            (
+                "application/vnd.oasis.opendocument.text-template",
+                AssetFormat::Zip,
+            ),
+        ];
+        for (mime, format) in cases {
+            assert_eq!(AssetFormat::from_mime(mime), Some(format), "{mime}");
         }
     }
     #[test]

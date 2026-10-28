@@ -45,7 +45,7 @@ use crate::c2pa_formats::{
 
 use super::live_video::{
     parse_init_track_timing, validate_emsg_segments, validate_init_segment,
-    validate_live_video_assertion, validate_segment_manifest, validate_session_keys,
+    validate_live_video_assertion, validate_segment_manifest, validate_session_keys_with,
     LiveVideoApplicability, LiveVideoManifestState, LIVEVIDEO_CONTINUITY_METHOD_INVALID,
     LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSION_KEY_INVALID,
 };
@@ -338,6 +338,7 @@ pub fn verify_stream_safe_with_expected_seeks<'a>(
         ica_trusted_issuers: cawg_ica_trusted_issuers,
         ica_trust_anchors: cawg_ica_trust_anchors,
         ica_status_lists: cawg_ica_status_lists,
+        graph_inputs: super::ingredient_graph::GraphInputs::default(),
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         verify_stream_with_expected_seeks(
@@ -433,11 +434,13 @@ fn verify_delivered_live_session(
     );
 
     let keys_url = format!("self#jumbf=/c2pa/{manifest_id}/c2pa.assertions/{SESSION_KEYS_LABEL}");
+    let algorithms = super::spec25::claim_algorithms(input.profile);
     let keys = match &delivery.session_keys {
-        Ok(assertion_cbor) => validate_session_keys(
+        Ok(assertion_cbor) => validate_session_keys_with(
             applicability,
             assertion_cbor,
             &delivery.signer_chain_der,
+            algorithms,
             &mut out.results,
             &keys_url,
         ),
@@ -448,10 +451,7 @@ fn verify_delivered_live_session(
         }
     };
 
-    // Section 19.4.2 event timing is judged against the init segment's track
-    // timing, read once from the bytes that were delivered. Each segment's key
-    // window is judged at the caller's trusted presentation time for it, or
-    // else at the one validation time.
+    // Read track timing once and preserve collection-wide replay state.
     let init_timing = parse_init_track_timing(init_segment);
     validate_emsg_segments(
         applicability,
@@ -464,6 +464,7 @@ fn verify_delivered_live_session(
             .validation_time
             .unwrap_or_else(OffsetDateTime::now_utc),
         presentation_times,
+        algorithms,
         &mut out.results,
     );
     restate_results(&mut out, input.profile);

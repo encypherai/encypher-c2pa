@@ -4,10 +4,12 @@
 //! PDF incremental-update validation.
 
 use super::{
-    verify_with_fragments_mode, CawgTrustInputs, ValidateError, VerifyInput, VerifyOutput,
-    MANIFEST_INACCESSIBLE,
+    spec25, verify_detached_with_cawg_options, verify_with_fragments_mode, CawgTrustInputs,
+    StatusCode, ValidateError, ValidationState, VerifyInput, VerifyOutput, MANIFEST_INACCESSIBLE,
 };
-use crate::c2pa_formats::PdfManifestStoreSection;
+use crate::c2pa_formats::{
+    pdf_object_manifest_stores, AssetFormat, PdfManifestStoreSection, PdfObjectManifestStore,
+};
 use serde_json::{json, Value as Json};
 
 /// Attach validation of every retained PDF manifest store, oldest first.
@@ -36,10 +38,6 @@ pub(super) fn attach(
                 })]),
             );
         }
-        return Ok(());
-    }
-    if sections.is_empty() {
-        return Ok(());
     }
     let mut history = Vec::with_capacity(sections.len());
     for section in sections {
@@ -91,7 +89,122 @@ pub(super) fn attach(
         }));
     }
     if let Some(report) = out.report_json.as_object_mut() {
-        report.insert("pdf_incremental_history".into(), Json::Array(history));
+        if !history.is_empty() {
+            report.insert("pdf_incremental_history".into(), Json::Array(history));
+        }
+    }
+    if spec25::applies(input.profile)
+        && AssetFormat::from_mime(input.mime) == Some(AssetFormat::Pdf)
+    {
+        attach_object_manifests(out, input, cawg_inputs)?;
+    }
+    Ok(())
+}
+
+fn object_failure(owner: &PdfObjectManifestStore, explanation: &str) -> StatusCode {
+    StatusCode {
+        code: MANIFEST_INACCESSIBLE.into(),
+        url: format!(
+            "self#pdf-object={}:{}",
+            owner.owner_number, owner.owner_generation
+        ),
+        explanation: explanation.into(),
+        details: None,
+    }
+}
+
+/// Verify each object-level association as an independent detached asset. The
+/// owning object's exact coverage bytes replace the PDF document bytes; no
+/// catalog result is reused.
+fn attach_object_manifests(
+    out: &mut VerifyOutput,
+    input: &VerifyInput<'_>,
+    cawg_inputs: CawgTrustInputs<'_>,
+) -> Result<(), ValidateError> {
+    let inventory = match pdf_object_manifest_stores(input.data) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            let status = StatusCode {
+                code: MANIFEST_INACCESSIBLE.into(),
+                url: "self#pdf-objects".into(),
+                explanation: error.to_string(),
+                details: None,
+            };
+            out.results.failure.push(status.clone());
+            out.validation_state = ValidationState::Invalid;
+            if let Some(report) = out.report_json.as_object_mut() {
+                report.insert(
+                    "pdf_object_manifests".into(),
+                    Json::Array(vec![json!({
+                        "validation_state": "Invalid",
+                        "validation_status": [status],
+                    })]),
+                );
+            }
+            return Ok(());
+        }
+    };
+    if inventory.is_empty() {
+        return Ok(());
+    }
+    let mut reports = Vec::with_capacity(inventory.len());
+    for object in &inventory {
+        let identity = json!({
+            "object_number": object.owner_number,
+            "generation": object.owner_generation,
+        });
+        if let Some(defect) = object.defect {
+            let status = object_failure(object, defect);
+            out.results.failure.push(status.clone());
+            out.validation_state = ValidationState::Invalid;
+            reports.push(json!({
+                "owner": identity,
+                "validation_state": "Invalid",
+                "validation_status": [status],
+            }));
+            continue;
+        }
+        let (Some(store), Some(coverage)) = (object.store(input.data), object.coverage(input.data))
+        else {
+            let status =
+                object_failure(object, "PDF object association has no verifiable coverage");
+            out.results.failure.push(status.clone());
+            out.validation_state = ValidationState::Invalid;
+            reports.push(json!({
+                "owner": identity,
+                "validation_state": "Invalid",
+                "validation_status": [status],
+            }));
+            continue;
+        };
+        let verified = verify_detached_with_cawg_options(
+            store,
+            coverage,
+            "application/octet-stream",
+            input,
+            cawg_inputs,
+        )?;
+        if matches!(
+            verified.validation_state,
+            ValidationState::Invalid | ValidationState::None
+        ) {
+            out.validation_state = ValidationState::Invalid;
+        }
+        out.results.success.extend(verified.results.success.clone());
+        out.results
+            .informational
+            .extend(verified.results.informational.clone());
+        out.results.failure.extend(verified.results.failure.clone());
+        out.network_needs
+            .extend(verified.network_needs.iter().cloned());
+        reports.push(json!({
+            "owner": identity,
+            "validation_state": verified.validation_state.as_str(),
+            "report": verified.report_json,
+        }));
+    }
+    if let Some(report) = out.report_json.as_object_mut() {
+        report.insert("pdf_object_manifests".into(), Json::Array(reports));
     }
     Ok(())
 }

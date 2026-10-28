@@ -258,6 +258,16 @@ fn a_malformed_presentation_time_is_refused_by_index() {
         error.to_string().contains("stream_presentation_times[1]"),
         "{error}"
     );
+    let retained_error = malformed
+        .validate_with_external_data()
+        .expect_err("external-data preflight must refuse the same malformed instant");
+    assert_eq!(retained_error.code(), error.code());
+    assert!(
+        retained_error
+            .to_string()
+            .contains("stream_presentation_times[1]"),
+        "{retained_error}"
+    );
 
     let error = Stream::load(SESSION_KEY_STREAM)
         .verify(
@@ -320,4 +330,41 @@ fn lanes_without_session_keys_refuse_presentation_times() {
         matches!(error, Error::InvalidValidationTime(_)),
         "{error:?}"
     );
+}
+
+#[test]
+fn graph_fragment_verification_refuses_present_times_but_keeps_absent_times_valid() {
+    let t = Clock::of(SESSION_KEY_STREAM).in_window(0);
+    let merkle = Stream::load("fmp4-merkle-2.2");
+    let verify = |presentation_times: Option<&[String]>| {
+        encypher_c2pa::verify_fragmented_with_graph_inputs(
+            &merkle.init,
+            &merkle.refs(),
+            "video/mp4",
+            &options(&t, presentation_times),
+            encypher_c2pa::GraphInputs::default(),
+        )
+    };
+    let absent = verify(None).expect("absent times retain Merkle verification");
+    assert_eq!(absent.integrity, "valid", "{absent:?}");
+    assert_eq!(absent.hard_binding, "match", "{absent:?}");
+
+    for times in [
+        Vec::new(),
+        vec![t.clone(); merkle.segments.len()],
+        vec![t.clone()],
+        vec!["not-a-time".into()],
+    ] {
+        let error = verify(Some(&times))
+            .expect_err("graph fragmented verification must refuse supplied presentation times");
+        assert!(
+            matches!(error, Error::InvalidValidationTime(_)),
+            "{times:?}: {error:?}"
+        );
+        assert_eq!(error.code(), "invalid_validation_time");
+        assert!(
+            error.to_string().contains("stream_presentation_times"),
+            "{times:?}: {error}"
+        );
+    }
 }

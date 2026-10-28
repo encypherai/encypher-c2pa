@@ -33,6 +33,38 @@ fn offline_options() -> VerifyOptions {
     }
 }
 
+#[test]
+fn embedded_discovery_preserves_aac_aliases_across_profiles() {
+    let asset = fixture("signed_test.mp4");
+    for version in ["2.2", "2.4", "2.5"] {
+        let mut options = offline_options();
+        options.spec_version = Some(version.into());
+        let discover = |mime| {
+            encypher_c2pa::locate_external_resources(
+                asset.as_slice(),
+                mime,
+                &options,
+                encypher_c2pa::GraphLimits::default(),
+            )
+            .expect("BMFF discovery succeeds")
+        };
+        let canonical = discover("audio/mp4");
+        assert!(canonical.manifest_store_present, "{version}");
+        for alias in ["audio/aac", "AUDIO/AAC; codecs=aac"] {
+            let actual = discover(alias);
+            assert_eq!(
+                actual.manifest_store_present, canonical.manifest_store_present,
+                "{version}: {alias}"
+            );
+            assert_eq!(actual.resources, canonical.resources, "{version}: {alias}");
+            assert_eq!(
+                actual.stop_reason, canonical.stop_reason,
+                "{version}: {alias}"
+            );
+        }
+    }
+}
+
 /// A JPEG with no embedded manifest whose XMP names a remote store.
 fn jpeg_declaring_remote_manifest(uri: &str) -> Vec<u8> {
     let packet = format!(
@@ -193,4 +225,123 @@ fn reading_a_remote_declaration_opens_no_socket() {
 fn verify_with_options_offline(asset: &[u8]) -> encypher_c2pa::VerificationReport {
     encypher_c2pa::verify_with_options(asset, "image/jpeg", &offline_options())
         .expect("verification returns a report")
+}
+
+#[test]
+fn every_detached_entrypoint_refuses_malformed_designated_media_before_store_parsing() {
+    use encypher_c2pa::{
+        locate_external_resources_with_manifest_store, verify_with_manifest_store_and_graph_inputs,
+        GraphInputs, GraphLimits,
+    };
+    for version in ["2.2", "2.4", "2.5"] {
+        let mut options = offline_options();
+        options.spec_version = Some(version.into());
+        for mime in [
+            "VIDEO/WEBM; codecs=vp9",
+            "image/x-icon",
+            "image/bmp",
+            "audio/aac",
+            "font/woff2",
+        ] {
+            let ordinary =
+                verify_with_manifest_store(b"not designated media", b"store", mime, &options)
+                    .expect_err("malformed designated bytes must never become opaque");
+            assert_eq!(ordinary.code(), "verification_error", "{version} {mime}");
+            let graph = verify_with_manifest_store_and_graph_inputs(
+                b"not designated media",
+                b"store",
+                mime,
+                &options,
+                GraphInputs::default(),
+            )
+            .expect_err("the graph path must share byte admission");
+            assert_eq!(graph.code(), "verification_error", "{version} {mime}");
+            assert!(
+                locate_external_resources_with_manifest_store(
+                    b"not designated media".as_slice(),
+                    b"store",
+                    mime,
+                    &options,
+                    GraphLimits::default(),
+                )
+                .is_err(),
+                "{version} {mime}"
+            );
+        }
+    }
+}
+
+#[test]
+fn changing_the_detached_mime_cannot_enable_exclusions() {
+    use encypher_c2pa::{verify_with_manifest_store_and_graph_inputs, GraphInputs};
+    let jpeg = fixture("signed_test.jpg");
+    let store = detached_manifest_evidence(&jpeg, "image/jpeg")
+        .unwrap()
+        .unwrap()
+        .manifest_store;
+    // This genuine signed store excludes its embedded JPEG carrier. Such
+    // exclusions cannot bind detached-only media, regardless of the MIME name.
+    let webm = b"\x1a\x45\xdf\xa3\x87\x42\x82\x84webm";
+    for version in ["2.2", "2.4", "2.5"] {
+        let mut options = offline_options();
+        options.spec_version = Some(version.into());
+        for mime in ["video/webm", "application/x-private-asset"] {
+            for graph in [false, true] {
+                let result = if graph {
+                    verify_with_manifest_store_and_graph_inputs(
+                        webm,
+                        &store,
+                        mime,
+                        &options,
+                        GraphInputs::default(),
+                    )
+                } else {
+                    verify_with_manifest_store(webm, &store, mime, &options)
+                };
+                if mime == "application/x-private-asset" && version != "2.5" {
+                    assert_eq!(result.unwrap_err().code(), "unsupported_mime");
+                } else {
+                    let report = result.expect("admitted detached asset returns a report");
+                    assert_ne!(report.hard_binding, "match", "{version} {mime}");
+                    assert_ne!(report.integrity, "valid", "{version} {mime}");
+                    assert!(
+                        report
+                            .validation_results
+                            .failure
+                            .iter()
+                            .any(|status| status.code == "assertion.dataHash.malformed"
+                                || status.code == "assertion.dataHash.mismatch"),
+                        "{version} {mime}: {:?}",
+                        report.validation_results
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "caller-verified-binding")]
+#[test]
+fn cawg_detached_verification_shares_designated_media_admission() {
+    use encypher_c2pa::{
+        verify_with_manifest_store_and_cawg, CawgEvaluator, CawgProfile, GraphInputs,
+    };
+    let options = VerifyOptions {
+        validation_time: Some("2026-08-06T00:00:00Z".into()),
+        ..offline_options()
+    };
+    for version in ["2.2", "2.4", "2.5"] {
+        let profile = CawgProfile::new(version, false, false).unwrap();
+        let evaluator = CawgEvaluator::new(&options, &profile).unwrap();
+        let error = verify_with_manifest_store_and_cawg(
+            b"not webm",
+            b"store",
+            "VIDEO/WEBM; codecs=vp9",
+            &options,
+            &evaluator,
+            GraphInputs::default(),
+        )
+        .expect_err("CAWG must not bypass malformed designated media");
+        assert_eq!(error.code(), "verification_error", "{version}");
+    }
 }

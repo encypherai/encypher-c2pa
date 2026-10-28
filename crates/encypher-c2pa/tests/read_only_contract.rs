@@ -19,7 +19,11 @@
 use std::fs;
 use std::path::Path;
 
-use encypher_c2pa::{verify, verify_file, verify_with_options, VerifyOptions};
+use encypher_c2pa::{
+    ertmp_input_from_flv, ertmp_input_from_rtmp_connections, verify, verify_file,
+    verify_with_options, ErtmpConnectionContext, ErtmpWireLimits, FlvWireOptions,
+    RtmpWireConnection, VerifyOptions,
+};
 use sha2::{Digest, Sha256};
 
 fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
@@ -102,6 +106,83 @@ fn verify_with_options_does_not_mutate_its_input_buffer() {
     let before = digest(&data);
     let _ = verify_with_options(&data, "image/jpeg", &VerifyOptions::default());
     assert_eq!(before, digest(&data), "verify_with_options() mutated input");
+}
+
+#[test]
+fn ertmp_wire_adapters_do_not_mutate_input_buffers() {
+    let context = ErtmpConnectionContext {
+        client_caps_ex: 0x10,
+        server_caps_ex: 0x10,
+        object_encoding: 3,
+    };
+    let payload = [0x90, b'a', b'v', b'c', b'1', 1];
+
+    let mut tag = vec![9, 0, 0, payload.len() as u8, 0, 0, 0, 0, 0, 0, 0];
+    tag.extend_from_slice(&payload);
+    tag.extend_from_slice(&(11u32 + payload.len() as u32).to_be_bytes());
+    let mut flv = b"FLV\x01\x01\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
+    flv.extend(tag);
+    let flv_before = digest(&flv);
+    ertmp_input_from_flv(
+        &flv,
+        FlvWireOptions {
+            connection: context,
+            audio_chunk_stream_id: 4,
+            video_chunk_stream_id: 7,
+            limits: ErtmpWireLimits::default(),
+        },
+    )
+    .expect("valid FLV wire input");
+    assert_eq!(flv_before, digest(&flv), "FLV adapter mutated its input");
+
+    let malformed_flv = flv[..flv.len() - 1].to_vec();
+    let malformed_flv_before = digest(&malformed_flv);
+    assert!(ertmp_input_from_flv(
+        &malformed_flv,
+        FlvWireOptions {
+            connection: context,
+            audio_chunk_stream_id: 4,
+            video_chunk_stream_id: 7,
+            limits: ErtmpWireLimits::default(),
+        },
+    )
+    .is_err());
+    assert_eq!(
+        malformed_flv_before,
+        digest(&malformed_flv),
+        "FLV adapter mutated an input that failed parsing"
+    );
+
+    let mut rtmp = vec![7, 0, 0, 0, 0, 0, payload.len() as u8, 9, 1, 0, 0, 0];
+    rtmp.extend_from_slice(&payload);
+    let rtmp_before = digest(&rtmp);
+    ertmp_input_from_rtmp_connections(
+        &[RtmpWireConnection {
+            bytes: &rtmp,
+            connection: context,
+            initial_chunk_size: 128,
+        }],
+        ErtmpWireLimits::default(),
+    )
+    .expect("valid RTMP wire input");
+    assert_eq!(rtmp_before, digest(&rtmp), "RTMP adapter mutated its input");
+
+    let malformed_rtmp = rtmp[..rtmp.len() - 1].to_vec();
+    let malformed_rtmp_before = digest(&malformed_rtmp);
+    assert!(ertmp_input_from_rtmp_connections(
+        &[RtmpWireConnection {
+            bytes: &malformed_rtmp,
+            connection: context,
+            initial_chunk_size: 128,
+        }],
+        ErtmpWireLimits::default(),
+    )
+    .is_err());
+    assert_eq!(
+        malformed_rtmp_before,
+        digest(&malformed_rtmp),
+        "RTMP adapter mutated an input that failed parsing"
+    );
 }
 
 #[test]

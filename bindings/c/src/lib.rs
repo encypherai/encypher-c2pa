@@ -6,9 +6,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 use encypher_c2pa::{
-    set_telemetry_enabled, telemetry_preference, verify_fragmented_with_options,
-    verify_stream_with_options, verify_with_manifest_store, verify_with_options,
-    StreamEncapsulation, StreamMethod, VerifyOptions,
+    binding_target, request_soft_binding_receipt_verification, resolve_soft_binding,
+    set_telemetry_enabled, telemetry_preference, verify_ertmp_with_options,
+    verify_fragmented_with_options, verify_manifest_store_only, verify_stream_with_options,
+    verify_with_caller_verified_binding, verify_with_manifest_store, verify_with_options,
+    CallerBindingEvidence, CallerBindingVerdict, CawgStoreHost, ErtmpInput, GraphInputs,
+    ManifestBindingTarget, SoftBindingQuery, SoftBindingResolverOptions, StreamEncapsulation,
+    StreamMethod, VerifyOptions,
 };
 use serde_json::json;
 
@@ -214,6 +218,175 @@ pub unsafe extern "C" fn encypher_c2pa_verify_with_manifest_store(
     let payload = match result {
         Ok(payload) => payload,
         Err(_) => error_json("internal_panic", "verification aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Validate a manifest store without claiming that any asset content matched.
+///
+/// # Safety
+/// `manifest_store` must point to `manifest_store_len` readable bytes.
+/// `options_json` follows [`encypher_c2pa_verify`].
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_verify_manifest_store_only(
+    manifest_store: *const u8,
+    manifest_store_len: usize,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if manifest_store.is_null() || manifest_store_len == 0 {
+            return error_json("invalid_argument", "manifest_store is null or empty");
+        }
+        // SAFETY: The caller contract guarantees this pointer range.
+        let store = unsafe { slice::from_raw_parts(manifest_store, manifest_store_len) };
+        // SAFETY: The caller contract guarantees a null or NUL-terminated argument.
+        let options = match unsafe { optional_str(options_json) } {
+            Ok(None) => VerifyOptions::default(),
+            Ok(Some(raw)) => match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            },
+            Err(error) => return error_json("invalid_options", &error),
+        };
+        match verify_manifest_store_only(store, &options) {
+            Ok(report) => json!({ "ok": true, "result": report }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "store-only validation aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Derive the exact hard-binding target a caller must independently compare.
+///
+/// # Safety
+/// Byte and string pointers follow [`encypher_c2pa_verify_manifest_store_only`].
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_binding_target(
+    manifest_store: *const u8,
+    manifest_store_len: usize,
+    hostless: bool,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if manifest_store.is_null() || manifest_store_len == 0 {
+            return error_json("invalid_argument", "manifest_store is null or empty");
+        }
+        let store = unsafe { slice::from_raw_parts(manifest_store, manifest_store_len) };
+        let options = match unsafe { optional_str(options_json) } {
+            Ok(None) => VerifyOptions::default(),
+            Ok(Some(raw)) => match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            },
+            Err(error) => return error_json("invalid_options", &error),
+        };
+        match binding_target(
+            store,
+            if hostless {
+                CawgStoreHost::HostLess
+            } else {
+                CawgStoreHost::Asset
+            },
+            &options,
+        ) {
+            Ok(target) => json!({ "ok": true, "target": target }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "binding-target derivation aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Validate a store using a content-comparison verdict made by the caller.
+///
+/// # Safety
+/// Byte and string pointers follow [`encypher_c2pa_verify_manifest_store_only`].
+/// `target_json`, `verdict_json`, `engine`, and `content_mime` are required.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn encypher_c2pa_verify_with_caller_binding(
+    manifest_store: *const u8,
+    manifest_store_len: usize,
+    content_mime: *const c_char,
+    hostless: bool,
+    target_json: *const c_char,
+    verdict_json: *const c_char,
+    engine: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if manifest_store.is_null() || manifest_store_len == 0 {
+            return error_json("invalid_argument", "manifest_store is null or empty");
+        }
+        let store = unsafe { slice::from_raw_parts(manifest_store, manifest_store_len) };
+        let content_mime = match unsafe { required_str(content_mime, "content_mime") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let target_raw = match unsafe { required_str(target_json, "target_json") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let verdict_raw = match unsafe { required_str(verdict_json, "verdict_json") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let engine = match unsafe { required_str(engine, "engine") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let target: ManifestBindingTarget = match serde_json::from_str(target_raw) {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_binding_target", &error.to_string()),
+        };
+        let verdict: CallerBindingVerdict = match serde_json::from_str(verdict_raw) {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_binding_verdict", &error.to_string()),
+        };
+        let evidence = match CallerBindingEvidence::new(target, verdict, engine) {
+            Ok(value) => value,
+            Err(error) => return error_json(error.code(), &error.to_string()),
+        };
+        let options = match unsafe { optional_str(options_json) } {
+            Ok(None) => VerifyOptions::default(),
+            Ok(Some(raw)) => match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            },
+            Err(error) => return error_json("invalid_options", &error),
+        };
+        match verify_with_caller_verified_binding(
+            store,
+            content_mime,
+            if hostless {
+                CawgStoreHost::HostLess
+            } else {
+                CawgStoreHost::Asset
+            },
+            &evidence,
+            &options,
+            GraphInputs::default(),
+        ) {
+            Ok(report) => json!({ "ok": true, "report": report }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "caller-binding validation aborted safely"),
     };
     CString::new(payload)
         .expect("JSON serialization never emits an interior NUL")
@@ -482,6 +655,238 @@ pub unsafe extern "C" fn encypher_c2pa_verify_stream(
         .into_raw()
 }
 
+/// Verify caller-parsed Enhanced RTMP events in wire order.
+///
+/// `input_json` must match `ErtmpInput`. `options_json` may be null, in which
+/// case the required 2.5 policy is selected automatically.
+///
+/// # Safety
+/// Both non-null arguments must point to NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_verify_ertmp(
+    input_json: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if input_json.is_null() {
+            return error_json("invalid_argument", "input_json is null");
+        }
+        // SAFETY: The caller guarantees a NUL-terminated string.
+        let input_json = match unsafe { CStr::from_ptr(input_json) }.to_str() {
+            Ok(value) => value,
+            Err(error) => {
+                return error_json(
+                    "invalid_ertmp_input",
+                    &format!("input_json is not UTF-8: {error}"),
+                )
+            }
+        };
+        let input: ErtmpInput = match serde_json::from_str(input_json) {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_ertmp_input", &error.to_string()),
+        };
+        let options = if options_json.is_null() {
+            VerifyOptions {
+                spec_version: Some("2.5".into()),
+                ..VerifyOptions::default()
+            }
+        } else {
+            // SAFETY: The caller guarantees a NUL-terminated string.
+            let raw = match unsafe { CStr::from_ptr(options_json) }.to_str() {
+                Ok(value) => value,
+                Err(error) => {
+                    return error_json(
+                        "invalid_options",
+                        &format!("options_json is not UTF-8: {error}"),
+                    )
+                }
+            };
+            match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            }
+        };
+        match verify_ertmp_with_options(&input, &options) {
+            Ok(report) => json!({ "ok": true, "report": report }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "E-RTMP verification aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Resolve a caller-extracted soft binding and verify every recovered store.
+///
+/// Network access is denied unless every endpoint origin appears in
+/// `resolver_options_json.allowed_origins`. Redirects are always refused.
+///
+/// # Safety
+/// `asset` must point to `asset_len` readable bytes. All string arguments
+/// except `options_json` are required NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_resolve_soft_binding(
+    asset: *const u8,
+    asset_len: usize,
+    mime_type: *const c_char,
+    service_root: *const c_char,
+    query_json: *const c_char,
+    options_json: *const c_char,
+    resolver_options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = if asset_len == 0 {
+            &[]
+        } else if asset.is_null() {
+            return error_json(
+                "invalid_argument",
+                "asset is null but asset_len is non-zero",
+            );
+        } else {
+            // SAFETY: The caller contract guarantees this pointer range.
+            unsafe { slice::from_raw_parts(asset, asset_len) }
+        };
+        // SAFETY: The caller contract guarantees NUL-terminated arguments.
+        let mime = match unsafe { required_str(mime_type, "mime_type") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let service_root = match unsafe { required_str(service_root, "service_root") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let query_raw = match unsafe { required_str(query_json, "query_json") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let resolver_raw =
+            match unsafe { required_str(resolver_options_json, "resolver_options_json") } {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_argument", &error),
+            };
+        let query: SoftBindingQuery = match serde_json::from_str(query_raw) {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_soft_binding_query", &error.to_string()),
+        };
+        let resolver_options: SoftBindingResolverOptions = match serde_json::from_str(resolver_raw)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return error_json("invalid_soft_binding_resolver_options", &error.to_string())
+            }
+        };
+        // SAFETY: The caller contract guarantees a null or NUL-terminated argument.
+        let options = match unsafe { optional_str(options_json) } {
+            Ok(None) => VerifyOptions::default(),
+            Ok(Some(raw)) => match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            },
+            Err(error) => return error_json("invalid_options", &error),
+        };
+        match resolve_soft_binding(
+            bytes,
+            mime,
+            service_root,
+            &query,
+            &options,
+            &resolver_options,
+        ) {
+            Ok(resolution) => json!({ "ok": true, "resolution": resolution }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json("internal_panic", "soft-binding resolution aborted safely"),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
+/// Submit a receipt to a soft-binding repository for its reported result.
+///
+/// The returned `server_reported_verified` value is not a local cryptographic
+/// receipt verdict. All arguments are required NUL-terminated UTF-8 JSON or
+/// strings except `options_json`, which may be null.
+///
+/// # Safety
+/// Every non-null argument must remain readable for this call.
+#[no_mangle]
+pub unsafe extern "C" fn encypher_c2pa_request_soft_binding_receipt_verification(
+    service_root: *const c_char,
+    manifest_id: *const c_char,
+    receipt_json: *const c_char,
+    options_json: *const c_char,
+    resolver_options_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller contract guarantees NUL-terminated arguments.
+        let service_root = match unsafe { required_str(service_root, "service_root") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let manifest_id = match unsafe { required_str(manifest_id, "manifest_id") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let receipt_raw = match unsafe { required_str(receipt_json, "receipt_json") } {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_argument", &error),
+        };
+        let resolver_raw =
+            match unsafe { required_str(resolver_options_json, "resolver_options_json") } {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_argument", &error),
+            };
+        let receipt = match serde_json::from_str(receipt_raw) {
+            Ok(value) => value,
+            Err(error) => return error_json("invalid_soft_binding_receipt", &error.to_string()),
+        };
+        let resolver_options: SoftBindingResolverOptions = match serde_json::from_str(resolver_raw)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return error_json("invalid_soft_binding_resolver_options", &error.to_string())
+            }
+        };
+        let options = match unsafe { optional_str(options_json) } {
+            Ok(None) => VerifyOptions::default(),
+            Ok(Some(raw)) => match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(error) => return error_json("invalid_options", &error.to_string()),
+            },
+            Err(error) => return error_json("invalid_options", &error),
+        };
+        match request_soft_binding_receipt_verification(
+            service_root,
+            manifest_id,
+            receipt,
+            &options,
+            &resolver_options,
+        ) {
+            Ok(evidence) => json!({ "ok": true, "evidence": evidence }).to_string(),
+            Err(error) => error_json(error.code(), &error.to_string()),
+        }
+    }));
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(_) => error_json(
+            "internal_panic",
+            "soft-binding receipt verification aborted safely",
+        ),
+    };
+    CString::new(payload)
+        .expect("JSON serialization never emits an interior NUL")
+        .into_raw()
+}
+
 /// Borrow an optional NUL-terminated argument as UTF-8.
 ///
 /// # Safety
@@ -495,6 +900,19 @@ unsafe fn optional_str<'a>(value: *const c_char) -> Result<Option<&'a str>, Stri
         .to_str()
         .map(Some)
         .map_err(|error| format!("argument is not UTF-8: {error}"))
+}
+
+/// Borrow a required NUL-terminated argument as UTF-8.
+///
+/// # Safety
+/// `value` must point to a NUL-terminated string valid for the returned borrow.
+unsafe fn required_str<'a>(value: *const c_char, name: &str) -> Result<&'a str, String> {
+    // SAFETY: The caller guarantees the pointer contract.
+    match unsafe { optional_str(value) } {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err(format!("{name} is null")),
+        Err(error) => Err(format!("{name}: {error}")),
+    }
 }
 
 /// Persist failure telemetry consent for all native bindings used by this user.

@@ -134,6 +134,7 @@ mod tests {
         let not_after = time::macros::datetime!(2027-01-01 0:00 UTC);
         let resolved = crate::resolve_trust(
             Some(ENCYPHER_C2PA_ROOT_PEM),
+            None,
             Some(claim_signing()),
             AnchorPurpose::ClaimSigning,
             (None, Some(not_after)),
@@ -194,6 +195,7 @@ mod tests {
     fn caller_supplied_cawg_material_is_a_configured_entry() {
         let resolved = crate::resolve_trust(
             Some(ENCYPHER_IDENTITY_ROOT_PEM),
+            None,
             None,
             AnchorPurpose::CawgIdentity,
             (None, None),

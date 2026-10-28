@@ -19,8 +19,8 @@ use crate::c2pa_crypto::{
 };
 use crate::c2pa_trust::{
     certificate_eku_oids_der, certificate_policy_oids_der, certificate_valid_at,
-    leaf_profile_acceptable_der, validate_chain_admitting, AnchorPurpose, CawgTrustSource,
-    TrustAnchor, TrustList,
+    leaf_profile_acceptable_der, leaf_profile_acceptable_der_with, validate_chain_admitting_with,
+    AnchorPurpose, CawgTrustSource, CertificateProfile, TrustAnchor, TrustList,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -31,8 +31,8 @@ use super::timestamp_assertion::{
 };
 use super::{
     evaluate_embedded_ocsp, is_supported_hard_binding_label, ClaimAssertionReference,
-    ClaimAssertionRefs, EmbeddedOcspStatus as IdentityRevocationStatus, OnlineOcspVerdict,
-    ValidationResults,
+    ClaimAssertionRefs, EmbeddedOcspContext, EmbeddedOcspStatus as IdentityRevocationStatus,
+    EngineProfile, OnlineOcspVerdict, ValidationResults,
 };
 
 pub const CAWG_IDENTITY_TRUSTED: &str = "cawg.identity.trusted";
@@ -173,6 +173,8 @@ pub(super) struct IdentityContext<'a> {
     pub manifest: &'a ParsedManifest<'a>,
     pub claim: &'a Value,
     pub validation_time: OffsetDateTime,
+    /// Certificate and revocation rules selected by the caller's C2PA policy.
+    pub certificate_profile: CertificateProfile,
     pub claim_timestamp: Option<OffsetDateTime>,
     pub cawg_trust: Option<&'a TrustList>,
     pub cawg_allowed_certs: Option<&'a TrustList>,
@@ -287,6 +289,49 @@ fn identity_shape(assertion: &Value) -> Result<IdentityShape<'_>, IdentityShapeD
         referenced,
         signature,
     })
+}
+
+/// Locate DID documents needed by structurally readable, claim-bound ICA
+/// identity assertions without performing identity verification.
+pub(super) fn locate_identity_did_documents(
+    claim_refs: &ClaimAssertionRefs<'_>,
+) -> Vec<(String, String)> {
+    let mut documents = Vec::new();
+    for reference in claim_refs.references.iter().take(MAX_IDENTITY_ASSERTIONS) {
+        let Some(label) = reference
+            .label
+            .filter(|label| is_identity_assertion_label(label))
+        else {
+            continue;
+        };
+        let Some(assertion) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+        else {
+            continue;
+        };
+        let Ok(shape) = identity_shape(assertion) else {
+            continue;
+        };
+        if shape
+            .signer_payload
+            .get("sig_type")
+            .and_then(Value::as_text)
+            != Some(CAWG_ICA_COSE)
+        {
+            continue;
+        }
+        let Some(document) = super::cawg_ica::locate_did_document(shape.signature) else {
+            continue;
+        };
+        if !documents
+            .iter()
+            .any(|(did, _): &(String, String)| did == &document.0)
+        {
+            documents.push(document);
+        }
+    }
+    documents
 }
 
 fn report_identity_shape_defect(
@@ -495,7 +540,7 @@ fn verify_identity_assertion(
     record_identity_work(|counts| counts.cryptographic_evaluations += 1);
 
     if sig_type == CAWG_ICA_COSE {
-        super::cawg_ica::verify_ica_assertion(
+        super::cawg_ica::verify_ica_assertion_with(
             signer_payload,
             signature,
             url,
@@ -506,6 +551,7 @@ fn verify_identity_assertion(
             ctx.ica_trusted_issuers,
             ctx.ica_trust_anchors,
             ctx.ica_status_lists,
+            ctx.certificate_profile,
             ctx.results,
         );
         return;
@@ -569,6 +615,7 @@ fn verify_identity_assertion(
         ctx.tsa_trust,
         ctx.claim_timestamp,
         ctx.validation_time,
+        ctx.certificate_profile,
         ctx.results,
         url,
     );
@@ -587,6 +634,7 @@ fn verify_identity_assertion(
         ctx.cawg_allowed_certs,
         ctx.document_signing_require_anchor,
         timestamp_trusted,
+        ctx.certificate_profile,
     ) {
         IdentityTrust::Untrusted(reason) => {
             let credential_sha256 = leaf_credential_sha256(leaf, parsed_leaf.as_ref());
@@ -597,6 +645,7 @@ fn verify_identity_assertion(
                 timestamp_trusted.then_some(at),
                 ctx.ocsp_verification_time,
                 ctx.cawg_trust,
+                ctx.certificate_profile,
             );
             if revocation_status.ca_revoked() {
                 report_identity_ca_revoked(
@@ -673,6 +722,7 @@ fn verify_identity_assertion(
                 timestamp_trusted.then_some(at),
                 ctx.ocsp_verification_time,
                 ctx.cawg_trust,
+                ctx.certificate_profile,
             );
             if revocation_status.ca_revoked() {
                 report_identity_ca_revoked(
@@ -727,6 +777,7 @@ fn verify_identity_assertion(
         timestamp_trusted.then_some(at),
         ctx.ocsp_verification_time,
         ctx.cawg_trust,
+        ctx.certificate_profile,
     );
     let embedded_leaf_revoked = matches!(
         revocation_status,
@@ -744,7 +795,7 @@ fn verify_identity_assertion(
         return;
     }
     if embedded_leaf_revoked {
-        let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
+        let targets = super::ocsp_targets(&chain, ctx.cawg_trust, ctx.certificate_profile);
         if super::any_online_ca_revoked(
             &targets,
             ctx.evidence,
@@ -783,7 +834,7 @@ fn verify_identity_assertion(
     }
     // CAWG 1.3 "Determining revocation from online OCSP response" is the same
     // procedure the C2PA claim signer follows, with CAWG's own status codes.
-    let targets = super::ocsp_targets(&chain, ctx.cawg_trust);
+    let targets = super::ocsp_targets(&chain, ctx.cawg_trust, ctx.certificate_profile);
     let online = super::evaluate_online_ocsp(
         &targets,
         ctx.evidence,
@@ -1293,6 +1344,7 @@ fn identity_timestamp(
     tsa_trust: Option<&TrustList>,
     claim_timestamp: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
+    certificate_profile: CertificateProfile,
     results: &mut ValidationResults,
     url: &str,
 ) -> Option<OffsetDateTime> {
@@ -1306,8 +1358,14 @@ fn identity_timestamp(
         Some((ClaimTimestampVersion::V2, tokens)) => {
             match (tokens.as_slice(), timestamp_input(signature)) {
                 ([Some(token)], Ok(input)) => {
-                    match validate_token(token, &input, tsa_trust, verification_time) {
-                        TokenOutcome::Trusted(generated_at) => {
+                    match validate_token(
+                        token,
+                        &input,
+                        tsa_trust,
+                        verification_time,
+                        certificate_profile,
+                    ) {
+                        TokenOutcome::Trusted(generated_at, _) => {
                             report_identity_timestamp_trusted(results, url);
                             return Some(generated_at);
                         }
@@ -1326,8 +1384,14 @@ fn identity_timestamp(
         if let Ok(input) = timestamp_assertion_input(signature) {
             let mut assertion_defect = None;
             for token in candidates {
-                match validate_token(token, &input, tsa_trust, verification_time) {
-                    TokenOutcome::Trusted(generated_at) => {
+                match validate_token(
+                    token,
+                    &input,
+                    tsa_trust,
+                    verification_time,
+                    certificate_profile,
+                ) {
+                    TokenOutcome::Trusted(generated_at, _) => {
                         report_identity_timestamp_trusted(results, url);
                         return Some(generated_at);
                     }
@@ -1456,15 +1520,19 @@ fn identity_embedded_revocation_status(
     signed_at: Option<OffsetDateTime>,
     verification_time: OffsetDateTime,
     trust: Option<&TrustList>,
+    certificate_profile: CertificateProfile,
 ) -> IdentityRevocationStatus {
     evaluate_embedded_ocsp(
         signature,
         certificate_status_assertions,
-        chain,
-        signed_at,
-        verification_time,
-        trust,
-        false,
+        EmbeddedOcspContext {
+            chain,
+            signed_at,
+            verification_time,
+            trust,
+            any_good_wins: false,
+            profile: certificate_profile,
+        },
     )
     .status
 }
@@ -1551,6 +1619,7 @@ fn identity_trust_outcome(
     allowed: Option<&TrustList>,
     document_signing_require_anchor: bool,
     timestamp_trusted: bool,
+    certificate_profile: CertificateProfile,
 ) -> IdentityTrust {
     // A C2PA leaf-credential profile violation has no 1.3 status code of its
     // own. The 1.3 trust model requires the generator to sign with a compliant
@@ -1558,10 +1627,10 @@ fn identity_trust_outcome(
     // usage cannot anchor a chain of trust for this signature, so it is
     // reported as `cawg.x509.credential.untrusted` rather than as an Encypher
     // extension code.
-    if !leaf_profile_acceptable_der(leaf) {
+    if !leaf_profile_acceptable_der_with(leaf, certificate_profile) {
         return IdentityTrust::Untrusted("leaf_profile_unacceptable");
     }
-    match identity_certificate_trust(
+    match identity_certificate_trust_with(
         leaf,
         &chain[1..],
         at,
@@ -1570,6 +1639,7 @@ fn identity_trust_outcome(
         allowed,
         document_signing_require_anchor,
         timestamp_trusted,
+        certificate_profile,
     ) {
         Ok(evidence) => IdentityTrust::Trusted(evidence),
         Err(reason) if trust.is_none() && allowed.is_none() => IdentityTrust::NoRootOfTrust(reason),
@@ -1629,7 +1699,7 @@ struct IdentityTrustEvidence {
 ///
 /// Returns the entry that accepted the credential, or the reason no entry did.
 #[allow(clippy::too_many_arguments)]
-fn identity_certificate_trust(
+fn identity_certificate_trust_with(
     leaf: &[u8],
     intermediates: &[Vec<u8>],
     at: OffsetDateTime,
@@ -1638,6 +1708,7 @@ fn identity_certificate_trust(
     allowed: Option<&TrustList>,
     document_signing_require_anchor: bool,
     identity_timestamp_trusted: bool,
+    certificate_profile: CertificateProfile,
 ) -> Result<IdentityTrustEvidence, &'static str> {
     let ekus = certificate_eku_oids_der(leaf).unwrap_or_default();
     let has_eku = |eku: &str| ekus.iter().any(|oid| oid == eku);
@@ -1648,8 +1719,11 @@ fn identity_certificate_trust(
         .flatten();
     let base_direct = direct_match(leaf, at, allowed, base);
     let base_chain = std::cell::OnceCell::new();
-    let base_chain =
-        || *base_chain.get_or_init(|| chain_trust_anchor(leaf, intermediates, at, trust, base));
+    let base_chain = || {
+        *base_chain.get_or_init(|| {
+            chain_trust_anchor(leaf, intermediates, at, trust, base, certificate_profile)
+        })
+    };
 
     if has_eku(OID_KP_DOCUMENT_SIGNING) {
         if let Some(entry) = base_direct {
@@ -1702,7 +1776,7 @@ fn identity_certificate_trust(
     let Some((source, entry)) = direct_match(leaf, at, allowed, interim)
         .map(|entry| ("allowed_list", entry))
         .or_else(|| {
-            chain_trust_anchor(leaf, intermediates, at, trust, interim)
+            chain_trust_anchor(leaf, intermediates, at, trust, interim, certificate_profile)
                 .map(|anchor| (anchor.cawg_source.label(), anchor))
         })
     else {
@@ -1721,6 +1795,31 @@ fn identity_certificate_trust(
     } else {
         "trusted_timestamp_required"
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn identity_certificate_trust(
+    leaf: &[u8],
+    intermediates: &[Vec<u8>],
+    at: OffsetDateTime,
+    validation_time: OffsetDateTime,
+    trust: Option<&TrustList>,
+    allowed: Option<&TrustList>,
+    document_signing_require_anchor: bool,
+    identity_timestamp_trusted: bool,
+) -> Result<IdentityTrustEvidence, &'static str> {
+    identity_certificate_trust_with(
+        leaf,
+        intermediates,
+        at,
+        validation_time,
+        trust,
+        allowed,
+        document_signing_require_anchor,
+        identity_timestamp_trusted,
+        CertificateProfile::V2_4,
+    )
 }
 
 /// The first configured certificate equal to `leaf` that is in force at `at`
@@ -1745,14 +1844,16 @@ fn chain_trust_anchor<'a>(
     at: OffsetDateTime,
     trust: Option<&'a TrustList>,
     admit: impl Fn(&TrustAnchor) -> bool,
+    certificate_profile: CertificateProfile,
 ) -> Option<&'a TrustAnchor> {
     let anchors = trust?;
-    let result = validate_chain_admitting(
+    let result = validate_chain_admitting_with(
         leaf,
         intermediates,
         anchors,
         AnchorPurpose::CawgIdentity,
         Some(at),
+        certificate_profile,
         admit,
     );
     result
@@ -2182,6 +2283,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn did_discovery_is_limited_to_claim_bound_ica_identities() {
+        let binding = hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
+        let signer_payload = Value::Map(vec![
+            (
+                "referenced_assertions".into(),
+                Value::Array(vec![binding.clone()]),
+            ),
+            ("sig_type".into(), Value::Text(CAWG_ICA_COSE.to_string())),
+        ]);
+        let assertion = encode(
+            &Value::Map(vec![
+                ("signer_payload".into(), signer_payload),
+                (
+                    "signature".into(),
+                    Value::Bytes(super::super::cawg_ica::did_locator_fixture(
+                        "did:web:issuer.example:publishers",
+                    )),
+                ),
+                ("pad1".into(), Value::Bytes(Vec::new())),
+            ]),
+            Profile::CanonicalForHashedSubstructures,
+        )
+        .expect("identity assertion");
+        let manifest = ParsedManifest {
+            label: "test".into(),
+            manifest_jumbf: &[],
+            assertions: vec![("cawg.identity".into(), assertion.as_slice())],
+            assertion_jumbf: Vec::new(),
+            claim_cbor: None,
+            signature_cose: None,
+            claim_count: 1,
+            claim_box_label: Some("c2pa.claim.v2".into()),
+        };
+
+        let bound = claim_with_references(vec![
+            hashed_uri("self#jumbf=c2pa.assertions/cawg.identity", 0x01),
+            binding.clone(),
+        ]);
+        let bound = ClaimAssertionRefs::build(&manifest, &bound, super::super::ClaimGeneration::V2);
+        assert_eq!(
+            locate_identity_did_documents(&bound),
+            vec![(
+                "did:web:issuer.example:publishers".to_string(),
+                "https://issuer.example/publishers/did.json".to_string(),
+            )]
+        );
+
+        let unbound = claim_with_references(vec![binding]);
+        let unbound =
+            ClaimAssertionRefs::build(&manifest, &unbound, super::super::ClaimGeneration::V2);
+        assert!(locate_identity_did_documents(&unbound).is_empty());
+    }
+
+    #[test]
     fn duplicate_signer_payload_keys_fail_before_semantic_or_signature_checks() {
         let expected_binding =
             hashed_uri("self#jumbf=/c2pa/test/c2pa.assertions/c2pa.hash.data", 0x22);
@@ -2241,6 +2396,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim: &claim,
                 validation_time: datetime!(2025-05-01 0:00 UTC),
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: None,
                 cawg_allowed_certs: None,
@@ -2325,6 +2481,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim: &claim,
                 validation_time: datetime!(2025-05-01 0:00 UTC),
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: None,
                 cawg_allowed_certs: None,
@@ -2416,6 +2573,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim,
                 validation_time: datetime!(2025-05-01 0:00 UTC),
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: None,
                 cawg_allowed_certs: None,
@@ -2682,6 +2840,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim: &claim,
                 validation_time: datetime!(2025-05-01 0:00 UTC),
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: None,
                 cawg_allowed_certs: None,
@@ -2994,6 +3153,7 @@ pub(crate) mod tests {
             manifest: &manifest,
             claim: &claim,
             validation_time,
+            certificate_profile: CertificateProfile::V2_4,
             claim_timestamp,
             cawg_trust,
             cawg_allowed_certs,
@@ -3390,6 +3550,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim: &claim,
                 validation_time: datetime!(2025-05-01 0:00 UTC),
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: None,
                 cawg_allowed_certs: None,
@@ -3464,6 +3625,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim: &claim,
                 validation_time: IDENTITY_VALIDATION_TIME,
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: None,
                 cawg_allowed_certs: None,
@@ -5486,6 +5648,7 @@ pub(crate) mod tests {
                 manifest: &manifest,
                 claim: &claim,
                 validation_time: AFTER_INTERIM_CUTOFF,
+                certificate_profile: CertificateProfile::V2_4,
                 claim_timestamp: None,
                 cawg_trust: Some(&trust),
                 cawg_allowed_certs: None,

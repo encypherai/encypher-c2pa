@@ -16,27 +16,29 @@
 //! Both return `Some(reason)` on rejection so the caller can report *why* a
 //! credential was refused instead of collapsing every defect into "untrusted".
 //!
-//! The trust anchor's own certificate is deliberately **not** subject to
-//! [`profile_violation`]: RFC 5280 section 6.1 treats an anchor as a name, a
-//! key and an algorithm rather than as a certificate on the path. Its name and
-//! policy constraints are still honored, which is what section 6.2 permits.
+//! RFC 5280 treats the trust anchor as a name, key, and algorithm rather than
+//! as a certificate on the path. Exact 2.5 still admits its certificate under
+//! the C2PA profile, but its encoded validity period and path constraints are
+//! not RFC 5280 trust-anchor inputs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use const_oid::ObjectIdentifier;
-use der::{Decode, Encode};
+use der::{Decode, Encode, Tag, Tagged};
 use x509_cert::certificate::Version;
+use x509_cert::ext::pkix::certpolicy::PolicyInformation;
 use x509_cert::ext::pkix::constraints::name::GeneralSubtree;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{
-    CertificatePolicies, NameConstraints, PolicyConstraints, SubjectAltName,
+    CertificatePolicies, InhibitAnyPolicy, NameConstraints, PolicyConstraints, PolicyMappings,
+    SubjectAltName,
 };
 use x509_cert::Certificate;
 
 use super::{
     allows_digital_signature, certificate_eku_oids, has_key_cert_sign, is_ca_certificate,
-    path_len_constraint, OID_ANY_EKU, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EKU, OID_EXT_KEY_USAGE,
-    OID_KP_OCSP_SIGNING, OID_KP_TIME_STAMPING,
+    path_len_constraint, AnchorPurpose, CertificateProfile, OID_ANY_EKU, OID_EXT_BASIC_CONSTRAINTS,
+    OID_EXT_EKU, OID_EXT_KEY_USAGE, OID_KP_OCSP_SIGNING, OID_KP_TIME_STAMPING,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,8 @@ const OID_EXT_INHIBIT_ANY_POLICY: ObjectIdentifier = ObjectIdentifier::new_unwra
 
 /// `anyPolicy`, the wildcard certificate policy.
 const OID_ANY_POLICY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.32.0");
+const OID_QT_CPS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.2.1");
+const OID_QT_USER_NOTICE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.2.2");
 
 const OID_AT_EMAIL_ADDRESS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
 
@@ -79,6 +83,10 @@ const OID_RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 const OID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
 const OID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
+
+const OID_ML_DSA_44: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17");
+const OID_ML_DSA_65: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.18");
+const OID_ML_DSA_87: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
 
 /// Minimum RSA modulus length the profile accepts, in bits.
 const MIN_RSA_MODULUS_BITS: u32 = 2048;
@@ -109,23 +117,81 @@ pub(crate) enum CertRole {
     Intermediate,
 }
 
+/// Which revision's profile applies, and whether the end entity is a signing
+/// credential the algorithm requirements bind.
+///
+/// The 2.4 profile applies the signature-algorithm and public-key allow lists
+/// to every path certificate. The 2.5 profile adds RSASSA-PSS with the full
+/// RFC 4055 salt range and ML-DSA-44/65/87, and scopes those requirements to
+/// claim-signing certificates: "The requirements do not apply to TSA, OCSP or
+/// CA certificates in certificate chains" (Trust Model, Certificate Profiles,
+/// General Requirements). CAWG credentials import the C2PA claim-signing
+/// profile, so they are bound as well.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ProfileRules {
+    profile: CertificateProfile,
+    signing_credential: bool,
+}
+
+impl ProfileRules {
+    /// The established 2.4 rules.
+    pub(crate) const V2_4: Self = Self {
+        profile: CertificateProfile::V2_4,
+        signing_credential: true,
+    };
+
+    /// Rules for an end entity validated for `purpose` under `profile`.
+    pub(crate) fn for_purpose(profile: CertificateProfile, purpose: AnchorPurpose) -> Self {
+        Self {
+            profile,
+            signing_credential: purpose != AnchorPurpose::TimeStamping,
+        }
+    }
+
+    /// Rules for a TSA or OCSP responder end entity under `profile`.
+    pub(crate) fn exempt_end_entity(profile: CertificateProfile) -> Self {
+        Self {
+            profile,
+            signing_credential: false,
+        }
+    }
+
+    fn algorithm_violation(self, cert: &Certificate, role: CertRole) -> Option<&'static str> {
+        match self.profile {
+            CertificateProfile::V2_2 | CertificateProfile::V2_4 => {
+                signature_algorithm_violation(cert).or_else(|| public_key_violation(cert))
+            }
+            CertificateProfile::V2_5 if role == CertRole::EndEntity && self.signing_credential => {
+                signature_algorithm_violation_v2_5(cert).or_else(|| public_key_violation_v2_5(cert))
+            }
+            CertificateProfile::V2_5 => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Single-certificate profile
 // ---------------------------------------------------------------------------
+
+/// [`profile_violation_with`] under [`ProfileRules::V2_4`].
+pub(crate) fn profile_violation(cert: &Certificate, role: CertRole) -> Option<&'static str> {
+    profile_violation_with(cert, role, ProfileRules::V2_4)
+}
 
 /// Check one certificate against the C2PA certificate profile.
 ///
 /// Returns `Some(reason)` when the certificate is unacceptable. The EKU
 /// *purpose* rules that differ per application (which claim-signing OIDs are
 /// accepted) stay with the caller; what lives here is what the profile demands
-/// of every certificate regardless of purpose.
-pub(crate) fn profile_violation(cert: &Certificate, role: CertRole) -> Option<&'static str> {
-    // "All certificates shall fulfill the following requirements": signature
-    // algorithm allow list and public-key constraints.
-    if let Some(reason) = signature_algorithm_violation(cert) {
-        return Some(reason);
-    }
-    if let Some(reason) = public_key_violation(cert) {
+/// of every certificate regardless of purpose, plus the algorithm
+/// requirements `rules` selects.
+pub(crate) fn profile_violation_with(
+    cert: &Certificate,
+    role: CertRole,
+    rules: ProfileRules,
+) -> Option<&'static str> {
+    // Signature algorithm allow list and public-key constraints.
+    if let Some(reason) = rules.algorithm_violation(cert, role) {
         return Some(reason);
     }
 
@@ -144,12 +210,34 @@ pub(crate) fn profile_violation(cert: &Certificate, role: CertRole) -> Option<&'
         return Some("certificate carries an issuerUniqueID or subjectUniqueID");
     }
 
-    let self_signed = cert.tbs_certificate.subject == cert.tbs_certificate.issuer;
-    if !self_signed && !has_extension(cert, OID_EXT_AUTHORITY_KEY_IDENTIFIER) {
-        return Some("certificate is not self-signed and has no Authority Key Identifier");
+    let has_aki = has_extension(cert, OID_EXT_AUTHORITY_KEY_IDENTIFIER);
+    if !has_aki {
+        let names_match = cert.tbs_certificate.subject == cert.tbs_certificate.issuer;
+        let self_signed = names_match
+            && (rules.profile != CertificateProfile::V2_5
+                || super::verify_signature_with(cert, cert, CertificateProfile::V2_5));
+        if !self_signed {
+            return Some(if rules.profile == CertificateProfile::V2_5 {
+                "certificate has no Authority Key Identifier and its self-signed status cannot be verified"
+            } else {
+                "certificate is not self-signed and has no Authority Key Identifier"
+            });
+        }
     }
 
-    if let Some(reason) = critical_extension_violation(cert) {
+    if rules.profile == CertificateProfile::V2_5 {
+        if let Some(extensions) = cert.tbs_certificate.extensions.as_ref() {
+            let mut seen = HashSet::with_capacity(extensions.len());
+            if extensions
+                .iter()
+                .any(|extension| !seen.insert(extension.extn_id))
+            {
+                return Some("certificate repeats an extension OID");
+            }
+        }
+    }
+
+    if let Some(reason) = critical_extension_violation(cert, rules) {
         return Some(reason);
     }
 
@@ -232,11 +320,14 @@ fn extension_value(cert: &Certificate, oid: ObjectIdentifier) -> Option<&[u8]> {
         .map(|ext| ext.extn_value.as_bytes())
 }
 
-fn critical_extension_violation(cert: &Certificate) -> Option<&'static str> {
+fn critical_extension_violation(cert: &Certificate, rules: ProfileRules) -> Option<&'static str> {
     let exts = cert.tbs_certificate.extensions.as_ref()?;
-    let unknown = exts
-        .iter()
-        .any(|ext| ext.critical && !RECOGNIZED_CRITICAL_EXTENSIONS.contains(&ext.extn_id));
+    let unknown = exts.iter().any(|ext| {
+        ext.critical
+            && !RECOGNIZED_CRITICAL_EXTENSIONS.contains(&ext.extn_id)
+            && !(rules.profile == CertificateProfile::V2_5
+                && ext.extn_id == OID_EXT_POLICY_MAPPINGS)
+    });
     unknown.then_some("certificate carries an unrecognized critical extension")
 }
 
@@ -316,50 +407,152 @@ fn public_key_violation(cert: &Certificate) -> Option<&'static str> {
     Some("certificate public key algorithm is outside the C2PA allow list")
 }
 
+/// The 2.5 `signatureAlgorithm` allow list for a claim-signing certificate:
+/// the 2.4 algorithms plus ML-DSA-44/65/87 with absent parameters, and
+/// RSASSA-PSS whose parameters carry a present SHA-256/384/512 hash and MGF1
+/// over the same hash. The salt length may be any RFC 4055 value.
+fn signature_algorithm_violation_v2_5(cert: &Certificate) -> Option<&'static str> {
+    let alg = &cert.signature_algorithm;
+    match alg.oid {
+        OID_ECDSA_SHA256 | OID_ECDSA_SHA384 | OID_ECDSA_SHA512 | OID_RSA_SHA256
+        | OID_RSA_SHA384 | OID_RSA_SHA512 | OID_ED25519 => None,
+        OID_ML_DSA_44 | OID_ML_DSA_65 | OID_ML_DSA_87 => alg
+            .parameters
+            .is_some()
+            .then_some("ML-DSA certificate signature algorithm carries parameters"),
+        OID_RSASSA_PSS => {
+            let Some(parameters) = alg.parameters.as_ref() else {
+                return Some("RSASSA-PSS certificate signature has no parameters");
+            };
+            pss_parameters_violation(parameters)
+        }
+        _ => Some("certificate signature algorithm is outside the C2PA allow list"),
+    }
+}
+
+/// RFC 4055 `RSASSA-PSS-params` read with a full-range salt length.
+fn pss_parameters_violation(parameters: &der::Any) -> Option<&'static str> {
+    use der::{Reader as _, TagMode, TagNumber};
+
+    let parsed = parameters.sequence(|reader| {
+        let hash: Option<spki::AlgorithmIdentifierRef<'_>> =
+            reader.context_specific(TagNumber::N0, TagMode::Explicit)?;
+        let mask: Option<spki::AlgorithmIdentifier<spki::AlgorithmIdentifierRef<'_>>> =
+            reader.context_specific(TagNumber::N1, TagMode::Explicit)?;
+        let _salt: Option<u32> = reader.context_specific(TagNumber::N2, TagMode::Explicit)?;
+        let _trailer: Option<u32> = reader.context_specific(TagNumber::N3, TagMode::Explicit)?;
+        Ok((
+            hash.map(|hash| hash.oid),
+            mask.map(|mask| (mask.oid, mask.parameters.map(|inner| inner.oid))),
+        ))
+    });
+    let Ok((hash, mask)) = parsed else {
+        return Some("RSASSA-PSS certificate signature parameters are malformed");
+    };
+    let Some(hash) = hash else {
+        return Some("RSASSA-PSS hashAlgorithm is absent");
+    };
+    if !matches!(hash, OID_SHA256 | OID_SHA384 | OID_SHA512) {
+        return Some("RSASSA-PSS hashAlgorithm is not SHA-256, SHA-384 or SHA-512");
+    }
+    match mask {
+        None => Some("RSASSA-PSS maskGenAlgorithm is absent"),
+        Some((mgf, _)) if mgf != OID_MGF1 => Some("RSASSA-PSS maskGenAlgorithm is not MGF1"),
+        Some((_, None)) => Some("RSASSA-PSS maskGenAlgorithm has no hash parameter"),
+        Some((_, Some(mask_hash))) if mask_hash != hash => {
+            Some("RSASSA-PSS MGF1 hash does not match hashAlgorithm")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The 2.5 `subjectPublicKeyInfo` constraints for a claim-signing
+/// certificate: the 2.4 rules plus an ML-DSA key with absent parameters and
+/// the RFC 9881 encoding of its parameter set.
+fn public_key_violation_v2_5(cert: &Certificate) -> Option<&'static str> {
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    if matches!(
+        spki.algorithm.oid,
+        OID_ML_DSA_44 | OID_ML_DSA_65 | OID_ML_DSA_87
+    ) {
+        let Ok(der) = spki.to_der() else {
+            return Some("ML-DSA public key is malformed");
+        };
+        return crate::c2pa_crypto::ml_dsa_spki_alg(&der)
+            .is_err()
+            .then_some("ML-DSA public key is not an RFC 9881 encoding of its parameter set");
+    }
+    public_key_violation(cert)
+}
+
 // ---------------------------------------------------------------------------
 // Path constraints
 // ---------------------------------------------------------------------------
 
 /// Check a complete candidate path, ordered end entity first and trust anchor
-/// last, against the RFC 5280 section 6 constraints.
+/// last, against the certificate profile `rules` select and the RFC 5280
+/// section 6 constraints.
 ///
 /// `path[0]` is the certificate under validation; `path[path.len() - 1]` is the
-/// anchor. A single-element path (the anchor is itself the credential) has no
-/// constraints to apply.
-pub(crate) fn path_violation(path: &[Certificate]) -> Option<&'static str> {
+/// anchor. Exact 2.5 admits the anchor under the C2PA certificate profile but
+/// excludes its encoded RFC 5280 path constraints.
+pub(crate) fn path_violation(path: &[Certificate], rules: ProfileRules) -> Option<&'static str> {
+    let exact_v2_5 = rules.profile == CertificateProfile::V2_5;
     for (index, cert) in path.iter().enumerate() {
-        // The anchor is a trusted name and key, not a path certificate.
-        if index + 1 == path.len() {
+        let anchor = index + 1 == path.len();
+        if anchor && !exact_v2_5 {
             break;
         }
-        let role = if index == 0 {
+        // Exact 2.5 retains C2PA certificate-profile admission for the
+        // configured anchor. Its RFC 5280 role is still trust-anchor input,
+        // so path constraints below exclude its encoded extensions.
+        let role = if anchor && is_ca_certificate(cert) {
+            CertRole::Intermediate
+        } else if index == 0 {
             CertRole::EndEntity
         } else {
             CertRole::Intermediate
         };
-        if let Some(reason) = profile_violation(cert, role) {
+        if let Some(reason) = profile_violation_with(cert, role, rules) {
             return Some(reason);
         }
     }
 
-    // pathLenConstraint: an issuer at `index` has `index - 1` intermediate CAs
-    // below it, none of which it is allowed to exceed.
-    for (index, issuer) in path.iter().enumerate().skip(1) {
+    // The anchor's encoded pathLenConstraint is not a trust-anchor input.
+    let issuer_end = if exact_v2_5 {
+        path.len().saturating_sub(1)
+    } else {
+        path.len()
+    };
+    for (index, issuer) in path[..issuer_end].iter().enumerate().skip(1) {
         if let Some(max) = path_len_constraint(issuer) {
-            if index - 1 > max {
+            let ca_certificates_below = if exact_v2_5 {
+                path[1..index]
+                    .iter()
+                    .filter(|cert| cert.tbs_certificate.subject != cert.tbs_certificate.issuer)
+                    .count()
+            } else {
+                index - 1
+            };
+            if ca_certificates_below > max {
                 return Some("issuer pathLenConstraint violated");
             }
         }
     }
 
-    if let Some(reason) = name_constraints_violation(path) {
+    let constrained_path = if exact_v2_5 {
+        &path[..path.len().saturating_sub(1)]
+    } else {
+        path
+    };
+    if let Some(reason) = name_constraints_violation(constrained_path, exact_v2_5) {
         return Some(reason);
     }
-    policy_violation(path)
+    policy_violation(path, rules)
 }
 
 /// Apply each CA's name constraints to every certificate beneath it.
-fn name_constraints_violation(path: &[Certificate]) -> Option<&'static str> {
+fn name_constraints_violation(path: &[Certificate], exact_v2_5: bool) -> Option<&'static str> {
     for (index, ca) in path.iter().enumerate().skip(1) {
         let Some(raw) = extension_value(ca, OID_EXT_NAME_CONSTRAINTS) else {
             continue;
@@ -383,7 +576,13 @@ fn name_constraints_violation(path: &[Certificate]) -> Option<&'static str> {
                 }
             }
         }
-        for subordinate in &path[..index] {
+        for (subordinate_index, subordinate) in path[..index].iter().enumerate() {
+            if exact_v2_5
+                && subordinate_index > 0
+                && subordinate.tbs_certificate.subject == subordinate.tbs_certificate.issuer
+            {
+                continue;
+            }
             if let Some(reason) = subordinate_names_violation(subordinate, &constraints) {
                 return Some(reason);
             }
@@ -546,10 +745,18 @@ fn ip_within(name: &[u8], base: &[u8]) -> bool {
         .all(|((addr, net), mask)| addr & mask == net & mask)
 }
 
-/// RFC 5280 section 6.1.4 policy processing, in the conservative form this
-/// verifier can honor: policy mapping is not implemented, so a path that
-/// requires it is rejected rather than accepted unchecked.
-fn policy_violation(path: &[Certificate]) -> Option<&'static str> {
+/// Apply certificate-policy processing while retaining the established 2.2
+/// and 2.4 refusal behavior. Exact 2.5 paths use the RFC 5280 section 6 policy
+/// tree and counters, including mappings and `anyPolicy`.
+fn policy_violation(path: &[Certificate], rules: ProfileRules) -> Option<&'static str> {
+    match rules.profile {
+        CertificateProfile::V2_5 => rfc5280_policy_violation(path),
+        CertificateProfile::V2_2 | CertificateProfile::V2_4 => legacy_policy_violation(path),
+    }
+}
+
+/// The pre-2.5 policy behavior is intentionally frozen for compatibility.
+fn legacy_policy_violation(path: &[Certificate]) -> Option<&'static str> {
     let mut explicit_policy_required = false;
     for (index, ca) in path.iter().enumerate().skip(1) {
         if has_extension(ca, OID_EXT_POLICY_MAPPINGS) {
@@ -562,8 +769,6 @@ fn policy_violation(path: &[Certificate]) -> Option<&'static str> {
             return Some("policy constraints extension is malformed");
         };
         if let Some(skip) = constraints.require_explicit_policy {
-            // `skip` counts the certificates that may still appear before an
-            // explicit policy is required for the whole path.
             if (index as u64) > u64::from(skip) {
                 explicit_policy_required = true;
             }
@@ -573,9 +778,6 @@ fn policy_violation(path: &[Certificate]) -> Option<&'static str> {
         return None;
     }
 
-    // With no caller-supplied initial policy set, an explicit policy is
-    // satisfied when every certificate below the anchor asserts at least one
-    // policy and the assertions intersect.
     let mut common: Option<HashSet<ObjectIdentifier>> = None;
     for cert in &path[..path.len().saturating_sub(1)] {
         let Some(raw) = extension_value(cert, OID_EXT_CERTIFICATE_POLICIES) else {
@@ -603,6 +805,340 @@ fn policy_violation(path: &[Certificate]) -> Option<&'static str> {
             Some("no certificate policy is common to the whole path")
         }
         _ => None,
+    }
+}
+
+/// Expected policies for one RFC 9618 policy-graph node.
+///
+/// `None` is the common singleton case: the expected policy is the node's own
+/// valid-policy OID. A set is allocated only when policy mappings replace it.
+type ExpectedPolicies = Option<HashSet<ObjectIdentifier>>;
+
+/// The current policy-graph level, keyed by valid-policy OID.
+///
+/// RFC 9618 section 5.2 requires at most one node for each OID at a depth.
+type PolicyLevel = HashMap<ObjectIdentifier, ExpectedPolicies>;
+
+#[derive(Default)]
+struct ParsedPolicyExtensions {
+    policies: Option<CertificatePolicies>,
+    mappings: Option<HashMap<ObjectIdentifier, HashSet<ObjectIdentifier>>>,
+    constraints: Option<PolicyConstraints>,
+    inhibit_any_policy: Option<u32>,
+}
+
+/// RFC 5280 section 6 as updated by RFC 9618. The C2PA API supplies the
+/// unconstrained user policy set and no initial inhibit flags, so all three
+/// counters start at n+1.
+fn rfc5280_policy_violation(path: &[Certificate]) -> Option<&'static str> {
+    let certificate_count = path.len().saturating_sub(1);
+    if certificate_count == 0 {
+        return path
+            .first()
+            .and_then(|target_anchor| parse_policy_extensions(target_anchor).err());
+    }
+
+    let mut root = HashMap::new();
+    root.insert(OID_ANY_POLICY, None);
+    let mut valid_policy_level = Some(root);
+    let mut explicit_policy = certificate_count + 1;
+    let mut policy_mapping = certificate_count + 1;
+    let mut inhibit_any_policy = certificate_count + 1;
+
+    // RFC order is trust anchor toward target. The anchor itself is an input,
+    // not one of the n certificates processed by section 6.1.
+    for (offset, cert) in path[..certificate_count].iter().rev().enumerate() {
+        let position = offset + 1;
+        let self_issued = cert.tbs_certificate.subject == cert.tbs_certificate.issuer;
+        let parsed = match parse_policy_extensions(cert) {
+            Ok(parsed) => parsed,
+            Err(reason) => return Some(reason),
+        };
+        valid_policy_level = process_certificate_policies(
+            parsed.policies.as_ref(),
+            valid_policy_level,
+            inhibit_any_policy,
+            self_issued,
+            position,
+            certificate_count,
+        );
+
+        if explicit_policy == 0 && valid_policy_level.is_none() {
+            return Some("an explicit certificate policy is required but not asserted");
+        }
+
+        if position < certificate_count {
+            if let (Some(nodes), Some(mappings)) = (valid_policy_level.as_mut(), parsed.mappings) {
+                apply_policy_mappings(nodes, mappings, policy_mapping);
+                if nodes.is_empty() {
+                    valid_policy_level = None;
+                }
+            }
+
+            if !self_issued {
+                explicit_policy = explicit_policy.saturating_sub(1);
+                policy_mapping = policy_mapping.saturating_sub(1);
+                inhibit_any_policy = inhibit_any_policy.saturating_sub(1);
+            }
+            if let Some(constraints) = parsed.constraints {
+                if let Some(skip) = constraints.require_explicit_policy {
+                    explicit_policy = explicit_policy.min(skip as usize);
+                }
+                if let Some(skip) = constraints.inhibit_policy_mapping {
+                    policy_mapping = policy_mapping.min(skip as usize);
+                }
+            }
+            if let Some(skip) = parsed.inhibit_any_policy {
+                inhibit_any_policy = inhibit_any_policy.min(skip as usize);
+            }
+        } else {
+            explicit_policy = explicit_policy.saturating_sub(1);
+            if parsed
+                .constraints
+                .is_some_and(|constraints| constraints.require_explicit_policy == Some(0))
+            {
+                explicit_policy = 0;
+            }
+        }
+    }
+
+    (explicit_policy == 0 && valid_policy_level.is_none())
+        .then_some("an explicit certificate policy is required but not asserted")
+}
+
+fn parse_policy_extensions(cert: &Certificate) -> Result<ParsedPolicyExtensions, &'static str> {
+    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+        return Ok(ParsedPolicyExtensions::default());
+    };
+
+    let mut parsed = ParsedPolicyExtensions::default();
+    for extension in extensions {
+        match extension.extn_id {
+            OID_EXT_CERTIFICATE_POLICIES => {
+                let policies = CertificatePolicies::from_der(extension.extn_value.as_bytes())
+                    .map_err(|_| "certificate policies extension is malformed")?;
+                validate_certificate_policies(&policies, extension.critical)?;
+                parsed.policies = Some(policies);
+            }
+            OID_EXT_POLICY_MAPPINGS => {
+                let mappings = PolicyMappings::from_der(extension.extn_value.as_bytes())
+                    .map_err(|_| "policy mappings extension is malformed")?;
+                if mappings.0.is_empty() {
+                    return Err("policy mappings extension is malformed");
+                }
+                let mut groups: HashMap<ObjectIdentifier, HashSet<ObjectIdentifier>> =
+                    HashMap::new();
+                for mapping in mappings.0 {
+                    if mapping.issuer_domain_policy == OID_ANY_POLICY
+                        || mapping.subject_domain_policy == OID_ANY_POLICY
+                    {
+                        return Err("policy mapping to or from anyPolicy is forbidden");
+                    }
+                    groups
+                        .entry(mapping.issuer_domain_policy)
+                        .or_default()
+                        .insert(mapping.subject_domain_policy);
+                }
+                parsed.mappings = Some(groups);
+            }
+            OID_EXT_POLICY_CONSTRAINTS => {
+                let constraints = PolicyConstraints::from_der(extension.extn_value.as_bytes())
+                    .map_err(|_| "policy constraints extension is malformed")?;
+                if constraints.require_explicit_policy.is_none()
+                    && constraints.inhibit_policy_mapping.is_none()
+                {
+                    return Err("policy constraints extension is empty");
+                }
+                parsed.constraints = Some(constraints);
+            }
+            OID_EXT_INHIBIT_ANY_POLICY => {
+                let skip = InhibitAnyPolicy::from_der(extension.extn_value.as_bytes())
+                    .map_err(|_| "inhibit anyPolicy extension is malformed")?;
+                parsed.inhibit_any_policy = Some(skip.0);
+            }
+            _ => {}
+        }
+    }
+    Ok(parsed)
+}
+
+fn validate_certificate_policies(
+    policies: &CertificatePolicies,
+    critical: bool,
+) -> Result<(), &'static str> {
+    if policies.0.is_empty() {
+        return Err("certificate policies extension is malformed");
+    }
+    let mut seen = HashSet::with_capacity(policies.0.len());
+    for policy in &policies.0 {
+        if !seen.insert(policy.policy_identifier) {
+            return Err("certificate policies extension repeats a policy OID");
+        }
+        validate_policy_qualifiers(policy, critical)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_qualifiers(
+    policy: &PolicyInformation,
+    critical: bool,
+) -> Result<(), &'static str> {
+    let Some(qualifiers) = policy.policy_qualifiers.as_ref() else {
+        return Ok(());
+    };
+    if qualifiers.is_empty() {
+        return Err("certificate policy qualifiers are empty");
+    }
+    for qualifier in qualifiers {
+        let Some(value) = qualifier.qualifier.as_ref() else {
+            return Err("certificate policy qualifier has no value");
+        };
+        match qualifier.policy_qualifier_id {
+            OID_QT_CPS => {
+                value
+                    .decode_as::<der::asn1::Ia5String>()
+                    .map_err(|_| "certificate policy CPS qualifier is malformed")?;
+            }
+            OID_QT_USER_NOTICE => validate_user_notice(value)?,
+            _ if critical || policy.policy_identifier == OID_ANY_POLICY => {
+                return Err("critical certificate policy has an unknown qualifier");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Decode RFC 5280 `UserNotice` directly. x509-cert 0.2.5 models
+/// `NoticeReference` with the wrong field types and omits two `DisplayText`
+/// alternatives, so its `UserNotice` type cannot validate the wire format.
+fn validate_user_notice(value: &der::Any) -> Result<(), &'static str> {
+    use der::Reader as _;
+
+    value
+        .sequence(|reader| {
+            if reader.is_finished() {
+                return Ok(());
+            }
+            if reader.peek_tag()? == Tag::Sequence {
+                let notice_reference: der::asn1::AnyRef<'_> = reader.decode()?;
+                validate_notice_reference(notice_reference)?;
+            }
+            if !reader.is_finished() {
+                let explicit_text: der::asn1::AnyRef<'_> = reader.decode()?;
+                validate_display_text(explicit_text, false)?;
+            }
+            Ok(())
+        })
+        .map_err(|_| "certificate policy userNotice qualifier is malformed")
+}
+
+fn validate_notice_reference(value: der::asn1::AnyRef<'_>) -> der::Result<()> {
+    use der::Reader as _;
+
+    value.sequence(|reader| {
+        let organization: der::asn1::AnyRef<'_> = reader.decode()?;
+        validate_display_text(organization, true)?;
+        let notice_numbers: der::asn1::AnyRef<'_> = reader.decode()?;
+        notice_numbers.sequence(|numbers| {
+            while !numbers.is_finished() {
+                numbers.decode::<der::asn1::IntRef<'_>>()?;
+            }
+            Ok(())
+        })
+    })
+}
+
+fn validate_display_text(
+    value: der::asn1::AnyRef<'_>,
+    enforce_200_character_limit: bool,
+) -> der::Result<()> {
+    let bytes = value.value();
+    let character_count = match value.tag() {
+        Tag::Ia5String if bytes.iter().all(u8::is_ascii) => Some(bytes.len()),
+        Tag::VisibleString if bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) => {
+            Some(bytes.len())
+        }
+        Tag::Utf8String => std::str::from_utf8(bytes)
+            .ok()
+            .map(|text| text.chars().count()),
+        Tag::BmpString
+            if bytes.len() % 2 == 0
+                && bytes.chunks_exact(2).all(|unit| {
+                    !matches!(u16::from_be_bytes([unit[0], unit[1]]), 0xd800..=0xdfff)
+                }) =>
+        {
+            Some(bytes.len() / 2)
+        }
+        _ => None,
+    };
+    if character_count
+        .is_some_and(|count| count > 0 && (!enforce_200_character_limit || count <= 200))
+    {
+        Ok(())
+    } else {
+        Err(value.tag().unexpected_error(None))
+    }
+}
+
+fn process_certificate_policies(
+    policies: Option<&CertificatePolicies>,
+    previous: Option<PolicyLevel>,
+    inhibit_any_policy: usize,
+    self_issued: bool,
+    position: usize,
+    certificate_count: usize,
+) -> Option<PolicyLevel> {
+    let policies = policies?;
+    let previous = previous?;
+    let mut expected_policies = HashSet::with_capacity(previous.len());
+    for (valid, expected) in &previous {
+        match expected {
+            Some(expected) => expected_policies.extend(expected),
+            None => {
+                expected_policies.insert(*valid);
+            }
+        }
+    }
+    let mut current = HashMap::with_capacity(policies.0.len());
+
+    for policy in policies
+        .0
+        .iter()
+        .filter(|policy| policy.policy_identifier != OID_ANY_POLICY)
+    {
+        let oid = policy.policy_identifier;
+        if expected_policies.contains(&oid) || previous.contains_key(&OID_ANY_POLICY) {
+            current.entry(oid).or_insert(None);
+        }
+    }
+
+    let has_any_policy = policies
+        .0
+        .iter()
+        .any(|policy| policy.policy_identifier == OID_ANY_POLICY);
+    if has_any_policy && (inhibit_any_policy > 0 || (position < certificate_count && self_issued)) {
+        for oid in expected_policies {
+            current.entry(oid).or_insert(None);
+        }
+    }
+
+    (!current.is_empty()).then_some(current)
+}
+
+fn apply_policy_mappings(
+    nodes: &mut PolicyLevel,
+    mappings: HashMap<ObjectIdentifier, HashSet<ObjectIdentifier>>,
+    policy_mapping: usize,
+) {
+    for (issuer, subjects) in mappings {
+        if policy_mapping == 0 {
+            nodes.remove(&issuer);
+        } else if let Some(expected) = nodes.get_mut(&issuer) {
+            *expected = Some(subjects);
+        } else if nodes.contains_key(&OID_ANY_POLICY) {
+            nodes.insert(issuer, Some(subjects));
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use crate::c2pa_cbor::{decode, encode, Profile, Value};
 use crate::c2pa_crypto::{
     extract_claim_tsa_tokens, extract_tsa_tokens, timestamp_input, ClaimTimestampVersion, CoseAlg,
 };
-use crate::c2pa_trust::TrustList;
+use crate::c2pa_trust::{CertificateProfile, TrustList};
 use ecdsa::signature::hazmat::PrehashVerifier as _;
 use serde_json::{json, Value as Json};
 use sha2::Digest as _;
@@ -52,7 +52,7 @@ const MAX_DID_TRUST_DEPTH: usize = 16;
 /// Validate one ICA identity assertion. Every resolver and trust input is
 /// caller-supplied; this function never performs network I/O.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn verify_ica_assertion(
+pub(super) fn verify_ica_assertion_with(
     signer_payload: &Value,
     signature: &[u8],
     url: &str,
@@ -63,6 +63,7 @@ pub(super) fn verify_ica_assertion(
     trusted_issuers: Option<&[String]>,
     trust_anchors: Option<&[String]>,
     status_lists: Option<&HashMap<String, String>>,
+    certificate_profile: CertificateProfile,
     results: &mut ValidationResults,
 ) {
     let Some(cose) = CoseSign1::parse(signature) else {
@@ -181,7 +182,13 @@ pub(super) fn verify_ica_assertion(
         }
     }
 
-    let identity_time = match ica_timestamp(&cose, signature, tsa_trust, validation_time) {
+    let identity_time = match ica_timestamp(
+        &cose,
+        signature,
+        tsa_trust,
+        validation_time,
+        certificate_profile,
+    ) {
         IcaTimestamp::Absent => None,
         IcaTimestamp::Valid(at) => {
             results.push_success(
@@ -376,6 +383,37 @@ pub(super) fn verify_ica_assertion(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn verify_ica_assertion(
+    signer_payload: &Value,
+    signature: &[u8],
+    url: &str,
+    validation_time: OffsetDateTime,
+    manifest_time: Option<OffsetDateTime>,
+    tsa_trust: Option<&TrustList>,
+    did_documents: Option<&HashMap<String, Json>>,
+    trusted_issuers: Option<&[String]>,
+    trust_anchors: Option<&[String]>,
+    status_lists: Option<&HashMap<String, String>>,
+    results: &mut ValidationResults,
+) {
+    verify_ica_assertion_with(
+        signer_payload,
+        signature,
+        url,
+        validation_time,
+        manifest_time,
+        tsa_trust,
+        did_documents,
+        trusted_issuers,
+        trust_anchors,
+        status_lists,
+        CertificateProfile::V2_4,
+        results,
+    )
+}
+
 struct CoseSign1 {
     protected_bytes: Vec<u8>,
     protected: Vec<(Value, Value)>,
@@ -437,6 +475,65 @@ impl CoseSign1 {
             .iter()
             .any(|(key, _)| key.as_text() == Some(name))
     }
+}
+
+/// Locate the DID document a structurally readable ICA signature would need.
+///
+/// This is parse-only discovery for network adapters. Cryptographic,
+/// credential, and trust validation remain in [`verify_ica_assertion_with`].
+pub(super) fn locate_did_document(signature: &[u8]) -> Option<(String, String)> {
+    let cose = CoseSign1::parse(signature)?;
+    let credential = parse_ica_credential(cose.payload.as_deref()?).ok()?;
+    let url = super::network_needs::did_web_url(&credential.issuer)?;
+    Some((primary_did(&credential.issuer).to_string(), url))
+}
+
+#[cfg(test)]
+pub(super) fn did_locator_fixture(issuer: &str) -> Vec<u8> {
+    let signer_payload = Value::Map(vec![
+        (
+            "referenced_assertions".into(),
+            Value::Array(vec![Value::Map(vec![
+                (
+                    "url".into(),
+                    Value::Text("self#jumbf=c2pa.assertions/c2pa.hash.data".into()),
+                ),
+                ("hash".into(), Value::Bytes(vec![0xA7; 32])),
+            ])]),
+        ),
+        (
+            "sig_type".into(),
+            Value::Text("cawg.identity_claims_aggregation".into()),
+        ),
+    ]);
+    let credential = json!({
+        "@context": [VC_CONTEXT_V2, CAWG_ICA_CONTEXT],
+        "type": ["VerifiableCredential", "IdentityClaimsAggregationCredential"],
+        "issuer": issuer,
+        "validFrom": "2025-01-01T00:00:00Z",
+        "credentialSubject": {
+            "verifiedIdentities": [{
+                "type": "cawg.social_media",
+                "username": "user",
+                "verifiedAt": "2024-05-27T08:40:39Z",
+                "provider": {"id": "https://idp.example", "name": "Example IdP"},
+            }],
+            "c2paAsset": super::report::cbor_to_json(&signer_payload),
+        },
+    });
+    encode(
+        &Value::Tag(
+            18,
+            Box::new(Value::Array(vec![
+                Value::Bytes(Vec::new()),
+                Value::Map(Vec::new()),
+                Value::Bytes(serde_json::to_vec(&credential).expect("credential JSON")),
+                Value::Bytes(vec![0]),
+            ])),
+        ),
+        Profile::CanonicalForHashedSubstructures,
+    )
+    .expect("ICA fixture COSE")
 }
 
 fn map_int(entries: &[(Value, Value)], key: i128) -> Option<&Value> {
@@ -874,15 +971,28 @@ impl IcaKey {
 
 macro_rules! verify_ecdsa {
     ($key:expr, $algorithm:expr, $data:expr, $signature:expr, $signature_type:path) => {{
-        let digest = match $algorithm {
-            CoseAlg::Es256 => sha2::Sha256::digest($data).to_vec(),
-            CoseAlg::Es384 => sha2::Sha384::digest($data).to_vec(),
-            CoseAlg::Es512 => sha2::Sha512::digest($data).to_vec(),
+        let mut digest = [0_u8; 64];
+        let digest_len = match $algorithm {
+            CoseAlg::Es256 => {
+                digest[..32].copy_from_slice(&sha2::Sha256::digest($data));
+                32
+            }
+            CoseAlg::Es384 => {
+                digest[..48].copy_from_slice(&sha2::Sha384::digest($data));
+                48
+            }
+            CoseAlg::Es512 => {
+                digest.copy_from_slice(&sha2::Sha512::digest($data));
+                64
+            }
             _ => return false,
         };
         <$signature_type>::from_slice($signature)
             .or_else(|_| <$signature_type>::from_der($signature))
-            .is_ok_and(|signature| $key.verify_prehash(&digest, &signature).is_ok())
+            .is_ok_and(|signature| {
+                $key.verify_prehash(&digest[..digest_len], &signature)
+                    .is_ok()
+            })
     }};
 }
 
@@ -1204,6 +1314,7 @@ fn ica_timestamp(
     signature: &[u8],
     tsa_trust: Option<&TrustList>,
     verification_time: OffsetDateTime,
+    certificate_profile: CertificateProfile,
 ) -> IcaTimestamp {
     if !cose.has_unprotected("sigTst2") {
         return IcaTimestamp::Absent;
@@ -1216,8 +1327,13 @@ fn ica_timestamp(
         return IcaTimestamp::Invalid;
     };
 
-    let result =
-        crate::c2pa_trust::verify_timestamp_token(token, &payload, trust, verification_time);
+    let result = crate::c2pa_trust::verify_timestamp_token_with(
+        token,
+        &payload,
+        trust,
+        verification_time,
+        certificate_profile,
+    );
     match (result.verified, result.time) {
         (true, Some(at)) => IcaTimestamp::Valid(at),
         _ => IcaTimestamp::Invalid,
@@ -2014,6 +2130,26 @@ mod tests {
             &mut results,
         );
         results
+    }
+
+    #[test]
+    fn parse_only_locator_returns_only_readable_did_web_credentials() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let web = eddsa_cose(
+            &key,
+            &vc_json(json!("did:web:issuer.example:publishers"), false),
+        );
+        assert_eq!(
+            locate_did_document(&web),
+            Some((
+                "did:web:issuer.example:publishers".to_string(),
+                "https://issuer.example/publishers/did.json".to_string(),
+            ))
+        );
+
+        let local = eddsa_cose(&key, &vc_json(json!(did_jwk(&key)), false));
+        assert_eq!(locate_did_document(&local), None);
+        assert_eq!(locate_did_document(b"not cose"), None);
     }
 
     /// No pinned store means the DID document could only come from the network

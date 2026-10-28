@@ -8,7 +8,8 @@
 
 use crate::c2pa_cbor::{decode, encode, Profile, Value};
 
-use super::{CoseAlg, CryptoError};
+use super::{ClaimAlgorithmList, CoseAlg, CryptoError};
+use crate::c2pa_crypto::mldsa::verify_ml_dsa;
 
 const COSE_SIGN1_TAG: u64 = 18;
 
@@ -23,7 +24,8 @@ pub struct VerifiedCoseKeySignature {
     pub algorithm: CoseAlg,
 }
 
-/// Verify an embedded COSE_Sign1 with a serialized COSE_Key.
+/// Verify an embedded COSE_Sign1 with a serialized COSE_Key under an explicit
+/// revision's algorithm list.
 ///
 /// The protected `alg` (label 1) is authoritative: it selects the verification
 /// algorithm and is never inferred from coordinate shape. C2PA 2.4 session keys
@@ -33,9 +35,15 @@ pub struct VerifiedCoseKeySignature {
 /// P-256/P-384/P-521 key verifies ES256, ES384 and ES512, as C2PA requires and
 /// as the certificate verifier accepts. Detached payloads are not accepted for
 /// session data.
-pub fn verify_with_cose_key(
+///
+/// C2PA session keys may use any algorithm allowed for claim signing
+/// (Live Media, Session Keys), so the 2.5 list adds ESP256/384/512 keys
+/// (`kty` EC2 on the bound curve) and ML-DSA-44/65/87 keys (`kty` AKP with a
+/// `pub` of the parameter set's exact length and no `priv`, RFC 9964).
+pub fn verify_with_cose_key_with(
     cose_sign1: &[u8],
     cose_key: &[u8],
+    list: ClaimAlgorithmList,
 ) -> Result<VerifiedCoseKeySignature, CryptoError> {
     let decoded = decode(cose_sign1)?;
     let array = cose_array(&decoded)?;
@@ -47,7 +55,7 @@ pub fn verify_with_cose_key(
         .as_map()
         .ok_or_else(|| CryptoError::Malformed("protected header is not a map".into()))?;
     let alg_id = required_integer(protected, 1, "protected alg")?;
-    let algorithm = CoseAlg::from_cose_id(alg_id).ok_or(CryptoError::UnsupportedAlg(alg_id))?;
+    let algorithm = list.algorithm(alg_id)?;
     if optional_unique_bytes(protected, 4, "protected kid")?.is_some() {
         return Err(CryptoError::Malformed(
             "session signature kid must be unprotected".into(),
@@ -119,9 +127,12 @@ fn verify_key_signature(
 
     let kty = required_integer(key, 1, "COSE_Key kty")?;
     match alg {
-        CoseAlg::Es256 => verify_ecdsa(kty, key, &sha2::Sha256::digest(data), signature),
-        CoseAlg::Es384 => verify_ecdsa(kty, key, &sha2::Sha384::digest(data), signature),
-        CoseAlg::Es512 => verify_ecdsa(kty, key, &sha2::Sha512::digest(data), signature),
+        CoseAlg::Es256 => verify_ecdsa(kty, key, &sha2::Sha256::digest(data), signature, None),
+        CoseAlg::Es384 => verify_ecdsa(kty, key, &sha2::Sha384::digest(data), signature, None),
+        CoseAlg::Es512 => verify_ecdsa(kty, key, &sha2::Sha512::digest(data), signature, None),
+        CoseAlg::Esp256 => verify_ecdsa(kty, key, &sha2::Sha256::digest(data), signature, Some(1)),
+        CoseAlg::Esp384 => verify_ecdsa(kty, key, &sha2::Sha384::digest(data), signature, Some(2)),
+        CoseAlg::Esp512 => verify_ecdsa(kty, key, &sha2::Sha512::digest(data), signature, Some(3)),
         CoseAlg::EdDsa => {
             require_key_type_and_curve(kty, key, 1, 6)?;
             let x = required_bytes(key, -2, "COSE_Key x")?;
@@ -165,18 +176,35 @@ fn verify_key_signature(
                 _ => unreachable!("outer match already restricted this arm to the PSS algorithms"),
             }
         }
+        CoseAlg::MlDsa44 | CoseAlg::MlDsa65 | CoseAlg::MlDsa87 => {
+            if kty != COSE_KTY_AKP {
+                return Err(CryptoError::KeyParse(
+                    "ML-DSA algorithm requires kty 7 (AKP)".into(),
+                ));
+            }
+            if !integer_values(key, -2).is_empty() {
+                return Err(CryptoError::KeyParse(
+                    "a public AKP COSE_Key must not carry priv".into(),
+                ));
+            }
+            let public_key = required_bytes(key, -1, "COSE_Key pub")?;
+            verify_ml_dsa(alg, public_key, data, signature)
+        }
     }
 }
 
-/// Verify an ECDSA signature over `digest`, the hash the protected `alg` names.
-/// The curve comes from the key's own `crv`, independently of the digest. The
-/// curve crates turn the digest into a scalar as FIPS 186-5 specifies, keeping
-/// its leftmost bits when it is longer than the curve order.
+/// RFC 9964 Algorithm Key Pair key type.
+const COSE_KTY_AKP: i128 = 7;
+
+/// Verify ECDSA with the protected algorithm's digest and the key's curve.
+/// ESP requires its designated curve. Both ES and ESP require fixed-width
+/// COSE signatures.
 fn verify_ecdsa(
     kty: i128,
     key: &[(Value, Value)],
     digest: &[u8],
     signature: &[u8],
+    required_curve: Option<i128>,
 ) -> Result<(), CryptoError> {
     use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 
@@ -192,7 +220,13 @@ fn verify_ecdsa(
             "ECDSA algorithm requires COSE_Key kty 2".into(),
         ));
     }
-    match required_integer(key, -1, "COSE_Key curve")? {
+    let curve = required_integer(key, -1, "COSE_Key curve")?;
+    if required_curve.is_some_and(|required| required != curve) {
+        return Err(CryptoError::KeyParse(
+            "COSE_Key type or curve does not match algorithm".into(),
+        ));
+    }
+    match curve {
         1 => {
             let point = ec_point(key, 32)?;
             let verifying_key =
@@ -322,10 +356,192 @@ fn cose_array(value: &Value) -> Result<&[Value], CryptoError> {
 
 #[cfg(test)]
 mod tests {
-    //! Real ECDSA and Ed25519 signatures over the reconstructed `Sig_structure`;
-    //! nothing here echoes a canned verifier result.
-
     use super::*;
+
+    const PROFILE: Profile = Profile::LegacyPipelineBDefinite;
+
+    fn sig_structure(protected: &[u8], payload: &[u8]) -> Vec<u8> {
+        encode(
+            &Value::Array(vec![
+                Value::Text("Signature1".into()),
+                Value::Bytes(protected.to_vec()),
+                Value::Bytes(Vec::new()),
+                Value::Bytes(payload.to_vec()),
+            ]),
+            PROFILE,
+        )
+        .expect("Sig_structure")
+    }
+
+    /// An ESP256 session key and an embedded-payload segment signature.
+    fn esp256_session(curve_label: i128) -> (Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+
+        let key = SigningKey::from_slice(&[0x5e; 32]).expect("session key");
+        let point = key.verifying_key().to_sec1_point(false);
+        let cose_key = encode(
+            &Value::Map(vec![
+                (Value::Integer(1), Value::Integer(2)),
+                (Value::Integer(2), Value::Bytes(b"esp-session".to_vec())),
+                (Value::Integer(3), Value::Integer(-9)),
+                (Value::Integer(-1), Value::Integer(curve_label)),
+                (
+                    Value::Integer(-2),
+                    Value::Bytes(point.x().expect("x").to_vec()),
+                ),
+                (
+                    Value::Integer(-3),
+                    Value::Bytes(point.y().expect("y").to_vec()),
+                ),
+            ]),
+            PROFILE,
+        )
+        .expect("COSE_Key");
+        let protected = encode(
+            &Value::Map(vec![(Value::Integer(1), Value::Integer(-9))]),
+            PROFILE,
+        )
+        .expect("protected");
+        let payload = b"segment-info-map".to_vec();
+        let signature: Signature = key.sign(&sig_structure(&protected, &payload));
+        let cose = encode(
+            &Value::Tag(
+                COSE_SIGN1_TAG,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(protected),
+                    Value::Map(vec![(
+                        Value::Integer(4),
+                        Value::Bytes(b"esp-session".to_vec()),
+                    )]),
+                    Value::Bytes(payload),
+                    Value::Bytes(signature.to_bytes().to_vec()),
+                ])),
+            ),
+            PROFILE,
+        )
+        .expect("COSE_Sign1");
+        (cose, cose_key)
+    }
+
+    #[test]
+    fn esp_session_keys_verify_only_under_the_2_5_list() {
+        let (cose, key) = esp256_session(1);
+        let verified =
+            verify_with_cose_key_with(&cose, &key, ClaimAlgorithmList::V2_5).expect("ESP256");
+        assert_eq!(verified.algorithm, CoseAlg::Esp256);
+        assert_eq!(verified.payload, b"segment-info-map");
+        assert!(matches!(
+            verify_with_cose_key_with(&cose, &key, ClaimAlgorithmList::V2_4),
+            Err(CryptoError::UnsupportedAlg(-9))
+        ));
+
+        // The same key labelled as P-384 contradicts ESP256's bound curve.
+        let (cose, wrong_curve) = esp256_session(2);
+        assert!(matches!(
+            verify_with_cose_key_with(&cose, &wrong_curve, ClaimAlgorithmList::V2_5),
+            Err(CryptoError::KeyParse(_))
+        ));
+    }
+
+    struct Rfc9964 {
+        alg: CoseAlg,
+        public_key: &'static [u8],
+        sign1: &'static [u8],
+        to_be_signed: &'static [u8],
+    }
+
+    const RFC9964: [Rfc9964; 3] = [
+        Rfc9964 {
+            alg: CoseAlg::MlDsa44,
+            public_key: include_bytes!("fixtures/ml_dsa_44_rfc9964.pub"),
+            sign1: include_bytes!("fixtures/ml_dsa_44_rfc9964.sign1"),
+            to_be_signed: include_bytes!("fixtures/ml_dsa_44_rfc9964.tbs"),
+        },
+        Rfc9964 {
+            alg: CoseAlg::MlDsa65,
+            public_key: include_bytes!("fixtures/ml_dsa_65_rfc9964.pub"),
+            sign1: include_bytes!("fixtures/ml_dsa_65_rfc9964.sign1"),
+            to_be_signed: include_bytes!("fixtures/ml_dsa_65_rfc9964.tbs"),
+        },
+        Rfc9964 {
+            alg: CoseAlg::MlDsa87,
+            public_key: include_bytes!("fixtures/ml_dsa_87_rfc9964.pub"),
+            sign1: include_bytes!("fixtures/ml_dsa_87_rfc9964.sign1"),
+            to_be_signed: include_bytes!("fixtures/ml_dsa_87_rfc9964.tbs"),
+        },
+    ];
+
+    /// The public half of the RFC 9964 Appendix A.2 AKP COSE_Key.
+    fn akp_key(vector: &Rfc9964, kty: i128, with_priv: bool) -> Vec<(Value, Value)> {
+        let mut key = vec![
+            (Value::Integer(1), Value::Integer(kty)),
+            (Value::Integer(3), Value::Integer(vector.alg.cose_id())),
+            (Value::Integer(-1), Value::Bytes(vector.public_key.to_vec())),
+        ];
+        if with_priv {
+            key.push((Value::Integer(-2), Value::Bytes(vec![0; 32])));
+        }
+        key
+    }
+
+    fn rfc_signature(vector: &Rfc9964) -> Vec<u8> {
+        let decoded = decode(vector.sign1).expect("RFC COSE_Sign1");
+        cose_array(&decoded).expect("array")[3]
+            .as_bytes()
+            .expect("signature")
+            .to_vec()
+    }
+
+    #[test]
+    fn akp_session_keys_verify_rfc9964_ml_dsa_signatures() {
+        for vector in &RFC9964 {
+            let signature = rfc_signature(vector);
+            let key = akp_key(vector, COSE_KTY_AKP, false);
+            verify_key_signature(vector.alg, &key, vector.to_be_signed, &signature)
+                .unwrap_or_else(|e| panic!("{:?} AKP key must verify: {e}", vector.alg));
+
+            let mut tampered = vector.to_be_signed.to_vec();
+            tampered[20] ^= 0x01;
+            assert!(matches!(
+                verify_key_signature(vector.alg, &key, &tampered, &signature),
+                Err(CryptoError::Verify(_))
+            ));
+            assert!(matches!(
+                verify_key_signature(
+                    vector.alg,
+                    &akp_key(vector, COSE_KTY_AKP, true),
+                    vector.to_be_signed,
+                    &signature
+                ),
+                Err(CryptoError::KeyParse(_))
+            ));
+            assert!(matches!(
+                verify_key_signature(
+                    vector.alg,
+                    &akp_key(vector, 2, false),
+                    vector.to_be_signed,
+                    &signature
+                ),
+                Err(CryptoError::KeyParse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ml_dsa_session_signatures_follow_the_list_and_unprotected_kid_rules() {
+        let vector = &RFC9964[0];
+        let key = encode(&Value::Map(akp_key(vector, COSE_KTY_AKP, false)), PROFILE).expect("key");
+        assert!(matches!(
+            verify_with_cose_key_with(vector.sign1, &key, ClaimAlgorithmList::V2_4),
+            Err(CryptoError::UnsupportedAlg(-48))
+        ));
+        // The RFC example protects its kid; a C2PA segment signature carries
+        // the session key identifier in the unprotected bucket.
+        assert!(matches!(
+            verify_with_cose_key_with(vector.sign1, &key, ClaimAlgorithmList::V2_5),
+            Err(CryptoError::Malformed(_))
+        ));
+    }
 
     const KID: &[u8] = b"session-key-0001";
     const PAYLOAD: &[u8] = b"segment info";
@@ -398,9 +614,9 @@ mod tests {
             use sha2::Digest as _;
 
             let digest = match digest_alg {
-                CoseAlg::Es256 => sha2::Sha256::digest(data).to_vec(),
-                CoseAlg::Es384 => sha2::Sha384::digest(data).to_vec(),
-                CoseAlg::Es512 => sha2::Sha512::digest(data).to_vec(),
+                CoseAlg::Es256 | CoseAlg::Esp256 => sha2::Sha256::digest(data).to_vec(),
+                CoseAlg::Es384 | CoseAlg::Esp384 => sha2::Sha384::digest(data).to_vec(),
+                CoseAlg::Es512 | CoseAlg::Esp512 => sha2::Sha512::digest(data).to_vec(),
                 other => panic!("{other:?} is not an ECDSA algorithm"),
             };
             let secret = self.secret();
@@ -496,9 +712,11 @@ mod tests {
                 let declared = [Value::Integer(alg.cose_id())];
                 for alg_entries in [&declared[..], &[]] {
                     let key = ec_cose_key(curve, 2, curve.crv(), alg_entries);
-                    let verified = verify_with_cose_key(&message, &key).unwrap_or_else(|error| {
-                        panic!("{curve:?} {alg:?} key alg {alg_entries:?}: {error}")
-                    });
+                    let verified =
+                        verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4)
+                            .unwrap_or_else(|error| {
+                                panic!("{curve:?} {alg:?} key alg {alg_entries:?}: {error}")
+                            });
                     assert_eq!(verified.algorithm, alg);
                     assert_eq!(verified.payload, PAYLOAD);
                     assert_eq!(verified.key_id.as_deref(), Some(KID));
@@ -517,7 +735,7 @@ mod tests {
                     let key = ec_cose_key(curve, 2, curve.crv(), alg_entries);
                     assert!(
                         matches!(
-                            verify_with_cose_key(&message, &key),
+                            verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4),
                             Err(CryptoError::Verify(_))
                         ),
                         "{curve:?} {alg:?} accepted a tampered payload"
@@ -538,7 +756,7 @@ mod tests {
             let key = ec_cose_key(Curve::P384, 2, 2, &[]);
             assert!(
                 matches!(
-                    verify_with_cose_key(&message, &key),
+                    verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4),
                     Err(CryptoError::Verify(_))
                 ),
                 "SHA-256 signature verified under protected {claimed:?}"
@@ -556,7 +774,7 @@ mod tests {
             CoseAlg::Ps256,
         ] {
             let key = ec_cose_key(Curve::P256, 2, 1, &[Value::Integer(conflicting.cose_id())]);
-            match verify_with_cose_key(&message, &key) {
+            match verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4) {
                 Err(CryptoError::Verify(reason)) => {
                     assert_eq!(reason, "signature algorithm does not match COSE_Key alg")
                 }
@@ -566,7 +784,7 @@ mod tests {
         // An unregistered key alg conflicts as well.
         let key = ec_cose_key(Curve::P256, 2, 1, &[Value::Integer(-65_535)]);
         assert!(matches!(
-            verify_with_cose_key(&message, &key),
+            verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4),
             Err(CryptoError::Verify(_))
         ));
     }
@@ -591,7 +809,7 @@ mod tests {
             ),
         ] {
             let key = ec_cose_key(Curve::P256, 2, 1, &alg_entries);
-            match verify_with_cose_key(&message, &key) {
+            match verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4) {
                 Err(CryptoError::Malformed(reason)) => assert_eq!(reason, expected),
                 other => panic!("key alg {alg_entries:?} was not rejected: {other:?}"),
             }
@@ -604,13 +822,13 @@ mod tests {
         // OKP key type with an ECDSA protected alg.
         let key = ec_cose_key(Curve::P256, 1, 1, &[]);
         assert!(matches!(
-            verify_with_cose_key(&message, &key),
+            verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4),
             Err(CryptoError::KeyParse(_))
         ));
         // Ed25519 and unregistered curves are not ECDSA curves.
         for crv in [6, 4, 0] {
             let key = ec_cose_key(Curve::P256, 2, crv, &[]);
-            match verify_with_cose_key(&message, &key) {
+            match verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4) {
                 Err(CryptoError::KeyParse(reason)) => {
                     assert_eq!(reason, format!("unsupported COSE_Key EC curve {crv}"))
                 }
@@ -620,7 +838,7 @@ mod tests {
         // P-256 coordinates labelled as P-384 or P-521 fail the length check.
         for crv in [2, 3] {
             let key = ec_cose_key(Curve::P256, 2, crv, &[]);
-            match verify_with_cose_key(&message, &key) {
+            match verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4) {
                 Err(CryptoError::KeyParse(reason)) => {
                     assert_eq!(reason, "COSE_Key EC coordinate length does not match curve")
                 }
@@ -630,7 +848,7 @@ mod tests {
         // The right curve label with another key's point fails verification.
         let key = ec_cose_key(Curve::P384, 2, 2, &[]);
         assert!(matches!(
-            verify_with_cose_key(&message, &key),
+            verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_4),
             Err(CryptoError::Verify(_))
         ));
     }
@@ -663,13 +881,21 @@ mod tests {
             cbor(&Value::Map(map))
         };
         for alg_entries in [&[Value::Integer(CoseAlg::EdDsa.cose_id())][..], &[]] {
-            let verified = verify_with_cose_key(&message, &okp_key(1, 6, alg_entries))
-                .expect("Ed25519 session signature");
+            let verified = verify_with_cose_key_with(
+                &message,
+                &okp_key(1, 6, alg_entries),
+                ClaimAlgorithmList::V2_4,
+            )
+            .expect("Ed25519 session signature");
             assert_eq!(verified.algorithm, CoseAlg::EdDsa);
         }
         for (kty, crv) in [(2, 6), (1, 1)] {
             assert!(matches!(
-                verify_with_cose_key(&message, &okp_key(kty, crv, &[])),
+                verify_with_cose_key_with(
+                    &message,
+                    &okp_key(kty, crv, &[]),
+                    ClaimAlgorithmList::V2_4
+                ),
                 Err(CryptoError::KeyParse(_))
             ));
         }
@@ -677,8 +903,91 @@ mod tests {
             signing.sign(data).to_bytes().to_vec()
         });
         assert!(matches!(
-            verify_with_cose_key(&tampered, &okp_key(1, 6, &[])),
+            verify_with_cose_key_with(&tampered, &okp_key(1, 6, &[]), ClaimAlgorithmList::V2_4),
             Err(CryptoError::Verify(_))
         ));
+    }
+
+    #[test]
+    fn esp_sessions_bind_real_keys_to_curves_and_explicit_profiles() {
+        for (alg, required) in [
+            (CoseAlg::Esp256, Curve::P256),
+            (CoseAlg::Esp384, Curve::P384),
+            (CoseAlg::Esp512, Curve::P521),
+        ] {
+            for curve in CURVES {
+                let message = ecdsa_sign1(curve, alg);
+                for entries in [&[Value::Integer(alg.cose_id())][..], &[]] {
+                    let key = ec_cose_key(curve, 2, curve.crv(), entries);
+                    let result =
+                        verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_5);
+                    if curve == required {
+                        assert_eq!(result.expect("bound ESP key").algorithm, alg);
+                    } else {
+                        assert!(matches!(result, Err(CryptoError::KeyParse(_))));
+                    }
+                    for list in [ClaimAlgorithmList::V2_2, ClaimAlgorithmList::V2_4] {
+                        assert!(matches!(
+                            verify_with_cose_key_with(&message, &key, list),
+                            Err(CryptoError::UnsupportedAlg(id)) if id == alg.cose_id()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_mixed_curve_sessions_remain_valid_under_every_profile() {
+        let message = ecdsa_sign1(Curve::P384, CoseAlg::Es256);
+        let key = ec_cose_key(Curve::P384, 2, 2, &[]);
+        for list in [
+            ClaimAlgorithmList::V2_2,
+            ClaimAlgorithmList::V2_4,
+            ClaimAlgorithmList::V2_5,
+        ] {
+            verify_with_cose_key_with(&message, &key, list).expect("legacy ES256/P-384");
+        }
+    }
+
+    #[test]
+    fn session_ecdsa_requires_fixed_width_signatures_for_legacy_and_esp() {
+        for (curve, alg) in [
+            (Curve::P256, CoseAlg::Es256),
+            (Curve::P256, CoseAlg::Esp256),
+            (Curve::P384, CoseAlg::Es384),
+            (Curve::P384, CoseAlg::Esp384),
+            (Curve::P521, CoseAlg::Es512),
+            (Curve::P521, CoseAlg::Esp512),
+        ] {
+            let key = ec_cose_key(curve, 2, curve.crv(), &[]);
+            let fixed_width = ecdsa_sign1(curve, alg);
+            verify_with_cose_key_with(&fixed_width, &key, ClaimAlgorithmList::V2_5)
+                .expect("fixed-width session signature");
+            let message = session_sign1(alg, PAYLOAD, PAYLOAD, |data| {
+                let raw = curve.sign(alg, data);
+                match curve {
+                    Curve::P256 => p256::ecdsa::Signature::from_slice(&raw)
+                        .expect("P-256 signature")
+                        .to_der()
+                        .as_bytes()
+                        .to_vec(),
+                    Curve::P384 => p384::ecdsa::Signature::from_slice(&raw)
+                        .expect("P-384 signature")
+                        .to_der()
+                        .as_bytes()
+                        .to_vec(),
+                    Curve::P521 => p521::ecdsa::Signature::from_slice(&raw)
+                        .expect("P-521 signature")
+                        .to_der()
+                        .as_bytes()
+                        .to_vec(),
+                }
+            });
+            assert!(matches!(
+                verify_with_cose_key_with(&message, &key, ClaimAlgorithmList::V2_5),
+                Err(CryptoError::Verify(_))
+            ));
+        }
     }
 }

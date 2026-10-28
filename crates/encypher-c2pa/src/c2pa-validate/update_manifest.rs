@@ -35,6 +35,8 @@ pub(super) enum StoreRendition {
     AsSigned,
     /// Update manifests were appended to the store after it was signed.
     WithUpdates,
+    /// The manifest is external; no embedded carrier is excluded or resized.
+    Detached,
 }
 
 /// Re-derive a signed data-hash exclusion plan for a store that update
@@ -636,9 +638,12 @@ mod tests {
                 manifest_hashes: &hashes,
             },
             &[],
-            Some(AssetFormat::Jpeg),
+            super::super::ContentBinding::Asset {
+                format: AssetFormat::Jpeg,
+                prehashed_digest: Some(&asset_digest),
+                detached: false,
+            },
             &[],
-            Some(&asset_digest),
             crate::c2pa_core::EngineProfile::GENEROUS,
             &mut results,
         );
@@ -705,9 +710,12 @@ mod tests {
                 manifest_hashes: &hashes,
             },
             &[],
-            Some(AssetFormat::Jpeg),
+            super::super::ContentBinding::Asset {
+                format: AssetFormat::Jpeg,
+                prehashed_digest: Some(&asset_digest),
+                detached: false,
+            },
             &[],
-            Some(&asset_digest),
             crate::c2pa_core::EngineProfile::GENEROUS,
             &mut results,
         );
@@ -801,9 +809,12 @@ mod tests {
                 manifest_hashes: &hashes,
             },
             &updated,
-            Some(AssetFormat::Jpeg),
+            super::super::ContentBinding::Asset {
+                format: AssetFormat::Jpeg,
+                prehashed_digest: None,
+                detached: false,
+            },
             &[],
-            None,
             crate::c2pa_core::EngineProfile::GENEROUS,
             &mut results,
         );
@@ -842,9 +853,12 @@ mod tests {
                 manifest_hashes: &hashes,
             },
             &updated,
-            Some(AssetFormat::Jpeg),
+            super::super::ContentBinding::Asset {
+                format: AssetFormat::Jpeg,
+                prehashed_digest: None,
+                detached: false,
+            },
             &[],
-            None,
             crate::c2pa_core::EngineProfile::GENEROUS,
             &mut results,
         );

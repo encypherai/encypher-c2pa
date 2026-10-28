@@ -4,30 +4,9 @@
 import errno
 import json
 import os
-import sys
-import types
 from pathlib import Path
 
 import pytest
-
-native = types.ModuleType("encypher_c2pa._native")
-native.extensions_json = lambda: json.dumps(
-    [
-        ["jpg", "image/jpeg"],
-        ["dng", "image/x-adobe-dng"],
-        ["odg", "application/vnd.oasis.opendocument.graphics"],
-        ["tsv", "text/tab-separated-values"],
-    ]
-)
-native.formats_json = lambda: "[]"
-native.get_telemetry_preference = lambda: None
-native.set_telemetry_preference = lambda enabled: None
-native.validate_options = lambda *args: None
-native.verify_bytes = lambda *args: "{}"
-native.verify_detached_bytes = lambda *args: "{}"
-native.verify_fragmented_bytes = lambda *args: "{}"
-native.verify_stream_bytes = lambda *args: "{}"
-sys.modules.setdefault("encypher_c2pa._native", native)
 
 import encypher_c2pa
 from encypher_c2pa import _read_path
@@ -184,6 +163,92 @@ def test_invalid_options_win_over_missing_asset_paths(
                     {"profile": "base", "certificates_pem": ""}
                 ],
             )
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        "verify_manifest_store_only",
+        "binding_target",
+        "verify_with_caller_verified_binding",
+        "resolve_soft_binding",
+    ],
+)
+def test_new_entrypoints_reject_unknown_spec_before_missing_path(
+    entrypoint: str, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing.c2pa"
+    options = {"spec_version": "2.6"}
+
+    with pytest.raises(ValueError, match="unsupported_spec_version"):
+        if entrypoint == "verify_manifest_store_only":
+            encypher_c2pa.verify_manifest_store_only(missing, options=options)
+        elif entrypoint == "binding_target":
+            encypher_c2pa.binding_target(missing, options=options)
+        elif entrypoint == "verify_with_caller_verified_binding":
+            encypher_c2pa.verify_with_caller_verified_binding(
+                missing,
+                "image/jpeg",
+                {},
+                matched=True,
+                engine="test",
+                options=options,
+            )
+        else:
+            encypher_c2pa.resolve_soft_binding(
+                missing,
+                "image/jpeg",
+                "https://example.com",
+                {"route": "binding_get", "alg": "test", "value": "test"},
+                allowed_origins=["https://example.com"],
+                options=options,
+            )
+
+@pytest.mark.parametrize("entrypoint", ["verify", "verify_stream"])
+def test_cawg_trust_configurations_are_forwarded_to_validation_and_verification(
+    entrypoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configurations = [
+        {
+            "profile": "smime_interim",
+            "certificates_pem": "certificate",
+            "not_after": "2027-03-31T23:59:59Z",
+        }
+    ]
+    validated = []
+    verified = []
+    monkeypatch.setattr(
+        encypher_c2pa,
+        "_validate_options",
+        lambda options_json: validated.append(json.loads(options_json)),
+    )
+
+    if entrypoint == "verify_stream":
+        def capture_stream(*args):
+            verified.append(json.loads(args[-1]))
+            return "{}"
+
+        monkeypatch.setattr(encypher_c2pa, "verify_stream_bytes", capture_stream)
+        encypher_c2pa.verify_stream(
+            b"init",
+            [b"segment"],
+            "video/mp4",
+            cawg_trust_configurations=configurations,
+        )
+    else:
+        def capture_verify(_asset, _mime, options_json):
+            verified.append(json.loads(options_json))
+            return "{}"
+
+        monkeypatch.setattr(encypher_c2pa, "verify_bytes", capture_verify)
+        encypher_c2pa.verify(
+            b"asset",
+            "image/jpeg",
+            cawg_trust_configurations=configurations,
+        )
+
+    assert validated[0]["cawg_trust_configurations"] == configurations
+    assert verified[0]["cawg_trust_configurations"] == configurations
 
 
 def test_a_bare_string_is_not_a_sequence_of_presentation_times() -> None:

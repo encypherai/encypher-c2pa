@@ -11,7 +11,7 @@
 //! results is irrelevant to what is under test.
 
 use der::asn1::{BitString, Ia5String, OctetString};
-use der::{Decode, Encode};
+use der::{Decode, Encode, Tag};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
@@ -19,12 +19,18 @@ use rcgen::{
 use time::macros::datetime;
 use time::OffsetDateTime;
 use x509_cert::certificate::Version;
+use x509_cert::ext::pkix::certpolicy::{PolicyInformation, PolicyQualifierInfo};
 use x509_cert::ext::pkix::constraints::name::GeneralSubtree;
-use x509_cert::ext::pkix::{NameConstraints, PolicyConstraints};
+use x509_cert::ext::pkix::{
+    CertificatePolicies, InhibitAnyPolicy, NameConstraints, PolicyConstraints, PolicyMapping,
+    PolicyMappings,
+};
 use x509_cert::Certificate;
 
 use super::*;
-use crate::c2pa_trust::{validate_chain, AnchorPurpose, TrustAnchor, TrustList};
+use crate::c2pa_trust::{
+    validate_chain, validate_chain_with, AnchorPurpose, TrustAnchor, TrustList,
+};
 
 const NOT_BEFORE: OffsetDateTime = datetime!(2025-01-01 0:00 UTC);
 const NOT_AFTER: OffsetDateTime = datetime!(2030-01-01 0:00 UTC);
@@ -143,9 +149,9 @@ fn a_non_self_signed_certificate_without_an_authority_key_identifier_is_rejected
         .as_mut()
         .expect("extensions");
     extensions.retain(|extension| extension.extn_id != OID_EXT_AUTHORITY_KEY_IDENTIFIER);
-    assert_eq!(
-        violation(&pair.leaf),
-        Some("certificate is not self-signed and has no Authority Key Identifier")
+    assert!(
+        violation(&pair.leaf).is_some_and(|reason| reason.contains("Authority Key Identifier")),
+        "missing AKI must be rejected"
     );
 }
 
@@ -591,6 +597,189 @@ fn custom(oid: &[u64], value: Vec<u8>, critical: bool) -> CustomExtension {
     extension
 }
 
+fn certificate_policies(oids: &[ObjectIdentifier]) -> Vec<u8> {
+    CertificatePolicies(
+        oids.iter()
+            .map(|oid| PolicyInformation {
+                policy_identifier: *oid,
+                policy_qualifiers: None,
+            })
+            .collect(),
+    )
+    .to_der()
+    .expect("encode certificate policies")
+}
+
+fn policy_mappings(issuer: ObjectIdentifier, subject: ObjectIdentifier) -> Vec<u8> {
+    PolicyMappings(vec![PolicyMapping {
+        issuer_domain_policy: issuer,
+        subject_domain_policy: subject,
+    }])
+    .to_der()
+    .expect("encode policy mappings")
+}
+
+fn policy_constraints(require: Option<u32>, inhibit_mapping: Option<u32>) -> Vec<u8> {
+    PolicyConstraints {
+        require_explicit_policy: require,
+        inhibit_policy_mapping: inhibit_mapping,
+    }
+    .to_der()
+    .expect("encode policy constraints")
+}
+
+/// Root -> upper CA -> lower CA -> leaf as parsed, signed certificate fixtures.
+fn policy_hierarchy(
+    upper_hook: impl FnOnce(&mut CertificateParams),
+    lower_hook: impl FnOnce(&mut CertificateParams),
+    leaf_hook: impl FnOnce(&mut CertificateParams),
+    self_issued_lower: bool,
+) -> Vec<Certificate> {
+    let root_key = KeyPair::generate().expect("root key");
+    let root = ca_params("Policy Root", BasicConstraints::Unconstrained)
+        .self_signed(&root_key)
+        .expect("root");
+
+    let upper_key = KeyPair::generate().expect("upper key");
+    let mut upper_params = ca_params("Policy Upper", BasicConstraints::Unconstrained);
+    upper_hook(&mut upper_params);
+    let upper = upper_params
+        .signed_by(&upper_key, &root, &root_key)
+        .expect("upper CA");
+
+    let lower_key = KeyPair::generate().expect("lower key");
+    let lower_name = if self_issued_lower {
+        "Policy Upper"
+    } else {
+        "Policy Lower"
+    };
+    let mut lower_params = ca_params(lower_name, BasicConstraints::Unconstrained);
+    lower_hook(&mut lower_params);
+    let lower = lower_params
+        .signed_by(&lower_key, &upper, &upper_key)
+        .expect("lower CA");
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf = leaf_params("Policy Leaf");
+    leaf_hook(&mut leaf);
+    let leaf = leaf.signed_by(&leaf_key, &lower, &lower_key).expect("leaf");
+
+    [&leaf, &lower, &upper, &root]
+        .into_iter()
+        .map(|cert| Certificate::from_der(cert.der()).expect("parse policy fixture"))
+        .collect()
+}
+
+fn validate_policy_path(path: &[Certificate]) -> crate::c2pa_trust::ChainResult {
+    let path_der: Vec<Vec<u8>> = path
+        .iter()
+        .map(|certificate| certificate.to_der().expect("policy path DER"))
+        .collect();
+    validate_chain_with(
+        &path_der[0],
+        &[path_der[1].clone(), path_der[2].clone()],
+        &claim_signing_trust(&path[3]),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    )
+}
+
+fn policy_information(
+    oid: ObjectIdentifier,
+    qualifiers: Option<Vec<PolicyQualifierInfo>>,
+) -> PolicyInformation {
+    PolicyInformation {
+        policy_identifier: oid,
+        policy_qualifiers: qualifiers,
+    }
+}
+
+fn validate_policy_leaf(extensions: Vec<CustomExtension>) -> crate::c2pa_trust::ChainResult {
+    let path = hierarchy(
+        |_| {},
+        |params| {
+            params.custom_extensions.extend(extensions);
+        },
+    );
+    validate_chain_with(
+        &der(&path.leaf),
+        &[der(&path.intermediate)],
+        &claim_signing_trust(&path.root),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    )
+}
+
+fn cartesian_policy_chain(intermediate_count: usize) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+    let policies = [
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.90"),
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.91"),
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.92"),
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.93"),
+    ];
+    let mappings = PolicyMappings(
+        policies
+            .iter()
+            .flat_map(|issuer| {
+                policies.iter().map(move |subject| PolicyMapping {
+                    issuer_domain_policy: *issuer,
+                    subject_domain_policy: *subject,
+                })
+            })
+            .collect(),
+    )
+    .to_der()
+    .expect("Cartesian mappings");
+
+    let root_key = KeyPair::generate().expect("root key");
+    let root = ca_params("Cartesian Root", BasicConstraints::Unconstrained)
+        .self_signed(&root_key)
+        .expect("root");
+    let root_der = root.der().to_vec();
+    let mut issuer = root;
+    let mut issuer_key = root_key;
+    let mut intermediates = Vec::with_capacity(intermediate_count);
+    for index in 0..intermediate_count {
+        let key = KeyPair::generate().expect("intermediate key");
+        let mut params = ca_params(
+            &format!("Cartesian CA {index}"),
+            BasicConstraints::Unconstrained,
+        );
+        params.custom_extensions.extend([
+            custom(&[2, 5, 29, 32], certificate_policies(&policies), false),
+            custom(&[2, 5, 29, 33], mappings.clone(), true),
+        ]);
+        if index == 0 {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 36],
+                policy_constraints(Some(0), None),
+                true,
+            ));
+        }
+        let certificate = params
+            .signed_by(&key, &issuer, &issuer_key)
+            .expect("intermediate");
+        intermediates.push(certificate.der().to_vec());
+        issuer = certificate;
+        issuer_key = key;
+    }
+    intermediates.reverse();
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf = leaf_params("Cartesian Leaf");
+    leaf.custom_extensions.push(custom(
+        &[2, 5, 29, 32],
+        certificate_policies(&policies),
+        false,
+    ));
+    let leaf = leaf
+        .signed_by(&leaf_key, &issuer, &issuer_key)
+        .expect("leaf");
+    (leaf.der().to_vec(), intermediates, root_der)
+}
+
 #[test]
 fn a_leaf_outside_its_issuer_permitted_name_subtree_is_rejected() {
     let constraints = |permitted: &str| {
@@ -747,6 +936,569 @@ fn certificate_policy_mapping_is_rejected_rather_than_ignored() {
     );
 }
 
+#[test]
+fn exact_v2_5_accepts_a_valid_mapped_policy_chain() {
+    let issuer_policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.20");
+    let subject_policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.21");
+    let path = hierarchy(
+        |params| {
+            params.custom_extensions.extend([
+                custom(
+                    &[2, 5, 29, 32],
+                    certificate_policies(&[issuer_policy]),
+                    false,
+                ),
+                custom(
+                    &[2, 5, 29, 33],
+                    policy_mappings(issuer_policy, subject_policy),
+                    true,
+                ),
+                custom(&[2, 5, 29, 36], policy_constraints(Some(0), None), true),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 32],
+                certificate_policies(&[subject_policy]),
+                false,
+            ));
+        },
+    );
+
+    let result = validate_chain_with(
+        &der(&path.leaf),
+        &[der(&path.intermediate)],
+        &claim_signing_trust(&path.root),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(result.trusted, "{:?}", result.reason);
+}
+
+#[test]
+fn exact_v2_5_rejects_any_policy_mappings_on_the_processed_path() {
+    let mapped_policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.22");
+    let path = hierarchy(
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 33],
+                policy_mappings(OID_ANY_POLICY, mapped_policy),
+                true,
+            ));
+        },
+        |_| {},
+    );
+    let result = validate_chain_with(
+        &der(&path.leaf),
+        &[der(&path.intermediate)],
+        &claim_signing_trust(&path.root),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(!result.trusted);
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("policy mapping to or from anyPolicy is forbidden")
+    );
+}
+
+#[test]
+fn exact_v2_5_enforces_mapping_and_any_policy_inhibit_counters() {
+    let issuer_policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.30");
+    let subject_policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.31");
+    let inhibited_mapping = policy_hierarchy(
+        |params| {
+            params.custom_extensions.extend([
+                custom(
+                    &[2, 5, 29, 32],
+                    certificate_policies(&[issuer_policy]),
+                    false,
+                ),
+                custom(&[2, 5, 29, 36], policy_constraints(Some(0), Some(0)), true),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.extend([
+                custom(
+                    &[2, 5, 29, 32],
+                    certificate_policies(&[issuer_policy]),
+                    false,
+                ),
+                custom(
+                    &[2, 5, 29, 33],
+                    policy_mappings(issuer_policy, subject_policy),
+                    true,
+                ),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 32],
+                certificate_policies(&[subject_policy]),
+                false,
+            ));
+        },
+        false,
+    );
+    let inhibited_mapping = validate_policy_path(&inhibited_mapping);
+    assert_eq!(
+        inhibited_mapping.reason.as_deref(),
+        Some("an explicit certificate policy is required but not asserted")
+    );
+
+    let any_policy_inhibited = hierarchy(
+        |params| {
+            params.custom_extensions.extend([
+                custom(
+                    &[2, 5, 29, 32],
+                    certificate_policies(&[issuer_policy]),
+                    false,
+                ),
+                custom(&[2, 5, 29, 36], policy_constraints(Some(0), None), true),
+                custom(
+                    &[2, 5, 29, 54],
+                    InhibitAnyPolicy(0)
+                        .to_der()
+                        .expect("encode inhibit anyPolicy"),
+                    true,
+                ),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 32],
+                certificate_policies(&[OID_ANY_POLICY]),
+                false,
+            ));
+        },
+    );
+    let any_policy_inhibited = validate_chain_with(
+        &der(&any_policy_inhibited.leaf),
+        &[der(&any_policy_inhibited.intermediate)],
+        &claim_signing_trust(&any_policy_inhibited.root),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert_eq!(
+        any_policy_inhibited.reason.as_deref(),
+        Some("an explicit certificate policy is required but not asserted")
+    );
+}
+
+#[test]
+fn exact_v2_5_honors_self_issued_any_policy_and_anchor_boundaries() {
+    let policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.40");
+    let self_issued_rollover = policy_hierarchy(
+        |params| {
+            params.custom_extensions.extend([
+                custom(&[2, 5, 29, 32], certificate_policies(&[policy]), false),
+                custom(&[2, 5, 29, 36], policy_constraints(Some(0), None), true),
+                custom(
+                    &[2, 5, 29, 54],
+                    InhibitAnyPolicy(0)
+                        .to_der()
+                        .expect("encode inhibit anyPolicy"),
+                    true,
+                ),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 32],
+                certificate_policies(&[OID_ANY_POLICY]),
+                false,
+            ));
+        },
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 32],
+                certificate_policies(&[policy]),
+                false,
+            ));
+        },
+        true,
+    );
+    let rollover_der: Vec<Vec<u8>> = self_issued_rollover.iter().map(der).collect();
+    let result = validate_chain_with(
+        &rollover_der[0],
+        &[rollover_der[1].clone(), rollover_der[2].clone()],
+        &claim_signing_trust(&self_issued_rollover[3]),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(result.trusted, "{:?}", result.reason);
+    let selected_rollover_anchor = validate_chain_with(
+        &rollover_der[0],
+        &[],
+        &claim_signing_trust(&self_issued_rollover[1]),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(
+        selected_rollover_anchor.trusted,
+        "a self-issued old-key anchor with AKI is admitted: {:?}",
+        selected_rollover_anchor.reason
+    );
+    let mut rollover_without_aki = self_issued_rollover[1].clone();
+    rollover_without_aki
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("rollover extensions")
+        .retain(|extension| extension.extn_id != OID_EXT_AUTHORITY_KEY_IDENTIFIER);
+    let rejected = validate_chain_with(
+        &rollover_der[0],
+        &[],
+        &claim_signing_trust(&rollover_without_aki),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(
+        rejected
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Authority Key Identifier")),
+        "an old-key anchor without AKI must be rejected"
+    );
+    let rollover_without_aki = policy_hierarchy(
+        |_| {},
+        |params| params.use_authority_key_identifier_extension = false,
+        |_| {},
+        true,
+    );
+    let rejected = validate_policy_path(&rollover_without_aki);
+    assert!(
+        rejected
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Authority Key Identifier")),
+        "a valid old-key signature does not make a self-issued rollover self-signed"
+    );
+
+    let anchor_mapping = policy_mappings(OID_ANY_POLICY, ObjectIdentifier::new_unwrap("1.2.3.4"));
+    let anchor_constrained = issue(leaf_params("Anchor Boundary Leaf"), {
+        let mut root = ca_params("Anchor Boundary Root", BasicConstraints::Unconstrained);
+        root.custom_extensions.extend([
+            custom(&[2, 5, 29, 33], anchor_mapping, true),
+            custom(&[2, 5, 29, 36], policy_constraints(Some(0), Some(0)), true),
+        ]);
+        root
+    });
+    let result = validate_chain_with(
+        &der(&anchor_constrained.leaf),
+        &[],
+        &claim_signing_trust(&anchor_constrained.root),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(
+        result.trusted,
+        "trust-anchor certificate extensions are outside the processed path: {:?}",
+        result.reason
+    );
+    let mut contradictory_anchor = self_issued_rollover[1].clone();
+    let extensions = contradictory_anchor
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("anchor extensions");
+    let mut duplicate = extensions
+        .iter()
+        .find(|extension| extension.extn_id == OID_EXT_BASIC_CONSTRAINTS)
+        .expect("basic constraints")
+        .clone();
+    duplicate.extn_value = OctetString::new(
+        x509_cert::ext::pkix::BasicConstraints {
+            ca: false,
+            path_len_constraint: None,
+        }
+        .to_der()
+        .expect("contradictory basic constraints"),
+    )
+    .expect("extension value");
+    extensions.push(duplicate);
+    let rejected = validate_chain_with(
+        &rollover_der[0],
+        &[],
+        &claim_signing_trust(&contradictory_anchor),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert_eq!(
+        rejected.reason.as_deref(),
+        Some("certificate repeats an extension OID")
+    );
+}
+
+#[test]
+fn exact_v2_5_validates_target_policy_extensions_and_qualifiers() {
+    let policy = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.70");
+    let duplicate = CertificatePolicies(vec![
+        policy_information(policy, None),
+        policy_information(policy, None),
+    ])
+    .to_der()
+    .expect("duplicate policy DER");
+    let result = validate_policy_leaf(vec![custom(&[2, 5, 29, 32], duplicate, false)]);
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("certificate policies extension repeats a policy OID")
+    );
+
+    let repeated_extension = certificate_policies(&[policy]);
+    let result = validate_policy_leaf(vec![
+        custom(&[2, 5, 29, 32], repeated_extension.clone(), false),
+        custom(&[2, 5, 29, 32], repeated_extension, false),
+    ]);
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("certificate repeats an extension OID")
+    );
+
+    let malformed = validate_policy_leaf(vec![custom(&[2, 5, 29, 33], vec![0x01], true)]);
+    assert_eq!(
+        malformed.reason.as_deref(),
+        Some("policy mappings extension is malformed")
+    );
+    assert_eq!(
+        validate_policy_leaf(vec![custom(&[2, 5, 29, 54], vec![0x01], true)])
+            .reason
+            .as_deref(),
+        Some("inhibit anyPolicy extension is malformed")
+    );
+    assert_eq!(
+        validate_policy_leaf(vec![custom(
+            &[2, 5, 29, 36],
+            policy_constraints(None, None),
+            true,
+        )])
+        .reason
+        .as_deref(),
+        Some("policy constraints extension is empty")
+    );
+    for mappings in [
+        policy_mappings(OID_ANY_POLICY, policy),
+        policy_mappings(policy, OID_ANY_POLICY),
+    ] {
+        let result = validate_policy_leaf(vec![custom(&[2, 5, 29, 33], mappings, true)]);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("policy mapping to or from anyPolicy is forbidden")
+        );
+    }
+
+    let unknown_qualifier = PolicyQualifierInfo {
+        policy_qualifier_id: ObjectIdentifier::new_unwrap("1.2.3.99"),
+        qualifier: Some(der::Any::new(Tag::Null, Vec::new()).expect("NULL qualifier")),
+    };
+    let critical_unknown = CertificatePolicies(vec![policy_information(
+        policy,
+        Some(vec![unknown_qualifier.clone()]),
+    )])
+    .to_der()
+    .expect("critical unknown qualifier");
+    let result = validate_policy_leaf(vec![custom(&[2, 5, 29, 32], critical_unknown, true)]);
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("critical certificate policy has an unknown qualifier")
+    );
+
+    let noncritical_unknown = CertificatePolicies(vec![policy_information(
+        policy,
+        Some(vec![unknown_qualifier]),
+    )])
+    .to_der()
+    .expect("noncritical unknown qualifier");
+    assert!(
+        validate_policy_leaf(vec![custom(&[2, 5, 29, 32], noncritical_unknown, false,)]).trusted
+    );
+
+    let cps = PolicyQualifierInfo {
+        policy_qualifier_id: OID_QT_CPS,
+        qualifier: Some(
+            der::Any::new(Tag::Ia5String, b"https://example.test/cps".to_vec())
+                .expect("CPS qualifier"),
+        ),
+    };
+    let valid = CertificatePolicies(vec![policy_information(policy, Some(vec![cps]))])
+        .to_der()
+        .expect("valid CPS policy");
+    assert!(
+        validate_policy_leaf(vec![custom(&[2, 5, 29, 32], valid, true)]).trusted,
+        "a known, well-formed critical qualifier is processed"
+    );
+    let user_notice_policy = |encoded: &[u8]| {
+        let notice = PolicyQualifierInfo {
+            policy_qualifier_id: OID_QT_USER_NOTICE,
+            qualifier: Some(der::Any::from_der(encoded).expect("userNotice DER")),
+        };
+        CertificatePolicies(vec![policy_information(policy, Some(vec![notice]))])
+            .to_der()
+            .expect("userNotice policy")
+    };
+    let valid_notice = [
+        0x30, 0x12, 0x30, 0x0a, 0x1a, 0x03, b'O', b'r', b'g', 0x30, 0x03, 0x02, 0x01, 0x01, 0x1e,
+        0x04, 0x00, b'O', 0x00, b'K',
+    ];
+    assert!(
+        validate_policy_leaf(vec![custom(
+            &[2, 5, 29, 32],
+            user_notice_policy(&valid_notice),
+            true,
+        )])
+        .trusted,
+        "a noticeRef with VisibleString organization and BMPString explicitText is valid"
+    );
+    let mut overlong_explicit_text = vec![0x30, 0x81, 0xcc, 0x0c, 0x81, 0xc9];
+    overlong_explicit_text.extend(std::iter::repeat_n(b'x', 201));
+    assert!(
+        validate_policy_leaf(vec![custom(
+            &[2, 5, 29, 32],
+            user_notice_policy(&overlong_explicit_text),
+            true,
+        )])
+        .trusted,
+        "RFC 5280 clients must gracefully handle explicitText over 200 characters"
+    );
+    let mut generalized_time_notice = vec![0x30, 0x11, 0x18, 0x0f];
+    generalized_time_notice.extend_from_slice(b"20260101000000Z");
+    let missing_notice_numbers = [0x30, 0x07, 0x30, 0x05, 0x1a, 0x03, b'O', b'r', b'g'];
+    for invalid_notice in [&generalized_time_notice[..], &missing_notice_numbers[..]] {
+        assert_eq!(
+            validate_policy_leaf(vec![custom(
+                &[2, 5, 29, 32],
+                user_notice_policy(invalid_notice),
+                true,
+            )])
+            .reason
+            .as_deref(),
+            Some("certificate policy userNotice qualifier is malformed")
+        );
+    }
+}
+
+#[test]
+fn exact_v2_5_keeps_surviving_policy_branches_when_mapping_is_inhibited() {
+    let mapped = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.71");
+    let subject = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.72");
+    let surviving = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.62558.9.73");
+    let path = policy_hierarchy(
+        |params| {
+            params.custom_extensions.extend([
+                custom(
+                    &[2, 5, 29, 32],
+                    certificate_policies(&[mapped, surviving]),
+                    false,
+                ),
+                custom(&[2, 5, 29, 36], policy_constraints(Some(0), Some(0)), true),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.extend([
+                custom(
+                    &[2, 5, 29, 32],
+                    certificate_policies(&[mapped, surviving]),
+                    false,
+                ),
+                custom(&[2, 5, 29, 33], policy_mappings(mapped, subject), true),
+            ]);
+        },
+        |params| {
+            params.custom_extensions.push(custom(
+                &[2, 5, 29, 32],
+                certificate_policies(&[surviving]),
+                false,
+            ));
+        },
+        false,
+    );
+    let path_der: Vec<Vec<u8>> = path.iter().map(der).collect();
+    let result = validate_chain_with(
+        &path_der[0],
+        &[path_der[1].clone(), path_der[2].clone()],
+        &claim_signing_trust(&path[3]),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(result.trusted, "{:?}", result.reason);
+}
+
+#[test]
+fn exact_v2_5_stops_at_an_admitted_non_self_signed_anchor() {
+    let path = policy_hierarchy(
+        |params| {
+            params.not_after = datetime!(2025-06-01 0:00 UTC);
+        },
+        |_| {},
+        |_| {},
+        false,
+    );
+    let mut above_anchor = path[3].clone();
+    above_anchor.tbs_certificate.version = Version::V1;
+    let above_anchor = der(&above_anchor);
+    let path_der: Vec<Vec<u8>> = path.iter().map(der).collect();
+    let selected = claim_signing_trust(&path[2]);
+    let exact = validate_chain_with(
+        &path_der[0],
+        &[path_der[1].clone(), above_anchor.clone()],
+        &selected,
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(exact.trusted, "{:?}", exact.reason);
+    let mut invalid_anchor = path[2].clone();
+    invalid_anchor.tbs_certificate.version = Version::V1;
+    let invalid_anchor = claim_signing_trust(&invalid_anchor);
+    let rejected = validate_chain_with(
+        &path_der[0],
+        &[path_der[1].clone()],
+        &invalid_anchor,
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert_eq!(
+        rejected.reason.as_deref(),
+        Some("certificate is not X.509 v3"),
+        "trust configuration does not bypass C2PA anchor admission"
+    );
+    assert!(
+        !validate_chain(
+            &path_der[0],
+            &[path_der[1].clone(), above_anchor],
+            &selected,
+            AnchorPurpose::ClaimSigning,
+            Some(NOW),
+        )
+        .trusted,
+        "2.4 retains anchor-certificate validity behavior"
+    );
+}
+
+#[test]
+fn exact_v2_5_bounds_cartesian_policy_mappings_near_the_path_depth_limit() {
+    let (leaf, intermediates, root) = cartesian_policy_chain(17);
+    let result = validate_chain_with(
+        &leaf,
+        &intermediates,
+        &TrustList::from_certificates(AnchorPurpose::ClaimSigning, [root]),
+        AnchorPurpose::ClaimSigning,
+        Some(NOW),
+        CertificateProfile::V2_5,
+    );
+    assert!(result.trusted, "{:?}", result.reason);
+}
+
 // ---------------------------------------------------------------------------
 // Trust-anchor configuration (VAL-CRYP-0010/0011)
 // ---------------------------------------------------------------------------
@@ -867,4 +1619,72 @@ fn ip_and_rfc822_name_constraint_matching() {
         &GeneralName::UniformResourceIdentifier(ia5("https://news.example.org/")),
         &GeneralName::UniformResourceIdentifier(ia5("news.example"))
     ));
+}
+
+#[test]
+fn v2_5_claim_algorithm_rules_exempt_ca_tsa_and_ocsp_certificates_only() {
+    let dsa = x509_cert::spki::AlgorithmIdentifierOwned {
+        oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.2"),
+        parameters: None,
+    };
+
+    let mut claim_leaf = conformant().leaf;
+    claim_leaf.signature_algorithm = dsa.clone();
+    claim_leaf.tbs_certificate.signature = dsa.clone();
+    let claim_rules =
+        ProfileRules::for_purpose(CertificateProfile::V2_5, AnchorPurpose::ClaimSigning);
+    assert_eq!(
+        profile_violation_with(&claim_leaf, CertRole::EndEntity, claim_rules),
+        Some("certificate signature algorithm is outside the C2PA allow list")
+    );
+
+    let exempt_rules = ProfileRules::exempt_end_entity(CertificateProfile::V2_5);
+    assert_eq!(
+        profile_violation_with(&claim_leaf, CertRole::EndEntity, exempt_rules),
+        None,
+        "TSA and OCSP leaves are exempt only from the claim algorithm/key list"
+    );
+
+    let mut ca = conformant().root;
+    ca.signature_algorithm = dsa.clone();
+    ca.tbs_certificate.signature = dsa;
+    assert_eq!(
+        profile_violation_with(&ca, CertRole::Intermediate, claim_rules),
+        None,
+        "CA certificates are not claim-signing credentials"
+    );
+}
+
+#[test]
+fn v2_5_algorithm_exemptions_keep_structural_profile_checks() {
+    let mut tsa_or_ocsp = conformant().leaf;
+    tsa_or_ocsp
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("extensions")
+        .retain(|extension| extension.extn_id != OID_EXT_KEY_USAGE);
+    assert_eq!(
+        profile_violation_with(
+            &tsa_or_ocsp,
+            CertRole::EndEntity,
+            ProfileRules::exempt_end_entity(CertificateProfile::V2_5),
+        ),
+        Some("certificate has no Key Usage extension")
+    );
+
+    let mut ca = conformant().root;
+    ca.tbs_certificate
+        .extensions
+        .as_mut()
+        .expect("extensions")
+        .retain(|extension| extension.extn_id != OID_EXT_KEY_USAGE);
+    assert_eq!(
+        profile_violation_with(
+            &ca,
+            CertRole::Intermediate,
+            ProfileRules::for_purpose(CertificateProfile::V2_5, AnchorPurpose::ClaimSigning),
+        ),
+        Some("certificate has no Key Usage extension")
+    );
 }

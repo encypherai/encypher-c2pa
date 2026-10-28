@@ -182,5 +182,5 @@ jobs:
         with:
           go-version: "1.22"
       - run: cargo build -p encypher-c2pa-ffi --release
-      - run: go test ./...
+      - run: go test -a -count=1 ./...
         working-directory: bindings/go
