@@ -143,7 +143,7 @@ The report schema is `1.0` and stable. See [Report schema](https://github.com/en
 
 ## What it verifies
 
-- Manifest stores embedded in 71 media types across images, video, audio, documents, archives, fonts, and structured text, including Brotli-compressed stores and update manifests.
+- Embedded manifest readers for 73 canonical MIME types under the default C2PA 2.4 policy, 18 under 2.2, and 99 under 2.5, across images, video, audio, documents, archives, fonts, and text. These inventories include Brotli-compressed stores and update manifests; they do not enumerate every supported open MIME-family member.
 - Claim signatures, including RFC 3161 timestamps and OCSP responses stapled into the manifest. Signing, timestamp, and CAWG certificates are checked against the C2PA certificate profile and an RFC 5280 path to a trusted anchor.
 - Hashed references from the claim to each assertion, and the ingredient links that tie a manifest to the ones before it.
 - Hard bindings: data hash, BMFF hash (including Merkle trees for fragmented MP4), general box hash, ZIP collection hash, and multi-asset hash.
@@ -151,7 +151,7 @@ The report schema is `1.0` and stable. See [Report schema](https://github.com/en
 - Every manifest in a PDF's incremental-update history, each against the version of the file that introduced it.
 - CAWG identity assertions signed with X.509 certificates or identity claims aggregation credentials, with `did:jwk` resolution and `did:web` documents you pin or, with online checks allowed, fetch. X.509 identity signatures report the registered CAWG Identity 1.3 `cawg.x509.*` codes. CAWG results apply to the identity assertion only; they never change the C2PA integrity verdict.
 
-`encypher-c2pa formats` prints the supported MIME types. [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md) lists them with the binding each uses. Text support covers every method C2PA 2.4 defines (plain-text wrapper, structured-text comment block, and HTML script element) through the [`c2pa-text`](https://crates.io/crates/c2pa-text) crate.
+`encypher-c2pa formats` prints the default 2.4 inventory; `encypher-c2pa formats --spec 2.5` prints the 2.5 inventory. [Format coverage](https://github.com/encypherai/encypher-c2pa/blob/main/docs/FORMATS.md) provides the policy support matrix, carrier and binding rules, detached-only formats, and limitations. Text support includes the 2.4 plain-text wrapper, structured-text comment block, and HTML script element, plus 2.5 append-only text and JSON Lines checkpoints.
 
 ### Video streams
 

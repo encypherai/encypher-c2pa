@@ -1,6 +1,18 @@
 # Format coverage
 
-Run `encypher-c2pa formats` to read the canonical MIME types covered by the installed `c2pa-2.4` engine profile.
+Run `encypher-c2pa formats --spec <2.2|2.4|2.5>` to read the canonical MIME inventory for a policy. Omitting `--spec` selects 2.4.
+
+## Policy support matrix
+
+| Policy | Canonical embedded-reader MIME names | Selection and scope |
+|---|---:|---|
+| C2PA 2.2 | 18 | Explicit `--spec 2.2`; retained older policy |
+| C2PA 2.4 | 73 | Default or explicit `--spec 2.4`; inventories below |
+| C2PA 2.5 | 99 | Explicit `--spec 2.5`; additional carriers and limitations below |
+
+These counts describe the concrete names returned by the CLI, not aliases, detached-only media, or every member of an open MIME family. They are verification capabilities, not signing support or Conformance Program certification. An unknown type has no implied embedded carrier.
+
+The following category lists describe the default 2.4 policy. Use the versioned CLI inventory for 2.2 and 2.5.
 
 ## Images
 
@@ -13,6 +25,8 @@ Run `encypher-c2pa formats` to read the canonical MIME types covered by the inst
 ## Documents and archives
 
 `application/epub+zip`, `application/oxps`, `application/pdf`, `application/vnd.ms-excel.sheet.binary.macroenabled.12`, `application/vnd.ms-excel.sheet.macroenabled.12`, `application/vnd.ms-excel.template.macroenabled.12`, `application/vnd.ms-powerpoint.presentation.macroenabled.12`, `application/vnd.ms-powerpoint.slideshow.macroenabled.12`, `application/vnd.ms-powerpoint.template.macroenabled.12`, `application/vnd.ms-visio.drawing`, `application/vnd.ms-visio.drawing.macroenabled.12`, `application/vnd.ms-visio.stencil`, `application/vnd.ms-visio.stencil.macroenabled.12`, `application/vnd.ms-visio.template`, `application/vnd.ms-visio.template.macroenabled.12`, `application/vnd.ms-word.document.macroenabled.12`, `application/vnd.ms-word.template.macroenabled.12`, `application/vnd.ms-xpsdocument`, `application/vnd.oasis.opendocument.graphics`, `application/vnd.oasis.opendocument.presentation`, `application/vnd.oasis.opendocument.spreadsheet`, `application/vnd.oasis.opendocument.text`, `application/vnd.openxmlformats-officedocument.presentationml.presentation`, `application/vnd.openxmlformats-officedocument.presentationml.slideshow`, `application/vnd.openxmlformats-officedocument.presentationml.template`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `application/vnd.openxmlformats-officedocument.spreadsheetml.template`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/vnd.openxmlformats-officedocument.wordprocessingml.template`
+
+Generic ZIP packages also use `application/zip` and `application/x-zip-based`.
 
 ## Fonts and structured text
 
