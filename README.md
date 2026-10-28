@@ -29,7 +29,7 @@ The SDK verifies manifests under caller-selected [C2PA 2.2](https://spec.c2pa.or
 ### Command line
 
 ```bash
-cargo install encypher-c2pa-cli --version 1.8.0
+cargo install encypher-c2pa-cli --version 1.9.0
 encypher-c2pa verify photo.jpg
 encypher-c2pa verify photo.jpg --json
 encypher-c2pa formats
@@ -41,7 +41,7 @@ The MIME type comes from the file extension; pass `--mime` for a file whose name
 
 ```toml
 [dependencies]
-encypher-c2pa = "1.8.0"
+encypher-c2pa = "1.9.0"
 ```
 
 ```rust
