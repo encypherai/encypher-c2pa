@@ -45,8 +45,8 @@ use crate::c2pa_validate::{
 use crate::{
     copy_status, finish_store_only_validation, map_validate_error, parse_validation_time,
     report_from_output, require_embedded_mime, resolve_detached_mime, resolve_mime,
-    resolve_profile, Error, GraphInputs, ManifestDigest, ResolvedOptions, StoreOnlyValidation,
-    ValidationResults, VerificationReport, VerifyOptions, MAX_MANIFEST_STORE_BYTES,
+    resolve_profile, Error, GraphInputs, ResolvedOptions, StoreOnlyValidation, ValidationResults,
+    VerificationReport, VerifyOptions, MAX_MANIFEST_STORE_BYTES,
 };
 
 /// The caller's engine profile: spec revision, operating mode, and compliance
@@ -124,7 +124,7 @@ pub enum CawgEvaluation {
         /// Every manifest in store order, with the expanded-domain SHA-256 an
         /// ingredient reference uses. The caller compares this list with its
         /// own parse before using the statuses.
-        store_manifests: Vec<ManifestDigest>,
+        store_manifest_sha256: Vec<(String, [u8; 32])>,
         /// Exactly the statuses the identity step appended.
         validation_results: ValidationResults,
     },
@@ -246,13 +246,10 @@ impl CawgEvaluator {
         Ok(match (output.identity, output.manifest_label) {
             (Some(identity), Some(manifest_label)) => CawgEvaluation::Evaluated {
                 manifest_label,
-                store_manifests: output
+                store_manifest_sha256: output
                     .store_manifest_sha256
                     .into_iter()
-                    .map(|digest| ManifestDigest {
-                        label: digest.label,
-                        sha256: hex::encode(digest.sha256),
-                    })
+                    .map(|digest| (digest.label, digest.sha256))
                     .collect(),
                 validation_results: ValidationResults {
                     success: identity.success.iter().map(copy_status).collect(),
@@ -586,7 +583,7 @@ pub fn binding_target(
 /// assertion's format-specific schema rules. `None` for opaque bytes.
 fn content_format(content_mime: &str) -> (String, Option<AssetFormat>) {
     let mime = canonicalize_mime(content_mime);
-    let format = AssetFormat::from_mime(&mime);
+    let format = AssetFormat::from_canonical_mime(&mime);
     (mime, format)
 }
 
@@ -724,9 +721,12 @@ pub fn verify_with_cawg(
 }
 
 /// Verify an asset against a separately supplied manifest store with the
-/// policy, validation instant and CAWG configuration of `evaluator`. Any
-/// well-formed media type is accepted; one without an embedded carrier is
-/// hashed as opaque bytes. Never fetches; sends no telemetry.
+/// policy, validation instant and CAWG configuration of `evaluator`.
+///
+/// Retained profiles accept ordinary readers and designated detached media.
+/// Explicit C2PA 2.5 also accepts eligible unknown media types as opaque bytes
+/// bound by a whole-file data hash. Malformed designated media returns an error
+/// and never falls back to opaque handling. Never fetches; sends no telemetry.
 pub fn verify_with_manifest_store_and_cawg(
     asset: &[u8],
     manifest_store: &[u8],
@@ -769,9 +769,17 @@ pub fn verify_fragmented_with_cawg(
     evaluator: &CawgEvaluator,
     graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
+    if options.stream_presentation_times.is_some() {
+        return Err(Error::InvalidValidationTime(
+            "stream_presentation_times: per-segment presentation times apply only to \
+             session-key live streams verified with verify_stream_with_options; \
+             Merkle-bound fragments are assessed at validation_time"
+                .into(),
+        ));
+    }
     let resolved = evaluator.pass_options(options)?;
     let mime = resolve_mime(mime_type, resolved.profile)?;
-    if AssetFormat::from_mime(&mime) != Some(AssetFormat::Bmff) {
+    if AssetFormat::from_canonical_mime(&mime) != Some(AssetFormat::Bmff) {
         return Err(Error::UnsupportedMime(mime));
     }
     let input = resolved.input(init_segment, &mime);

@@ -346,11 +346,15 @@ pub(crate) fn verify_signature(
 ) -> Result<(), CryptoError> {
     use signature::Verifier as _;
 
+    // ECDSA uses signature 3/SPKI 0.8; RSA and Ed25519 retain signature 2/SPKI 0.7.
+    fn bad(e: impl std::fmt::Display) -> CryptoError {
+        CryptoError::Verify(e.to_string())
+    }
+    fn key_err<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> CryptoError {
+        move |e| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
+    }
+
     let spki = leaf_spki_der(cert_der)?;
-    let bad = |e: signature::Error| CryptoError::Verify(e.to_string());
-    let key_err = |what: &'static str| {
-        move |e: spki::Error| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
-    };
 
     match alg {
         CoseAlg::Es256 | CoseAlg::Es384 | CoseAlg::Es512 => {
@@ -410,13 +414,16 @@ fn verify_ecdsa(
     spki: &[u8],
     required_curve: Option<EcCurve>,
 ) -> Result<(), CryptoError> {
+    use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+    use p256::pkcs8::DecodePublicKey as _;
     use sha2::Digest as _;
-    use signature::hazmat::PrehashVerifier as _;
 
-    let bad = |e: signature::Error| CryptoError::Verify(e.to_string());
-    let key_err = |what: &'static str| {
-        move |e: spki::Error| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
-    };
+    fn bad(e: impl std::fmt::Display) -> CryptoError {
+        CryptoError::Verify(e.to_string())
+    }
+    fn key_err<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> CryptoError {
+        move |e| CryptoError::CertParse(format!("{what} public key parse failed: {e}"))
+    }
     let mut digest = [0_u8; 64];
     let digest_len = match alg {
         CoseAlg::Es256 | CoseAlg::Esp256 => {
@@ -478,12 +485,8 @@ fn verify_ecdsa(
                 .map_err(bad)
         }
         EcCurve::P521 => {
-            use p521::elliptic_curve::sec1::ToEncodedPoint;
-            let public_key =
-                p521::PublicKey::from_public_key_der(spki).map_err(key_err("P-521"))?;
             let verifying_key =
-                p521::ecdsa::VerifyingKey::from_encoded_point(&public_key.to_encoded_point(false))
-                    .map_err(bad)?;
+                p521::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(key_err("P-521"))?;
             let signature = p521::ecdsa::Signature::from_slice(signature)
                 .or_else(|e| {
                     if legacy_der {
@@ -1105,11 +1108,10 @@ mod tests {
 
     impl EcSigner {
         fn new() -> Self {
-            let mut rng = rand_core::OsRng;
             Self {
-                p256: p256::ecdsa::SigningKey::random(&mut rng),
-                p384: p384::ecdsa::SigningKey::random(&mut rng),
-                p521: p521::ecdsa::SigningKey::random(&mut rng),
+                p256: p256::ecdsa::SigningKey::from_slice(&[0x25; 32]).expect("P-256 scalar"),
+                p384: p384::ecdsa::SigningKey::from_slice(&[0x38; 48]).expect("P-384 scalar"),
+                p521: p521::ecdsa::SigningKey::from_slice(&[0x01; 66]).expect("P-521 scalar"),
             }
         }
 
@@ -1118,13 +1120,7 @@ mod tests {
             let spki = match curve {
                 EcCurve::P256 => self.p256.verifying_key().to_public_key_der(),
                 EcCurve::P384 => self.p384.verifying_key().to_public_key_der(),
-                EcCurve::P521 => p521::PublicKey::from_sec1_bytes(
-                    p521::ecdsa::VerifyingKey::from(&self.p521)
-                        .to_encoded_point(false)
-                        .as_bytes(),
-                )
-                .expect("P-521 point")
-                .to_public_key_der(),
+                EcCurve::P521 => self.p521.verifying_key().to_public_key_der(),
             }
             .expect("SPKI");
             certificate_for_spki_der(spki.as_bytes())
@@ -1132,7 +1128,7 @@ mod tests {
 
         /// Fixed-width `r || s`, the COSE encoding (RFC 9053 section 2.1).
         fn raw(&self, curve: EcCurve, data: &[u8]) -> Vec<u8> {
-            use signature::Signer as _;
+            use p256::ecdsa::signature::Signer as _;
             match curve {
                 EcCurve::P256 => {
                     let signature: p256::ecdsa::Signature = self.p256.sign(data);
@@ -1183,10 +1179,7 @@ mod tests {
         let claim = b"esp pairing".to_vec();
         for (alg_id, bound, es_twin, bits) in ESP {
             for (_, other, _, _) in ESP {
-                // A 256-bit digest is shorter than half of P-521's field, which
-                // RustCrypto ECDSA refuses (bits2field); C2PA lets validators
-                // reject non-matching pairings, so that one has no ES baseline.
-                if other == bound || (bits == 256 && other == EcCurve::P521) {
+                if other == bound {
                     continue;
                 }
                 // Both signatures are genuinely valid ECDSA by `other`'s key
@@ -1206,6 +1199,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_certificate_digests_and_curves_work_under_every_profile() {
+        let signer = EcSigner::new();
+        let claim = b"legacy mixed-curve claim";
+        for (_, curve, _, _) in ESP {
+            let leaf = signer.leaf(curve);
+            for (_, _, es_id, bits) in ESP {
+                let cose = detached_cose(es_id, claim, |data| {
+                    prehash_sign(&signer, curve, sha2_digest(bits, data))
+                });
+                for list in [
+                    ClaimAlgorithmList::V2_2,
+                    ClaimAlgorithmList::V2_4,
+                    ClaimAlgorithmList::V2_5,
+                ] {
+                    verify_claim_with(&cose, claim, &leaf, list)
+                        .unwrap_or_else(|error| panic!("{curve:?} ES {es_id} {list:?}: {error}"));
+                    assert!(matches!(
+                        verify_claim_with(&cose, b"tampered claim", &leaf, list),
+                        Err(CryptoError::Verify(_))
+                    ));
+                }
+            }
+        }
+    }
+
     fn sha2_digest(bits: u16, data: &[u8]) -> Vec<u8> {
         use sha2::Digest as _;
         match bits {
@@ -1216,7 +1235,7 @@ mod tests {
     }
 
     fn prehash_sign(signer: &EcSigner, curve: EcCurve, digest: Vec<u8>) -> Vec<u8> {
-        use signature::hazmat::PrehashSigner as _;
+        use p256::ecdsa::signature::hazmat::PrehashSigner as _;
         match curve {
             EcCurve::P256 => {
                 let signature: p256::ecdsa::Signature =
@@ -1243,7 +1262,7 @@ mod tests {
         let leaf = signer.leaf(EcCurve::P256);
         let der_signed = |alg_id| {
             detached_cose(alg_id, &claim, |data| {
-                use signature::Signer as _;
+                use p256::ecdsa::signature::Signer as _;
                 let signature: p256::ecdsa::Signature = signer.p256.sign(data);
                 signature.to_der().as_bytes().to_vec()
             })

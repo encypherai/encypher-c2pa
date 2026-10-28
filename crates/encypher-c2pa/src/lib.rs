@@ -307,6 +307,32 @@ pub struct VerifyOptions {
     pub cawg_strict_encoding: bool,
     /// RFC 3339 validation instant. Current UTC time is used when omitted.
     pub validation_time: Option<String>,
+    /// Trusted presentation-assessment instants for stream segments, RFC 3339,
+    /// exactly one per supplied segment and in the same order. Entry `i` is
+    /// the instant at which segment `i`'s C2PA 2.4 session-key validity window
+    /// is judged. `validation_time` still governs certificate and trust-list
+    /// evaluation of the init manifest; these instants never move that clock.
+    ///
+    /// The caller vouches for every entry. Supply each from your own trusted
+    /// record of when that segment was presented, such as an ingest log or a
+    /// packager clock you operate. The verifier never derives them from a
+    /// segment's own signed `iat`: that self-asserted time remains an
+    /// additional check inside the key window and never substitutes for the
+    /// caller's instant. `None` assesses every segment at `validation_time`,
+    /// which itself defaults to now. A time stamp on the init manifest proves
+    /// when the init segment was signed; it does not time stamp later
+    /// segments, so a historical archive needs these instants to verify
+    /// segments whose keys have since expired.
+    ///
+    /// Sequence continuity is still enforced across the whole supplied run, so
+    /// segments signed under different session keys, each valid at its own
+    /// instant, verify as one unbroken stream. Applies only to session-key
+    /// live streams verified through [`verify_stream_with_options`]; a
+    /// Merkle-bound or per-segment stream refuses it, as does
+    /// [`verify_fragmented_with_options`]. Single-asset verification ignores
+    /// it. A malformed entry, or a count that differs from the number of
+    /// segments supplied, fails the call before any segment is judged.
+    pub stream_presentation_times: Option<Vec<String>>,
     /// Failure telemetry override. `None` uses the saved per-user preference.
     pub telemetry: TelemetryOptions,
     /// Allow this verification to fetch what the asset references: a manifest
@@ -353,20 +379,31 @@ impl VerifyOptions {
     ///
     /// Path-based adapters call this before opening asset files so malformed
     /// trust material and invalid validation instants fail deterministically.
+    /// The per-segment count of `stream_presentation_times` needs the segments
+    /// and is checked by the stream entry point itself.
     pub fn validate(&self) -> Result<(), Error> {
-        ResolvedOptions::resolve(self).map(|_| ())
+        self.resolve_and_validate()?;
+        Ok(())
     }
 
     /// Validate every option and retain decoded external-data evidence.
     ///
     /// This has the same error ordering and checks as [`Self::validate`].
     pub fn validate_with_external_data(&self) -> Result<ValidatedExternalData, Error> {
-        let resolved = ResolvedOptions::resolve(self)?;
+        let resolved = self.resolve_and_validate()?;
         Ok(ValidatedExternalData {
             data: resolved.external_data,
             media_types: resolved.external_data_media_types,
             unreachable: resolved.external_data_unreachable,
         })
+    }
+
+    fn resolve_and_validate(&self) -> Result<ResolvedOptions, Error> {
+        let resolved = ResolvedOptions::resolve(self)?;
+        for (index, raw) in self.stream_presentation_times.iter().flatten().enumerate() {
+            parse_stream_presentation_time(raw, index)?;
+        }
+        Ok(resolved)
     }
 }
 
@@ -741,7 +778,7 @@ pub fn detached_manifest_evidence_with_options(
     let profile = resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
     let mime = canonicalize_mime(mime_type);
     require_embedded_mime(&mime, profile)?;
-    let format = crate::c2pa_formats::AssetFormat::from_mime(&mime)
+    let format = crate::c2pa_formats::AssetFormat::from_canonical_mime(&mime)
         .ok_or_else(|| Error::UnsupportedMime(mime.clone()))?;
     if !crate::c2pa_formats::supports_hash_mode(&mime) {
         return Ok(None);
@@ -787,6 +824,8 @@ pub fn detached_manifest_evidence_with_options(
 ///
 /// `mime_type` describes `asset`, not the store. `application/c2pa` is
 /// rejected: the content side must be a real asset.
+/// WebM, ICO, BMP, raw AAC, and WOFF media are supported only on this explicit
+/// sidecar path, using a whole-file data hash without exclusions.
 pub fn verify_with_manifest_store(
     asset: &[u8],
     manifest_store: &[u8],
@@ -1131,10 +1170,18 @@ pub fn verify_fragmented_with_options(
     mime_type: &str,
     options: &VerifyOptions,
 ) -> Result<VerificationReport, Error> {
+    if options.stream_presentation_times.is_some() {
+        return Err(Error::InvalidValidationTime(
+            "stream_presentation_times: per-segment presentation times apply only to \
+             session-key live streams verified with verify_stream_with_options; \
+             Merkle-bound fragments are assessed at validation_time"
+                .into(),
+        ));
+    }
     let resolved = ResolvedOptions::resolve(options)?;
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let mime = canonicalize_mime(mime_type);
-    let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
+    let result = if crate::c2pa_formats::AssetFormat::from_canonical_mime(&mime)
         == Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
         verify_with_options_inner(init_segment, Some(fragments), &mime, options, resolved)
@@ -1156,10 +1203,18 @@ pub fn verify_fragmented_with_graph_inputs(
     options: &VerifyOptions,
     graph_inputs: GraphInputs<'_>,
 ) -> Result<VerificationReport, Error> {
+    if options.stream_presentation_times.is_some() {
+        return Err(Error::InvalidValidationTime(
+            "stream_presentation_times: per-segment presentation times apply only to \
+             session-key live streams verified with verify_stream_with_options; \
+             Merkle-bound fragments are assessed at validation_time"
+                .into(),
+        ));
+    }
     let resolved = ResolvedOptions::resolve(options)?;
     let telemetry_enabled = telemetry_consent::resolve_telemetry_enabled(options.telemetry.enabled);
     let mime = canonicalize_mime(mime_type);
-    let result = if crate::c2pa_formats::AssetFormat::from_mime(&mime)
+    let result = if crate::c2pa_formats::AssetFormat::from_canonical_mime(&mime)
         == Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
         embedded_graph_pass(
@@ -1447,7 +1502,7 @@ fn decode_base64_map(
 pub(crate) fn resolve_mime(mime_type: &str, profile: EngineProfile) -> Result<String, Error> {
     let mime = canonicalize_mime(mime_type);
     if !crate::c2pa_core::spec::reader_permits(&mime, profile.version)
-        || crate::c2pa_formats::AssetFormat::from_mime(&mime).is_none()
+        || crate::c2pa_formats::AssetFormat::from_canonical_mime(&mime).is_none()
     {
         return Err(Error::UnsupportedMime(mime));
     }
@@ -1457,27 +1512,12 @@ pub(crate) fn resolve_mime(mime_type: &str, profile: EngineProfile) -> Result<St
 /// Canonicalize the media type of an asset bound by a separately supplied
 /// store.
 ///
-/// The 2.4 policy keeps its published behavior: only a type it reads with an
-/// embedded-manifest reader is accepted. Under 2.5 a byte-range hard binding
-/// applies to any asset type, so any syntactically valid `type/subtype` is
-/// accepted: one with an embedded carrier keeps that reader, and any other is
-/// read as opaque bytes. A host-less `application/c2pa` store is never an
-/// asset.
+/// Retained profiles admit ordinary readers and designated detached media.
+/// C2PA 2.5 also admits syntactically valid unknown types as opaque bytes.
+/// Byte checks happen in the shared detached validation pipeline.
 fn resolve_detached_mime(mime_type: &str, profile: EngineProfile) -> Result<String, Error> {
-    if profile.version != SpecVersion::V2_5 {
-        return resolve_mime(mime_type, profile);
-    }
-    let mime = canonicalize_mime(mime_type);
-    let token = |part: &str| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&byte))
-    };
-    let well_formed = mime
-        .split_once('/')
-        .is_some_and(|(kind, subtype)| token(kind) && token(subtype));
-    if !well_formed || mime == "application/c2pa" {
+    let mime = crate::c2pa_formats::canonicalize_detached_mime(mime_type);
+    if !crate::c2pa_formats::detached_mime_permitted(&mime, profile.version) {
         return Err(Error::UnsupportedMime(mime));
     }
     Ok(mime)
@@ -1488,7 +1528,7 @@ fn resolve_detached_mime(mime_type: &str, profile: EngineProfile) -> Result<Stri
 fn is_xml_comment_carrier(mime: &str) -> bool {
     (matches!(mime, "application/xml" | "text/xml") || mime.ends_with("+xml"))
         && matches!(
-            crate::c2pa_formats::AssetFormat::from_mime(mime),
+            crate::c2pa_formats::AssetFormat::from_canonical_mime(mime),
             Some(crate::c2pa_formats::AssetFormat::TextStructured {
                 comment_prefix: "<!--",
                 ..
@@ -1699,13 +1739,14 @@ fn verify_detached_online_v25(
     options: &VerifyOptions,
     mut resolved: ResolvedOptions,
 ) -> Result<VerificationReport, Error> {
-    let mut plan = locate_external_resources_with_manifest_store(
-        asset,
-        manifest_store,
-        mime,
-        options,
-        GraphLimits::default(),
-    )?;
+    let mut plan =
+        c2pa_validate::external_discovery::locate_external_resources_with_canonical_manifest_store(
+            asset,
+            manifest_store,
+            mime,
+            resolved.profile,
+            GraphLimits::default(),
+        )?;
     let mut online = native_online::NativeOnline::new(resolved.take_external_data(), options);
     while !plan.resources.is_empty() {
         let frontier = plan.resources.clone();
@@ -2316,6 +2357,29 @@ fn parse_optional_instant(
         .map(|raw| {
             OffsetDateTime::parse(raw, &Rfc3339)
                 .map_err(|error| Error::InvalidValidationTime(format!("{field}: {error}")))
+        })
+        .transpose()
+}
+
+fn parse_stream_presentation_time(raw: &str, index: usize) -> Result<OffsetDateTime, Error> {
+    OffsetDateTime::parse(raw, &Rfc3339).map_err(|error| {
+        Error::InvalidValidationTime(format!("stream_presentation_times[{index}]: {error}"))
+    })
+}
+
+/// Parse caller-supplied per-segment presentation instants, naming the first
+/// malformed entry by index. `None` stays `None`: the stream is then assessed
+/// at `validation_time`, never at a time read from the segments themselves.
+pub(crate) fn parse_stream_presentation_times(
+    values: Option<&[String]>,
+) -> Result<Option<Vec<OffsetDateTime>>, Error> {
+    values
+        .map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| parse_stream_presentation_time(raw, index))
+                .collect()
         })
         .transpose()
 }

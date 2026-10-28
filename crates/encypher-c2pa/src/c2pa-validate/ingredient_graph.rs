@@ -1161,7 +1161,10 @@ mod tests {
         let actions = Assertion::new("c2pa.actions.v2", &created_actions());
         let related = Assertion::new(
             "com.example.ingredient",
-            &vmap(vec![("description", Value::Text("ingredient metadata".into()))]),
+            &vmap(vec![(
+                "description",
+                Value::Text("ingredient metadata".into()),
+            )]),
         );
         let child_assertions = vec![binding.clone(), actions.clone(), related.clone()];
         let (child, child_cose) = manifest_box(
@@ -1196,10 +1199,7 @@ mod tests {
         build_manifest_store(&[child, active])
     }
 
-    fn verify_related_ingredient_store(
-        store: &[u8],
-        version: &str,
-    ) -> crate::StoreOnlyValidation {
+    fn verify_related_ingredient_store(store: &[u8], version: &str) -> crate::StoreOnlyValidation {
         crate::verify_manifest_store_only(
             store,
             &VerifyOptions {
@@ -1220,7 +1220,11 @@ mod tests {
         for version in ["2.2", "2.4", "2.5"] {
             let validation = verify_related_ingredient_store(&store, version);
             let results = &validation.report.validation_results;
-            assert!(results.failure.is_empty(), "{version}: {:?}", results.failure);
+            assert!(
+                results.failure.is_empty(),
+                "{version}: {:?}",
+                results.failure
+            );
             for code in ["claimSignature.validated", "ingredient.manifest.validated"] {
                 assert!(
                     results.success.iter().any(|status| status.code == code),
@@ -1324,7 +1328,10 @@ mod tests {
                 results.failure
             );
             assert!(
-                results.success.iter().any(|status| status.code == "claimSignature.validated"),
+                results
+                    .success
+                    .iter()
+                    .any(|status| status.code == "claimSignature.validated"),
                 "{case}: the negative must retain a valid claim signature"
             );
             // Earlier policies do not apply the 2.5 relatedAssertions rule.
@@ -1355,13 +1362,18 @@ mod tests {
         for version in ["2.2", "2.4", "2.5"] {
             let validation = verify_related_ingredient_store(&store, version);
             assert!(
-                validation.report.validation_results.failure.iter().any(|status| {
-                    status.code == "assertion.ingredient.malformed"
-                        && status.url
-                            == format!(
-                                "self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3"
-                            )
-                }),
+                validation
+                    .report
+                    .validation_results
+                    .failure
+                    .iter()
+                    .any(|status| {
+                        status.code == "assertion.ingredient.malformed"
+                            && status.url
+                                == format!(
+                                    "self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3"
+                                )
+                    }),
                 "{version}: {:?}",
                 validation.report.validation_results.failure
             );

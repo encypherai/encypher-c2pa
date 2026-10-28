@@ -1075,7 +1075,7 @@ mod tests {
 
         let profile = crate::c2pa_cbor::Profile::CanonicalForHashedSubstructures;
         let key = SigningKey::from_slice(&[0x5e; 32]).unwrap();
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let key_id = b"stale-key".to_vec();
         let cose_key = crate::c2pa_cbor::encode(
             &Value::Map(vec![

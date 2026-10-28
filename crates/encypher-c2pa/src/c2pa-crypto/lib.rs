@@ -24,7 +24,7 @@ pub(crate) use cose::{
 };
 pub(crate) use error::CryptoError;
 pub(crate) use mldsa::ml_dsa_spki_alg;
-pub(crate) use session::{cose_key_id, verify_with_cose_key, verify_with_cose_key_with};
+pub(crate) use session::{cose_key_id, verify_with_cose_key_with};
 pub(crate) use timestamp::{
     parse_timestamp_header, protected_iat, timestamp_assertion_input, TimestampHeader,
     TimestampHeaderDefect, TimestampHeaderEvidence, TimestampHeaderVersion,

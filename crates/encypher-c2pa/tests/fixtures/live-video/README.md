@@ -26,8 +26,18 @@ verifies against in production.
 - The four spec-2.4 streams are copied verbatim from that repository's C2PA
   Conformance Program 0.2 corpus, under
   `tests/conformance/fixtures-0.2/applications/encypher-enterprise-api/live-video/`.
-- `fmp4-merkle-2.2` was produced from the `fmp4-verifiable-segment-info` media
-  with that engine's CLI:
+  That engine writes them with
+  `cargo test -p c2pa-cli --test spec_matrix_fixtures refresh_live_video_fixture_set -- --ignored`.
+  The current set was refreshed when the verifiable-segment-info layout moved
+  to C2PA 2.4 sections 19.4.1 and 19.4.2. Each segment's version-0 `emsg`
+  follows `styp`, declares the value `fseg`, has `presentation_time_delta` 0,
+  and has a `timescale` and `event_duration` that cover the segment. Its
+  `bmffHash` excludes only that `emsg`, through an `/emsg` exclusion whose
+  `data` qualifier matches the scheme URI and its terminating NUL at box
+  offset 12.
+- `fmp4-merkle-2.2` was produced from the earlier `fmp4-verifiable-segment-info`
+  media, before the refresh above, with that engine's CLI. It is unchanged; the
+  2.2 Merkle lane does not read `emsg`:
 
   ```
   encypher-c2pa sign init.mp4 --mime video/mp4 --spec 2.2 \

@@ -5,32 +5,33 @@
   "spec_version": "2.4",
   "init": {
     "path": "init.mp4",
-    "bytes": 2952,
-    "sha256": "a8737ac9cbdde52159d34a180a81232e5b8bc4da0d6af6b011d0f6497761b654",
+    "bytes": 3128,
+    "sha256": "7f61f242c05267b31bbbfd793dc73d72f5eb16f2bc688f041ec11f2f0064d76f",
     "sequence_number": null,
     "manifest_label": null
   },
   "segments": [
     {
       "path": "seg-0.m4s",
-      "bytes": 417,
-      "sha256": "15d9ec5249c76f3562fe10937de8e5e66525d5ac50cec5a18138507a30a7c732",
+      "bytes": 513,
+      "sha256": "742ffbc42676cef314b0fb14955c85ffc6f75b2883b0d8356b30e72152cf013a",
       "sequence_number": null,
       "manifest_label": null
     },
     {
       "path": "seg-1.m4s",
-      "bytes": 417,
-      "sha256": "05ba87fcd6ad9da64714eb6db703a14e4fb5d91bb8bb819473fc82e6eb2b6b48",
+      "bytes": 513,
+      "sha256": "e474790491ea3982b35bf99b9269e165b9f6931f9b8a2c4cccb4d6deced61570",
       "sequence_number": null,
       "manifest_label": null
     },
     {
       "path": "seg-2.m4s",
-      "bytes": 417,
-      "sha256": "651f61e981e75755dfebb11233b3101f617910b6d95d4b764454d3d23d7bd986",
+      "bytes": 513,
+      "sha256": "b87bb09743183d12f5489955a047ea4c028f3e209fa3bbe0647bc8e2e53f423f",
       "sequence_number": null,
       "manifest_label": null
     }
-  ]
+  ],
+  "validation_time": "2026-10-26T22:30:00Z"
 }

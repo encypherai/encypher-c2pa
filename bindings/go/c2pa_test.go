@@ -65,9 +65,13 @@ func TestVerifyWithManifestStoreBindsTheSidecarToItsAsset(t *testing.T) {
 	}
 }
 
+func liveVideoDir(name string) string {
+	return filepath.Join("..", "..", "crates", "encypher-c2pa", "tests", "fixtures", "live-video", name)
+}
+
 func liveVideoStream(t *testing.T, name string, tamper bool) ([]byte, [][]byte) {
 	t.Helper()
-	base := filepath.Join("..", "..", "crates", "encypher-c2pa", "tests", "fixtures", "live-video", name)
+	base := liveVideoDir(name)
 	init, err := os.ReadFile(filepath.Join(base, "init.mp4"))
 	if err != nil {
 		t.Fatal(err)
@@ -86,9 +90,51 @@ func liveVideoStream(t *testing.T, name string, tamper bool) ([]byte, [][]byte) 
 	return init, segments
 }
 
+// fixtureClock is the trusted instant a fixture set's segments.json recorded
+// as validation_time when the set was signed and verified. It follows the
+// session key's creation and falls inside its 24-hour window; two days either
+// side is outside the window and inside every fixture certificate. Tests pin
+// to it rather than the wall clock, so a regenerated set carries its own
+// anchor.
+type fixtureClock time.Time
+
+func fixtureValidationTime(t *testing.T, name string) fixtureClock {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(liveVideoDir(name), "segments.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var index struct {
+		ValidationTime string `json:"validation_time"`
+	}
+	if err := json.Unmarshal(raw, &index); err != nil {
+		t.Fatal(err)
+	}
+	at, err := time.Parse(time.RFC3339Nano, index.ValidationTime)
+	if err != nil {
+		t.Fatalf("%s/segments.json validation_time: %v", name, err)
+	}
+	return fixtureClock(at)
+}
+
+func (c fixtureClock) at(offset time.Duration) string {
+	return time.Time(c).Add(offset).Format(time.RFC3339Nano)
+}
+
+func (c fixtureClock) inWindow() string {
+	return c.at(0)
+}
+
+func (c fixtureClock) afterExpiry() string {
+	return c.at(48 * time.Hour)
+}
+
+const sessionKeyStream = "fmp4-verifiable-segment-info"
+
 func TestVerifyStreamAcceptsCleanSessionKeyStreamAndRejectsTampering(t *testing.T) {
-	init, segments := liveVideoStream(t, "fmp4-verifiable-segment-info", false)
-	report, err := VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, nil)
+	pinned := &Options{ValidationTime: fixtureValidationTime(t, sessionKeyStream).inWindow()}
+	init, segments := liveVideoStream(t, sessionKeyStream, false)
+	report, err := VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, pinned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,8 +142,8 @@ func TestVerifyStreamAcceptsCleanSessionKeyStreamAndRejectsTampering(t *testing.
 		t.Fatalf("clean session-key stream must verify: %+v", report)
 	}
 
-	init, segments = liveVideoStream(t, "fmp4-verifiable-segment-info", true)
-	report, err = VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, nil)
+	init, segments = liveVideoStream(t, sessionKeyStream, true)
+	report, err = VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, pinned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,8 +162,9 @@ func TestVerifyStreamAcceptsCleanSessionKeyStreamAndRejectsTampering(t *testing.
 }
 
 func TestVerifyStreamRecomputesThePerSegmentChain(t *testing.T) {
+	pinned := &Options{ValidationTime: fixtureValidationTime(t, "cmaf-per-segment").inWindow()}
 	init, segments := liveVideoStream(t, "cmaf-per-segment", false)
-	report, err := VerifyStream(init, segments, "video/mp4", EncapsulationCMAF, MethodPerSegment, nil)
+	report, err := VerifyStream(init, segments, "video/mp4", EncapsulationCMAF, MethodPerSegment, pinned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +176,7 @@ func TestVerifyStreamRecomputesThePerSegmentChain(t *testing.T) {
 	}
 
 	init, segments = liveVideoStream(t, "cmaf-per-segment", true)
-	report, err = VerifyStream(init, segments, "video/mp4", EncapsulationCMAF, MethodPerSegment, nil)
+	report, err = VerifyStream(init, segments, "video/mp4", EncapsulationCMAF, MethodPerSegment, pinned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,10 +186,99 @@ func TestVerifyStreamRecomputesThePerSegmentChain(t *testing.T) {
 }
 
 func TestVerifyStreamRefusesAStreamDeclaredAsTheWrongEncapsulation(t *testing.T) {
-	init, segments := liveVideoStream(t, "fmp4-verifiable-segment-info", false)
-	_, err := VerifyStream(init, segments, "video/mp4", EncapsulationCMAF, MethodVerifiableSegmentInfo, nil)
+	pinned := &Options{ValidationTime: fixtureValidationTime(t, sessionKeyStream).inWindow()}
+	init, segments := liveVideoStream(t, sessionKeyStream, false)
+	_, err := VerifyStream(init, segments, "video/mp4", EncapsulationCMAF, MethodVerifiableSegmentInfo, pinned)
 	if err == nil || !strings.Contains(err.Error(), "CMAF") {
 		t.Fatalf("expected the brand gate to refuse fMP4 bytes declared as CMAF, got %v", err)
+	}
+}
+
+func segmentFailureURLs(report *StreamReport) map[string]bool {
+	urls := map[string]bool{}
+	for _, status := range report.Stream.ValidationResults.Failure {
+		if status.Code == "livevideo.segment.invalid" {
+			urls[status.URL] = true
+		}
+	}
+	return urls
+}
+
+func TestVerifyStreamChecksEachSessionKeySegmentAtItsPresentationTime(t *testing.T) {
+	clock := fixtureValidationTime(t, sessionKeyStream)
+	init, segments := liveVideoStream(t, sessionKeyStream, false)
+	verify := func(options *Options) *StreamReport {
+		t.Helper()
+		report, err := VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return report
+	}
+
+	// Without per-segment times, an archive check after the key expired
+	// assesses every segment at ValidationTime and fails.
+	expired := verify(&Options{ValidationTime: clock.afterExpiry()})
+	if expired.Integrity != "invalid" || len(segmentFailureURLs(expired)) == 0 {
+		t.Fatalf("segments assessed after key expiry must fail: %+v", expired)
+	}
+
+	// Distinct trusted presentation times inside the window verify the same
+	// archive, and the common ValidationTime still governs the certificates.
+	archived := verify(&Options{
+		ValidationTime:          clock.afterExpiry(),
+		StreamPresentationTimes: []string{clock.at(0), clock.at(time.Second), clock.at(2 * time.Second)},
+	})
+	if archived.Integrity != "valid" {
+		t.Fatalf("segments presented inside the key window must verify: %+v", archived)
+	}
+
+	// Each time applies to its own segment only, on either side of the window.
+	for _, outside := range []string{clock.afterExpiry(), clock.at(-48 * time.Hour)} {
+		mixed := verify(&Options{
+			ValidationTime:          clock.inWindow(),
+			StreamPresentationTimes: []string{clock.inWindow(), clock.inWindow(), outside},
+		})
+		urls := segmentFailureURLs(mixed)
+		if mixed.Integrity != "invalid" || !urls["self#segment=3"] || urls["self#segment=1"] || urls["self#segment=2"] {
+			t.Fatalf("%s: only the segment presented outside the window may fail: %+v", outside, mixed.Stream.ValidationResults.Failure)
+		}
+	}
+}
+
+func TestVerifyStreamRefusesMalformedOrMiscountedPresentationTimes(t *testing.T) {
+	in := fixtureValidationTime(t, sessionKeyStream).inWindow()
+	init, segments := liveVideoStream(t, sessionKeyStream, false)
+	// Exercise nil through the actual C JSON bridge: it means absent and
+	// must verify, while the explicitly empty slice below must be refused.
+	report, err := VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, &Options{
+		ValidationTime:          in,
+		StreamPresentationTimes: nil,
+	})
+	if err != nil || report.Integrity != "valid" {
+		t.Fatalf("nil presentation times must retain validation-time verification: report=%+v err=%v", report, err)
+	}
+	for name, times := range map[string][]string{
+		"too few":   {in, in},
+		"too many":  {in, in, in, in},
+		"empty":     {},
+		"malformed": {in, "yesterday", in},
+	} {
+		_, err := VerifyStream(init, segments, "video/mp4", EncapsulationFMP4, MethodVerifiableSegmentInfo, &Options{
+			ValidationTime:          in,
+			StreamPresentationTimes: times,
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid_validation_time") || !strings.Contains(err.Error(), "stream_presentation_times") {
+			t.Fatalf("%s: expected an invalid_validation_time refusal naming stream_presentation_times, got %v", name, err)
+		}
+	}
+
+	perSegmentInit, perSegment := liveVideoStream(t, "cmaf-per-segment", false)
+	if _, err := VerifyStream(perSegmentInit, perSegment, "video/mp4", EncapsulationCMAF, MethodPerSegment, &Options{
+		ValidationTime:          in,
+		StreamPresentationTimes: []string{in, in, in},
+	}); err == nil {
+		t.Fatal("a per-segment stream must refuse per-segment presentation times, not ignore them")
 	}
 }
 

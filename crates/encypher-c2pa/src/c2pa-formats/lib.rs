@@ -26,6 +26,8 @@ use thiserror::Error;
 mod append_text;
 mod blockfact;
 mod bmff;
+mod external_media;
+pub(crate) use external_media::canonicalize_detached_mime;
 mod flac;
 mod font;
 mod gif;
@@ -155,6 +157,9 @@ pub enum AssetFormat {
     /// (external) manifest store can bind them; [`AssetFormat::from_mime`]
     /// never returns it.
     Opaque,
+    /// Detached-only media: a whole-file data hash, with no embedded carrier.
+    /// Ordinary MIME resolution never selects this variant.
+    ExternalMedia,
 }
 
 /// C2PA user-type UUID for the unique BMFF manifest carrier.
@@ -212,7 +217,12 @@ impl AssetFormat {
         // aliased input resolves to the same format — and signs to the same
         // bytes — as its canonical form.
         let canon = crate::c2pa_core::spec::canonicalize_mime(mime);
-        Some(match canon.as_str() {
+        Self::from_canonical_mime(&canon)
+    }
+
+    /// Resolve an already canonicalized MIME without allocating.
+    pub(crate) fn from_canonical_mime(mime: &str) -> Option<Self> {
+        Some(match mime {
             "image/jpeg" => Self::Jpeg,
             "image/png" => Self::Png,
             "image/webp" => Self::Riff,
@@ -372,6 +382,34 @@ impl AssetFormat {
         })
     }
 
+    /// Classify detached bytes for an already canonicalized detached MIME.
+    /// Malformed designated media never becomes opaque through a MIME fallback.
+    pub(crate) fn from_detached_content_for_profile(
+        mime: &str,
+        data: &[u8],
+        profile: crate::c2pa_core::EngineProfile,
+    ) -> Result<Option<Self>, FormatError> {
+        if !detached_mime_permitted(mime, profile.version) {
+            return Ok(None);
+        }
+        if external_media::EXTERNAL_MEDIA_MIMES.contains(&mime) {
+            // Detached normalization preserves raw AAC's spelling. BMFF bytes
+            // still take the ordinary AAC-to-MP4 reader route.
+            if mime == "audio/aac" && external_media::is_bmff(data) {
+                return Ok(Some(Self::Bmff));
+            }
+            external_media::check(mime, data)?;
+            return Ok(Some(Self::ExternalMedia));
+        }
+        let format = Self::from_canonical_mime(mime);
+        Ok(match format {
+            Some(Self::C2paStore) => None,
+            ordinary if crate::c2pa_core::spec::reader_permits(mime, profile.version) => ordinary,
+            _ if profile.version == SpecVersion::V2_5 => Some(Self::Opaque),
+            _ => None,
+        })
+    }
+
     /// Resolve a MIME type to its [`AssetFormat`] **only if the given engine
     /// profile permits it**. Returns `None` when the type is unrecognized OR is
     /// out of scope for `profile` (e.g. text/font/ZIP under a conformance
@@ -390,6 +428,23 @@ impl AssetFormat {
         }
         Self::from_mime(mime)
     }
+}
+
+/// MIME admission shared by the facade and detached byte classification.
+pub(crate) fn detached_mime_permitted(mime: &str, version: SpecVersion) -> bool {
+    let token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&byte))
+    };
+    mime != "application/c2pa"
+        && mime
+            .split_once('/')
+            .is_some_and(|(kind, subtype)| token(kind) && token(subtype))
+        && (external_media::EXTERNAL_MEDIA_MIMES.contains(&mime)
+            || crate::c2pa_core::spec::reader_permits(mime, version)
+            || version == SpecVersion::V2_5)
 }
 
 /// A contiguous byte range to exclude from a `c2pa.hash.data` hash binding.
@@ -455,7 +510,8 @@ pub(crate) use bmff::{bmff_box_ranges, bmff_exclusion_ranges};
 
 /// Re-export: compute BMFF V2/V3 hard-binding hashes.
 pub(crate) use bmff::{
-    bmff_hash, bmff_hash_with_exclusions, BmffDataMap, BmffExclusionMap, BmffSubsetMap,
+    bmff_excluded_ranges, bmff_hash, bmff_hash_with_exclusions, BmffDataMap, BmffExclusionMap,
+    BmffSubsetMap,
 };
 
 /// Re-export: streaming, bounded-memory BMFF hash for assets too large to hold
@@ -817,6 +873,7 @@ pub(crate) fn extract_manifest_for_spec(
             text::extract(text::TextMethod::Structured, data, rules)
         }
         AssetFormat::TextHtml => text::extract(text::TextMethod::Html, data, rules),
+        AssetFormat::ExternalMedia => Ok(None),
         // The bytes ARE the manifest store; return verbatim (empty => no manifest).
         AssetFormat::C2paStore => {
             if data.is_empty() {
@@ -877,6 +934,7 @@ pub fn strip_manifest(format: AssetFormat, asset: &[u8]) -> Result<Vec<u8>, Form
         AssetFormat::Flac => flac::strip(asset),
         AssetFormat::Ogg => ogg::strip(asset),
         AssetFormat::Jxl => jxl::strip(asset),
+        AssetFormat::ExternalMedia => Ok(asset.to_vec()),
         AssetFormat::Tiff
         | AssetFormat::Font
         | AssetFormat::Id3
@@ -951,9 +1009,9 @@ pub fn embed_manifest(
             comment_suffix,
         } => text::embed_structured(asset, manifest_store, comment_prefix, comment_suffix),
         AssetFormat::TextHtml => text::embed(text::TextMethod::Html, asset, manifest_store),
-        // A host-less manifest store has no container to embed into, and the
-        // 2.5 carriers' fixtures are built by their own modules' test helpers.
+        // These formats have no fixture writer through this helper.
         other @ (AssetFormat::C2paStore
+        | AssetFormat::ExternalMedia
         | AssetFormat::Midi
         | AssetFormat::Ttml
         | AssetFormat::Onnx
@@ -1039,12 +1097,61 @@ pub(crate) fn compute_data_hash_exclusions_for_spec(
             append_text::exclusions(asset_with_placeholder, flavor)
         }
         AssetFormat::Opaque => Ok(Vec::new()),
+        AssetFormat::ExternalMedia => Ok(Vec::new()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_profile_admission_preserves_aac_and_unknown_boundaries() {
+        use crate::c2pa_core::{EngineProfile, OperatingMode};
+        for version in [SpecVersion::V2_2, SpecVersion::V2_4, SpecVersion::V2_5] {
+            let profile = EngineProfile::new(version, OperatingMode::Regular);
+            assert_eq!(
+                AssetFormat::from_detached_content_for_profile(
+                    &crate::resolve_detached_mime("AUDIO/AAC; codecs=aac", profile).unwrap(),
+                    b"\0\0\0\x18ftypmp42",
+                    profile,
+                )
+                .unwrap(),
+                Some(AssetFormat::Bmff),
+            );
+            assert_eq!(
+                AssetFormat::from_detached_content_for_profile(
+                    &crate::resolve_detached_mime("AUDIO/AAC", profile).unwrap(),
+                    &[0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc],
+                    profile,
+                )
+                .unwrap(),
+                Some(AssetFormat::ExternalMedia),
+            );
+            assert!(AssetFormat::from_detached_content_for_profile(
+                "audio/aac",
+                b"not AAC",
+                profile,
+            )
+            .is_err());
+            assert_eq!(
+                AssetFormat::from_detached_content_for_profile(
+                    "application/x-private-asset",
+                    b"unknown bytes",
+                    profile,
+                )
+                .unwrap(),
+                (version == SpecVersion::V2_5).then_some(AssetFormat::Opaque),
+            );
+            for mime in ["bad mime", "application/c2pa", "text/invalid/subtype"] {
+                assert_eq!(
+                    AssetFormat::from_detached_content_for_profile(mime, b"anything", profile,)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+    }
 
     /// Build a small but structurally valid manifest store for round-trip tests.
     pub(crate) fn dummy_manifest_store() -> Vec<u8> {

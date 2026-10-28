@@ -309,11 +309,15 @@ pub fn locate_external_resources<A: AsRef<[u8]>>(
     let profile =
         crate::resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
     let mime = if profile.version == SpecVersion::V2_5 {
-        crate::resolve_detached_mime(mime_type, profile)?
+        let mime = crate::c2pa_core::spec::canonicalize_mime(mime_type);
+        if !crate::c2pa_formats::detached_mime_permitted(&mime, profile.version) {
+            return Err(Error::UnsupportedMime(mime));
+        }
+        mime
     } else {
         crate::resolve_mime(mime_type, profile)?
     };
-    let format = match AssetFormat::from_mime(&mime) {
+    let format = match AssetFormat::from_canonical_mime(&mime) {
         Some(format)
             if crate::c2pa_core::spec::reader_permits(&mime, profile.version)
                 && crate::require_embedded_mime(&mime, profile).is_ok() =>
@@ -382,8 +386,27 @@ pub fn locate_external_resources_with_manifest_store<A: AsRef<[u8]>>(
     let profile =
         crate::resolve_profile(options.spec_version.as_deref(), options.strict_conformance)?;
     let mime = crate::resolve_detached_mime(mime_type, profile)?;
-    let format = AssetFormat::from_mime(&mime).unwrap_or(AssetFormat::Opaque);
-    let format = super::spec25::select_format(format, &mime, asset.as_ref(), profile);
+    locate_external_resources_with_canonical_manifest_store(
+        asset,
+        manifest_store,
+        &mime,
+        profile,
+        limits,
+    )
+}
+
+/// Detached discovery after the facade has normalized and admitted the MIME.
+pub(crate) fn locate_external_resources_with_canonical_manifest_store<A: AsRef<[u8]>>(
+    asset: A,
+    manifest_store: &[u8],
+    mime: &str,
+    profile: EngineProfile,
+    limits: GraphLimits,
+) -> Result<ExternalResourcePlan<A>, Error> {
+    let format = AssetFormat::from_detached_content_for_profile(mime, asset.as_ref(), profile)
+        .map_err(|error| Error::Verification(error.to_string()))?
+        .ok_or_else(|| Error::UnsupportedMime(mime.to_string()))?;
+    let format = super::spec25::select_format(format, mime, asset.as_ref(), profile);
     let flavor = match format {
         AssetFormat::AppendOnlyText { flavor } => Some(flavor),
         _ => None,

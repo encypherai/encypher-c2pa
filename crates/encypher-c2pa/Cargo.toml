@@ -42,9 +42,13 @@ spki = { workspace = true }
 const-oid = { workspace = true }
 der = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing"] }
-p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
-p384 = { workspace = true, features = ["ecdsa", "pkcs8"] }
-p521 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+# Curve `std` enables getrandom 0.4, which verification does not need. Enable
+# std only on the table backend: its lazy precomputed tables require a
+# synchronization implementation, including on wasm32-unknown-unknown.
+primeorder = { version = "0.14", default-features = false, features = ["std"] }
+p256 = { workspace = true, features = ["alloc", "ecdsa", "pem", "pkcs8", "precomputed-tables"] }
+p384 = { workspace = true, features = ["alloc", "ecdsa", "pem", "pkcs8", "precomputed-tables"] }
+p521 = { workspace = true, features = ["alloc", "ecdsa", "pem", "pkcs8", "precomputed-tables"] }
 ecdsa = { workspace = true }
 rsa = { workspace = true, features = ["sha2"] }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
@@ -77,8 +81,8 @@ boon = "0.6"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# The elliptic-curve stack reaches `getrandom` transitively (ecdsa -> p256 ->
-# elliptic-curve -> crypto-bigint -> rand_core), and on wasm32 that crate
+# `getrandom` 0.2 is reached through `rand_core` 0.6 (this crate's own
+# `rand_core` with its `getrandom` feature, and rsa), and on wasm32 that crate
 # refuses to compile unless a backend is selected. Until now the browser
 # binding declared this itself, which meant the published library did not
 # actually build for a target the README says it supports: a consumer taking

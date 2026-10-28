@@ -18,6 +18,14 @@ Run `encypher-c2pa formats` to read the canonical MIME types covered by the inst
 
 `application/font-sfnt`, `application/javascript`, `application/json`, `application/toml`, `application/xhtml+xml`, `application/xml`, `application/yaml`, `application/x-font-ttf`, `font/otf`, `font/sfnt`, `font/ttf`, `text/css`, `text/csv`, `text/html`, `text/markdown`, `text/plain`, `text/tab-separated-values`, `text/x-python`, `text/xml`
 
+## Detached-only media
+
+`verify_with_manifest_store` also accepts `video/webm`, `audio/webm`, `image/x-icon`, `image/vnd.microsoft.icon`, `image/bmp`, raw ADTS `audio/aac`, `font/woff`, and `font/woff2`. The caller supplies the manifest store separately; these formats do not gain an embedded carrier or automatic manifest discovery.
+
+The verifier checks the MIME against a bounded file signature, then requires a whole-file `c2pa.hash.data` binding with no exclusions. Claim signatures, ingredient assertions, trust and identity use the normal validation pipeline. The signature check is not a full container or playback check. An MP4-family file labelled `audio/aac` still uses BMFF verification.
+
+Designated detached media and eligible unknown 2.5 types both require whole-file binding without exclusions. A multi-asset fallback cannot rescue a failed primary binding for either kind.
+
 ## What coverage means
 
 A listed MIME type has a container reader and a C2PA hard-binding path in this build. The exact binding depends on the format:
@@ -35,7 +43,7 @@ Coverage does not promise recovery from arbitrary container corruption. Unsuppor
 
 Fragmented verification takes the signed initialization segment and the media segments available, in playback order. Missing trailing segments are not a failure; an unsignalled gap or reordering inside the supplied run is `assertion.bmffHash.mismatch`, unless the caller marks the jump with `expected_seek_positions`. Both fMP4 and CMAF use `video/mp4`; they are verification modes, not additional MIME types. Supplied segments that no binding covers fail verification.
 
-Live streams signed under C2PA 2.4 are verified with the stream entry points (`verify_stream`, `--encapsulation`). Both methods are covered: `verifiable-segment-info`, where session keys in the initialization manifest authenticate each segment's signed segment information, and `per-segment`, where each segment carries a manifest chained to the one before it. The declared encapsulation is checked against the brands in the segment bytes.
+Live streams signed under C2PA 2.4 are verified with the stream entry points (`verify_stream`, `--encapsulation`). Both methods are covered: `verifiable-segment-info`, where session keys in the initialization manifest authenticate each segment's signed segment information, and `per-segment`, where each segment carries a manifest chained to the one before it. The declared encapsulation is checked against the brands in the segment bytes. Session-key windows are checked at the validation time, or at one caller-supplied trusted presentation time per segment (`stream_presentation_times`, `--stream-presentation-time`), with sequence continuity enforced across segments signed under different keys.
 
 Any carrier may hold a Brotli-compressed manifest store (`brob`), which is expanded under a size bound before validation, and an update manifest (`c2um`), which inherits its hard binding from the first standard manifest in its authenticated parent chain.
 
@@ -57,7 +65,7 @@ Format-specific rules the verifier applies:
 
 The 2.5 policy reads the carriers 2.5 adds: Standard MIDI Files (`audio/midi`, sole/last/first track by SMF format, `FF 7F 00 43 32` event), standalone TTML (`application/ttml+xml`, namespace-matched `/tt:tt/tt:head/tt:metadata/c2pa:manifest`), ONNX (`application/onnx`, `metadata_props` `c2pa:manifest` value), SafeTensors (`application/safetensors`, `__metadata__.c2pa:manifest` value), Parquet (`application/vnd.apache.parquet`, footer `key_value_metadata`; encrypted-footer files carry none), BlockFact (`image/vnd.blockfact.facti`, `audio/vnd.blockfact.facta`, `video/vnd.blockfact.factv`, `C2PA` extension block), WARC (`application/warc`, collection binding by `WARC-Record-ID`), append-only text and JSON Lines checkpoints (`c2pa.hash.segment`, including the predecessor chain), WebVTT (`text/vtt`) and every other `text/*` structured-text type. A duplicate carrier in any of these locates no manifest. MIDI, ONNX, SafeTensors and JSONL have no registered media type; the spellings above are this SDK's non-normative choice.
 
-Generic XML-comment embedding is unsupported under 2.5 for every XML-derived type without a dedicated carrier (XML, XHTML, RSS, Atom): its armor contains `--`, which XML forbids inside comments ([upstream issue 2590](https://github.com/c2pa-org/specs-core/issues/2590)). Separately supplied manifest stores remain readable for those types, and for any well-formed media type as opaque bytes.
+Generic XML-comment embedding is unsupported under 2.5 for every XML-derived type without a dedicated carrier (XML, XHTML, RSS, Atom): its armor contains `--`, which XML forbids inside comments ([upstream issue 2590](https://github.com/c2pa-org/specs-core/issues/2590)). Separately supplied manifest stores remain readable for those types; eligible unknown media types use opaque whole-file bindings. Designated detached media still require valid file signatures.
 
 E-RTMP uses `verify_ertmp` or `verify_ertmp_with_options` with caller-supplied audio/video track events, including codec configuration, frames and named metadata. It validates segment signatures, continuity and manifest refreshes without treating the transport as a file MIME. The API does not invent the audio metadata packet assignment missing from the referenced transport specification.
 

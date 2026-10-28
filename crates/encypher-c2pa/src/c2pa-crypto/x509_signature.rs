@@ -213,7 +213,7 @@ pub fn verify_x509_signature(
     }
 }
 
-fn bad(error: signature::Error) -> CryptoError {
+fn bad(error: impl std::fmt::Display) -> CryptoError {
     CryptoError::Verify(error.to_string())
 }
 
@@ -324,7 +324,7 @@ fn verify_ecdsa(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), CryptoError> {
-    use signature::hazmat::PrehashVerifier as _;
+    use ecdsa::signature::hazmat::PrehashVerifier as _;
 
     if key.algorithm.oid != ID_EC_PUBLIC_KEY {
         return Err(CryptoError::Verify(format!(
@@ -342,7 +342,7 @@ fn verify_ecdsa(
         .subject_public_key
         .as_bytes()
         .ok_or_else(|| CryptoError::CertParse("EC public key bit string has unused bits".into()))?;
-    let point_error = |e: signature::Error| CryptoError::CertParse(format!("EC public key: {e}"));
+    let point_error = |e: ecdsa::Error| CryptoError::CertParse(format!("EC public key: {e}"));
     let mut prehash = [0_u8; 64];
     let prehash = hash.digest(message, &mut prehash);
     match curve {

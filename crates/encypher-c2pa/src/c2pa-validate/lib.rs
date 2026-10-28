@@ -1682,6 +1682,9 @@ pub fn verify_fragmented_with_cawg_options_and_expected_seeks_safe(
 /// content side must be a real asset: `application/c2pa` (the host-less compound
 /// store) is rejected, and this path never touches the compound `C2paStore`
 /// verification flow.
+///
+/// `content_mime` must already be canonicalized by the facade's detached MIME
+/// boundary. This internal kernel does not normalize raw MIME input.
 pub fn verify_detached<'a>(
     manifest_store: &'a [u8],
     content: &'a [u8],
@@ -1720,6 +1723,7 @@ pub(crate) fn verify_detached_with_cawg_options<'a>(
     )
 }
 
+/// `content_mime` has the same canonical-input requirement as `verify_detached`.
 #[allow(clippy::too_many_arguments)]
 fn verify_detached_with_cawg_options_and_fragments<'a>(
     manifest_store: &'a [u8],
@@ -1730,11 +1734,9 @@ fn verify_detached_with_cawg_options_and_fragments<'a>(
     expected_seek_positions: &[usize],
     cawg_inputs: CawgTrustInputs<'_>,
 ) -> Result<VerifyOutput, ValidateError> {
-    // A separately supplied store binds any bytes through its ordinary hard
-    // binding (Cryptography, Hard bindings: a byte-range binding applies to
-    // any asset type), so a media type with no standardized embedding is read
-    // as opaque bytes rather than refused.
-    let format = AssetFormat::from_mime(content_mime).unwrap_or(AssetFormat::Opaque);
+    let format =
+        AssetFormat::from_detached_content_for_profile(content_mime, content, input.profile)?
+            .ok_or_else(|| ValidateError::UnsupportedMime(content_mime.to_string()))?;
     let format = spec25::select_format(format, content_mime, content, input.profile);
     if format == AssetFormat::C2paStore {
         // The content side cannot itself be a host-less manifest store.
@@ -7286,6 +7288,7 @@ fn is_primary_binding_match(label: &str, status: &StatusCode) -> bool {
 /// fallback, never a peer hard binding: it is evaluated only after an ordinary
 /// byte mismatch. Structural, malformed, missing, and unsupported failures
 /// remain attached to the primary and do not activate the fallback.
+/// Detached-only media never falls back: its whole-file data hash is final.
 #[allow(clippy::too_many_arguments)]
 fn verify_data_hash<'index, 'claim>(
     claim: &Value,
@@ -7301,6 +7304,16 @@ fn verify_data_hash<'index, 'claim>(
     let plan = claim_refs.binding_plan(format == AssetFormat::C2paStore);
     let primary = plan.primary()?;
     let primary_label = primary.label?;
+    if matches!(format, AssetFormat::ExternalMedia | AssetFormat::Opaque)
+        && primary_label != "c2pa.hash.data"
+    {
+        results.push_failure(
+            ASSERTION_DATA_HASH_MALFORMED,
+            format!("self#jumbf=/c2pa/{label}/c2pa.assertions/{primary_label}"),
+            "detached-only media requires a whole-file data hash".into(),
+        );
+        return None;
+    }
     if primary_label == COMPOUND_CONTENT_LABEL {
         return None;
     }
@@ -7322,9 +7335,11 @@ fn verify_data_hash<'index, 'claim>(
         return Some(OperativeBinding::Primary(primary));
     }
 
-    // 2.5 Validating a multi-asset hash: the fallback applies only when "the
-    // standard manifest contains a multi-asset hash assertion in
-    // `created_assertions`".
+    // Whole-file detached bindings cannot be rescued by an excluding part.
+    if matches!(format, AssetFormat::ExternalMedia | AssetFormat::Opaque) {
+        return None;
+    }
+    // C2PA 2.5 permits this fallback only in created_assertions.
     let fallback = plan
         .multi_asset()
         .filter(|reference| !spec25::applies(profile) || reference.field == "created_assertions")?;
@@ -7582,6 +7597,16 @@ fn verify_primary_hard_binding(
                 return;
             }
         };
+        if matches!(format, AssetFormat::ExternalMedia | AssetFormat::Opaque)
+            && !exclusions.is_empty()
+        {
+            results.push_failure(
+                ASSERTION_DATA_HASH_MALFORMED,
+                url,
+                "detached-only media cannot exclude asset bytes".into(),
+            );
+            return;
+        }
         let carrier = if rendition == update_manifest::StoreRendition::Detached {
             None
         } else {
@@ -12673,7 +12698,8 @@ mod tests {
         results
     }
 
-    fn run_text_data_hash(
+    fn run_asset_data_hash(
+        format: AssetFormat,
         data: &[u8],
         expected: Vec<u8>,
         exclusions: &[(usize, usize)],
@@ -12717,7 +12743,7 @@ mod tests {
             &claim,
             &claim_refs,
             data,
-            AssetFormat::TextUnstructured,
+            format,
             &[],
             rendition,
             "urn:test",
@@ -12728,12 +12754,345 @@ mod tests {
     }
 
     #[test]
+    fn detached_media_whole_file_hash_detects_changed_bytes() {
+        let original = b"opaque media bytes";
+        let valid = run_asset_data_hash(
+            AssetFormat::ExternalMedia,
+            original,
+            sha(original),
+            &[],
+            update_manifest::StoreRendition::Detached,
+            EngineProfile::GENEROUS,
+        );
+        assert!(valid.has_success(ASSERTION_DATA_HASH_MATCH));
+        let tampered = run_asset_data_hash(
+            AssetFormat::ExternalMedia,
+            b"opaque media byteS",
+            sha(original),
+            &[],
+            update_manifest::StoreRendition::Detached,
+            EngineProfile::GENEROUS,
+        );
+        assert!(tampered.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert!(!tampered.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    #[test]
+    fn detached_media_rejects_excluded_bytes_even_when_digest_matches() {
+        for version in [SpecVersion::V2_2, SpecVersion::V2_4, SpecVersion::V2_5] {
+            for format in [AssetFormat::ExternalMedia, AssetFormat::Opaque] {
+                let result = run_asset_data_hash(
+                    format,
+                    b"unsigned prefix, signed suffix",
+                    sha(b"signed suffix"),
+                    &[(0, 17)],
+                    update_manifest::StoreRendition::Detached,
+                    EngineProfile::new(version, OperatingMode::Regular),
+                );
+                assert!(result.has_failure(ASSERTION_DATA_HASH_MALFORMED));
+                assert!(!result.has_success(ASSERTION_DATA_HASH_MATCH));
+            }
+        }
+    }
+
+    /// A signed detached WebM store binds the whole file through
+    /// `c2pa.hash.data` and also declares a multi-asset fallback whose one
+    /// data part excludes the asset's last byte. Changing that byte must keep
+    /// the whole-file mismatch: detached-only media never reaches the
+    /// fallback. The same signed manifest still falls back for an ordinary
+    /// format, which proves the exclusion really hides the changed byte.
+    #[test]
+    fn detached_media_primary_mismatch_never_uses_excluding_multi_asset_fallback() {
+        use crate::c2pa_core::jumbf::assertion_box;
+
+        const LABEL: &str = "urn:c2pa:00000000-0000-4000-8000-0000000000e1";
+        const PART: &str = "c2pa.hash.data.part";
+        let reference = |label: &str, payload: &[u8]| {
+            let stored = assertion_box(label, payload, None);
+            vmap(vec![
+                (
+                    "url",
+                    Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                ),
+                ("alg", Value::Text("sha256".into())),
+                (
+                    "hash",
+                    Value::Bytes(sha(superbox_content(&stored).expect("assertion content"))),
+                ),
+            ])
+        };
+
+        let mut asset = b"\x1a\x45\xdf\xa3\x87\x42\x82\x84webm".to_vec();
+        asset.extend_from_slice(b" cluster payload bound by the whole-file hash");
+        let excluded = asset.len() - 1;
+        let mut tampered = asset.clone();
+        tampered[excluded] ^= 0x01;
+
+        let primary = enc(&vmap(vec![
+            ("exclusions", Value::Array(Vec::new())),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(&asset))),
+        ]));
+        let part = enc(&vmap(vec![
+            (
+                "exclusions",
+                Value::Array(vec![vmap(vec![
+                    ("start", Value::Integer(excluded as i128)),
+                    ("length", Value::Integer(1)),
+                ])]),
+            ),
+            ("alg", Value::Text("sha256".into())),
+            ("hash", Value::Bytes(sha(&asset[..excluded]))),
+        ]));
+        let part_reference = reference(PART, &part);
+        let fallback = enc(&vmap(vec![(
+            "parts",
+            Value::Array(vec![vmap(vec![
+                (
+                    "location",
+                    vmap(vec![
+                        ("byteOffset", Value::Integer(0)),
+                        ("length", Value::Integer(asset.len() as i128)),
+                    ]),
+                ),
+                ("hashAssertion", part_reference.clone()),
+                ("optional", Value::Bool(false)),
+            ])]),
+        )]));
+        let actions = enc(&vmap(vec![(
+            "actions",
+            Value::Array(vec![vmap(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ])]),
+        )]));
+        let assertions = [
+            ("c2pa.hash.data", primary),
+            ("c2pa.hash.multi-asset", fallback),
+            (PART, part),
+            ("c2pa.actions.v2", actions),
+        ];
+        let claim = enc(&vmap(vec![
+            ("instanceID", Value::Text("xmp:iid:detached-webm".into())),
+            (
+                "claim_generator_info",
+                vmap(vec![("name", Value::Text("Encypher Fixture".into()))]),
+            ),
+            (
+                "created_assertions",
+                Value::Array(
+                    assertions
+                        .iter()
+                        .map(|(label, payload)| reference(label, payload))
+                        .collect(),
+                ),
+            ),
+            ("signature", Value::Text("self#jumbf=c2pa.signature".into())),
+        ]));
+        let signer = signature_conformance_tests::Signer::conformant();
+        let signature = signer.sign(&claim);
+        let chain = extract_x5chain(&signature).expect("claim x5chain");
+        let trust = TrustList::from_certificates(
+            crate::c2pa_trust::AnchorPurpose::ClaimSigning,
+            [chain.last().expect("claim root").clone()],
+        );
+        let boxes: Vec<Vec<u8>> = assertions
+            .iter()
+            .map(|(label, payload)| assertion_box(label, payload, None))
+            .collect();
+        let store = build_manifest_store(&[build_manifest(LABEL, &boxes, &claim, &signature)]);
+        let input = VerifyInput {
+            data: &[],
+            mime: "",
+            claim_signer_trust: Some(&trust),
+            tsa_trust: None,
+            allowed_certs: None,
+            validation_time: Some(
+                OffsetDateTime::from_unix_timestamp(1_811_808_000).expect("2027-06-01 UTC"),
+            ),
+            profile: EngineProfile::GENEROUS,
+            evidence: Default::default(),
+            cawg_strict_encoding: false,
+        };
+
+        let intact = verify_detached(&store, &asset, "video/webm", &input).expect("intact report");
+        assert!(
+            intact.results.has_success(CLAIM_SIGNATURE_VALIDATED),
+            "{:#?}",
+            intact.results
+        );
+        assert!(intact.results.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(!intact.results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert_ne!(
+            intact.validation_state,
+            ValidationState::Invalid,
+            "{:#?}",
+            intact.results
+        );
+
+        let changed =
+            verify_detached(&store, &tampered, "video/webm", &input).expect("tampered report");
+        assert!(changed.results.has_success(CLAIM_SIGNATURE_VALIDATED));
+        assert!(changed.results.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+        assert!(!changed.results.has_success(ASSERTION_DATA_HASH_MATCH));
+        assert!(!changed
+            .results
+            .has_success(ASSERTION_MULTI_ASSET_HASH_MATCH));
+        assert_eq!(changed.validation_state, ValidationState::Invalid);
+
+        // The same real whole-file signature remains supported with a genuinely
+        // unknown 2.5 MIME. Both public detached routes must keep finality.
+        for version in ["2.2", "2.4", "2.5"] {
+            let mut options = crate::VerifyOptions {
+                spec_version: Some(version.into()),
+                validation_time: Some("2027-06-01T00:00:00Z".into()),
+                no_default_trust: true,
+                online: Some(false),
+                ..crate::VerifyOptions::default()
+            };
+            options.telemetry.enabled = Some(false);
+            for (graph, mime) in [
+                (false, "video/webm"),
+                (true, "VIDEO/WEBM; codecs=vp9"),
+                (false, "application/x-private-asset"),
+                (true, "application/x-private-asset"),
+            ] {
+                let verify = |bytes: &[u8]| {
+                    if graph {
+                        crate::verify_with_manifest_store_and_graph_inputs(
+                            bytes,
+                            &store,
+                            mime,
+                            &options,
+                            crate::GraphInputs::default(),
+                        )
+                    } else {
+                        crate::verify_with_manifest_store(bytes, &store, mime, &options)
+                    }
+                };
+                if mime == "application/x-private-asset" && version != "2.5" {
+                    assert_eq!(verify(&asset).unwrap_err().code(), "unsupported_mime");
+                    continue;
+                }
+                let intact = verify(&asset).expect("whole-file detached binding");
+                assert_eq!(intact.signature, "valid", "{intact:?}");
+                assert_eq!(intact.hard_binding, "match", "{intact:?}");
+                let changed = verify(&tampered).expect("detached tamper report");
+                assert_ne!(changed.hard_binding, "match", "{changed:?}");
+                assert!(
+                    changed
+                        .validation_results
+                        .failure
+                        .iter()
+                        .any(|status| status.code == ASSERTION_DATA_HASH_MISMATCH),
+                    "{changed:?}"
+                );
+                assert!(
+                    !changed
+                        .validation_results
+                        .success
+                        .iter()
+                        .any(|status| status.code == ASSERTION_MULTI_ASSET_HASH_MATCH),
+                    "{changed:?}"
+                );
+            }
+            #[cfg(feature = "caller-verified-binding")]
+            {
+                let evaluator_options = crate::VerifyOptions {
+                    spec_version: None,
+                    ..options.clone()
+                };
+                let evaluator = crate::CawgEvaluator::new(
+                    &evaluator_options,
+                    &crate::CawgProfile::new(version, false, false).unwrap(),
+                )
+                .unwrap();
+                for mime in ["video/webm", "application/x-private-asset"] {
+                    let verify = |bytes: &[u8]| {
+                        crate::verify_with_manifest_store_and_cawg(
+                            bytes,
+                            &store,
+                            mime,
+                            &options,
+                            &evaluator,
+                            crate::GraphInputs::default(),
+                        )
+                    };
+                    if mime == "application/x-private-asset" && version != "2.5" {
+                        assert_eq!(verify(&asset).unwrap_err().code(), "unsupported_mime");
+                        continue;
+                    }
+                    let intact = verify(&asset).expect("CAWG whole-file binding");
+                    assert_eq!(intact.signature, "valid", "{intact:?}");
+                    assert_eq!(intact.hard_binding, "match", "{intact:?}");
+                    let changed = verify(&tampered).expect("CAWG detached tamper report");
+                    assert_ne!(changed.hard_binding, "match", "{changed:?}");
+                    assert!(
+                        !changed
+                            .validation_results
+                            .success
+                            .iter()
+                            .any(|status| status.code == ASSERTION_MULTI_ASSET_HASH_MATCH),
+                        "{changed:?}"
+                    );
+                }
+            }
+        }
+
+        let parsed = parse_manifest_store(&store).expect("signed store parses");
+        let manifest = &parsed.manifests[0];
+        let claim = decode(manifest.claim_cbor.expect("claim")).expect("claim CBOR");
+        let claim_refs = ClaimAssertionRefs::build(manifest, &claim, ClaimGeneration::V2);
+        let run = |format, profile| {
+            let mut results = ValidationResults::default();
+            let operative = verify_data_hash(
+                &claim,
+                &claim_refs,
+                &tampered,
+                format,
+                &[],
+                update_manifest::StoreRendition::AsSigned,
+                LABEL,
+                profile,
+                &mut results,
+            );
+            let kind = match operative {
+                Some(OperativeBinding::Primary(_)) => "primary",
+                Some(OperativeBinding::MultiAsset(_)) => "multi-asset",
+                None => "none",
+            };
+            (kind, results)
+        };
+
+        let (ordinary_kind, ordinary) = run(AssetFormat::Jpeg, EngineProfile::GENEROUS);
+        assert_eq!(ordinary_kind, "multi-asset", "{ordinary:#?}");
+        assert!(ordinary.has_success(ASSERTION_MULTI_ASSET_HASH_MATCH));
+        assert!(!ordinary.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+
+        for version in [SpecVersion::V2_2, SpecVersion::V2_4, SpecVersion::V2_5] {
+            for format in [AssetFormat::ExternalMedia, AssetFormat::Opaque] {
+                let (detached_kind, detached) =
+                    run(format, EngineProfile::new(version, OperatingMode::Regular));
+                assert_eq!(detached_kind, "none", "{detached:#?}");
+                assert!(detached.has_failure(ASSERTION_DATA_HASH_MISMATCH));
+                assert!(!detached.has_success(ASSERTION_MULTI_ASSET_HASH_MATCH));
+            }
+        }
+    }
+
+    #[test]
     fn unstructured_text_hash_removes_wrapper_then_normalizes_to_nfc() {
         let carrier_nfd = "Cafe\u{301}";
         let wrapper = c2pa_text::encode_wrapper(b"manifest");
         let asset = format!("{carrier_nfd}{wrapper}");
         let expected = sha("Caf\u{e9}".as_bytes());
-        let results = run_text_data_hash(
+        let results = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             asset.as_bytes(),
             expected,
             &[(carrier_nfd.len(), wrapper.len())],
@@ -12750,7 +13109,8 @@ mod tests {
         let carrier = "signed text";
         let wrapper = c2pa_text::encode_wrapper(b"manifest");
         let asset = format!("{carrier}{wrapper}");
-        let results = run_text_data_hash(
+        let results = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             asset.as_bytes(),
             sha(carrier.as_bytes()),
             &[(0, 1)],
@@ -12768,7 +13128,8 @@ mod tests {
         let second = c2pa_text::encode_wrapper(b"second");
         let asset = format!("signed{first} text{second}");
         let second_start = "signed".len() + first.len() + " text".len();
-        let results = run_text_data_hash(
+        let results = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             asset.as_bytes(),
             sha(b"signed text"),
             &[("signed".len(), first.len()), (second_start, second.len())],
@@ -12784,7 +13145,8 @@ mod tests {
     fn detached_text_hashes_exact_asset_bytes_without_an_embedded_wrapper() {
         let nfd = "Cafe\u{301}".as_bytes();
         let profile = EngineProfile::new(SpecVersion::V2_5, OperatingMode::Regular);
-        let intact = run_text_data_hash(
+        let intact = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             nfd,
             sha(nfd),
             &[],
@@ -12793,7 +13155,8 @@ mod tests {
         );
         assert!(intact.has_success(ASSERTION_DATA_HASH_MATCH));
         assert!(!intact.has_failure(ASSERTION_DATA_HASH_MALFORMED));
-        let changed = run_text_data_hash(
+        let changed = run_asset_data_hash(
+            AssetFormat::TextUnstructured,
             nfd,
             sha("Caf\u{e9}".as_bytes()),
             &[],
@@ -18099,6 +18462,43 @@ mod tests {
             "{results:?}"
         );
         assert!(!results.has_success(ASSERTION_DATA_HASH_MATCH));
+    }
+
+    /// C2PA 2.4 A.9.4: a structured-text block appended at the end of the file
+    /// is excluded "from the newline character preceding the manifest block"
+    /// to the end of the file. That newline belongs to the manifest carrier, so
+    /// a conformant exclusion matches; one more byte of the host text does not.
+    #[test]
+    fn an_end_placed_structured_text_block_binds_from_its_preceding_newline() {
+        use c2pa_text::structured::{embed_structured, encode_data_uri, Placement};
+        let format = AssetFormat::TextStructured {
+            comment_prefix: "<!--",
+            comment_suffix: "-->",
+        };
+        let signed = embed_structured(
+            "# Budget\n\nThe committee approved the budget.\n",
+            &encode_data_uri(&[0xAA; 32]),
+            "<!--",
+            "-->",
+            Placement::End,
+            "\n",
+        );
+        let asset = signed.text.as_bytes();
+        let conformant = (signed.exclusion_start, signed.exclusion_length);
+        assert_eq!(asset[conformant.0], b'\n');
+
+        let results = data_hash_binding(format, asset, &[conformant]);
+        assert!(
+            results.has_success(ASSERTION_DATA_HASH_MATCH),
+            "{results:?}"
+        );
+
+        let widened = (conformant.0 - 1, conformant.1 + 1);
+        let results = data_hash_binding(format, asset, &[widened]);
+        assert!(
+            results.has_failure(ASSERTION_DATA_HASH_MISMATCH),
+            "{results:?}"
+        );
     }
 
     /// Zeroed padding beside the store is explicitly permitted, and metadata

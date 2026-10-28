@@ -32,10 +32,10 @@ spki = "0.7"
 const-oid = "0.9"
 der = "0.7"
 time = "0.3"
-p256 = "0.13"
-p384 = "0.13"
-p521 = "0.13.3"
-ecdsa = "0.16"
+p256 = { version = "0.14", default-features = false }
+p384 = { version = "0.14", default-features = false }
+p521 = { version = "0.14", default-features = false }
+ecdsa = "0.17"
 rsa = "0.9"
 ed25519-dalek = "2"
 pkcs8 = "0.10"

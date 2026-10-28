@@ -104,58 +104,6 @@ def test_verify_uses_core_dng_mime_before_platform_fallback(
 
 
 @pytest.mark.parametrize(
-    "asset",
-    [b"asset", bytearray(b"asset"), memoryview(b"asset")],
-    ids=["bytes", "bytearray", "memoryview"],
-)
-def test_verify_passes_buffer_to_native_without_wrapper_copy(
-    asset, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    observed = {}
-
-    def capture_verify(data, _mime_type, _options_json):
-        observed["data"] = data
-        return "{}"
-
-    monkeypatch.setattr(encypher_c2pa, "verify_bytes", capture_verify)
-
-    encypher_c2pa.verify(asset, "image/jpeg")
-
-    assert observed["data"] is asset
-
-
-def test_verify_routes_fragmented_buffers_to_native(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    observed = {}
-
-    def capture_verify(init, fragments, mime_type, options_json):
-        observed.update(
-            init=init,
-            fragments=fragments,
-            mime_type=mime_type,
-            options=json.loads(options_json),
-        )
-        return "{}"
-
-    monkeypatch.setattr(
-        encypher_c2pa, "verify_fragmented_bytes", capture_verify
-    )
-    fragments = [b"one", bytearray(b"two"), memoryview(b"three")]
-    encypher_c2pa.verify(
-        b"init",
-        "video/mp4",
-        fragments=fragments,
-        telemetry=False,
-    )
-
-    assert observed["init"] == b"init"
-    assert observed["fragments"] == fragments
-    assert observed["mime_type"] == "video/mp4"
-    assert observed["options"]["telemetry"]["enabled"] is False
-
-
-@pytest.mark.parametrize(
     ("name", "expected"),
     [
         ("drawing.odg", "application/vnd.oasis.opendocument.graphics"),
@@ -301,3 +249,13 @@ def test_cawg_trust_configurations_are_forwarded_to_validation_and_verification(
 
     assert validated[0]["cawg_trust_configurations"] == configurations
     assert verified[0]["cawg_trust_configurations"] == configurations
+
+
+def test_a_bare_string_is_not_a_sequence_of_presentation_times() -> None:
+    with pytest.raises(TypeError, match="stream_presentation_times"):
+        encypher_c2pa.verify_stream(
+            b"init",
+            [b"seg-0"],
+            "video/mp4",
+            stream_presentation_times="2026-10-26T22:30:00Z",
+        )

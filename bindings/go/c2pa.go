@@ -98,13 +98,19 @@ type Options struct {
 	// verification ignores them.
 	ExpectedSeekPositions []int `json:"expected_seek_positions,omitempty"`
 	// SpecVersion selects the C2PA validation policy: "2.2", "" or "2.4"
-	// (the default, identical reports), or "2.5" for the proposed draft.
+	// (the default, identical reports), or "2.5" for the published standard.
 	// StrictConformance selects the published program posture under 2.2/2.4
 	// and strict technical core validation under 2.5. The latter makes no
 	// certified or Conformance Program claim.
 	SpecVersion       string `json:"spec_version,omitempty"`
 	StrictConformance bool   `json:"strict_conformance,omitempty"`
 	ValidationTime    string `json:"validation_time,omitempty"`
+	// StreamPresentationTimes are trusted RFC 3339 instants, one per segment.
+	// Nil assesses every segment at ValidationTime (default now). A non-nil
+	// slice must have one entry per segment; empty is refused, not absent.
+	// Merkle-bound and per-segment streams, and VerifyFragmented, refuse it.
+	// Only supply times from a record you control, never from signed iat.
+	StreamPresentationTimes []string `json:"stream_presentation_times"`
 	// Online allows this call to fetch what the asset references: a manifest
 	// store held elsewhere, certificate revocation status, a did:web
 	// document, externally stored content. Nil leaves it off unless the
@@ -717,7 +723,8 @@ func VerifyFragmented(initSegment []byte, fragments [][]byte, mimeType string, o
 // segments in playback order. Both files' declared brands are checked against
 // encapsulation, so a stream presented under the wrong one is refused rather
 // than verified.
-// Mark intentional discontinuities in Options.ExpectedSeekPositions.
+// Mark intentional discontinuities in Options.ExpectedSeekPositions, and pass
+// trusted per-segment presentation times in Options.StreamPresentationTimes.
 func VerifyStream(initSegment []byte, segments [][]byte, mimeType string, encapsulation StreamEncapsulation, method StreamMethod, options *Options) (*StreamReport, error) {
 	if mimeType == "" {
 		return nil, errors.New("mime type is required")

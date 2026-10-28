@@ -949,14 +949,15 @@ fn locate_span(text: &str, begin: &str, end: &str) -> Option<(usize, usize)> {
     Some((start, end_abs - start))
 }
 
-/// Locate the full A.9 structured manifest block span, widening the bare armour
-/// delimiter span to include any host comment markers that wrap it (e.g.
-/// `<!-- … -->`, `/* … */`). The armour delimiters are found first, then the
-/// span is grown to the start of the line holding `BEGIN` and the end of the
-/// line holding `END`, so the `c2pa.hash.data` exclusion covers the entire
-/// comment-wrapped annotation rather than just the inner armour. For an
-/// un-wrapped (bare) block the widened span equals the delimiter span. Scanning
-/// for `\n` (0x0A) is UTF-8-safe: it never occurs inside a multi-byte sequence.
+/// Locate the A.9 structured manifest block's `c2pa.hash.data` exclusion
+/// (C2PA 2.4 A.9.4). The armour delimiters are found first, then the span is
+/// grown to the whole comment line(s) holding them, so host comment markers
+/// (`<!-- … -->`, `/* … */`) are excluded with the armour. The line
+/// terminators then follow A.9.4: a block appended at the end of the file is
+/// excluded from the newline preceding it, and a block at the start of the file
+/// is excluded through its trailing line terminator. Both match the range
+/// `c2pa_text::structured::embed_structured` reports. Scanning for `\n` (0x0A)
+/// is UTF-8-safe: it never occurs inside a multi-byte sequence.
 fn structured_block_span(text: &str) -> Option<(usize, usize)> {
     let (start, len) = locate_span(
         text,
@@ -968,8 +969,12 @@ fn structured_block_span(text: &str) -> Option<(usize, usize)> {
     while block_start > 0 && bytes[block_start - 1] != b'\n' {
         block_start -= 1;
     }
+    block_start = block_start.saturating_sub(1);
     let mut block_end = start + len;
     while block_end < bytes.len() && bytes[block_end] != b'\n' {
+        block_end += 1;
+    }
+    if block_end < bytes.len() {
         block_end += 1;
     }
     Some((block_start, block_end - block_start))
@@ -1168,13 +1173,13 @@ mod tests {
             Some(store)
         );
         // The data-hash exclusion spans the WHOLE comment block (markers
-        // included); the original source lies entirely outside it.
+        // included) from its preceding newline (A.9.4).
         let ex = exclusions(TextMethod::Structured, &embedded, TextLocatorRules::V2_4).unwrap();
         assert_eq!(ex.len(), 1);
         let excluded = &embedded[ex[0].start..ex[0].start + ex[0].length];
-        assert!(excluded.starts_with(b"/* -----BEGIN C2PA MANIFEST-----"));
+        assert!(excluded.starts_with(b"\n/* -----BEGIN C2PA MANIFEST-----"));
         assert!(excluded.ends_with(b"*/"));
-        assert!(ex[0].start >= src.len());
+        assert_eq!(ex[0].start, src.len());
         assert_eq!(&embedded[..src.len()], src.as_bytes());
     }
 
@@ -1572,6 +1577,32 @@ mod tests {
                 .unwrap()
                 .is_empty(),
                 "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_exclusion_is_the_a94_range_for_either_placement() {
+        // A.9.4 includes the preceding newline at EOF, or the trailing
+        // terminator at the start of the file.
+        use c2pa_text::structured::{embed_structured, encode_data_uri, Placement};
+        let reference = encode_data_uri(&fake_store());
+        for (placement, host) in [
+            (Placement::End, "# Title\n\nsome markdown body\n"),
+            (Placement::End, "# Title without a final newline"),
+            (Placement::Start, "body { color: red }\n"),
+        ] {
+            let signed = embed_structured(host, &reference, "<!--", "-->", placement, "\n");
+            let ex = exclusions(
+                TextMethod::Structured,
+                signed.text.as_bytes(),
+                TextLocatorRules::V2_4,
+            )
+            .unwrap();
+            assert_eq!(
+                ex.iter().map(|e| (e.start, e.length)).collect::<Vec<_>>(),
+                vec![(signed.exclusion_start, signed.exclusion_length)],
+                "{placement:?}: {host:?}"
             );
         }
     }

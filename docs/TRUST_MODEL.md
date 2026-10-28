@@ -83,6 +83,10 @@ Malformed PEM is a hard input error. The verifier never converts malformed trust
 
 A supplied `validation_time` must be RFC 3339. If omitted, native bindings capture current UTC time. The browser binding captures `Date` in JavaScript and passes it explicitly to the Rust core.
 
+A C2PA 2.4 live stream's session keys carry their own validity window. Each segment's window is checked at a trusted assessment time: the matching entry of `stream_presentation_times` when the caller supplies one RFC 3339 instant per segment, otherwise `validation_time`. When present, the segment's signed `iat` must also fall inside the window, but it is self-asserted by the key holder and never replaces the assessment time, so a holder of an expired key cannot backdate a new segment into validity. The SDK makes no claim about where the caller's instants came from: supply them only from a record you trust, such as an ingest log. A time stamp on the initialization manifest dates that manifest, not later segments. `validation_time` alone governs certificate paths and trust-list windows, including for the initialization manifest of a stream verified with per-segment times. A malformed entry, or a count that differs from the supplied segments, fails with `invalid_validation_time`; Merkle-bound and per-segment streams refuse the option rather than ignore it.
+
+The SDK detects a missing prefix by requiring the first live segment to start at the lowest authenticated session-key `minSequenceNumber`, or 1 if that floor is 0. This is the SDK's continuity policy, not a claim that C2PA makes a lower bound an exact start. To begin later, declare an intentional seek at index 0 in `expected_seek_positions`. Retaining an older key with a lower floor retains that expected start.
+
 ## No ambient network or mutable trust
 
 The public SDK does not:
@@ -120,6 +124,8 @@ Maintainers run `scripts/refresh-trust-snapshot --check` to compare the packaged
 A valid C2PA hard binding proves that the bytes covered by the signed assertion match. It does not prove that a composition declared every source used to create it. An omitted ingredient can coexist with a valid signature.
 
 For a 20-source video, each source should appear as its own ingredient assertion. The verifier validates the ingredient links that exist. A policy layer must decide whether the declared set is complete for the workflow.
+
+A valid live segment requires an authenticated C2PA event covering its media. Extra excluded C2PA event boxes can remain without changing that binding; validity does not authenticate every event carried in the segment.
 
 ## Managed decisions
 

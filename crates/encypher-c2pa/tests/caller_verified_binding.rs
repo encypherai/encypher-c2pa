@@ -126,7 +126,7 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
 
     let CawgEvaluation::Evaluated {
         manifest_label,
-        store_manifests,
+        store_manifest_sha256,
         ..
     } = evaluation
     else {
@@ -136,9 +136,8 @@ fn evaluates_the_identity_of_a_store_whose_binding_the_caller_verified() {
         Some(manifest_label.as_str()),
         full.manifest_report["active_manifest"].as_str()
     );
-    assert!(store_manifests
-        .iter()
-        .any(|manifest| manifest.label == manifest_label));
+    let manifests: &[(String, [u8; 32])] = &store_manifest_sha256;
+    assert!(manifests.iter().any(|(label, _)| label == &manifest_label));
 }
 
 /// Statuses the pipeline records outside the identity step (here the
@@ -558,6 +557,36 @@ fn unknown_spec_versions_are_rejected() {
     let error = CawgEvaluator::new(&options, &CawgProfile::new("2.4", false, false).unwrap())
         .expect_err("spec_version in options is ambiguous");
     assert!(error.to_string().contains("spec_version"));
+}
+
+#[test]
+fn evaluator_fragmented_verification_refuses_presentation_times_instead_of_ignoring_them() {
+    let base = offline(VerifyOptions {
+        validation_time: Some("2026-08-06T00:00:00Z".into()),
+        ..VerifyOptions::default()
+    });
+    let evaluator = CawgEvaluator::new(&base, &generous()).unwrap();
+    for times in [
+        Vec::new(),
+        vec!["2026-10-26T12:30:00Z".into()],
+        vec!["malformed".into()],
+    ] {
+        let options = VerifyOptions {
+            stream_presentation_times: Some(times),
+            ..base.clone()
+        };
+        let error = encypher_c2pa::verify_fragmented_with_cawg(
+            b"init",
+            &[b"segment"],
+            "video/mp4",
+            &options,
+            &evaluator,
+            GraphInputs::default(),
+        )
+        .expect_err("fragmented verification cannot consume presentation times");
+        assert_eq!(error.code(), "invalid_validation_time");
+        assert!(error.to_string().contains("stream_presentation_times"));
+    }
 }
 
 /// A manifest store superbox with the same description box and no children.

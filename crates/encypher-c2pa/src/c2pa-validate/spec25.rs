@@ -95,7 +95,7 @@ pub(super) fn is_segment_hash_label(label: &str) -> bool {
     base_assertion_label(label) == "c2pa.hash.segment"
 }
 
-/// The carrier the selected policy reads an asset with.
+/// The carrier the selected policy reads an asset with, for a canonical MIME.
 ///
 /// 2.5 distinguishes the two `text/plain` methods by their delimiters alone
 /// (Embedding manifests into append-only text files, Applicability): a plain
@@ -110,7 +110,7 @@ pub(super) fn select_format(
 ) -> AssetFormat {
     if applies(profile)
         && format == AssetFormat::TextUnstructured
-        && crate::c2pa_core::spec::canonicalize_mime(mime) == "text/plain"
+        && mime == "text/plain"
         && crate::c2pa_formats::declares_checkpoints(data, AppendOnlyFlavor::PlainText)
     {
         AssetFormat::AppendOnlyText {

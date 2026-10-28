@@ -2,7 +2,7 @@
 
 All notable changes to this project are recorded here.
 
-## 1.8.0 - unreleased
+## Unreleased
 
 ### Added
 
@@ -36,7 +36,7 @@ All notable changes to this project are recorded here.
 
 - Published 2.5 permits `activeManifest` alongside `relatedAssertions` in an ingredient. Verification retains reference shape, target eligibility, hash and same-manifest checks, and still rejects `activeManifest` alongside `digitalSourceType`. Signed graph regressions and CLI checks cover accepted and malformed references without changing 2.2/2.4 policy.
 - Failure telemetry reports the profile of the policy that produced the report (`c2pa-2.4` or `c2pa-2.5`).
-- Live session-key delivery and `emsg` signatures now use the claim-algorithm list selected by `VerifyOptions::spec_version`. The compatibility helpers retain their C2PA 2.4 defaults.
+- Live session-key delivery and `emsg` signatures use the claim-algorithm list selected by `VerifyOptions::spec_version`. Default verification remains C2PA 2.4.
 - Exact `"2.5"` certificate paths apply RFC 5280 policy mappings and inhibition through bounded RFC 9618 policy levels, including self-issued key rollover. Processing stops at the selected trust anchor: its encoded validity, path-length, name and policy constraints do not replace configured trust authority. C2PA certificate-profile admission still applies to anchors, including duplicate-extension rejection and a verified self-signed exemption when AKI is absent. Policy qualifiers use their RFC DER shapes, including all four `DisplayText` encodings and overlong `explicitText`. The 2.2 and 2.4 trust paths remain unchanged.
 - Caller-verified ZIP collection bindings now apply the exact 2.5 directory-entry URI policy. Directory URIs remain invalid under 2.2 and 2.4.
 - Exact 2.5 ZIP verification checks local CRC and sizes against the central directory, resolves local ZIP64 size fields, rejects inconsistent classic/ZIP64 end records and nonzero disk starts, and consumes ZIP64 extra fields exactly. Earlier policies remain unchanged.
@@ -45,6 +45,35 @@ All notable changes to this project are recorded here.
 ### Fixed
 
 - Evaluator-driven strict verification retains the caller's diagnostic request and emits the kernel's Content Credentials JSON, including caller-verified-binding results. The evaluator still owns the selected revision, compliance posture, CAWG inputs and validation instant. Regular and default verification keep their existing report behavior.
+- Fragmented verification rejects supplied presentation times consistently across ordinary, graph-input and CAWG evaluator entry points. Merkle-bound fragments use `validation_time`; omitting presentation times preserves existing verification.
+- `VerifyOptions::validate_with_external_data` rejects malformed indexed presentation times with the same checks and error ordering as `validate`, while retaining already-decoded external evidence.
+- Embedded resource discovery preserves the BMFF `audio/aac` alias, including case and parameters, under every supported policy. Detached raw ADTS keeps its separate byte-based dispatch.
+- Detached 2.5 verification shares designated-media byte checks across ordinary, graph, online and CAWG paths. Both designated external media and eligible unknown types require a whole-file binding; exclusions and multi-asset fallback cannot rescue a failed primary binding.
+- Go binding CI and contributor commands force fresh compilation and test execution after rebuilding the Rust archive; cgo's cache does not detect changes to that external library.
+
+## 1.8.0 - 2026-10-27
+
+### Added
+
+- Detached-manifest verification for WebM, ICO, BMP, raw ADTS AAC, WOFF and WOFF2. The supplied media bytes must match the declared format's file signature and a whole-file data hash with no exclusions. Embedded discovery and the existing format registry are unchanged.
+- `VerifyOptions::stream_presentation_times` (CLI `--stream-presentation-time`, repeatable; Python `stream_presentation_times`; Go `StreamPresentationTimes`; the WebAssembly and C options objects): one trusted RFC 3339 presentation time per stream segment, in segment order. Each session-key segment's key window is checked at its own time, so an archive recorded under several session keys can be verified after those keys expired, with sequence continuity still enforced across the key changes. Omitted, every segment is checked at `validation_time`, which defaults to now. The verifier takes the times on the caller's word and never derives them from a segment's signed `iat`; a time stamp on the initialization manifest does not date later segments. `validation_time` alone still governs certificate trust. A malformed time or a count that differs from the supplied segments fails with `invalid_validation_time`. Merkle-bound and per-segment streams, and `verify_fragmented_with_options`, refuse the option.
+
+### Fixed
+
+- Live streams using verifiable segment info are checked against C2PA 2.4 sections 19.4.1 and 19.4.2. A C2PA `emsg` must be version 0 with the value `fseg` (the verifier previously required `c2pa`) and `presentation_time_delta` 0. Its `timescale` and `event_duration` must cover every track's samples in the segment, timed by the init segment's `mdhd` timescales and `trex` defaults. The segment's `bmffHash` must carry no `merkle` field, and its exclusions are applied with every 18.6.2 qualifier. Before this change, a bare `/emsg` path excluded every event message, so an ad-insertion or timed-metadata `emsg` could be edited without failing verification. Now the `/emsg` exclusions must carry a `data` qualifier on the C2PA scheme URI and must remove the C2PA event and no other `emsg`; every other event message is hashed. Section 19.4.1 places that qualifier at offset 0, which under 18.6.2's box-relative offsets can never match a box. The verifier applies the generic matcher instead (offset 12 for a version-0 `emsg` with a 32-bit size) and does not reinterpret offsets for `emsg`. Streams signed with the previous layout no longer verify.
+- Live duration checks include composition offsets, fragment gaps and unit-rate edit lists. Edited tracks without an explicit decode-time origin, and unsupported timing layouts, fail closed. Rotated initialization manifests start continuity checks at the lowest authenticated session-key sequence floor rather than always at 1.
+- Detached whole-file binding failures cannot be rescued by a multi-asset assertion that excludes changed bytes.
+- Session-key `COSE_Key.alg` is optional; when present, it must match the protected signature algorithm. All nine combinations of ES256/ES384/ES512 and P-256/P-384/P-521 are supported.
+- Distinct C2PA events must have session-unique IDs, including extra candidates after a valid carrier. Replaying an identical segment remains subject to the explicit seek and sequence-continuity rules.
+- `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.11 in the lock file, for RUSTSEC-2026-0382 and RUSTSEC-2026-0381. Both are reached only through the HTTP client behind the `online` and `telemetry` features.
+- `p256`, `p384` and `p521` 0.14 with `ecdsa` 0.17, which move `crypto-bigint` from 0.5.5 to 0.7.10, for RUSTSEC-2026-0387. One acceptance change follows from `ecdsa` 0.17: a valid ECDSA signature over a P-521 key with a SHA-256 digest now verifies. The previous release rejected it because the digest is shorter than half the field size.
+
+## 1.7.1 - 2026-10-18
+
+### Fixed
+
+- A structured-text manifest block appended at the end of a file verifies when its `c2pa.hash.data` exclusion starts at the newline before the block, as C2PA 2.4 A.9.4 requires. The verifier located the block from its comment line, read that newline as asset data inside the manifest exclusion, and failed every conformant Markdown, XML, CSS, YAML, TOML and JavaScript asset with `assertion.dataHash.mismatch`. A block at the start of a file is now located through its trailing line terminator, also per A.9.4. An exclusion that reaches into the host text is still rejected.
+- `rustls` 0.23.46 in the lock file, for RUSTSEC-2026-0346, -0347, -0348 and -0349.
 
 ## 1.7.0 - 2026-10-01
 

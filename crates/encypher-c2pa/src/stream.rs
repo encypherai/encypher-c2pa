@@ -13,6 +13,7 @@
 //! Merkle tree, or one manifest at a time.
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::c2pa_formats::{
     StreamEncapsulation as KernelEncapsulation, StreamMethod as KernelMethod,
@@ -20,8 +21,8 @@ use crate::c2pa_formats::{
 use crate::c2pa_validate::stream::{verify_stream_safe_with_expected_seeks, StreamVerifyOutput};
 use crate::online::{self, NetworkNeed};
 use crate::{
-    map_validate_error, report_from_output, resolve_mime, Error, NetworkReport, ResolvedOptions,
-    VerificationReport, VerifyOptions, REPORT_SCHEMA_VERSION,
+    map_validate_error, parse_stream_presentation_times, report_from_output, resolve_mime, Error,
+    NetworkReport, ResolvedOptions, VerificationReport, VerifyOptions, REPORT_SCHEMA_VERSION,
 };
 
 /// How a fragmented stream is packaged.
@@ -206,6 +207,12 @@ pub fn verify_stream(
 ///
 /// [`VerifyOptions::expected_seek_positions`] marks intentional discontinuities
 /// by their zero-based indexes into `segments`.
+///
+/// Each session-key segment's key window is judged at
+/// [`VerifyOptions::validation_time`] (default now), or at the matching entry
+/// of [`VerifyOptions::stream_presentation_times`] when the caller supplies a
+/// trusted presentation instant for every segment. Those instants are parsed
+/// once here and must number exactly `segments.len()`.
 pub fn verify_stream_with_options(
     init_segment: &[u8],
     segments: &[&[u8]],
@@ -238,14 +245,27 @@ fn verify_stream_with_options_and_expected_seeks(
     // Every BMFF type is in the 2.4 registry, so the policy-independent
     // registry check is the right one; the BMFF test below narrows it.
     let mime = resolve_mime(mime_type, crate::c2pa_core::EngineProfile::GENEROUS)?;
-    if crate::c2pa_formats::AssetFormat::from_mime(&mime)
+    if crate::c2pa_formats::AssetFormat::from_canonical_mime(&mime)
         != Some(crate::c2pa_formats::AssetFormat::Bmff)
     {
         return Err(Error::UnsupportedMime(mime));
     }
+    let presentation_times =
+        parse_stream_presentation_times(options.stream_presentation_times.as_deref())?;
+    if let Some(times) = &presentation_times {
+        if times.len() != segments.len() {
+            return Err(Error::InvalidValidationTime(format!(
+                "stream_presentation_times: {} entries for {} supplied segment(s); \
+                 supply exactly one trusted presentation time per segment",
+                times.len(),
+                segments.len()
+            )));
+        }
+    }
     let (mut report, needs) = stream_pass(
         init_segment,
         segments,
+        presentation_times.as_deref(),
         expected_seek_positions,
         &mime,
         encapsulation,
@@ -263,6 +283,7 @@ fn verify_stream_with_options_and_expected_seeks(
     let (mut report, _) = stream_pass(
         init_segment,
         segments,
+        presentation_times.as_deref(),
         expected_seek_positions,
         &mime,
         encapsulation,
@@ -278,6 +299,7 @@ fn verify_stream_with_options_and_expected_seeks(
 fn stream_pass(
     init_segment: &[u8],
     segments: &[&[u8]],
+    presentation_times: Option<&[OffsetDateTime]>,
     expected_seek_positions: &[usize],
     mime: &str,
     encapsulation: StreamEncapsulation,
@@ -290,6 +312,7 @@ fn stream_pass(
         &resolved.input(init_segment, &mime),
         init_segment,
         segments,
+        presentation_times,
         expected_seek_positions,
         encapsulation.kernel(),
         method.kernel(),
