@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Added
+
+- C2PA 2.5 reader reports serialize matching `trust_list_sources`. Bundled C2PA claim and TSA anchors carry their respective trust-list URIs. Supplemental Encypher anchors carry no attribution unless the same certificate also appears in the corresponding C2PA list, whose attribution then takes precedence.
+
 ## 1.9.0 - 2026-10-28
 
 ### Added

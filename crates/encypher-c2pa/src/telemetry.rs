@@ -229,6 +229,7 @@ mod tests {
             validation_results: ValidationResults {
                 success: vec![],
                 informational: vec![],
+                trust_list_sources: Vec::new(),
                 failure: vec![
                     crate::VerificationStatus {
                         code: "claimSignature.mismatch".to_string(),

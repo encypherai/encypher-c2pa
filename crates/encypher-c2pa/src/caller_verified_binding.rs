@@ -255,6 +255,7 @@ impl CawgEvaluator {
                     success: identity.success.iter().map(copy_status).collect(),
                     informational: identity.informational.iter().map(copy_status).collect(),
                     failure: identity.failure.iter().map(copy_status).collect(),
+                    trust_list_sources: identity.trust_list_sources.clone(),
                 },
             },
             (_, manifest_label) => CawgEvaluation::StoreGateClosed {
