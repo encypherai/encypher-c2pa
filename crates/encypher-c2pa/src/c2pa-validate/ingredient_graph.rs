@@ -140,6 +140,7 @@ pub(super) struct Budget {
     bytes: usize,
     exhausted: [Option<usize>; 4],
     reported: [bool; 4],
+    pub(super) redactions: Option<std::sync::Arc<super::redaction::Index>>,
 }
 
 impl Budget {
@@ -156,6 +157,7 @@ impl Budget {
             bytes: 0,
             exhausted: [None; 4],
             reported: [false; 4],
+            redactions: None,
         }
     }
 
@@ -308,6 +310,63 @@ struct Edge {
     recorded: Option<Value>,
 }
 
+/// Discover the complete bounded lineage before validating any target. Sorting
+/// edges makes resource-limited discovery independent of ingredient order.
+pub(super) fn redaction_index(
+    active_label: &str,
+    store: StoreContext<'_>,
+    profile: EngineProfile,
+    limits: GraphLimits,
+    results: &mut ValidationResults,
+) -> std::sync::Arc<super::redaction::Index> {
+    let mut index = super::redaction::Index::default();
+    let mut budget = Budget::new(limits);
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([(active_label.to_string(), 0)]);
+    while let Some((label, depth)) = queue.pop_front() {
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        let Some(manifest) = store
+            .manifests
+            .iter()
+            .find(|manifest| manifest.label == label)
+        else {
+            continue;
+        };
+        if !budget.depth(depth) || !budget.node() || !budget.bytes(manifest.manifest_jumbf.len()) {
+            break;
+        }
+        let Some(claim) = manifest.claim_cbor.and_then(|bytes| decode(bytes).ok()) else {
+            continue;
+        };
+        let generation = versions::claim_generation(manifest, &claim);
+        let refs = ClaimAssertionRefs::build(manifest, &claim, generation);
+        if label != active_label && is_time_stamp_manifest(&refs) {
+            continue;
+        }
+        let declarations = match claim.get("redacted_assertions") {
+            Some(Value::Array(entries)) => {
+                entries.len().min(super::redaction::MAX_REDACTED_ASSERTIONS)
+            }
+            _ => 0,
+        };
+        if !budget.references(declarations) {
+            break;
+        }
+        index.add_claim(&label, &claim, store.manifests);
+        let mut ignored = ValidationResults::default();
+        let mut next = edges(manifest, &refs, generation, profile, &mut ignored);
+        next.sort_by(|left, right| left.target.cmp(&right.target));
+        if !budget.references(next.len()) {
+            break;
+        }
+        queue.extend(next.into_iter().map(|edge| (edge.target, depth + 1)));
+    }
+    budget.report(active_label, results);
+    std::sync::Arc::new(index)
+}
+
 /// Walk the active manifest's ingredient graph.
 ///
 /// `active_label` must name a manifest in `store`; anything else yields an
@@ -324,6 +383,15 @@ pub(super) fn build<'a>(
         deltas: Vec::new(),
         reached: Vec::new(),
     };
+    if budget.redactions.is_none() {
+        budget.redactions = Some(redaction_index(
+            active_label,
+            store,
+            profile,
+            budget.limits,
+            &mut graph.active,
+        ));
+    }
     let index_of: HashMap<&str, usize> = store
         .manifests
         .iter()
@@ -366,6 +434,7 @@ pub(super) fn build<'a>(
         };
         let generation = versions::claim_generation(manifest, claim);
         let mut claim_refs = ClaimAssertionRefs::build(manifest, claim, generation);
+        claim_refs.redactions = budget.redactions.clone();
         // A time-stamp manifest reached through an ingredient "shall be
         // ignored" (C2PA 2.4, Time-Stamp Manifests in an ingredient).
         if !is_active && is_time_stamp_manifest(&claim_refs) {
@@ -550,6 +619,13 @@ fn validate_reached_manifest<'a>(
     results: &mut ValidationResults,
 ) {
     let sig_url = format!("self#jumbf=/c2pa/{}/c2pa.signature", manifest.label);
+    super::redaction::verify_claim_redactions(
+        &manifest.label,
+        claim,
+        cache.store.manifests,
+        results,
+    );
+    super::verify_redacted_identity_references(claim_refs, results);
     verify_assertion_bindings(
         claim,
         claim_refs,
@@ -1871,4 +1947,9 @@ mod tests {
             limited.report.validation_results.informational
         );
     }
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/redaction_lineage/mod.rs"
+    ));
 }

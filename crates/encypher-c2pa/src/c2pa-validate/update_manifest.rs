@@ -645,6 +645,7 @@ mod tests {
             },
             &[],
             crate::c2pa_core::EngineProfile::GENEROUS,
+            None,
             &mut results,
         );
 
@@ -717,6 +718,7 @@ mod tests {
             },
             &[],
             crate::c2pa_core::EngineProfile::GENEROUS,
+            None,
             &mut results,
         );
 
@@ -816,6 +818,7 @@ mod tests {
             },
             &[],
             crate::c2pa_core::EngineProfile::GENEROUS,
+            None,
             &mut results,
         );
 
@@ -860,6 +863,7 @@ mod tests {
             },
             &[],
             crate::c2pa_core::EngineProfile::GENEROUS,
+            None,
             &mut results,
         );
 
