@@ -478,4 +478,79 @@ mod redaction_lineage {
             assert!(out.results.success.iter().any(|status| status.code == "ingredient.claimSignature.validated"));
         }
     }
+
+    #[test]
+    fn signed_parent_action_related_assertions_reach_the_child_ingredient_delta() {
+        let signer = Signer::conformant();
+        for schema_path in [false, true] {
+            let private = secret();
+            let binding = Assertion::new("c2pa.hash.data", &data_hash());
+            let mut actions = created_actions();
+            let mut items = actions.get("actions").unwrap().clone();
+            let Value::Array(list) = &mut items else { unreachable!() };
+            let references = Value::Array(vec![absolute(&private, INGREDIENT)]);
+            if schema_path {
+                set(&mut list[0], "parameters", Some(vmap(vec![("relatedAssertions", references)])));
+            } else {
+                // An action-item extension with this name is not the schema's
+                // parameters.relatedAssertions reference field.
+                set(&mut list[0], "relatedAssertions", Some(references));
+            }
+            set(&mut actions, "actions", Some(items));
+            let actions = Assertion::new("c2pa.actions.v2", &actions);
+            let claim_bytes = enc(&claim(vec![binding.reference(), actions.reference(), private.reference()]));
+            let signature = signer.sign(&claim_bytes);
+            // Remove only the private box. The parent's signed claim, actions
+            // assertion and COSE signature retain their original bytes.
+            let parent = build_manifest(INGREDIENT,
+                &[binding.jumbf, actions.jumbf], &claim_bytes, &signature);
+
+            let parent_link = Assertion::new("c2pa.ingredient.v3",
+                &ingredient(INGREDIENT, &parent, &signature, "parentOf", None));
+            let target = uri(INGREDIENT, SECRET);
+            let actions = Assertion::new("c2pa.actions.v2", &vmap(vec![
+                ("allActionsIncluded", Value::Bool(true)),
+                ("actions", Value::Array(vec![
+                    vmap(vec![
+                        ("action", Value::Text("c2pa.opened".into())),
+                        ("parameters", vmap(vec![
+                            ("ingredients", Value::Array(vec![parent_link.reference()])),
+                        ])),
+                    ]),
+                    vmap(vec![
+                        ("action", Value::Text("c2pa.redacted".into())),
+                        ("reason", Value::Text("c2pa.PII.present".into())),
+                        ("parameters", vmap(vec![("redacted", Value::Text(target.clone()))])),
+                    ]),
+                ])),
+            ]));
+            let binding = Assertion::new("c2pa.hash.data", &data_hash());
+            let mut child_claim = claim(vec![actions.reference(), parent_link.reference(), binding.reference()]);
+            set(&mut child_claim, "redacted_assertions", Some(Value::Array(vec![Value::Text(target.clone())])));
+            let claim_bytes = enc(&child_claim);
+            let signature = signer.sign(&claim_bytes);
+            let child = build_manifest(ACTIVE,
+                &[actions.jumbf, parent_link.jumbf, binding.jumbf], &claim_bytes, &signature);
+
+            for profile in policies() {
+                let out = verify_store_under(&[parent.clone(), child.clone()], profile);
+                let edge = format!("self#jumbf=/c2pa/{ACTIVE}/c2pa.assertions/c2pa.ingredient.v3");
+                let delta = deltas(&out).into_iter().find(|delta|
+                    delta["ingredientAssertionURI"].as_str() == Some(edge.as_str()))
+                    .expect("child-to-parent ingredient delta");
+                assert!(delta_codes(delta, "success").contains(&"claimSignature.validated"));
+                let informational = delta["validationDeltas"]["informational"].as_array().unwrap();
+                assert_eq!(informational.iter().any(|status|
+                    status["code"] == "assertion.redacted" && status["url"] == target),
+                    schema_path && profile.version == SpecVersion::V2_5,
+                    "schema_path={schema_path}, policy={:?}, delta={delta}", profile.version);
+                assert_eq!(delta_codes(delta, "failure").contains(&"hashedURI.missing"),
+                    schema_path && profile.version != SpecVersion::V2_5);
+                if profile.version == SpecVersion::V2_5 {
+                    assert!(delta_codes(delta, "failure").is_empty(), "{delta}");
+                    assert_no_redaction_binding_failures(&out);
+                }
+            }
+        }
+    }
 }
