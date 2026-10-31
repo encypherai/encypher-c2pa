@@ -647,7 +647,7 @@ mod tests {
                 not_after: Some(end.into()),
             }];
             let trust = crate::resolve_trust(
-                None,
+                Some(&pem),
                 Some(&sources),
                 None,
                 crate::c2pa_trust::AnchorPurpose::TimeStamping,
@@ -655,6 +655,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+            assert_eq!(
+                trust.get().anchors.len(),
+                1,
+                "windowed source replaces the PEM duplicate"
+            );
             for profile in [
                 CertificateProfile::V2_2,
                 CertificateProfile::V2_4,

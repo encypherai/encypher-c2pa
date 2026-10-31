@@ -2237,6 +2237,7 @@ fn resolve_trust(
             AnchorPurpose::CawgIdentity => trust.with_cawg_source(CawgTrustSource::CallerSupplied),
             _ => trust,
         });
+    let mut windowed = TrustList::default();
     for (index, source) in sources.unwrap_or_default().iter().enumerate() {
         if source.uri.trim().is_empty() || url::Url::parse(&source.uri).is_err() {
             return Err(Error::InvalidTrust(format!(
@@ -2288,10 +2289,47 @@ fn resolve_trust(
             .map_err(|error| Error::InvalidTrust(format!("trust source {index}: {error}")))?
             .with_bounds(not_before, not_after)
             .with_source(metadata);
-        match &mut custom {
-            Some(custom) => custom.anchors.extend(sourced.anchors),
-            None => custom = Some(sourced),
+        if source.not_before.is_some() || source.not_after.is_some() {
+            for anchor in sourced.anchors {
+                if let Some(existing) = windowed
+                    .anchors
+                    .iter_mut()
+                    .find(|existing| existing.certificate == anchor.certificate)
+                {
+                    existing.not_before = existing
+                        .not_before
+                        .into_iter()
+                        .chain(anchor.not_before)
+                        .max();
+                    existing.not_after =
+                        existing.not_after.into_iter().chain(anchor.not_after).min();
+                } else {
+                    windowed.anchors.push(anchor);
+                }
+            }
+        } else {
+            match &mut custom {
+                Some(custom) => custom.anchors.extend(sourced.anchors),
+                None => custom = Some(sourced),
+            }
         }
+    }
+    if !windowed.anchors.is_empty() {
+        let mut merged = bundled.cloned().unwrap_or_default();
+        if let Some(custom) = custom {
+            merged.anchors.extend(custom.anchors);
+        }
+        // A window is a restriction on the certificate, not just on one
+        // occurrence of it. Remove every unbounded duplicate, including a
+        // bundled copy, before installing the intersected sourced entry.
+        merged.anchors.retain(|anchor| {
+            !windowed
+                .anchors
+                .iter()
+                .any(|bounded| bounded.certificate == anchor.certificate)
+        });
+        merged.anchors.extend(windowed.anchors);
+        return Ok(Some(ResolvedTrust::Owned(merged)));
     }
     match (bundled, custom) {
         (None, None) => Ok(None),
@@ -2576,6 +2614,90 @@ mod tests {
         GraphLimits, VerificationReport, VerifyOptions,
     };
     use std::{io::Cursor, path::Path};
+
+    #[test]
+    fn windowed_claim_sources_override_pem_duplicates_and_intersect() {
+        use crate::c2pa_crypto::extract_x5chain;
+        use crate::c2pa_trust::{validate_chain_with, AnchorPurpose, CertificateProfile};
+        use crate::c2pa_validate::signature_conformance_tests::Signer;
+        use time::macros::datetime;
+
+        let signer = Signer::conformant();
+        let other = Signer::conformant();
+        let pem = format!("{}{}", signer.root_pem(), other.root_pem());
+        let chain = extract_x5chain(&signer.sign(b"claim")).unwrap();
+        let other_chain = extract_x5chain(&other.sign(b"claim")).unwrap();
+        let source = |uri: &str, start: Option<&str>, end: Option<&str>| {
+            serde_json::from_value::<super::TrustListSource>(serde_json::json!({
+                "uri": uri, "type": "c2pa.trustList", "certificates_pem": signer.root_pem(),
+                "not_before": start, "not_after": end,
+            }))
+            .unwrap()
+        };
+        for reverse in [false, true] {
+            let mut sources = vec![
+                source("urn:fixture:start", Some("2026-06-01T00:00:00Z"), None),
+                source("urn:fixture:end", None, Some("2026-06-30T00:00:00Z")),
+                source("urn:fixture:unbounded", None, None),
+            ];
+            if reverse {
+                sources.reverse();
+            }
+            let trust = super::resolve_trust(
+                Some(&pem),
+                Some(&sources),
+                None,
+                AnchorPurpose::ClaimSigning,
+                (None, None),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(trust.get().anchors.len(), 2);
+            let bounded = trust
+                .get()
+                .anchors
+                .iter()
+                .find(|anchor| anchor.certificate == *chain.last().unwrap())
+                .unwrap();
+            assert_eq!(bounded.not_before, Some(datetime!(2026-06-01 0:00 UTC)));
+            assert_eq!(bounded.not_after, Some(datetime!(2026-06-30 0:00 UTC)));
+            assert!(bounded.source.as_ref().unwrap().uri != "urn:fixture:unbounded");
+            for profile in [
+                CertificateProfile::V2_2,
+                CertificateProfile::V2_4,
+                CertificateProfile::V2_5,
+            ] {
+                for (at, expected) in [
+                    (datetime!(2026-05-31 23:59:59 UTC), false),
+                    (datetime!(2026-06-01 0:00 UTC), true),
+                    (datetime!(2026-06-30 0:00 UTC), true),
+                    (datetime!(2026-06-30 0:00:01 UTC), false),
+                ] {
+                    let result = validate_chain_with(
+                        &chain[0],
+                        &chain[1..],
+                        trust.get(),
+                        AnchorPurpose::ClaimSigning,
+                        Some(at),
+                        profile,
+                    );
+                    assert_eq!(result.trusted, expected, "{at} {profile:?}: {result:?}");
+                    let unaffected = validate_chain_with(
+                        &other_chain[0],
+                        &other_chain[1..],
+                        trust.get(),
+                        AnchorPurpose::ClaimSigning,
+                        Some(at),
+                        profile,
+                    );
+                    assert!(
+                        unaffected.trusted,
+                        "PEM-only anchor must stay trusted: {unaffected:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn source_windows_are_validated_before_asset_io() {

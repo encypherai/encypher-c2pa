@@ -7,6 +7,7 @@ All notable changes to this project are recorded here.
 ### Added
 
 - Caller-supplied claim and TSA trust sources accept optional inclusive RFC 3339 `not_before` and `not_after` windows in Rust, Python mappings, and Go. Options validation refuses malformed or reversed dates. Source windows narrow global anchor bounds at every policy; TSA windows apply at the token's `genTime`, and an out-of-window anchor yields `timeStamp.untrusted`.
+- Source windows govern every copy of the same certificate, including copies in legacy PEM bundles or defaults. Windowed duplicates collapse to one sourced entry; multiple source windows intersect. Certificates supplied only through PEM retain their existing bounds.
 
 ## 1.9.0 - 2026-10-28
 
