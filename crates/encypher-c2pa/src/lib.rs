@@ -473,15 +473,32 @@ pub enum CawgTrustProfile {
     SmimeInterim,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct VerificationStatus {
     pub code: String,
+    #[serde(default)]
     pub url: String,
+    /// Linked resource URI for a per-entry LRI status, serialized as `resourceUrl`.
+    #[serde(default, rename = "resourceUrl")]
+    pub resource_url: Option<String>,
     pub explanation: String,
     /// Machine-readable evidence for extension status codes (e.g. the CAWG
     /// `payload_encoding` detail).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+impl Serialize for VerificationStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        crate::c2pa_validate::serialize_status(
+            serializer,
+            &self.code,
+            &self.url,
+            self.resource_url.as_deref(),
+            &self.explanation,
+            self.details.as_ref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2388,6 +2405,7 @@ fn copy_status(status: &CoreStatus) -> VerificationStatus {
     VerificationStatus {
         code: status.code.clone(),
         url: status.url.clone(),
+        resource_url: status.resource_url.clone(),
         explanation: status.explanation.clone(),
         details: status.details.clone(),
     }
@@ -2610,6 +2628,7 @@ mod tests {
         let status = |source: Option<&str>| StatusCode {
             code: crate::c2pa_validate::SIGNING_CREDENTIAL_OCSP_NOT_REVOKED.into(),
             url: "self#jumbf=/c2pa/urn:c2pa:x/c2pa.signature".into(),
+            resource_url: None,
             explanation: "not revoked".into(),
             details: source.map(|source| serde_json::json!({ "source": source })),
         };

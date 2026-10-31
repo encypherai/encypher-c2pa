@@ -432,18 +432,58 @@ impl ValidationState {
     }
 }
 
-/// A single validation status code with its JUMBF URL and human explanation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A single validation status code with its location and human explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusCode {
     /// The C2PA status code, e.g. `"claimSignature.validated"`.
     pub code: String,
     /// The JUMBF URI the status applies to.
     pub url: String,
+    /// The linked resource URI, instead of a JUMBF URI, for per-entry LRI codes.
+    pub resource_url: Option<String>,
     /// Human-readable explanation.
     pub explanation: String,
     /// Machine-readable evidence for extension status codes.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Json>,
+}
+
+impl Serialize for StatusCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_status(
+            serializer,
+            &self.code,
+            &self.url,
+            self.resource_url.as_deref(),
+            &self.explanation,
+            self.details.as_ref(),
+        )
+    }
+}
+
+/// Keep reader and public status serialization identical, including legacy
+/// empty JUMBF URLs. A resource location replaces the JUMBF location.
+pub(crate) fn serialize_status<S: serde::Serializer>(
+    serializer: S,
+    code: &str,
+    url: &str,
+    resource_url: Option<&str>,
+    explanation: &str,
+    details: Option<&Json>,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut status = serializer.serialize_map(Some(3 + usize::from(details.is_some())))?;
+    status.serialize_entry("code", code)?;
+    if let Some(resource_url) = resource_url {
+        status.serialize_entry("resourceUrl", resource_url)?;
+    } else {
+        status.serialize_entry("url", url)?;
+    }
+    status.serialize_entry("explanation", explanation)?;
+    if let Some(details) = details {
+        status.serialize_entry("details", details)?;
+    }
+    status.end()
 }
 
 /// Validation status codes partitioned by severity.
@@ -490,6 +530,7 @@ impl ValidationResults {
         self.success.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: None,
         });
@@ -504,6 +545,7 @@ impl ValidationResults {
         self.success.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: Some(details),
         });
@@ -512,6 +554,7 @@ impl ValidationResults {
         self.failure.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: None,
         });
@@ -526,6 +569,7 @@ impl ValidationResults {
         self.failure.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: Some(details),
         });
@@ -534,6 +578,7 @@ impl ValidationResults {
         self.informational.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: None,
         });
@@ -549,6 +594,7 @@ impl ValidationResults {
         self.informational.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: Some(details),
         });
@@ -11247,24 +11293,7 @@ fn container_failure_output(code: &str, explanation: &str, profile: EngineProfil
 
 /// Serialize a slice of status codes for the reader report.
 fn status_array(codes: &[StatusCode]) -> Json {
-    Json::Array(
-        codes
-            .iter()
-            .map(|status| {
-                let mut value = json!({
-                    "code": status.code,
-                    "explanation": status.explanation,
-                    "url": status.url,
-                });
-                if let (Some(object), Some(details)) =
-                    (value.as_object_mut(), status.details.as_ref())
-                {
-                    object.insert("details".into(), details.clone());
-                }
-                value
-            })
-            .collect(),
-    )
+    Json::Array(codes.iter().map(|status| json!(status)).collect())
 }
 
 /// Build the `validation_results.activeManifest` object.
@@ -11929,6 +11958,7 @@ mod tests {
         let status = |code: &str, details: Option<Json>| StatusCode {
             code: code.into(),
             url: String::new(),
+            resource_url: None,
             explanation: String::new(),
             details,
         };

@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- C2PA 2.5 linked-resource integrity entry statuses retain their resource URI as `resourceUrl` in public reports, reader reports and crJSON, without a competing JUMBF `url`. C2PA 2.2 and 2.4 report serialization is unchanged. crJSON schema regressions use the published schema for each revision.
+
 ## 1.9.0 - 2026-10-28
 
 ### Added

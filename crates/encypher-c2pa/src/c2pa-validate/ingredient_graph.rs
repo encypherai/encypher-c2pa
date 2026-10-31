@@ -256,6 +256,7 @@ impl Budget {
             results.informational.push(StatusCode {
                 code: GRAPH_LIMIT_EXCEEDED.into(),
                 url: format!("self#jumbf=/c2pa/{active_label}"),
+                resource_url: None,
                 explanation: format!(
                     "verification graph {name} ceiling reached ({limit}); traversal stopped. \
                      This is a resource outcome and does not affect manifest validity."
@@ -770,6 +771,10 @@ fn collect_recorded(codes: Option<&Value>, into: &mut Vec<(&'static str, StatusC
                         .and_then(Value::as_text)
                         .unwrap_or_default()
                         .to_string(),
+                    resource_url: entry
+                        .get("resourceUrl")
+                        .and_then(Value::as_text)
+                        .map(str::to_string),
                     explanation: entry
                         .get("explanation")
                         .and_then(Value::as_text)

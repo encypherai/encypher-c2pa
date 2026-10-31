@@ -1,9 +1,8 @@
 // Copyright 2026 Encypher Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-//! The crJSON the verifier emits under `strict_conformance` is checked against
-//! the C2PA 2.4 crJSON schema, so a conformance-program rubric reading it sees
-//! the same document shape it gets from the reference implementation.
+//! Strict crJSON is checked against the published schema for its selected
+//! C2PA revision, including linked-resource locations introduced in 2.5.
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,9 +43,10 @@ fn content_credentials(name: &str, mime: &str) -> Value {
         .unwrap_or_else(|| panic!("{name} emits crJSON under strict conformance"))
 }
 
-fn crjson_schema() -> (Schemas, SchemaIndex) {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crjson/crJSON.schema.json");
+fn crjson_schema(filename: &str) -> (Schemas, SchemaIndex) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/crjson")
+        .join(filename);
     let document: Value = serde_json::from_slice(&fs::read(&path).expect("schema is readable"))
         .expect("schema is valid JSON");
     let mut schemas = Schemas::new();
@@ -62,7 +62,7 @@ fn crjson_schema() -> (Schemas, SchemaIndex) {
 
 #[test]
 fn strict_conformance_crjson_validates_against_the_c2pa_2_4_schema() {
-    let (schemas, index) = crjson_schema();
+    let (schemas, index) = crjson_schema("crJSON.schema.json");
     for (name, mime) in ASSETS {
         let document = content_credentials(name, mime);
         if let Err(error) = schemas.validate(&document, index) {
@@ -157,4 +157,35 @@ fn the_default_posture_emits_no_crjson() {
             "{name}: crJSON is a strict-conformance side output"
         );
     }
+}
+
+#[test]
+fn status_serialization_preserves_legacy_bytes_and_exclusive_resource_locations() {
+    use encypher_c2pa::VerificationStatus;
+
+    let legacy = VerificationStatus {
+        code: "claim.missing".into(),
+        url: String::new(),
+        resource_url: None,
+        explanation: "no claim".into(),
+        details: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&legacy).expect("legacy status serializes"),
+        r#"{"code":"claim.missing","url":"","explanation":"no claim"}"#
+    );
+    let resource = VerificationStatus {
+        code: "assertion.linkedResourceIntegrity.skipped".into(),
+        url: String::new(),
+        resource_url: Some("https://example.test/resource".into()),
+        explanation: "not retrieved".into(),
+        details: None,
+    };
+    let value = serde_json::to_value(&resource).expect("resource status serializes");
+    assert_eq!(value["resourceUrl"], "https://example.test/resource");
+    assert!(value.get("url").is_none());
+    assert_eq!(
+        serde_json::from_value::<VerificationStatus>(value).expect("resource status round-trips"),
+        resource
+    );
 }
