@@ -383,15 +383,6 @@ pub(super) fn build<'a>(
         deltas: Vec::new(),
         reached: Vec::new(),
     };
-    if budget.redactions.is_none() {
-        budget.redactions = Some(redaction_index(
-            active_label,
-            store,
-            profile,
-            budget.limits,
-            &mut graph.active,
-        ));
-    }
     let index_of: HashMap<&str, usize> = store
         .manifests
         .iter()
