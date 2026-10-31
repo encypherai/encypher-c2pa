@@ -616,6 +616,81 @@ mod tests {
     }
 
     #[test]
+    fn source_windows_apply_at_gen_time_under_every_certificate_policy() {
+        use der::{Decode, EncodePem};
+        use x509_cert::Certificate;
+
+        let tsa = TestTsa::new(
+            datetime!(2025-01-01 0:00 UTC),
+            datetime!(2030-01-01 0:00 UTC),
+        );
+        let pem = Certificate::from_der(&tsa.trust_list().anchors[0].certificate)
+            .unwrap()
+            .to_pem(der::pem::LineEnding::LF)
+            .unwrap();
+        let gen_time = datetime!(2026-06-01 12:00 UTC);
+        let cose = cose(Some(tst_header(
+            "sigTst2",
+            tsa.token(&imprint_input("sigTst2"), gen_time),
+        )));
+        for (start, end, expected) in [
+            ("2026-06-01T12:00:00Z", "2026-06-01T12:00:00Z", true),
+            ("2026-06-01T12:00:01Z", "2027-01-01T00:00:00Z", false),
+            ("2025-01-01T00:00:00Z", "2026-06-01T11:59:59Z", false),
+        ] {
+            let sources = [crate::TrustListSource {
+                uri: "urn:fixture:tsa-list".into(),
+                source_type: "c2pa.tsaTrustList".into(),
+                identifier: None,
+                certificates_pem: pem.clone(),
+                not_before: Some(start.into()),
+                not_after: Some(end.into()),
+            }];
+            let trust = crate::resolve_trust(
+                None,
+                Some(&sources),
+                None,
+                crate::c2pa_trust::AnchorPurpose::TimeStamping,
+                (None, None),
+            )
+            .unwrap()
+            .unwrap();
+            for profile in [
+                CertificateProfile::V2_2,
+                CertificateProfile::V2_4,
+                CertificateProfile::V2_5,
+            ] {
+                let mut results = ValidationResults::default();
+                let trusted = validate_timestamp_evidence(
+                    &cose,
+                    CLAIM,
+                    MANIFEST_ID,
+                    &TimestampAssertionIndex::default(),
+                    Some(trust.get()),
+                    datetime!(2026-09-01 0:00 UTC),
+                    profile,
+                    &mut results,
+                    URL,
+                );
+                assert_eq!(
+                    trusted.is_some(),
+                    expected,
+                    "{start}..{end} {profile:?}: {results:?}"
+                );
+                if expected {
+                    assert_eq!(trusted.unwrap().generated_at, gen_time);
+                    assert!(results
+                        .success
+                        .iter()
+                        .any(|status| status.code == TIME_STAMP_TRUSTED));
+                } else {
+                    assert_eq!(codes(&results.informational), vec![TIME_STAMP_UNTRUSTED]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_trusted_legacy_sig_tst_establishes_signing_time_with_its_caveat() {
         let tsa = TestTsa::new(
             datetime!(2025-01-01 0:00 UTC),

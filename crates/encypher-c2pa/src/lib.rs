@@ -425,6 +425,12 @@ pub struct TrustListSource {
     pub identifier: Option<String>,
     /// PEM certificates supplied by this source.
     pub certificates_pem: String,
+    /// Inclusive RFC 3339 start of this source's trust window.
+    #[serde(default)]
+    pub not_before: Option<String>,
+    /// Inclusive RFC 3339 end of this source's trust window.
+    #[serde(default)]
+    pub not_after: Option<String>,
 }
 
 /// One entry of the CAWG Identity 1.3 trust configuration a caller supplies.
@@ -2251,6 +2257,28 @@ fn resolve_trust(
                 "trust source {index} has an empty identifier"
             )));
         }
+        let instant = |value: Option<&str>, field: &str| {
+            value
+                .map(|raw| {
+                    OffsetDateTime::parse(raw, &Rfc3339).map_err(|error| {
+                        Error::InvalidTrust(format!("trust source {index}.{field}: {error}"))
+                    })
+                })
+                .transpose()
+        };
+        let not_before = instant(source.not_before.as_deref(), "not_before")?;
+        let not_after = instant(source.not_after.as_deref(), "not_after")?;
+        if let (Some(start), Some(end)) = (not_before, not_after) {
+            if start > end {
+                return Err(Error::InvalidTrust(format!(
+                    "trust source {index}: not_before is later than not_after"
+                )));
+            }
+        }
+        // A source-specific window may narrow, but never relax, the caller's
+        // bounds on all supplied anchors.
+        let not_before = not_before.into_iter().chain(bounds.0).max();
+        let not_after = not_after.into_iter().chain(bounds.1).min();
         let mut metadata =
             crate::c2pa_trust::TrustSource::new(source.uri.clone(), source.source_type.clone());
         if let Some(identifier) = &source.identifier {
@@ -2258,7 +2286,7 @@ fn resolve_trust(
         }
         let sourced = TrustList::from_pem_for(purpose, &source.certificates_pem)
             .map_err(|error| Error::InvalidTrust(format!("trust source {index}: {error}")))?
-            .with_bounds(bounds.0, bounds.1)
+            .with_bounds(not_before, not_after)
             .with_source(metadata);
         match &mut custom {
             Some(custom) => custom.anchors.extend(sourced.anchors),
@@ -2548,6 +2576,63 @@ mod tests {
         GraphLimits, VerificationReport, VerifyOptions,
     };
     use std::{io::Cursor, path::Path};
+
+    #[test]
+    fn source_windows_are_validated_before_asset_io() {
+        for field in ["not_before", "not_after"] {
+            for list in ["claim_trust_sources", "tsa_trust_sources"] {
+                let mut source = serde_json::json!({
+                    "uri": "urn:fixture:list",
+                    "type": "c2pa.tsaTrustList",
+                    "certificates_pem": include_str!("c2pa-trust/tests/fixtures/rfc3161_root.pem")
+                });
+                source[field] = serde_json::json!("not-an-rfc3339-instant");
+                let mut value = serde_json::json!({"no_default_trust": true});
+                value[list] = serde_json::json!([source]);
+                let options: VerifyOptions = serde_json::from_value(value).unwrap();
+                let error = options.validate().unwrap_err();
+                assert_eq!(error.code(), "invalid_trust_material");
+                assert!(error
+                    .to_string()
+                    .contains(&format!("trust source 0.{field}")));
+            }
+        }
+    }
+
+    #[test]
+    fn source_windows_preserve_global_bounds_and_refuse_reversed_dates() {
+        let source = |start: &str, end: &str| {
+            serde_json::from_value::<super::TrustListSource>(serde_json::json!({
+                "uri": "urn:fixture:list", "type": "c2pa.tsaTrustList",
+                "certificates_pem": include_str!("c2pa-trust/tests/fixtures/rfc3161_root.pem"),
+                "not_before": start, "not_after": end
+            }))
+            .unwrap()
+        };
+        let global_start = time::macros::datetime!(2026-01-01 0:00 UTC);
+        let global_end = time::macros::datetime!(2027-01-01 0:00 UTC);
+        let sources = [source("2025-01-01T00:00:00Z", "2028-01-01T00:00:00Z")];
+        let trust = super::resolve_trust(
+            None,
+            Some(&sources),
+            None,
+            super::AnchorPurpose::TimeStamping,
+            (Some(global_start), Some(global_end)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(trust.get().anchors[0].not_before, Some(global_start));
+        assert_eq!(trust.get().anchors[0].not_after, Some(global_end));
+        let options = VerifyOptions {
+            tsa_trust_sources: Some(vec![source("2028-01-01T00:00:00Z", "2025-01-01T00:00:00Z")]),
+            ..Default::default()
+        };
+        assert!(options
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not_before is later than not_after"));
+    }
 
     #[test]
     fn known_filename_maps_to_mime() {
