@@ -695,7 +695,10 @@ fn edges(
         let Some(label) = reference.label else {
             continue;
         };
-        if !label.starts_with("c2pa.ingredient") {
+        if !matches!(
+            super::refs::base_label(label),
+            "c2pa.ingredient" | "c2pa.ingredient.v2" | "c2pa.ingredient.v3"
+        ) {
             continue;
         }
         let Some(ingredient) = claim_refs

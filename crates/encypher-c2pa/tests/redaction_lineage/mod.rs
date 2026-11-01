@@ -165,6 +165,25 @@ mod redaction_lineage {
     }
 
     #[test]
+    fn ingredient_label_collisions_cannot_authorize_passenger_redactions() {
+        let signer = Signer::conformant();
+        let (child, signature) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
+        let (passenger, passenger_sig) = node(&signer, OTHER, vec![], &[], &[uri(INGREDIENT, SECRET)]);
+        for label in ["c2pa.ingredient.evil", "c2pa.ingredient.v30",
+            "c2pa.ingredient.v3__evil", "c2pa.ingredient.v3__1suffix", "c2pa.ingredient.v3__"] {
+            let (active, _) = node(&signer, ACTIVE, vec![
+                link("c2pa.ingredient.v3", INGREDIENT, &child, &signature),
+                link(label, OTHER, &passenger, &passenger_sig),
+            ], &[], &[]);
+            for profile in policies() {
+                let out = verify_store_under(&[child.clone(), passenger.clone(), active.clone()], profile);
+                assert!(failures(&out).iter().any(|code| code == "assertion.missing"),
+                    "{label}, {:?}: {:?}", profile.version, failures(&out));
+            }
+        }
+    }
+
+    #[test]
     fn self_redaction_is_rejected_and_does_not_exempt_the_claim_binding() {
         let signer = Signer::conformant();
         let (active, _) = node(&signer, ACTIVE, vec![], &[secret()], &[uri(ACTIVE, SECRET)]);

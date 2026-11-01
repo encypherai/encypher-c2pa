@@ -8,6 +8,7 @@ All notable changes to this project are recorded here.
 
 - Build one bounded redaction index from the active manifest's ingredient lineage under both the default 2.4 and explicit 2.5 policies. Ignore passenger declarations, require claim-signature ingredient binding for indexed manifests, and resolve `c2pa.redacted` against the declaring claim's own list. Preserve target-side forbidden-redaction and non-zero-content failures. Apply 2.5 reference exemptions only to the specified action ingredient and related-assertion fields; thumbnails, icons, CAWG references and 2.4 references retain their failures.
 - Reuse the redaction index prepared before manifest validation throughout the ingredient walk; remove the unreachable second-index fallback.
+- Resolve redaction lineage edges only from the three registered ingredient labels and their numeric `__N` instances. Prefix-colliding custom labels no longer let a passenger manifest suppress a reached ingredient's integrity failures.
 
 ## 1.9.0 - 2026-10-28
 
