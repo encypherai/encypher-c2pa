@@ -184,6 +184,97 @@ mod redaction_lineage {
     }
 
     #[test]
+    fn hash_invalid_ingredient_edges_cannot_authorize_passenger_redactions() {
+        let signer = Signer::conformant();
+        let (child, signature) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
+        let (passenger, passenger_sig) = node(&signer, OTHER, vec![], &[], &[uri(INGREDIENT, SECRET)]);
+        for mode in ["valid", "wrong-hash", "missing-hash"] {
+            let binding = Assertion::new("c2pa.hash.data", &data_hash());
+            let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+            let child_link = link("c2pa.ingredient.v3", INGREDIENT, &child, &signature);
+            let passenger_link = link("c2pa.ingredient.v3__1", OTHER, &passenger, &passenger_sig);
+            let mut passenger_reference = passenger_link.reference();
+            match mode {
+                "wrong-hash" => set(&mut passenger_reference, "hash", Some(Value::Bytes(vec![0; 32]))),
+                "missing-hash" => set(&mut passenger_reference, "hash", None),
+                _ => {}
+            }
+            let references = vec![binding.reference(), actions.reference(), child_link.reference(), passenger_reference];
+            // Put the invalid reference in a reached manifest so active-claim
+            // shape validation cannot short-circuit the missing-hash case.
+            let (middle, middle_sig) = manifest_box(&signer, GRAND,
+                &[binding, actions, child_link, passenger_link], references);
+            let (active, _) = node(&signer, ACTIVE,
+                vec![link("c2pa.ingredient.v3", GRAND, &middle, &middle_sig)], &[], &[]);
+            for profile in policies() {
+                let out = verify_store_under(&[child.clone(), passenger.clone(), middle.clone(), active.clone()], profile);
+                let codes = failures(&out);
+                assert_eq!(codes.iter().any(|code| code == "assertion.missing"), mode != "valid",
+                    "{mode}, {:?}: {codes:?}", profile.version);
+                let child_edge = uri(GRAND, "c2pa.ingredient.v3");
+                let child_delta = deltas(&out).into_iter().find(|delta|
+                    delta["ingredientAssertionURI"].as_str() == Some(child_edge.as_str()))
+                    .expect("valid child edge remains reachable");
+                assert_eq!(delta_codes(child_delta, "failure").contains(&"assertion.missing"), mode != "valid");
+                assert_eq!(deltas(&out).len(), if mode == "valid" { 3 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn claim_generator_icons_cannot_inherit_redacted_declaration_exemptions() {
+        let signer = Signer::conformant();
+        let icon = Assertion::new("c2pa.icon", &vmap(vec![("image", Value::Text("private icon".into()))]));
+        for v1 in [false, true] {
+            for identical_hash in [true, false] {
+                for redacted in [false, true] {
+                    let binding = Assertion::new("c2pa.hash.data", &data_hash());
+                    let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+                    let references = vec![binding.reference(), actions.reference(), icon.reference()];
+                    let mut parent_claim = claim(references.clone());
+                    let mut icon_reference = icon.reference();
+                    if !identical_hash {
+                        set(&mut icon_reference, "hash", Some(Value::Bytes(vec![0; 32])));
+                    }
+                    let info = vmap(vec![
+                        ("name", Value::Text("Encypher Fixture".into())),
+                        ("icon", icon_reference),
+                    ]);
+                    set(&mut parent_claim, "claim_generator_info", Some(if v1 { Value::Array(vec![info]) } else { info }));
+                    if v1 {
+                        set(&mut parent_claim, "created_assertions", None);
+                        set(&mut parent_claim, "assertions", Some(Value::Array(references)));
+                        set(&mut parent_claim, "claim_generator", Some(Value::Text("Encypher Fixture".into())));
+                    }
+                    let bytes = enc(&parent_claim);
+                    let signature = signer.sign(&bytes);
+                    let mut boxes = vec![binding.jumbf, actions.jumbf];
+                    if !redacted { boxes.push(icon.jumbf.clone()); }
+                    let parent = superbox(
+                        &crate::c2pa_core::jumbf::UUID_MANIFEST, INGREDIENT,
+                        &[
+                            superbox(&UUID_ASSERTION_STORE, "c2pa.assertions", &boxes, None),
+                            superbox(&UUID_CLAIM, if v1 { "c2pa.claim" } else { "c2pa.claim.v2" }, &[cbor_box(&bytes)], None),
+                            superbox(&UUID_CLAIM_SIGNATURE, "c2pa.signature", &[cbor_box(&signature)], None),
+                        ], None,
+                    );
+                    let redactions = if redacted { vec![uri(INGREDIENT, &icon.label)] } else { vec![] };
+                    let (active, _) = node(&signer, ACTIVE,
+                        vec![link("c2pa.ingredient.v3", INGREDIENT, &parent, &signature)], &[], &redactions);
+                    for profile in policies() {
+                        let out = verify_store_under(&[parent.clone(), active.clone()], profile);
+                        let codes = failures(&out);
+                        assert_eq!(codes.iter().any(|code| code == "hashedURI.missing"), redacted,
+                            "v1={v1}, identical_hash={identical_hash}, redacted={redacted}, {:?}: {codes:?}", profile.version);
+                        assert_eq!(codes.iter().any(|code| code == "assertion.hashedURI.mismatch"), !redacted && !identical_hash,
+                            "v1={v1}, identical_hash={identical_hash}, redacted={redacted}: {codes:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn self_redaction_is_rejected_and_does_not_exempt_the_claim_binding() {
         let signer = Signer::conformant();
         let (active, _) = node(&signer, ACTIVE, vec![], &[secret()], &[uri(ACTIVE, SECRET)]);

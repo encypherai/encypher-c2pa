@@ -4012,7 +4012,7 @@ const GENERATOR_ICON_REFERENCE_FIELD: &str = "claim_generator_info.icon";
 /// Identity of the binding a hashed-URI reference asserts: the assertion it
 /// resolves to, the algorithm it names (absent means the claim's `alg`, which
 /// is the same for every reference in one claim), and the digest it expects.
-/// References sharing this key are interchangeable during validation.
+/// References sharing this key are interchangeable only within the same role.
 fn hashed_uri_binding_key<'a>(
     value: &'a Value,
     label: &'a str,
@@ -4127,11 +4127,10 @@ impl<'a> ClaimAssertionRefs<'a> {
         let mut declared_labels = std::collections::HashSet::with_capacity(total);
         // Declaration set: assertion lists only. A label may be declared once.
         let mut declaration_labels = std::collections::HashSet::with_capacity(total);
-        // Every distinct hashed-URI binding the claim asserts. Two references
-        // sharing a key resolve the same assertion bytes under the same
-        // algorithm against the same expected digest, so the second can only
-        // restate the first's verdict.
-        let mut binding_keys = std::collections::HashSet::with_capacity(total);
+        // Deduplicate icons only against other icons. An assertion declaration
+        // and an icon can assert the same digest but have different redaction
+        // exemptions. Their digest computation is shared by IndexedAssertion.
+        let mut icon_binding_keys = std::collections::HashSet::with_capacity(total);
         let mut duplicate_label = None;
         let mut binding_labels = Vec::new();
         for field in ref_fields(generation) {
@@ -4156,9 +4155,6 @@ impl<'a> ClaimAssertionRefs<'a> {
                         continue;
                     }
                     declared_labels.insert(label);
-                    if let Some(key) = hashed_uri_binding_key(value, label) {
-                        binding_keys.insert(key);
-                    }
                 }
                 references.push(ClaimAssertionReference {
                     field,
@@ -4182,7 +4178,7 @@ impl<'a> ClaimAssertionRefs<'a> {
             if let Some(label) = label {
                 declared_labels.insert(label);
                 if let Some(key) = hashed_uri_binding_key(value, label) {
-                    if !binding_keys.insert(key) {
+                    if !icon_binding_keys.insert(key) {
                         return;
                     }
                 }

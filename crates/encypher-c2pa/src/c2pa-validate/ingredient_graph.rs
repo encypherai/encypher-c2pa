@@ -341,7 +341,7 @@ pub(super) fn redaction_index(
             continue;
         };
         let generation = versions::claim_generation(manifest, &claim);
-        let refs = ClaimAssertionRefs::build(manifest, &claim, generation);
+        let mut refs = ClaimAssertionRefs::build(manifest, &claim, generation);
         if label != active_label && is_time_stamp_manifest(&refs) {
             continue;
         }
@@ -356,7 +356,14 @@ pub(super) fn redaction_index(
         }
         index.add_claim(&label, &claim, store.manifests);
         let mut ignored = ValidationResults::default();
-        let mut next = edges(manifest, &refs, generation, profile, &mut ignored);
+        let mut next = edges(
+            manifest,
+            &claim,
+            &mut refs,
+            generation,
+            profile,
+            &mut ignored,
+        );
         next.sort_by(|left, right| left.target.cmp(&right.target));
         if !budget.references(next.len()) {
             break;
@@ -464,7 +471,8 @@ pub(super) fn build<'a>(
         }
         let graph_edges = edges(
             manifest,
-            &claim_refs,
+            claim,
+            &mut claim_refs,
             generation,
             profile,
             &mut results[index],
@@ -678,14 +686,59 @@ fn validate_reached_manifest<'a>(
     }
 }
 
+/// An ingredient assertion grants discovery authority only when its claim
+/// declaration resolves to non-zero content with a matching digest. Signature
+/// validity of the declaring manifest is deliberately not a prerequisite.
+fn ingredient_edge_is_eligible(
+    manifest: &ParsedManifest<'_>,
+    claim: &Value,
+    generation: ClaimGeneration,
+    reference: &super::ClaimAssertionReference<'_>,
+    assertion: &mut super::IndexedAssertion<'_>,
+) -> bool {
+    if !matches!(
+        reference.field,
+        "assertions" | "created_assertions" | "gathered_assertions"
+    ) || reference
+        .label
+        .and_then(|label| manifest.assertion_content_is_zeroed(label))
+        != Some(false)
+    {
+        return false;
+    }
+    let Some(expected) = reference.value.get("hash").and_then(Value::as_bytes) else {
+        return false;
+    };
+    let Some(algorithm) = super::resolved_hash_algorithm(reference.value, claim)
+        .filter(|algorithm| super::is_allowed_hash_algorithm(algorithm))
+    else {
+        return false;
+    };
+    let Some(index) = super::bmff_algorithm_index(algorithm) else {
+        return false;
+    };
+    if assertion.jumbf_digests[index].is_none() {
+        assertion.jumbf_digests[index] = assertion
+            .jumbf
+            .and_then(|bytes| super::hash_bytes(algorithm, bytes));
+    }
+    assertion.jumbf_digests[index].as_deref() == Some(expected)
+        || (generation == ClaimGeneration::V1
+            && assertion
+                .payload
+                .and_then(|bytes| super::hash_bytes(algorithm, bytes))
+                .as_deref()
+                == Some(expected))
+}
+
 /// The ingredient edges one manifest's claim declares.
 ///
-/// Only a claim-declared ingredient assertion is an edge: reading a link out of
-/// an assertion box the claim never referenced would let an injected box extend
-/// the graph with the claim signature untouched.
+/// Only a digest-checked claim declaration is an edge: an injected or altered
+/// assertion box cannot extend the graph with the claim signature untouched.
 fn edges(
     manifest: &ParsedManifest<'_>,
-    claim_refs: &ClaimAssertionRefs<'_>,
+    claim: &Value,
+    claim_refs: &mut ClaimAssertionRefs<'_>,
     generation: ClaimGeneration,
     profile: EngineProfile,
     results: &mut ValidationResults,
@@ -701,10 +754,16 @@ fn edges(
         ) {
             continue;
         }
-        let Some(ingredient) = claim_refs
-            .indexed(label)
-            .and_then(|assertion| assertion.decoded.as_ref())
-        else {
+        if claim_refs.is_redacted(label) {
+            continue;
+        }
+        let Some(assertion) = claim_refs.assertions.get_mut(label) else {
+            continue;
+        };
+        if !ingredient_edge_is_eligible(manifest, claim, generation, reference, assertion) {
+            continue;
+        }
+        let Some(ingredient) = assertion.decoded.as_ref() else {
             continue;
         };
         let assertion_uri = format!(
