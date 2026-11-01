@@ -10,7 +10,7 @@ All notable changes to this project are recorded here.
 - Reuse the redaction index prepared before manifest validation throughout the ingredient walk; remove the unreachable second-index fallback.
 - Resolve redaction lineage edges only from the three registered ingredient labels and their numeric `__N` instances. Prefix-colliding custom labels no longer let a passenger manifest suppress a reached ingredient's integrity failures.
 - Preserve claim-generator icon reference roles when their hashed URIs share an assertion declaration's binding. A declaration's redaction exemption no longer suppresses an icon reference failure in v1 or v2 claims. Unredacted bindings retain their existing deduplicated status output.
-- Require ingredient assertion bytes to match the claim's hashed URI before following an edge for lineage discovery or validation. Missing or invalid hashes cannot give passenger manifests redaction authority; declarant signature validity remains a separate check.
+- Require ingredient assertion bytes to match the claim's hashed URI before following an edge for lineage discovery or validation. Follow a target only when its manifest or same-target claim-signature link also has a resolvable algorithm and matching digest. Resolve link algorithms from the link, then the ingredient assertion, then the claim, with no default. Missing or invalid hashes cannot give passenger manifests redaction authority; declarant signature validity remains a separate check.
 
 ## 1.9.0 - 2026-10-28
 

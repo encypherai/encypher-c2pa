@@ -322,6 +322,7 @@ pub(super) fn redaction_index(
     let mut index = super::redaction::Index::default();
     let mut budget = Budget::new(limits);
     let mut seen = HashSet::new();
+    let mut cache = IngredientManifestDigestCache::new(store, profile);
     let mut queue = VecDeque::from([(active_label.to_string(), 0)]);
     while let Some((label, depth)) = queue.pop_front() {
         if !seen.insert(label.clone()) {
@@ -362,6 +363,7 @@ pub(super) fn redaction_index(
             &mut refs,
             generation,
             profile,
+            &mut cache,
             &mut ignored,
         );
         next.sort_by(|left, right| left.target.cmp(&right.target));
@@ -475,6 +477,7 @@ pub(super) fn build<'a>(
             &mut claim_refs,
             generation,
             profile,
+            &mut cache,
             &mut results[index],
         );
         if !budget.references(graph_edges.len()) {
@@ -731,6 +734,59 @@ fn ingredient_edge_is_eligible(
                 == Some(expected))
 }
 
+/// Follow only an authenticated link to this target. The signature method can
+/// still reach a redacted store whose original full-manifest hash has changed.
+fn ingredient_link_target<'a>(
+    ingredient: &'a Value,
+    claim: &Value,
+    cache: &mut IngredientManifestDigestCache<'_>,
+) -> Option<&'a str> {
+    let active = ingredient.get("activeManifest");
+    let link = active.or_else(|| ingredient.get("c2pa_manifest"))?;
+    let target = link
+        .get("url")
+        .and_then(Value::as_text)
+        .and_then(|url| super::ingredient_manifest_label(url, None))?;
+    let manifest = cache
+        .store
+        .manifests
+        .iter()
+        .find(|manifest| manifest.label == target)?;
+    let algorithm = super::resolved_hash_algorithm(link, ingredient)
+        .or_else(|| super::resolved_hash_algorithm(ingredient, claim));
+    let manifest_matches = match (algorithm, link.get("hash").and_then(Value::as_bytes)) {
+        (Some(algorithm), Some(expected)) => {
+            super::bmff_algorithm_index(algorithm).is_some_and(|index| {
+                cache.matches(manifest, index, expected)
+                    || (active.is_none()
+                        && is_generous(cache.profile)
+                        && manifest
+                            .claim_cbor
+                            .and_then(|bytes| super::hash_bytes(algorithm, bytes))
+                            .as_deref()
+                            == Some(expected))
+            })
+        }
+        _ => false,
+    };
+    if manifest_matches {
+        return Some(target);
+    }
+    let signature = ingredient.get("claimSignature")?;
+    let signature_target = signature
+        .get("url")
+        .and_then(Value::as_text)
+        .and_then(|url| super::ingredient_manifest_label(url, Some("/c2pa.signature")))?;
+    if signature_target != target {
+        return None;
+    }
+    let algorithm = super::resolved_hash_algorithm(signature, ingredient)
+        .or_else(|| super::resolved_hash_algorithm(ingredient, claim))?;
+    let expected = signature.get("hash").and_then(Value::as_bytes)?;
+    let digest = super::hash_claim_signature_box(algorithm, manifest.signature_cose?)?;
+    (digest.as_slice() == expected).then_some(target)
+}
+
 /// The ingredient edges one manifest's claim declares.
 ///
 /// Only a digest-checked claim declaration is an edge: an injected or altered
@@ -741,6 +797,7 @@ fn edges(
     claim_refs: &mut ClaimAssertionRefs<'_>,
     generation: ClaimGeneration,
     profile: EngineProfile,
+    cache: &mut IngredientManifestDigestCache<'_>,
     results: &mut ValidationResults,
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
@@ -770,14 +827,7 @@ fn edges(
             "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
             manifest.label
         );
-        let link = ingredient
-            .get("activeManifest")
-            .or_else(|| ingredient.get("c2pa_manifest"));
-        let Some(target) = link
-            .and_then(|link| link.get("url"))
-            .and_then(Value::as_text)
-            .and_then(super::extract_manifest_label)
-        else {
+        let Some(target) = ingredient_link_target(ingredient, claim, cache) else {
             continue;
         };
         let recorded = ingredient.get("validationResults").cloned();
@@ -1589,9 +1639,9 @@ mod tests {
         );
     }
 
-    /// Two manifests naming each other. Neither link hash can be valid (each
-    /// claim would have to commit to the other's digest), but the walk must
-    /// terminate and validate each manifest once.
+    /// Two manifests naming each other. The entry link is valid; the return
+    /// link cannot also commit to the completed cycle. Validate the reached
+    /// manifest once and reject its broken return link without following it.
     #[test]
     fn a_label_cycle_terminates_and_validates_each_manifest_once() {
         let signer = Signer::conformant();
@@ -1610,14 +1660,17 @@ mod tests {
         };
         let first_binding = Assertion::new("c2pa.hash.data", &data_hash());
         let first_ingredient = Assertion::new("c2pa.ingredient.v3", &link(ACTIVE));
-        let (first, _) = manifest_box(
+        let (first, first_sig) = manifest_box(
             &signer,
             INGREDIENT,
             &[first_binding.clone(), first_ingredient.clone()],
             vec![first_binding.reference(), first_ingredient.reference()],
         );
         let second_binding = Assertion::new("c2pa.hash.data", &data_hash());
-        let second_ingredient = Assertion::new("c2pa.ingredient.v3", &link(INGREDIENT));
+        let second_ingredient = Assertion::new(
+            "c2pa.ingredient.v3",
+            &ingredient(INGREDIENT, &first, &first_sig, "componentOf", None),
+        );
         let (second, _) = manifest_box(
             &signer,
             ACTIVE,

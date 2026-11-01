@@ -279,6 +279,74 @@ mod redaction_lineage {
     }
 
     #[test]
+    fn ingredient_links_require_resolvable_algorithms_and_matching_target_hashes() {
+        let signer = Signer::conformant();
+        let (child, child_sig) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
+        let (passenger, passenger_sig) = node(&signer, OTHER, vec![], &[], &[uri(INGREDIENT, SECRET)]);
+        for mode in ["missing-alg", "wrong-hash", "missing-hash", "ingredient", "claim",
+            "ingredient-signature", "claim-signature", "signature", "manifest"] {
+            let mut value = ingredient(OTHER, &passenger, &passenger_sig, "componentOf", None);
+            for field in ["activeManifest", "claimSignature"] {
+                let mut reference = value.get(field).unwrap().clone();
+                set(&mut reference, "alg", None);
+                let digest = if field == "activeManifest" {
+                    sha2::Sha384::digest(superbox_content(&passenger).unwrap()).to_vec()
+                } else {
+                    hash_claim_signature_box("sha384", &passenger_sig).unwrap()
+                };
+                set(&mut reference, "hash", Some(Value::Bytes(digest)));
+                if matches!(mode, "wrong-hash" | "missing-hash")
+                    || (mode == "signature" && field == "claimSignature")
+                    || (mode == "manifest" && field == "activeManifest")
+                {
+                    set(&mut reference, "alg", Some(Value::Text("sha384".into())));
+                }
+                if mode == "wrong-hash"
+                    || (field == "activeManifest" && matches!(mode, "ingredient-signature" | "claim-signature"))
+                {
+                    set(&mut reference, "hash", Some(Value::Bytes(vec![0; 48])));
+                } else if mode == "missing-hash" {
+                    set(&mut reference, "hash", None);
+                }
+                set(&mut value, field, Some(reference));
+            }
+            if matches!(mode, "ingredient" | "ingredient-signature") {
+                set(&mut value, "alg", Some(Value::Text("sha384".into())));
+            }
+            let binding = Assertion::new("c2pa.hash.data", &data_hash());
+            let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+            let child_link = link("c2pa.ingredient.v3", INGREDIENT, &child, &child_sig);
+            let passenger_link = Assertion::new("c2pa.ingredient.v3__1", &value);
+            let mut middle_claim = claim(vec![binding.reference(), actions.reference(), child_link.reference(), passenger_link.reference()]);
+            if matches!(mode, "claim" | "claim-signature") {
+                set(&mut middle_claim, "alg", Some(Value::Text("sha384".into())));
+            } else if matches!(mode, "ingredient" | "ingredient-signature") {
+                // The nearest enclosing alg takes precedence over the claim.
+                set(&mut middle_claim, "alg", Some(Value::Text("sha256".into())));
+            }
+            let bytes = enc(&middle_claim);
+            let middle_sig = signer.sign(&bytes);
+            let middle = build_manifest(GRAND,
+                &[binding.jumbf, actions.jumbf, child_link.jumbf, passenger_link.jumbf], &bytes, &middle_sig);
+            let (active, _) = node(&signer, ACTIVE,
+                vec![link("c2pa.ingredient.v3", GRAND, &middle, &middle_sig)], &[], &[]);
+            let eligible = !matches!(mode, "missing-alg" | "wrong-hash" | "missing-hash");
+            for profile in policies() {
+                let out = verify_store_under(&[child.clone(), passenger.clone(), middle.clone(), active.clone()], profile);
+                let codes = failures(&out);
+                assert_eq!(codes.iter().any(|code| code == "assertion.missing"), !eligible,
+                    "{mode}, {:?}: {codes:?}", profile.version);
+                assert_eq!(deltas(&out).len(), if eligible { 3 } else { 2 },
+                    "{mode}, {:?}: passenger traversal", profile.version);
+                if matches!(mode, "ingredient" | "claim" | "ingredient-signature" | "claim-signature" | "manifest") {
+                    assert!(!codes.iter().any(|code| code == "algorithm.unsupported"),
+                        "{mode}, {:?}: {codes:?}", profile.version);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn claim_generator_icons_cannot_inherit_redacted_declaration_exemptions() {
         let signer = Signer::conformant();
         let icon = Assertion::new("c2pa.icon", &vmap(vec![("image", Value::Text("private icon".into()))]));

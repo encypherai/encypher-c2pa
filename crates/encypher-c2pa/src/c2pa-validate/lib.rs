@@ -6446,6 +6446,7 @@ fn verify_ingredient_references<'a>(
                 }
                 verify_ingredient_signature_reference(
                     claim_signature,
+                    ingredient,
                     claim,
                     digest_cache.store,
                     sig_url,
@@ -6461,6 +6462,7 @@ fn verify_ingredient_references<'a>(
         } else {
             verify_ingredient_manifest_reference(
                 manifest_reference,
+                ingredient,
                 claim,
                 digest_cache,
                 sig_url,
@@ -6474,6 +6476,7 @@ fn verify_ingredient_references<'a>(
 /// Authenticate an ingredient not named by the lineage redaction index.
 fn verify_ingredient_manifest_reference<'a>(
     reference: &Value,
+    ingredient: &Value,
     claim: &Value,
     digest_cache: &mut IngredientManifestDigestCache<'a>,
     fallback_url: &str,
@@ -6505,7 +6508,9 @@ fn verify_ingredient_manifest_reference<'a>(
         );
         return;
     };
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(reference, ingredient)
+        .or_else(|| resolved_hash_algorithm(ingredient, claim))
+    else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6558,6 +6563,7 @@ fn verify_ingredient_manifest_reference<'a>(
 
 fn verify_ingredient_signature_reference(
     reference: &Value,
+    ingredient: &Value,
     claim: &Value,
     store: StoreContext<'_>,
     fallback_url: &str,
@@ -6588,7 +6594,9 @@ fn verify_ingredient_signature_reference(
         );
         return;
     };
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(reference, ingredient)
+        .or_else(|| resolved_hash_algorithm(ingredient, claim))
+    else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
