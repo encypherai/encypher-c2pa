@@ -24,7 +24,6 @@ use super::{
     ClaimAssertionRefs, EngineProfile, OnlineEvidence, SpecVersion, ValidationResults, Value,
     ALGORITHM_UNSUPPORTED,
 };
-use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_crypto::ClaimAlgorithmList;
 use crate::c2pa_formats::{AppendOnlyFlavor, AssetFormat, TextLocatorRules};
 
@@ -689,41 +688,13 @@ fn terminal_linked_resource(
         "linked resource integrity matched",
     ));
 }
-/// Every assertion named in any claim's `redacted_assertions` across the
-/// store, as `(manifest label, assertion label)` (2.5 Preparing the list of
-/// redacted assertions: the list spans the asset's whole lineage).
-pub(super) fn store_redactions(manifests: &[ParsedManifest<'_>]) -> HashSet<(String, String)> {
-    let mut redacted = HashSet::new();
-    for manifest in manifests {
-        let Some(claim) = manifest
-            .claim_cbor
-            .and_then(|bytes| crate::c2pa_cbor::decode(bytes).ok())
-        else {
-            continue;
-        };
-        let Some(Value::Array(entries)) = claim.get("redacted_assertions") else {
-            continue;
-        };
-        for entry in entries {
-            let url = match entry {
-                Value::Text(url) => Some(url.as_str()),
-                other => other.get("url").and_then(Value::as_text),
-            };
-            if let Some(target) = url.and_then(absolute_assertion_target) {
-                redacted.insert(target);
-            }
-        }
-    }
-    redacted
-}
 
 /// `(manifest, assertion)` named by an absolute assertion JUMBF URI.
-fn absolute_assertion_target(url: &str) -> Option<(String, String)> {
+fn absolute_assertion_target(url: &str) -> Option<(&str, &str)> {
     let (manifest, label) = url
         .strip_prefix("self#jumbf=/c2pa/")?
         .split_once("/c2pa.assertions/")?;
-    (!manifest.is_empty() && !label.is_empty() && !label.contains('/'))
-        .then(|| (manifest.to_string(), label.to_string()))
+    (!manifest.is_empty() && !label.is_empty() && !label.contains('/')).then_some((manifest, label))
 }
 
 /// An assertion reference whose target appears in the list of redacted
@@ -732,7 +703,7 @@ pub(super) struct RedactedTarget<'v> {
     /// Whether the target lives in the manifest being validated.
     pub(super) same_manifest: bool,
     /// The target assertion's label.
-    pub(super) label: String,
+    pub(super) label: &'v str,
     /// The reference's JUMBF URL, for the status record.
     pub(super) url: &'v str,
 }
@@ -746,19 +717,20 @@ pub(super) struct RedactedTarget<'v> {
 pub(super) fn redacted_reference_target<'v>(
     reference: &'v Value,
     manifest_label: &str,
-    redactions: &HashSet<(String, String)>,
+    redactions: Option<&super::redaction::Index>,
 ) -> Option<RedactedTarget<'v>> {
+    let redactions = redactions?;
     let url = reference.get("url").and_then(Value::as_text)?;
     let (manifest, label) = match absolute_assertion_target(url) {
         Some(target) => target,
         None => (
-            manifest_label.to_string(),
-            url.strip_prefix("self#jumbf=c2pa.assertions/")?.to_string(),
+            manifest_label,
+            url.strip_prefix("self#jumbf=c2pa.assertions/")?,
         ),
     };
     let same_manifest = manifest == manifest_label;
     redactions
-        .contains(&(manifest, label.clone()))
+        .contains(manifest, label)
         .then_some(RedactedTarget {
             same_manifest,
             label,

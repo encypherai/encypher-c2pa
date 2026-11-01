@@ -6,6 +6,11 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Build one bounded redaction index from the active manifest's ingredient lineage under both the default 2.4 and explicit 2.5 policies. Ignore passenger declarations, require claim-signature ingredient binding for indexed manifests, and resolve `c2pa.redacted` against the declaring claim's own list. Preserve target-side forbidden-redaction and non-zero-content failures. Apply 2.5 reference exemptions only to the specified action ingredient and related-assertion fields; thumbnails, icons, CAWG references and 2.4 references retain their failures.
+- Reuse the redaction index prepared before manifest validation throughout the ingredient walk; remove the unreachable second-index fallback.
+- Resolve redaction lineage edges only from the three registered ingredient labels and their numeric `__N` instances. Prefix-colliding custom labels no longer let a passenger manifest suppress a reached ingredient's integrity failures.
+- Preserve claim-generator icon reference roles when their hashed URIs share an assertion declaration's binding. A declaration's redaction exemption no longer suppresses an icon reference failure in v1 or v2 claims. Unredacted bindings retain their existing deduplicated status output.
+- Require ingredient assertion bytes to match the claim's hashed URI before following an edge for lineage discovery or validation. Missing or invalid assertion bindings cannot give passenger manifests redaction authority; declarant signature validity remains a separate check. Retain reached targets despite missing or wrong manifest/signature link hashes, then validate those links using the lineage-selected method. Resolve algorithms nearest first, stopping at the first present declaration: malformed or unregistered values fail rather than inheriting an outer algorithm.
 - C2PA 2.5 linked-resource integrity entry statuses retain their resource URI as `resourceUrl` in public reports, reader reports and crJSON, without a competing JUMBF `url`. C2PA 2.2 and 2.4 report serialization is unchanged. crJSON schema regressions use the published schema for each revision.
 
 ## 1.9.0 - 2026-10-28
