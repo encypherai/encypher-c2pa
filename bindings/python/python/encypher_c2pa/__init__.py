@@ -136,6 +136,11 @@ def verify(
     31 March 2027 or with a trusted time stamp from before it.
     ``trust_anchor_not_before``/``trust_anchor_not_after`` are RFC 3339
     instants bounding when the caller-supplied anchors are trusted;
+    ``claim_trust_sources`` and ``tsa_trust_sources`` accept mappings with
+    ``uri``, ``type``, ``certificates_pem``, optional ``identifier``, and optional
+    RFC 3339 ``not_before``/``not_after`` inclusive bounds. Source bounds narrow
+    the global anchor bounds. TSA bounds are evaluated at the token's genTime
+    under every policy; an out-of-window anchor yields ``timeStamp.untrusted``.
     ``cawg_did_documents`` maps a primary DID (e.g. ``did:web:example.com``)
     to its DID document for offline ``did:web`` ICA resolution;
     ``cawg_ica_trusted_issuers`` and ``cawg_ica_trust_anchors`` supply explicit
@@ -511,6 +516,9 @@ def verify_stream(
     tree - is read from the init manifest, never taken from the caller.
     ``expected_seek_positions`` contains zero-based indexes into ``segments``
     where the player expects a discontinuity.
+    ``claim_trust_sources`` and ``tsa_trust_sources`` accept the same mappings
+    and optional RFC 3339 ``not_before``/``not_after`` bounds as :func:`verify`.
+
 
     ``stream_presentation_times`` is one trusted RFC 3339 instant per entry in
     ``segments``, in the same order. Each session-key segment's key window is

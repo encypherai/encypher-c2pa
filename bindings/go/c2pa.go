@@ -67,6 +67,9 @@ type TrustListSource struct {
 	Type            string `json:"type"`
 	Identifier      string `json:"identifier,omitempty"`
 	CertificatesPEM string `json:"certificates_pem"`
+	// Inclusive RFC 3339 bounds; empty strings leave that side unbounded.
+	NotBefore       string `json:"not_before,omitempty"`
+	NotAfter        string `json:"not_after,omitempty"`
 }
 
 // Options mirrors the SDK VerifyOptions JSON. TrustAnchorNotBefore and

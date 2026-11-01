@@ -521,3 +521,72 @@ func TestSpecVersionSelectsThePolicyAndRejectsUnknownValues(t *testing.T) {
 		}
 	}
 }
+
+func TestTrustListSourceWindowJSON(t *testing.T) {
+	source := TrustListSource{
+		URI: "urn:fixture:tsa", Type: "c2pa.tsaTrustList", CertificatesPEM: "roots",
+		NotBefore: "2026-01-01T00:00:00Z", NotAfter: "2027-01-01T00:00:00Z",
+	}
+	for _, options := range []Options{
+		{ClaimTrustSources: []TrustListSource{source}},
+		{TSATrustSources: []TrustListSource{source}},
+	} {
+		data, err := json.Marshal(options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal(data, &wire); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"claim_trust_sources", "tsa_trust_sources"} {
+			if raw, ok := wire[key]; ok {
+				var entries []map[string]string
+				if err := json.Unmarshal(raw, &entries); err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 1 || entries[0]["not_before"] != source.NotBefore || entries[0]["not_after"] != source.NotAfter {
+					t.Fatalf("source windows lost: %s", data)
+				}
+			}
+		}
+	}
+	data, err := json.Marshal(TrustListSource{URI: "urn:fixture:unbounded"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unbounded map[string]string
+	if err := json.Unmarshal(data, &unbounded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := unbounded["not_before"]; ok {
+		t.Fatalf("unset not_before must be omitted: %s", data)
+	}
+	if _, ok := unbounded["not_after"]; ok {
+		t.Fatalf("unset not_after must be omitted: %s", data)
+	}
+}
+
+func TestSourceWindowValidationPrecedesAssetIO(t *testing.T) {
+	pem, err := os.ReadFile(filepath.Join("..", "..", "crates", "encypher-c2pa", "src", "c2pa-trust", "tests", "fixtures", "rfc3161_root.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"not_before", "not_after"} {
+		source := TrustListSource{URI: "urn:fixture:tsa", Type: "c2pa.tsaTrustList", CertificatesPEM: string(pem)}
+		if field == "not_before" {
+			source.NotBefore = "malformed"
+		} else {
+			source.NotAfter = "malformed"
+		}
+		for _, options := range []Options{
+			{ClaimTrustSources: []TrustListSource{source}, NoDefaultTrust: true},
+			{TSATrustSources: []TrustListSource{source}, NoDefaultTrust: true},
+		} {
+			_, err := VerifyFile(filepath.Join(t.TempDir(), "missing.jpg"), "image/jpeg", &options)
+			if err == nil || !strings.Contains(err.Error(), "trust source 0."+field) {
+				t.Fatalf("expected malformed source bound before asset I/O, got %v", err)
+			}
+		}
+	}
+}

@@ -14,6 +14,35 @@ from encypher_c2pa import _read_path
 
 PATH_LIMIT = 128 * 1024 * 1024
 
+@pytest.mark.parametrize("entrypoint", ["verify", "verify_stream"])
+@pytest.mark.parametrize("source_key", ["claim_trust_sources", "tsa_trust_sources"])
+@pytest.mark.parametrize("field", ["not_before", "not_after"])
+def test_source_window_is_validated_before_asset_io(
+    tmp_path: Path, entrypoint: str, source_key: str, field: str
+) -> None:
+    root = Path(__file__).resolve().parents[3]
+    pem = (
+        root / "crates/encypher-c2pa/src/c2pa-trust/tests/fixtures/rfc3161_root.pem"
+    ).read_text()
+    options = {
+        source_key: [{
+            "uri": "urn:fixture:tsa-list",
+            "type": "c2pa.tsaTrustList",
+            "certificates_pem": pem,
+            field: "not-an-rfc3339-instant",
+        }],
+        "no_default_trust": True,
+        "telemetry": False,
+    }
+    with pytest.raises(ValueError, match=rf"trust source 0\.{field}"):
+        if entrypoint == "verify":
+            encypher_c2pa.verify(tmp_path / "missing.jpg", "image/jpeg", **options)
+        else:
+            encypher_c2pa.verify_stream(
+                tmp_path / "missing.mp4", [], "video/mp4", **options
+            )
+
+
 
 def test_path_reader_accepts_exact_boundary_with_small_seam(tmp_path: Path) -> None:
     asset = tmp_path / "exact.jpg"
