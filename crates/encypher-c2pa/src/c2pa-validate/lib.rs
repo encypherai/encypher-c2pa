@@ -2260,7 +2260,7 @@ fn visit_declared_certificate_status_payloads<'a>(
             let (Some(url), Some(_hash), Some(algorithm)) = (
                 reference.get("url").and_then(Value::as_text),
                 reference.get("hash").and_then(Value::as_bytes),
-                resolved_hash_algorithm(reference, &claim),
+                resolved_hash_algorithm(&[reference, &claim]),
             ) else {
                 continue;
             };
@@ -5984,7 +5984,7 @@ fn foreign_ingredient_relationship(
     }
     let content = unique(&manifest.assertion_jumbf, label)?;
     let expected = reference.get("hash").and_then(Value::as_bytes)?;
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6031,7 +6031,7 @@ fn nested_assertion_reference_label<'a>(
     let assertion = claim_refs.indexed(label)?;
     let content = assertion.jumbf?;
     let expected = reference.get("hash").and_then(Value::as_bytes)?;
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6228,7 +6228,7 @@ fn verify_alternative_content(
                 continue;
             };
             let expected = embedded.get("hash").and_then(Value::as_bytes);
-            let Some(algorithm) = resolved_hash_algorithm(embedded, claim) else {
+            let Some(algorithm) = resolved_hash_algorithm(&[embedded, claim]) else {
                 results.push_failure(
                     ALGORITHM_UNSUPPORTED,
                     url,
@@ -6313,11 +6313,14 @@ fn manifest_label_conformant(label: &str) -> bool {
     parts.len() == 4 && parts[1] == "urn" && parts[2] == "uuid"
 }
 
-fn resolved_hash_algorithm<'a>(value: &'a Value, enclosing: &'a Value) -> Option<&'a str> {
-    value
-        .get("alg")
-        .and_then(Value::as_text)
-        .or_else(|| enclosing.get("alg").and_then(Value::as_text))
+/// Resolve nearest first. A present malformed or unregistered declaration
+/// blocks inheritance; only an absent `alg` advances to the next structure.
+fn resolved_hash_algorithm<'a>(declarations: &[&'a Value]) -> Option<&'a str> {
+    let algorithm = declarations
+        .iter()
+        .find_map(|declaration| declaration.get("alg"))?
+        .as_text()?;
+    is_allowed_hash_algorithm(algorithm).then_some(algorithm)
 }
 
 struct IngredientManifestDigestCache<'a> {
@@ -6508,9 +6511,7 @@ fn verify_ingredient_manifest_reference<'a>(
         );
         return;
     };
-    let Some(algorithm) = resolved_hash_algorithm(reference, ingredient)
-        .or_else(|| resolved_hash_algorithm(ingredient, claim))
-    else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, ingredient, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6594,9 +6595,7 @@ fn verify_ingredient_signature_reference(
         );
         return;
     };
-    let Some(algorithm) = resolved_hash_algorithm(reference, ingredient)
-        .or_else(|| resolved_hash_algorithm(ingredient, claim))
-    else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, ingredient, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6772,7 +6771,7 @@ fn verify_assertion_bindings(
             continue;
         }
         let expected = reference.get("hash").and_then(Value::as_bytes);
-        let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+        let Some(algorithm) = resolved_hash_algorithm(&[reference, claim]) else {
             results.push_failure(
                 ALGORITHM_UNSUPPORTED,
                 assertion_url,
@@ -7326,7 +7325,7 @@ fn verify_prehashed_hard_binding<'index, 'claim>(
         );
         return None;
     };
-    let Some(algorithm) = resolved_hash_algorithm(assertion, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[assertion, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url,
@@ -7583,7 +7582,7 @@ fn verify_primary_hard_binding(
         return;
     };
     let expected = hash_data.get("hash").and_then(Value::as_bytes);
-    let Some(alg) = resolved_hash_algorithm(hash_data, claim) else {
+    let Some(alg) = resolved_hash_algorithm(&[hash_data, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url,
@@ -9100,7 +9099,7 @@ fn verify_boxes_hash(
         results.push_failure(ASSERTION_BOXES_HASH_MALFORMED, url, "no boxes field".into());
         return;
     };
-    let default_alg = resolved_hash_algorithm(&box_map, claim);
+    let default_alg = resolved_hash_algorithm(&[&box_map, claim]);
     for entry in entries {
         let Some(alg) = entry.get("alg").and_then(Value::as_text).or(default_alg) else {
             results.push_failure(
@@ -9399,7 +9398,7 @@ fn verify_collection_hash(
         malformed(results, "collection must contain at least one URI".into());
         return;
     }
-    let Some(alg) = resolved_hash_algorithm(&map, claim) else {
+    let Some(alg) = resolved_hash_algorithm(&[&map, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url,
@@ -10161,12 +10160,12 @@ fn verify_multi_asset(
         };
 
         let nested_hash = hash_assertion.get("hash").and_then(Value::as_bytes);
-        let nested_algorithm = resolved_hash_algorithm(hash_assertion, claim);
+        let nested_algorithm = resolved_hash_algorithm(&[hash_assertion, claim]);
         let exact_declaration = claim_refs.references.iter().find(|reference| {
             reference.label == Some(part_label)
                 && nested_hash.is_some()
                 && reference.value.get("hash").and_then(Value::as_bytes) == nested_hash
-                && resolved_hash_algorithm(reference.value, claim) == nested_algorithm
+                && resolved_hash_algorithm(&[reference.value, claim]) == nested_algorithm
         });
         let (Some(nested_hash), Some(nested_algorithm), Some(_)) =
             (nested_hash, nested_algorithm, exact_declaration)
@@ -10223,9 +10222,7 @@ fn verify_multi_asset(
                     );
                     return;
                 };
-                let Some(algorithm) = resolved_hash_algorithm(part_hash, &ma)
-                    .or_else(|| claim.get("alg").and_then(Value::as_text))
-                else {
+                let Some(algorithm) = resolved_hash_algorithm(&[part_hash, &ma, claim]) else {
                     results.push_failure(
                         ALGORITHM_UNSUPPORTED,
                         url,
@@ -10274,9 +10271,7 @@ fn verify_multi_asset(
                     );
                     return;
                 }
-                let Some(algorithm) = resolved_hash_algorithm(part_hash, &ma)
-                    .or_else(|| claim.get("alg").and_then(Value::as_text))
-                else {
+                let Some(algorithm) = resolved_hash_algorithm(&[part_hash, &ma, claim]) else {
                     results.push_failure(
                         ALGORITHM_UNSUPPORTED,
                         url,

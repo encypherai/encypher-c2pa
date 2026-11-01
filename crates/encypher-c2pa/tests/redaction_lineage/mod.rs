@@ -245,7 +245,7 @@ mod redaction_lineage {
         let signer = Signer::conformant();
         let (child, signature) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
         let (passenger, passenger_sig) = node(&signer, OTHER, vec![], &[], &[uri(INGREDIENT, SECRET)]);
-        for mode in ["valid", "wrong-hash", "missing-hash"] {
+        for mode in ["valid", "wrong-hash", "missing-hash", "malformed-alg", "unknown-alg"] {
             let binding = Assertion::new("c2pa.hash.data", &data_hash());
             let actions = Assertion::new("c2pa.actions.v2", &created_actions());
             let child_link = link("c2pa.ingredient.v3", INGREDIENT, &child, &signature);
@@ -254,13 +254,19 @@ mod redaction_lineage {
             match mode {
                 "wrong-hash" => set(&mut passenger_reference, "hash", Some(Value::Bytes(vec![0; 32]))),
                 "missing-hash" => set(&mut passenger_reference, "hash", None),
+                "malformed-alg" => set(&mut passenger_reference, "alg", Some(Value::Integer(256))),
+                "unknown-alg" => set(&mut passenger_reference, "alg", Some(Value::Text("unknown".into()))),
                 _ => {}
             }
             let references = vec![binding.reference(), actions.reference(), child_link.reference(), passenger_reference];
             // Put the invalid reference in a reached manifest so active-claim
             // shape validation cannot short-circuit the missing-hash case.
-            let (middle, middle_sig) = manifest_box(&signer, GRAND,
-                &[binding, actions, child_link, passenger_link], references);
+            let mut middle_claim = claim(references);
+            set(&mut middle_claim, "alg", Some(Value::Text("sha256".into())));
+            let bytes = enc(&middle_claim);
+            let middle_sig = signer.sign(&bytes);
+            let middle = build_manifest(GRAND,
+                &[binding.jumbf, actions.jumbf, child_link.jumbf, passenger_link.jumbf], &bytes, &middle_sig);
             let (active, _) = node(&signer, ACTIVE,
                 vec![link("c2pa.ingredient.v3", GRAND, &middle, &middle_sig)], &[], &[]);
             for profile in policies() {
@@ -268,6 +274,8 @@ mod redaction_lineage {
                 let codes = failures(&out);
                 assert_eq!(codes.iter().any(|code| code == "assertion.missing"), mode != "valid",
                     "{mode}, {:?}: {codes:?}", profile.version);
+                assert_eq!(codes.iter().any(|code| code == "algorithm.unsupported"),
+                    matches!(mode, "malformed-alg" | "unknown-alg"), "{mode}: {codes:?}");
                 let child_edge = uri(GRAND, "c2pa.ingredient.v3");
                 let child_delta = deltas(&out).into_iter().find(|delta|
                     delta["ingredientAssertionURI"].as_str() == Some(child_edge.as_str()))
@@ -279,7 +287,7 @@ mod redaction_lineage {
     }
 
     #[test]
-    fn ingredient_links_require_resolvable_algorithms_and_matching_target_hashes() {
+    fn ingredient_link_algorithm_inheritance_is_validated_after_discovery() {
         let signer = Signer::conformant();
         let (child, child_sig) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
         let (passenger, passenger_sig) = node(&signer, OTHER, vec![], &[], &[uri(INGREDIENT, SECRET)]);
@@ -330,18 +338,93 @@ mod redaction_lineage {
                 &[binding.jumbf, actions.jumbf, child_link.jumbf, passenger_link.jumbf], &bytes, &middle_sig);
             let (active, _) = node(&signer, ACTIVE,
                 vec![link("c2pa.ingredient.v3", GRAND, &middle, &middle_sig)], &[], &[]);
-            let eligible = !matches!(mode, "missing-alg" | "wrong-hash" | "missing-hash");
             for profile in policies() {
                 let out = verify_store_under(&[child.clone(), passenger.clone(), middle.clone(), active.clone()], profile);
                 let codes = failures(&out);
-                assert_eq!(codes.iter().any(|code| code == "assertion.missing"), !eligible,
+                assert!(!codes.iter().any(|code| code == "assertion.missing"),
                     "{mode}, {:?}: {codes:?}", profile.version);
-                assert_eq!(deltas(&out).len(), if eligible { 3 } else { 2 },
-                    "{mode}, {:?}: passenger traversal", profile.version);
+                assert_eq!(deltas(&out).len(), 3,
+                    "{mode}, {:?}: link failures must not prevent passenger traversal", profile.version);
                 if matches!(mode, "ingredient" | "claim" | "ingredient-signature" | "claim-signature" | "manifest") {
                     assert!(!codes.iter().any(|code| code == "algorithm.unsupported"),
                         "{mode}, {:?}: {codes:?}", profile.version);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ingredient_link_hash_failures_do_not_discard_target_redaction_declarations() {
+        let signer = Signer::conformant();
+        let (child, child_sig) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
+        for field in ["activeManifest", "claimSignature"] {
+            for missing in [false, true] {
+                let signature_method = field == "claimSignature";
+                let (passenger, passenger_sig) = node(&signer, OTHER, vec![],
+                    if signature_method { vec![secret()] } else { vec![] }.as_slice(), &[uri(INGREDIENT, SECRET)]);
+                let mut value = ingredient(OTHER, &passenger, &passenger_sig, "componentOf", None);
+                let mut reference = value.get(field).unwrap().clone();
+                set(&mut reference, "hash", if missing { None } else { Some(Value::Bytes(vec![0; 32])) });
+                set(&mut value, field, Some(reference));
+                if signature_method {
+                    let mut reference = value.get("activeManifest").unwrap().clone();
+                    set(&mut reference, "hash", Some(Value::Bytes(vec![0; 32])));
+                    set(&mut value, "activeManifest", Some(reference));
+                } else {
+                    set(&mut value, "claimSignature", None);
+                }
+                let (middle, middle_sig) = node(&signer, GRAND, vec![
+                    link("c2pa.ingredient.v3", INGREDIENT, &child, &child_sig),
+                    Assertion::new("c2pa.ingredient.v3__1", &value),
+                ], &[], &[]);
+                let redactions = if signature_method { vec![uri(OTHER, SECRET)] } else { vec![] };
+                let (active, _) = node(&signer, ACTIVE,
+                    vec![link("c2pa.ingredient.v3", GRAND, &middle, &middle_sig)], &[], &redactions);
+                for profile in policies() {
+                    let out = verify_store_under(&[child.clone(), passenger.clone(), middle.clone(), active.clone()], profile);
+                    let codes = failures(&out);
+                    assert!(!codes.iter().any(|code| code == "assertion.missing"),
+                        "{field}, missing={missing}, {:?}: {codes:?}", profile.version);
+                    assert_eq!(deltas(&out).len(), 3);
+                    let expected = if signature_method { "ingredient.claimSignature.mismatch" } else { "ingredient.manifest.mismatch" };
+                    assert!(codes.iter().any(|code| code == expected), "{field}, missing={missing}: {codes:?}");
+                    assert_eq!(codes.iter().any(|code| code == "ingredient.manifest.mismatch"), !signature_method,
+                        "indexed targets use only the signature method: {codes:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_nearest_link_algorithms_never_fall_through() {
+        let signer = Signer::conformant();
+        for field in ["activeManifest", "claimSignature"] {
+            let signature_method = field == "claimSignature";
+            let removed = if signature_method { vec![secret()] } else { vec![] };
+            let (child, child_sig) = node(&signer, INGREDIENT, vec![], &removed, &[]);
+            let mut value = ingredient(INGREDIENT, &child, &child_sig, "componentOf", None);
+            set(&mut value, "alg", Some(Value::Text("sha256".into())));
+            let mut reference = value.get(field).unwrap().clone();
+            set(&mut reference, "alg", Some(Value::Integer(256)));
+            set(&mut value, field, Some(reference));
+            let binding = Assertion::new("c2pa.hash.data", &data_hash());
+            let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+            let link = Assertion::new("c2pa.ingredient.v3", &value);
+            let mut active_claim = claim(vec![binding.reference(), actions.reference(), link.reference()]);
+            set(&mut active_claim, "alg", Some(Value::Text("sha384".into())));
+            if signature_method {
+                set(&mut active_claim, "redacted_assertions",
+                    Some(Value::Array(vec![Value::Text(uri(INGREDIENT, SECRET))])));
+            }
+            let bytes = enc(&active_claim);
+            let signature = signer.sign(&bytes);
+            let active = build_manifest(ACTIVE, &[binding.jumbf, actions.jumbf, link.jumbf], &bytes, &signature);
+            for profile in policies() {
+                let out = verify_store_under(&[child.clone(), active.clone()], profile);
+                let codes = failures(&out);
+                assert!(codes.iter().any(|code| code == "algorithm.unsupported"),
+                    "{field}, {:?}: {codes:?}", profile.version);
+                assert_eq!(deltas(&out).len(), 1, "link algorithms do not gate discovery");
             }
         }
     }
