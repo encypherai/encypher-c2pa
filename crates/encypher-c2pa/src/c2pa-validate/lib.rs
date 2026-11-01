@@ -3970,6 +3970,9 @@ struct ClaimAssertionReference<'a> {
     field: &'static str,
     value: &'a Value,
     label: Option<&'a str>,
+    /// This binding also appears as a claim-generator icon. Status emission is
+    /// shared, but that referrer's role never gains a declaration's exemption.
+    has_generator_icon: bool,
 }
 #[derive(Clone, Copy)]
 enum OperativeBinding<'index, 'claim> {
@@ -4012,7 +4015,7 @@ const GENERATOR_ICON_REFERENCE_FIELD: &str = "claim_generator_info.icon";
 /// Identity of the binding a hashed-URI reference asserts: the assertion it
 /// resolves to, the algorithm it names (absent means the claim's `alg`, which
 /// is the same for every reference in one claim), and the digest it expects.
-/// References sharing this key are interchangeable only within the same role.
+/// References sharing this key share a digest verdict, not redaction roles.
 fn hashed_uri_binding_key<'a>(
     value: &'a Value,
     label: &'a str,
@@ -4127,10 +4130,10 @@ impl<'a> ClaimAssertionRefs<'a> {
         let mut declared_labels = std::collections::HashSet::with_capacity(total);
         // Declaration set: assertion lists only. A label may be declared once.
         let mut declaration_labels = std::collections::HashSet::with_capacity(total);
-        // Deduplicate icons only against other icons. An assertion declaration
-        // and an icon can assert the same digest but have different redaction
-        // exemptions. Their digest computation is shared by IndexedAssertion.
-        let mut icon_binding_keys = std::collections::HashSet::with_capacity(total);
+        // Retain one status per distinct binding, as for unredacted manifests.
+        // Each entry indexes the reference whose role metadata must also retain
+        // any claim-generator icon sharing this binding.
+        let mut binding_keys = std::collections::HashMap::with_capacity(total);
         let mut duplicate_label = None;
         let mut binding_labels = Vec::new();
         for field in ref_fields(generation) {
@@ -4155,11 +4158,15 @@ impl<'a> ClaimAssertionRefs<'a> {
                         continue;
                     }
                     declared_labels.insert(label);
+                    if let Some(key) = hashed_uri_binding_key(value, label) {
+                        binding_keys.insert(key, references.len());
+                    }
                 }
                 references.push(ClaimAssertionReference {
                     field,
                     value,
                     label,
+                    has_generator_icon: false,
                 });
             }
         }
@@ -4178,15 +4185,18 @@ impl<'a> ClaimAssertionRefs<'a> {
             if let Some(label) = label {
                 declared_labels.insert(label);
                 if let Some(key) = hashed_uri_binding_key(value, label) {
-                    if !icon_binding_keys.insert(key) {
+                    if let Some(index) = binding_keys.get(&key).copied() {
+                        references[index].has_generator_icon = true;
                         return;
                     }
+                    binding_keys.insert(key, references.len());
                 }
             }
             references.push(ClaimAssertionReference {
                 field: GENERATOR_ICON_REFERENCE_FIELD,
                 value,
                 label,
+                has_generator_icon: true,
             });
         });
 
@@ -6739,10 +6749,12 @@ fn verify_assertion_bindings(
             .as_deref()
             .is_some_and(|index| index.contains(label, assertion_label))
         {
-            if !matches!(
-                indexed_reference.field,
-                "assertions" | "created_assertions" | "gathered_assertions"
-            ) {
+            if indexed_reference.has_generator_icon
+                || !matches!(
+                    indexed_reference.field,
+                    "assertions" | "created_assertions" | "gathered_assertions"
+                )
+            {
                 results.push_failure(
                     HASHED_URI_MISSING,
                     assertion_url,

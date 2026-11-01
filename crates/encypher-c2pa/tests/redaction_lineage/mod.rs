@@ -268,6 +268,14 @@ mod redaction_lineage {
                             "v1={v1}, identical_hash={identical_hash}, redacted={redacted}, {:?}: {codes:?}", profile.version);
                         assert_eq!(codes.iter().any(|code| code == "assertion.hashedURI.mismatch"), !redacted && !identical_hash,
                             "v1={v1}, identical_hash={identical_hash}, redacted={redacted}: {codes:?}");
+                        let target = uri(INGREDIENT, &icon.label);
+                        let matching_statuses = deltas(&out).into_iter().flat_map(|delta|
+                            delta["validationDeltas"]["success"].as_array().into_iter().flatten())
+                            .filter(|status| status["code"] == "assertion.hashedURI.match"
+                                && status["url"].as_str() == Some(target.as_str()))
+                            .count();
+                        assert_eq!(matching_statuses, usize::from(!redacted),
+                            "v1={v1}, identical_hash={identical_hash}, redacted={redacted}, {:?}: duplicate icon binding status", profile.version);
                     }
                 }
             }
