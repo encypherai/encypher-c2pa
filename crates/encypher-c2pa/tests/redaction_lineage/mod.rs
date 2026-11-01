@@ -184,6 +184,63 @@ mod redaction_lineage {
     }
 
     #[test]
+    fn duplicate_ingredient_boxes_cannot_authorize_passenger_redactions() {
+        let signer = Signer::conformant();
+        let (child, child_sig) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
+        let (passenger, passenger_sig) = node(&signer, OTHER, vec![], &[], &[uri(INGREDIENT, SECRET)]);
+        let binding = Assertion::new("c2pa.hash.data", &data_hash());
+        let actions = Assertion::new("c2pa.actions.v2", &created_actions());
+        let declared_link = link("c2pa.ingredient.v3", INGREDIENT, &child, &child_sig);
+        let injected_link = link("c2pa.ingredient.v3", OTHER, &passenger, &passenger_sig);
+        let references = vec![binding.reference(), actions.reference(), declared_link.reference()];
+        let declared = vec![binding, actions, declared_link];
+        let (active, signature) = manifest_box(&signer, ACTIVE, &declared, references.clone());
+        for profile in policies() {
+            let out = verify_store_under(&[child.clone(), passenger.clone(), active.clone()], profile);
+            assert!(failures(&out).iter().any(|code| code == "assertion.missing"));
+        }
+        for prepend in [false, true] {
+            let mut boxes: Vec<Vec<u8>> = declared.iter().map(|assertion| assertion.jumbf.clone()).collect();
+            if prepend {
+                boxes.insert(0, injected_link.jumbf.clone());
+            } else {
+                boxes.push(injected_link.jumbf.clone());
+            }
+            // Inject only an unbound box: retain the original signed claim and
+            // COSE signature, whose ingredient hash commits to declared_link.
+            let active = build_manifest(ACTIVE, &boxes, &enc(&claim(references.clone())), &signature);
+            let store = build_manifest_store(&[child.clone(), passenger.clone(), active]);
+            assert!(matches!(
+                parse_manifest_store(&store),
+                Err(crate::c2pa_core::jumbf::JumbfError::AmbiguousLabel(label))
+                    if label == "c2pa.ingredient.v3"
+            ), "prepend={prepend}: duplicate labels must fail before lineage discovery");
+            for version in ["2.4", "2.5"] {
+                let result = crate::verify_manifest_store_only(&store, &VerifyOptions {
+                    spec_version: Some(version.into()),
+                    no_default_trust: true,
+                    validation_time: Some("2026-06-01T00:00:00Z".into()),
+                    ..VerifyOptions::default()
+                }).expect("ambiguous stores produce a failure report");
+                assert_eq!(result.report.integrity, "invalid",
+                    "prepend={prepend}, version={version}: ambiguous stores cannot grant redaction exemptions");
+                let expected = if version == "2.5" {
+                    "manifest.inaccessible.malformed"
+                } else {
+                    "claim.malformed"
+                };
+                let failures = &result.report.validation_results.failure;
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].code, expected);
+                assert!(failures[0].explanation.contains("ambiguous JUMBF label: c2pa.ingredient.v3"));
+                assert!(result.report.validation_results.success.is_empty());
+                assert!(result.active_manifest_label.is_none());
+                assert!(result.store_manifests.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn hash_invalid_ingredient_edges_cannot_authorize_passenger_redactions() {
         let signer = Signer::conformant();
         let (child, signature) = node(&signer, INGREDIENT, vec![], &[secret()], &[]);
