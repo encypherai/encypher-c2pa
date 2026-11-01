@@ -105,6 +105,7 @@ pub use stream::{
 mod caller_verified_binding;
 mod telemetry;
 mod telemetry_consent;
+pub use c2pa_trust::TrustSource;
 #[cfg(feature = "caller-verified-binding")]
 pub use caller_verified_binding::{
     binding_target, verify_fragmented_with_cawg, verify_manifest_store_only_with_cawg,
@@ -506,6 +507,9 @@ pub struct ValidationResults {
     pub success: Vec<VerificationStatus>,
     pub informational: Vec<VerificationStatus>,
     pub failure: Vec<VerificationStatus>,
+    /// Trust lists whose anchors accepted the active claim or timestamp.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust_list_sources: Vec<TrustSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2416,6 +2420,7 @@ fn copy_results(results: &CoreResults) -> ValidationResults {
         success: results.success.iter().map(copy_status).collect(),
         informational: results.informational.iter().map(copy_status).collect(),
         failure: results.failure.iter().map(copy_status).collect(),
+        trust_list_sources: results.trust_list_sources.clone(),
     }
 }
 

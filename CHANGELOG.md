@@ -4,6 +4,10 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+### Added
+
+- C2PA 2.5 reader reports serialize matching `trust_list_sources`. Bundled C2PA claim and TSA anchors carry their respective trust-list URIs. Supplemental Encypher anchors carry no attribution unless the same certificate also appears in the corresponding C2PA list, whose attribution then takes precedence.
+
 ### Fixed
 
 - Build one bounded redaction index from the active manifest's ingredient lineage under both the default 2.4 and explicit 2.5 policies. Ignore passenger declarations, require claim-signature ingredient binding for indexed manifests, and resolve `c2pa.redacted` against the declaring claim's own list. Preserve target-side forbidden-redaction and non-zero-content failures. Apply 2.5 reference exemptions only to the specified action ingredient and related-assertion fields; thumbnails, icons, CAWG references and 2.4 references retain their failures.

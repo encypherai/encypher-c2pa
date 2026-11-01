@@ -227,13 +227,15 @@ impl CawgTrustSource {
 /// `c2pa.trustList` for claim-signing anchors or `c2pa.tsaTrustList` for TSA
 /// anchors. `identifier` names a specific list snapshot when one is known.
 /// For ETSI TS 119 602/612 lists it is the decimal `LoTESequenceNumber`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrustSource {
     /// URI identifying the trust list. It need not be network-retrievable.
     pub uri: String,
     /// Namespaced trust-list type.
+    #[serde(rename = "type")]
     pub source_type: String,
     /// Optional identifier for the exact trust-list instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
 }
 

@@ -507,8 +507,8 @@ pub struct ValidationResults {
     #[serde(skip)]
     pub(crate) network_needs: Vec<NetworkNeed>,
     /// Provenance of claim/TSA trust lists whose anchors accepted this
-    /// manifest. Consumed only by the C2PA 2.5 crJSON renderer.
-    #[serde(skip)]
+    /// manifest, also consumed by the C2PA 2.5 crJSON renderer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) trust_list_sources: Vec<crate::c2pa_trust::TrustSource>,
 }
 
@@ -3463,7 +3463,7 @@ fn verify_manifest_bound<'a>(
         )),
         _ => None,
     };
-    if input.profile.version == SpecVersion::V2_5 && input.profile.debug {
+    if input.profile.version == SpecVersion::V2_5 {
         if let (Some(chain), Some(trust)) = (&chain_result, input.claim_signer_trust) {
             results
                 .trust_list_sources

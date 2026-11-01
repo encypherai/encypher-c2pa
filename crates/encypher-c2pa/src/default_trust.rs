@@ -3,7 +3,7 @@
 
 use std::sync::LazyLock;
 
-use crate::c2pa_trust::{AnchorPurpose, CawgTrustSource, TrustList};
+use crate::c2pa_trust::{AnchorPurpose, CawgTrustSource, TrustList, TrustSource};
 
 pub const SNAPSHOT_DATE: &str = "2026-09-24";
 
@@ -18,18 +18,46 @@ const ENCYPHER_TSA_ISSUING_CA_PEM: &str = include_str!("default_trust/encypher-t
 const ENCYPHER_IDENTITY_ROOT_PEM: &str = include_str!("default_trust/encypher-identity-root.pem");
 
 static CLAIM_SIGNING: LazyLock<TrustList> = LazyLock::new(|| {
-    merge(
+    let mut trust = parse(
         AnchorPurpose::ClaimSigning,
-        "claim-signing",
-        &[C2PA_TRUST_PEM, ENCYPHER_C2PA_ROOT_PEM],
+        "C2PA claim-signing",
+        C2PA_TRUST_PEM,
     )
+    .with_source(TrustSource::new(
+        "https://c2pa.org/trustlist",
+        "c2pa.trustList",
+    ));
+    append_bundled(
+        &mut trust,
+        parse(
+            AnchorPurpose::ClaimSigning,
+            "Encypher claim-signing",
+            ENCYPHER_C2PA_ROOT_PEM,
+        )
+        .anchors,
+    );
+    trust
 });
 static TIMESTAMP_AUTHORITIES: LazyLock<TrustList> = LazyLock::new(|| {
-    merge(
+    let mut trust = parse(
         AnchorPurpose::TimeStamping,
-        "timestamp-authority",
-        &[C2PA_TSA_TRUST_PEM, ENCYPHER_TSA_ISSUING_CA_PEM],
+        "C2PA timestamp-authority",
+        C2PA_TSA_TRUST_PEM,
     )
+    .with_source(TrustSource::new(
+        "https://c2pa.org/trustlist-tsa",
+        "c2pa.tsaTrustList",
+    ));
+    append_bundled(
+        &mut trust,
+        parse(
+            AnchorPurpose::TimeStamping,
+            "Encypher timestamp-authority",
+            ENCYPHER_TSA_ISSUING_CA_PEM,
+        )
+        .anchors,
+    );
+    trust
 });
 static ALLOWED_CLAIM_SIGNERS: LazyLock<TrustList> = LazyLock::new(|| {
     parse(
@@ -111,10 +139,218 @@ pub(crate) fn cawg_identity() -> &'static TrustList {
 pub(crate) fn cawg_allowed_identities() -> &'static TrustList {
     &CAWG_ALLOWED_IDENTITIES
 }
+/// A certificate also present in the published list retains that attribution
+/// even when a supplemental bundle supplies another copy.
+fn append_bundled(trust: &mut TrustList, anchors: Vec<crate::c2pa_trust::TrustAnchor>) {
+    for mut anchor in anchors {
+        if let Some(listed) = trust
+            .anchors
+            .iter()
+            .find(|listed| listed.certificate == anchor.certificate)
+        {
+            anchor.source.clone_from(&listed.source);
+        }
+        trust.anchors.push(anchor);
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_store_reports_only_the_source_of_the_matching_anchor() {
+        use crate::c2pa_cbor::{encode, Profile, Value};
+        use crate::c2pa_core::jumbf::{
+            assertion_box, build_manifest, build_manifest_store, superbox_content,
+        };
+        use crate::c2pa_validate::signature_conformance_tests::Signer;
+        use sha2::{Digest, Sha256};
+
+        let signer = Signer::conformant();
+        let map = |entries: Vec<(&str, Value)>| {
+            Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (Value::Text(key.into()), value))
+                    .collect(),
+            )
+        };
+        let enc = |value: &Value| encode(value, Profile::LegacyPipelineBDefinite).unwrap();
+        let binding = enc(&map(vec![
+            ("exclusions", Value::Array(vec![])),
+            ("alg", Value::Text("sha256".into())),
+            (
+                "hash",
+                Value::Bytes(Sha256::digest(b"fixture asset").to_vec()),
+            ),
+        ]));
+        let actions = enc(&map(vec![(
+            "actions",
+            Value::Array(vec![map(vec![
+                ("action", Value::Text("c2pa.created".into())),
+                (
+                    "digitalSourceType",
+                    Value::Text(
+                        "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                    ),
+                ),
+            ])]),
+        )]));
+        let assertions = [
+            assertion_box("c2pa.hash.data", &binding, None),
+            assertion_box("c2pa.actions.v2", &actions, None),
+        ];
+        let references = ["c2pa.hash.data", "c2pa.actions.v2"]
+            .into_iter()
+            .zip(&assertions)
+            .map(|(label, stored)| {
+                map(vec![
+                    (
+                        "url",
+                        Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                    ),
+                    ("alg", Value::Text("sha256".into())),
+                    (
+                        "hash",
+                        Value::Bytes(Sha256::digest(superbox_content(stored).unwrap()).to_vec()),
+                    ),
+                ])
+            })
+            .collect();
+        let claim = encode(
+            &Value::Map(vec![
+                (
+                    Value::Text("instanceID".into()),
+                    Value::Text("xmp:iid:trust-source".into()),
+                ),
+                (
+                    Value::Text("claim_generator_info".into()),
+                    Value::Map(vec![(
+                        Value::Text("name".into()),
+                        Value::Text("Trust source fixture".into()),
+                    )]),
+                ),
+                (
+                    Value::Text("created_assertions".into()),
+                    Value::Array(references),
+                ),
+                (
+                    Value::Text("signature".into()),
+                    Value::Text("self#jumbf=c2pa.signature".into()),
+                ),
+            ]),
+            Profile::LegacyPipelineBDefinite,
+        )
+        .unwrap();
+        let signature = signer.sign(&claim);
+        let store = build_manifest_store(&[build_manifest(
+            "urn:c2pa:trust-source",
+            &assertions,
+            &claim,
+            &signature,
+        )]);
+        for sourced in [false, true] {
+            let mut options = crate::VerifyOptions {
+                spec_version: Some("2.5".into()),
+                no_default_trust: true,
+                validation_time: Some("2026-06-01T00:00:00Z".into()),
+                strict_conformance: true,
+                ..Default::default()
+            };
+            if sourced {
+                options.claim_trust_sources =
+                    Some(vec![serde_json::from_value(serde_json::json!({
+                        "uri": "urn:fixture:trust-list",
+                        "type": "c2pa.trustList",
+                        "certificates_pem": signer.root_pem(),
+                    }))
+                    .unwrap()]);
+            } else {
+                options.trust_pem = Some(signer.root_pem());
+            }
+            let report = crate::verify_manifest_store_only(&store, &options)
+                .unwrap()
+                .report;
+            assert_eq!(report.signature, "valid");
+            let reader = serde_json::to_value(&report).unwrap();
+            let sources = &reader["validation_results"]["trust_list_sources"];
+            let credentials = report.content_credentials.as_ref().unwrap();
+            let uris = &credentials["manifests"][0]["validationResults"]["trustListUris"];
+            if sourced {
+                let expected = serde_json::json!([{
+                    "uri": "urn:fixture:trust-list", "type": "c2pa.trustList"
+                }]);
+                assert_eq!(sources, &expected);
+                assert_eq!(uris, &expected);
+            } else {
+                assert!(sources.is_null());
+                assert!(uris.is_null());
+            }
+            options.strict_conformance = false;
+            let regular = crate::verify_manifest_store_only(&store, &options)
+                .unwrap()
+                .report;
+            let regular = serde_json::to_value(regular).unwrap();
+            assert_eq!(
+                regular["validation_results"]["trust_list_sources"],
+                reader["validation_results"]["trust_list_sources"],
+                "reader attribution must not depend on debug/crJSON rendering",
+            );
+        }
+    }
+
+    #[test]
+    fn reader_report_serializes_matching_sources_without_a_snapshot_identifier() {
+        let source = claim_signing().anchors[0].source.as_ref().unwrap();
+        let results = crate::c2pa_validate::ValidationResults {
+            trust_list_sources: vec![source.as_ref().clone()],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(results).unwrap();
+        assert_eq!(
+            json["trust_list_sources"],
+            serde_json::json!([{
+                "uri": "https://c2pa.org/trustlist",
+                "type": "c2pa.trustList"
+            }])
+        );
+        let empty =
+            serde_json::to_value(crate::c2pa_validate::ValidationResults::default()).unwrap();
+        assert!(empty.get("trust_list_sources").is_none());
+    }
+
+    #[test]
+    fn bundled_sources_describe_only_the_pem_that_supplied_each_anchor() {
+        for (trust, pem, uri, kind) in [
+            (
+                claim_signing(),
+                C2PA_TRUST_PEM,
+                "https://c2pa.org/trustlist",
+                "c2pa.trustList",
+            ),
+            (
+                timestamp_authorities(),
+                C2PA_TSA_TRUST_PEM,
+                "https://c2pa.org/trustlist-tsa",
+                "c2pa.tsaTrustList",
+            ),
+        ] {
+            let listed = parse(trust.anchors[0].purpose, "listed", pem);
+            for anchor in &trust.anchors {
+                let expected = listed
+                    .anchors
+                    .iter()
+                    .any(|listed| listed.certificate == anchor.certificate);
+                assert_eq!(anchor.source.is_some(), expected);
+                if let Some(source) = &anchor.source {
+                    assert_eq!(source.uri, uri);
+                    assert_eq!(source.source_type, kind);
+                    assert_eq!(source.identifier, None);
+                }
+            }
+        }
+    }
 
     #[test]
     fn packaged_snapshot_contains_each_default_trust_source() {
