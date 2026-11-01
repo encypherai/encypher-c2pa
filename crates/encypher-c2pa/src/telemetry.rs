@@ -229,16 +229,19 @@ mod tests {
             validation_results: ValidationResults {
                 success: vec![],
                 informational: vec![],
+                trust_list_sources: Vec::new(),
                 failure: vec![
                     crate::VerificationStatus {
                         code: "claimSignature.mismatch".to_string(),
                         url: String::new(),
+                        resource_url: None,
                         explanation: "must not leave the device".to_string(),
                         details: None,
                     },
                     crate::VerificationStatus {
                         code: "assertion.dataHash.mismatch".to_string(),
                         url: String::new(),
+                        resource_url: None,
                         explanation: "must not leave the device".to_string(),
                         details: None,
                     },

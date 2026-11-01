@@ -138,8 +138,26 @@ type Options struct {
 type Status struct {
 	Code        string          `json:"code"`
 	URL         string          `json:"url"`
+	ResourceURL *string         `json:"resourceUrl,omitempty"`
 	Explanation string          `json:"explanation"`
 	Details     json.RawMessage `json:"details,omitempty"`
+}
+
+func (s Status) MarshalJSON() ([]byte, error) {
+	var url *string
+	if s.ResourceURL == nil {
+		url = &s.URL
+	}
+	return json.Marshal(struct {
+		Code        string          `json:"code"`
+		URL         *string         `json:"url,omitempty"`
+		Explanation string          `json:"explanation"`
+		Details     json.RawMessage `json:"details,omitempty"`
+		ResourceURL *string         `json:"resourceUrl,omitempty"`
+	}{
+		Code: s.Code, URL: url, Explanation: s.Explanation,
+		Details: s.Details, ResourceURL: s.ResourceURL,
+	})
 }
 
 type ValidationResults struct {

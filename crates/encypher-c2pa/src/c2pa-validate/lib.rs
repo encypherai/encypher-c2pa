@@ -432,18 +432,58 @@ impl ValidationState {
     }
 }
 
-/// A single validation status code with its JUMBF URL and human explanation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A single validation status code with its location and human explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusCode {
     /// The C2PA status code, e.g. `"claimSignature.validated"`.
     pub code: String,
     /// The JUMBF URI the status applies to.
     pub url: String,
+    /// The linked resource URI, instead of a JUMBF URI, for per-entry LRI codes.
+    pub resource_url: Option<String>,
     /// Human-readable explanation.
     pub explanation: String,
     /// Machine-readable evidence for extension status codes.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Json>,
+}
+
+impl Serialize for StatusCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_status(
+            serializer,
+            &self.code,
+            &self.url,
+            self.resource_url.as_deref(),
+            &self.explanation,
+            self.details.as_ref(),
+        )
+    }
+}
+
+/// Keep reader and public status serialization identical, including legacy
+/// empty JUMBF URLs. A resource location replaces the JUMBF location.
+pub(crate) fn serialize_status<S: serde::Serializer>(
+    serializer: S,
+    code: &str,
+    url: &str,
+    resource_url: Option<&str>,
+    explanation: &str,
+    details: Option<&Json>,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut status = serializer.serialize_map(Some(3 + usize::from(details.is_some())))?;
+    status.serialize_entry("code", code)?;
+    if let Some(resource_url) = resource_url {
+        status.serialize_entry("resourceUrl", resource_url)?;
+    } else {
+        status.serialize_entry("url", url)?;
+    }
+    status.serialize_entry("explanation", explanation)?;
+    if let Some(details) = details {
+        status.serialize_entry("details", details)?;
+    }
+    status.end()
 }
 
 /// Validation status codes partitioned by severity.
@@ -467,8 +507,8 @@ pub struct ValidationResults {
     #[serde(skip)]
     pub(crate) network_needs: Vec<NetworkNeed>,
     /// Provenance of claim/TSA trust lists whose anchors accepted this
-    /// manifest. Consumed only by the C2PA 2.5 crJSON renderer.
-    #[serde(skip)]
+    /// manifest, also consumed by the C2PA 2.5 crJSON renderer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) trust_list_sources: Vec<crate::c2pa_trust::TrustSource>,
 }
 
@@ -490,6 +530,7 @@ impl ValidationResults {
         self.success.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: None,
         });
@@ -504,6 +545,7 @@ impl ValidationResults {
         self.success.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: Some(details),
         });
@@ -512,6 +554,7 @@ impl ValidationResults {
         self.failure.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: None,
         });
@@ -526,6 +569,7 @@ impl ValidationResults {
         self.failure.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: Some(details),
         });
@@ -534,6 +578,7 @@ impl ValidationResults {
         self.informational.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: None,
         });
@@ -549,6 +594,7 @@ impl ValidationResults {
         self.informational.push(StatusCode {
             code: code.into(),
             url,
+            resource_url: None,
             explanation,
             details: Some(details),
         });
@@ -2260,7 +2306,7 @@ fn visit_declared_certificate_status_payloads<'a>(
             let (Some(url), Some(_hash), Some(algorithm)) = (
                 reference.get("url").and_then(Value::as_text),
                 reference.get("hash").and_then(Value::as_bytes),
-                resolved_hash_algorithm(reference, &claim),
+                resolved_hash_algorithm(&[reference, &claim]),
             ) else {
                 continue;
             };
@@ -3152,6 +3198,16 @@ fn verify_manifest_bound<'a>(
     // the output and is finalized in `finish` (cleared when Invalid).
     let generation = versions::claim_generation(manifest, &claim);
     let mut claim_refs = ClaimAssertionRefs::build(manifest, &claim, generation);
+    let mut graph_budget = ingredient_graph::Budget::new(cawg_inputs.graph_inputs.limits);
+    let redactions = ingredient_graph::redaction_index(
+        &manifest.label,
+        store,
+        input.profile,
+        cawg_inputs.graph_inputs.limits,
+        &mut results,
+    );
+    claim_refs.redactions = Some(redactions.clone());
+    graph_budget.redactions = Some(redactions);
     // The ladder frame follows the caller's selected policy, never the
     // manifest's declaration: the default 2.4 policy keeps the historical
     // 1.4-2.4 frame, and only an explicit 2.5 selection adds the 2.5 rung.
@@ -3228,7 +3284,6 @@ fn verify_manifest_bound<'a>(
         &mut results,
     );
     let mut structure_ok = first_fatal.is_none();
-    let mut graph_budget = ingredient_graph::Budget::new(cawg_inputs.graph_inputs.limits);
     let mut graph_resources =
         refs::ResourceCache::with_evidence(cawg_inputs.graph_inputs.external, input.evidence);
     // Runs alongside the structural gate rather than inside it: the external
@@ -3408,7 +3463,7 @@ fn verify_manifest_bound<'a>(
         )),
         _ => None,
     };
-    if input.profile.version == SpecVersion::V2_5 && input.profile.debug {
+    if input.profile.version == SpecVersion::V2_5 {
         if let (Some(chain), Some(trust)) = (&chain_result, input.claim_signer_trust) {
             results
                 .trust_list_sources
@@ -3613,6 +3668,7 @@ fn verify_manifest_bound<'a>(
                 binding,
                 fragments,
                 input.profile,
+                claim_refs.redactions.as_ref(),
                 &mut results,
             );
         } else if let Some(digest) = binding.prehashed_digest() {
@@ -3960,6 +4016,9 @@ struct ClaimAssertionReference<'a> {
     field: &'static str,
     value: &'a Value,
     label: Option<&'a str>,
+    /// This binding also appears as a claim-generator icon. Status emission is
+    /// shared, but that referrer's role never gains a declaration's exemption.
+    has_generator_icon: bool,
 }
 #[derive(Clone, Copy)]
 enum OperativeBinding<'index, 'claim> {
@@ -4002,7 +4061,7 @@ const GENERATOR_ICON_REFERENCE_FIELD: &str = "claim_generator_info.icon";
 /// Identity of the binding a hashed-URI reference asserts: the assertion it
 /// resolves to, the algorithm it names (absent means the claim's `alg`, which
 /// is the same for every reference in one claim), and the digest it expects.
-/// References sharing this key are interchangeable during validation.
+/// References sharing this key share a digest verdict, not redaction roles.
 fn hashed_uri_binding_key<'a>(
     value: &'a Value,
     label: &'a str,
@@ -4043,7 +4102,9 @@ fn visit_generator_icon_references<'a>(
 /// in claim order, assertion payloads are indexed once, and only declared
 /// assertion-store boxes are decoded or exposed to semantic validation.
 struct ClaimAssertionRefs<'a> {
+    redactions: Option<std::sync::Arc<redaction::Index>>,
     complete: bool,
+    manifest: &'a str,
     /// A label declared more than once by the claim's assertion lists
     /// (`assertions` / `created_assertions` / `gathered_assertions`). A
     /// `claim_generator_info` icon pointing at an already-declared assertion is
@@ -4115,11 +4176,10 @@ impl<'a> ClaimAssertionRefs<'a> {
         let mut declared_labels = std::collections::HashSet::with_capacity(total);
         // Declaration set: assertion lists only. A label may be declared once.
         let mut declaration_labels = std::collections::HashSet::with_capacity(total);
-        // Every distinct hashed-URI binding the claim asserts. Two references
-        // sharing a key resolve the same assertion bytes under the same
-        // algorithm against the same expected digest, so the second can only
-        // restate the first's verdict.
-        let mut binding_keys = std::collections::HashSet::with_capacity(total);
+        // Retain one status per distinct binding, as for unredacted manifests.
+        // Each entry indexes the reference whose role metadata must also retain
+        // any claim-generator icon sharing this binding.
+        let mut binding_keys = std::collections::HashMap::with_capacity(total);
         let mut duplicate_label = None;
         let mut binding_labels = Vec::new();
         for field in ref_fields(generation) {
@@ -4145,13 +4205,14 @@ impl<'a> ClaimAssertionRefs<'a> {
                     }
                     declared_labels.insert(label);
                     if let Some(key) = hashed_uri_binding_key(value, label) {
-                        binding_keys.insert(key);
+                        binding_keys.insert(key, references.len());
                     }
                 }
                 references.push(ClaimAssertionReference {
                     field,
                     value,
                     label,
+                    has_generator_icon: false,
                 });
             }
         }
@@ -4170,15 +4231,18 @@ impl<'a> ClaimAssertionRefs<'a> {
             if let Some(label) = label {
                 declared_labels.insert(label);
                 if let Some(key) = hashed_uri_binding_key(value, label) {
-                    if !binding_keys.insert(key) {
+                    if let Some(index) = binding_keys.get(&key).copied() {
+                        references[index].has_generator_icon = true;
                         return;
                     }
+                    binding_keys.insert(key, references.len());
                 }
             }
             references.push(ClaimAssertionReference {
                 field: GENERATOR_ICON_REFERENCE_FIELD,
                 value,
                 label,
+                has_generator_icon: true,
             });
         });
 
@@ -4283,7 +4347,9 @@ impl<'a> ClaimAssertionRefs<'a> {
             .collect();
 
         Self {
+            redactions: None,
             complete: true,
+            manifest: &manifest.label,
             duplicate_label,
             references,
             binding_labels,
@@ -4301,7 +4367,9 @@ impl<'a> ClaimAssertionRefs<'a> {
 
     fn incomplete() -> Self {
         Self {
+            redactions: None,
             complete: false,
+            manifest: "",
             duplicate_label: None,
             references: Vec::new(),
             binding_labels: Vec::new(),
@@ -4318,7 +4386,16 @@ impl<'a> ClaimAssertionRefs<'a> {
     }
 
     fn indexed(&self, label: &str) -> Option<&IndexedAssertion<'a>> {
+        if self.is_redacted(label) {
+            return None;
+        }
         self.assertions.get(label)
+    }
+
+    fn is_redacted(&self, label: &str) -> bool {
+        self.redactions
+            .as_deref()
+            .is_some_and(|index| index.contains(self.manifest, label))
     }
 
     /// Whether the claim declares a `c2pa.soft-binding` assertion, counting the
@@ -4843,6 +4920,9 @@ fn claim_structure_first_fatal(
 
     // Decode only declared assertions, once, when building the index.
     for label in &claim_refs.invalid_cbor_labels {
+        if claim_refs.is_redacted(label) {
+            continue;
+        }
         results.push_failure(
             ASSERTION_CBOR_INVALID,
             format!(
@@ -4853,6 +4933,9 @@ fn claim_structure_first_fatal(
         );
     }
     for label in &claim_refs.invalid_json_labels {
+        if claim_refs.is_redacted(label) {
+            continue;
+        }
         results.push_failure(
             ASSERTION_JSON_INVALID,
             format!(
@@ -4899,11 +4982,46 @@ fn is_cawg_assertion_instance(label: &str, base: &str) -> bool {
         && instance.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Identity references have their own digest procedure, but never inherit a
+/// C2PA action/ingredient redaction exemption.
+fn verify_redacted_identity_references(
+    claim_refs: &ClaimAssertionRefs<'_>,
+    results: &mut ValidationResults,
+) {
+    for label in &claim_refs.declaration_labels {
+        if !is_cawg_assertion_instance(label, "cawg.identity") {
+            continue;
+        }
+        let Some(Value::Array(references)) = claim_refs
+            .indexed(label)
+            .and_then(|assertion| assertion.decoded.as_ref())
+            .and_then(|value| value.get("signer_payload"))
+            .and_then(|value| value.get("referenced_assertions"))
+        else {
+            continue;
+        };
+        for reference in references {
+            if let Some(target) = spec25::redacted_reference_target(
+                reference,
+                claim_refs.manifest,
+                claim_refs.redactions.as_deref(),
+            ) {
+                results.push_failure(
+                    HASHED_URI_MISSING,
+                    target.url.to_string(),
+                    "CAWG referenced_assertions names a redacted assertion".into(),
+                );
+            }
+        }
+    }
+}
+
 fn verify_cawg_content_assertions(
     manifest: &ParsedManifest<'_>,
     claim_refs: &ClaimAssertionRefs<'_>,
     results: &mut ValidationResults,
 ) {
+    verify_redacted_identity_references(claim_refs, results);
     for (label, _) in &manifest.assertion_jumbf {
         if !claim_refs.declaration_labels.contains(label.as_str()) {
             continue;
@@ -5449,13 +5567,7 @@ fn verify_action_assertions(
     };
 
     let v2_5 = spec25::applies(profile);
-    // 2.5 lets ingredient and related-assertion references resolve to a
-    // redacted assertion; the list spans the whole store.
-    let redactions = if v2_5 {
-        spec25::store_redactions(store.manifests)
-    } else {
-        std::collections::HashSet::new()
-    };
+    let redactions = claim_refs.redactions.as_deref();
     let created_field = if generation == ClaimGeneration::V1 {
         "assertions"
     } else {
@@ -5601,12 +5713,14 @@ fn verify_action_assertions(
                     // 2.5: "or to a redacted ingredient assertion in the
                     // current manifest" (another manifest for removed and
                     // deleted). 2.4 has no such alternative.
-                    match spec25::redacted_reference_target(reference, manifest_label, &redactions)
-                    {
+                    match spec25::redacted_reference_target(reference, manifest_label, redactions) {
                         Some(target)
                             if v2_5
                                 && target.same_manifest != foreign
-                                && target.label.starts_with("c2pa.ingredient") =>
+                                && matches!(
+                                    refs::base_label(target.label),
+                                    "c2pa.ingredient" | "c2pa.ingredient.v2" | "c2pa.ingredient.v3"
+                                ) =>
                         {
                             redacted_references.push(target.url.to_string());
                             true
@@ -5650,8 +5764,9 @@ fn verify_action_assertions(
                 let redacted_resolves = parameters
                     .and_then(|value| value.get("redacted"))
                     .and_then(Value::as_text)
-                    .and_then(|url| assertion_label_for_manifest(url, manifest_label))
-                    .is_some_and(|target| claim_refs.indexed(target).is_some());
+                    .is_some_and(|url| {
+                        redactions.is_some_and(|index| index.declared_by(manifest_label, url))
+                    });
                 if !has_reason || !redacted_resolves {
                     fail(
                         results,
@@ -5696,10 +5811,10 @@ fn verify_action_assertions(
                         None if v2_5 => match spec25::redacted_reference_target(
                             reference,
                             manifest_label,
-                            &redactions,
+                            redactions,
                         ) {
                             Some(target)
-                                if target.same_manifest && eligible(target.label.as_str()) =>
+                                if target.same_manifest && eligible(target.label) =>
                             {
                                 redacted_related.push(target.url.to_string());
                                 true
@@ -5915,7 +6030,7 @@ fn foreign_ingredient_relationship(
     }
     let content = unique(&manifest.assertion_jumbf, label)?;
     let expected = reference.get("hash").and_then(Value::as_bytes)?;
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -5951,10 +6066,18 @@ fn nested_assertion_reference_label<'a>(
 ) -> Option<&'a str> {
     let url = reference.get("url").and_then(Value::as_text)?;
     let label = assertion_label_for_manifest(url, manifest_label)?;
+    if spec25::applies(_profile) && claim_refs.is_redacted(label) {
+        results.push_informational(
+            spec25::ASSERTION_REDACTED,
+            url.to_string(),
+            "reference resolves to a redacted assertion".into(),
+        );
+        return Some(label);
+    }
     let assertion = claim_refs.indexed(label)?;
     let content = assertion.jumbf?;
     let expected = reference.get("hash").and_then(Value::as_bytes)?;
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6151,7 +6274,7 @@ fn verify_alternative_content(
                 continue;
             };
             let expected = embedded.get("hash").and_then(Value::as_bytes);
-            let Some(algorithm) = resolved_hash_algorithm(embedded, claim) else {
+            let Some(algorithm) = resolved_hash_algorithm(&[embedded, claim]) else {
                 results.push_failure(
                     ALGORITHM_UNSUPPORTED,
                     url,
@@ -6236,11 +6359,14 @@ fn manifest_label_conformant(label: &str) -> bool {
     parts.len() == 4 && parts[1] == "urn" && parts[2] == "uuid"
 }
 
-fn resolved_hash_algorithm<'a>(value: &'a Value, enclosing: &'a Value) -> Option<&'a str> {
-    value
-        .get("alg")
-        .and_then(Value::as_text)
-        .or_else(|| enclosing.get("alg").and_then(Value::as_text))
+/// Resolve nearest first. A present malformed or unregistered declaration
+/// blocks inheritance; only an absent `alg` advances to the next structure.
+fn resolved_hash_algorithm<'a>(declarations: &[&'a Value]) -> Option<&'a str> {
+    let algorithm = declarations
+        .iter()
+        .find_map(|declaration| declaration.get("alg"))?
+        .as_text()?;
+    is_allowed_hash_algorithm(algorithm).then_some(algorithm)
 }
 
 struct IngredientManifestDigestCache<'a> {
@@ -6290,10 +6416,9 @@ impl<'a> IngredientManifestDigestCache<'a> {
 
 /// Authenticate embedded provenance references carried by ingredient assertions.
 ///
-/// An exact `activeManifest` hash authenticates the complete child manifest and
-/// short-circuits `claimSignature`, matching the C2PA validation procedure. If
-/// the parent claim redacts assertions from that child, the full manifest must
-/// differ and `claimSignature` becomes the required fallback binding.
+/// The lineage index selects the claim-signature method before any manifest
+/// hash comparison. Without indexed redactions, the full-manifest method
+/// authenticates the ingredient and does not inspect `claimSignature`.
 fn verify_ingredient_references<'a>(
     manifest_label: &str,
     claim_refs: &ClaimAssertionRefs<'_>,
@@ -6337,22 +6462,40 @@ fn verify_ingredient_references<'a>(
             }
             continue;
         };
-        let supports_signature_fallback = active_manifest.is_some();
         // Only the legacy `c2pa_manifest` link may carry the C2PA 1.0 claim
         // hash, and only the default posture reads it (1.x content rule).
         let accept_legacy_claim_hash = active_manifest.is_none() && is_generous(profile);
-        if verify_ingredient_manifest_reference(
-            manifest_reference,
-            claim,
-            digest_cache,
-            sig_url,
-            supports_signature_fallback,
-            accept_legacy_claim_hash,
-            results,
-        ) {
+        let redacted_manifest = manifest_reference
+            .get("url")
+            .and_then(Value::as_text)
+            .and_then(|url| ingredient_manifest_label(url, None))
+            .is_some_and(|target| {
+                claim_refs
+                    .redactions
+                    .as_deref()
+                    .is_some_and(|index| index.names_manifest(target))
+            });
+        if redacted_manifest {
             if let Some(claim_signature) = ingredient.get("claimSignature") {
+                let target = manifest_reference
+                    .get("url")
+                    .and_then(Value::as_text)
+                    .and_then(|url| ingredient_manifest_label(url, None));
+                let signature_target = claim_signature
+                    .get("url")
+                    .and_then(Value::as_text)
+                    .and_then(|url| ingredient_manifest_label(url, Some("/c2pa.signature")));
+                if signature_target.is_some() && signature_target != target {
+                    results.push_failure(
+                        INGREDIENT_CLAIM_SIGNATURE_MISMATCH,
+                        sig_url.to_string(),
+                        "claimSignature names a different ingredient manifest".into(),
+                    );
+                    continue;
+                }
                 verify_ingredient_signature_reference(
                     claim_signature,
+                    ingredient,
                     claim,
                     digest_cache.store,
                     sig_url,
@@ -6365,21 +6508,30 @@ fn verify_ingredient_references<'a>(
                     "redacted ingredient is missing claimSignature".into(),
                 );
             }
+        } else {
+            verify_ingredient_manifest_reference(
+                manifest_reference,
+                ingredient,
+                claim,
+                digest_cache,
+                sig_url,
+                accept_legacy_claim_hash,
+                results,
+            );
         }
     }
 }
 
-/// Validate `activeManifest`; return true only when redaction requires the
-/// caller to authenticate the child through `claimSignature` instead.
+/// Authenticate an ingredient not named by the lineage redaction index.
 fn verify_ingredient_manifest_reference<'a>(
     reference: &Value,
+    ingredient: &Value,
     claim: &Value,
     digest_cache: &mut IngredientManifestDigestCache<'a>,
     fallback_url: &str,
-    allow_signature_fallback: bool,
     accept_legacy_claim_hash: bool,
     results: &mut ValidationResults,
-) -> bool {
+) {
     let url = reference
         .get("url")
         .and_then(Value::as_text)
@@ -6390,7 +6542,7 @@ fn verify_ingredient_manifest_reference<'a>(
             url.to_string(),
             "ingredient activeManifest does not resolve to a manifest".into(),
         );
-        return false;
+        return;
     };
     let store = digest_cache.store;
     let actual_manifest = store
@@ -6403,15 +6555,15 @@ fn verify_ingredient_manifest_reference<'a>(
             url.to_string(),
             format!("ingredient references manifest '{label}' not in store"),
         );
-        return false;
+        return;
     };
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, ingredient, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
             "ingredient manifest reference has no hash algorithm".into(),
         );
-        return false;
+        return;
     };
     let Some(algorithm_index) = bmff_algorithm_index(algorithm) else {
         results.push_failure(
@@ -6419,7 +6571,7 @@ fn verify_ingredient_manifest_reference<'a>(
             url.to_string(),
             format!("ingredient manifest uses unsupported hash algorithm '{algorithm}'"),
         );
-        return false;
+        return;
     };
     let expected = reference.get("hash").and_then(Value::as_bytes);
     if expected
@@ -6430,10 +6582,7 @@ fn verify_ingredient_manifest_reference<'a>(
             url.to_string(),
             "ingredient manifest hash matched".into(),
         );
-        return false;
-    }
-    if allow_signature_fallback && claim_redacts_manifest(claim, label) {
-        return true;
+        return;
     }
     // C2PA 1.0 hashed the ingredient link over the ingredient's claim bytes.
     // Those bytes are authenticated by the ingredient's own claim signature,
@@ -6450,26 +6599,18 @@ fn verify_ingredient_manifest_reference<'a>(
             url.to_string(),
             "ingredient link matches the C2PA 1.0 claim hash, not the manifest-box hash".into(),
         );
-        return false;
+        return;
     }
     results.push_failure(
         INGREDIENT_MANIFEST_MISMATCH,
         url.to_string(),
         "ingredient manifest hash mismatch".into(),
     );
-    false
-}
-
-/// Whether a redaction the claim lawfully declared removed an assertion from
-/// `manifest_label`, which selects the claim-signature hash validation method
-/// for that ingredient. Unlawful declarations do not count: see
-/// [`redaction::redacts_manifest`].
-fn claim_redacts_manifest(claim: &Value, manifest_label: &str) -> bool {
-    redaction::redacts_manifest(claim, manifest_label)
 }
 
 fn verify_ingredient_signature_reference(
     reference: &Value,
+    ingredient: &Value,
     claim: &Value,
     store: StoreContext<'_>,
     fallback_url: &str,
@@ -6500,7 +6641,7 @@ fn verify_ingredient_signature_reference(
         );
         return;
     };
-    let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[reference, ingredient, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url.to_string(),
@@ -6631,6 +6772,9 @@ fn verify_assertion_bindings(
     _profile: EngineProfile,
     results: &mut ValidationResults,
 ) {
+    if let Some(index) = claim_refs.redactions.as_deref() {
+        index.verify_manifest(label, results);
+    }
     let references = &claim_refs.references;
     let assertions = &mut claim_refs.assertions;
     for indexed_reference in references {
@@ -6653,8 +6797,27 @@ fn verify_assertion_bindings(
             continue;
         };
         let assertion_url = format!("self#jumbf=/c2pa/{label}/c2pa.assertions/{assertion_label}");
+        if claim_refs
+            .redactions
+            .as_deref()
+            .is_some_and(|index| index.contains(label, assertion_label))
+        {
+            if indexed_reference.has_generator_icon
+                || !matches!(
+                    indexed_reference.field,
+                    "assertions" | "created_assertions" | "gathered_assertions"
+                )
+            {
+                results.push_failure(
+                    HASHED_URI_MISSING,
+                    assertion_url,
+                    "reference names a redacted assertion".into(),
+                );
+            }
+            continue;
+        }
         let expected = reference.get("hash").and_then(Value::as_bytes);
-        let Some(algorithm) = resolved_hash_algorithm(reference, claim) else {
+        let Some(algorithm) = resolved_hash_algorithm(&[reference, claim]) else {
             results.push_failure(
                 ALGORITHM_UNSUPPORTED,
                 assertion_url,
@@ -7008,6 +7171,7 @@ fn verify_update_hard_binding(
     binding: ContentBinding<'_>,
     fragments: &[&[u8]],
     profile: EngineProfile,
+    redactions: Option<&std::sync::Arc<redaction::Index>>,
     results: &mut ValidationResults,
 ) {
     let Ok(direct_parent) = update_manifest::resolve_parent(active, store.manifests) else {
@@ -7030,6 +7194,7 @@ fn verify_update_hard_binding(
         };
         let parent_generation = versions::claim_generation(parent, &parent_claim);
         let mut parent_refs = ClaimAssertionRefs::build(parent, &parent_claim, parent_generation);
+        parent_refs.redactions = redactions.cloned();
         let failures_before = results.failure.len();
         let successes_before = results.success.len();
         verify_assertion_bindings(
@@ -7064,6 +7229,7 @@ fn verify_update_hard_binding(
     };
     let generation = versions::claim_generation(standard, &claim);
     let mut claim_refs = ClaimAssertionRefs::build(standard, &claim, generation);
+    claim_refs.redactions = redactions.cloned();
     verify_assertion_bindings(
         &claim,
         &mut claim_refs,
@@ -7205,7 +7371,7 @@ fn verify_prehashed_hard_binding<'index, 'claim>(
         );
         return None;
     };
-    let Some(algorithm) = resolved_hash_algorithm(assertion, claim) else {
+    let Some(algorithm) = resolved_hash_algorithm(&[assertion, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url,
@@ -7462,7 +7628,7 @@ fn verify_primary_hard_binding(
         return;
     };
     let expected = hash_data.get("hash").and_then(Value::as_bytes);
-    let Some(alg) = resolved_hash_algorithm(hash_data, claim) else {
+    let Some(alg) = resolved_hash_algorithm(&[hash_data, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url,
@@ -8979,7 +9145,7 @@ fn verify_boxes_hash(
         results.push_failure(ASSERTION_BOXES_HASH_MALFORMED, url, "no boxes field".into());
         return;
     };
-    let default_alg = resolved_hash_algorithm(&box_map, claim);
+    let default_alg = resolved_hash_algorithm(&[&box_map, claim]);
     for entry in entries {
         let Some(alg) = entry.get("alg").and_then(Value::as_text).or(default_alg) else {
             results.push_failure(
@@ -9278,7 +9444,7 @@ fn verify_collection_hash(
         malformed(results, "collection must contain at least one URI".into());
         return;
     }
-    let Some(alg) = resolved_hash_algorithm(&map, claim) else {
+    let Some(alg) = resolved_hash_algorithm(&[&map, claim]) else {
         results.push_failure(
             ALGORITHM_UNSUPPORTED,
             url,
@@ -10040,12 +10206,12 @@ fn verify_multi_asset(
         };
 
         let nested_hash = hash_assertion.get("hash").and_then(Value::as_bytes);
-        let nested_algorithm = resolved_hash_algorithm(hash_assertion, claim);
+        let nested_algorithm = resolved_hash_algorithm(&[hash_assertion, claim]);
         let exact_declaration = claim_refs.references.iter().find(|reference| {
             reference.label == Some(part_label)
                 && nested_hash.is_some()
                 && reference.value.get("hash").and_then(Value::as_bytes) == nested_hash
-                && resolved_hash_algorithm(reference.value, claim) == nested_algorithm
+                && resolved_hash_algorithm(&[reference.value, claim]) == nested_algorithm
         });
         let (Some(nested_hash), Some(nested_algorithm), Some(_)) =
             (nested_hash, nested_algorithm, exact_declaration)
@@ -10102,9 +10268,7 @@ fn verify_multi_asset(
                     );
                     return;
                 };
-                let Some(algorithm) = resolved_hash_algorithm(part_hash, &ma)
-                    .or_else(|| claim.get("alg").and_then(Value::as_text))
-                else {
+                let Some(algorithm) = resolved_hash_algorithm(&[part_hash, &ma, claim]) else {
                     results.push_failure(
                         ALGORITHM_UNSUPPORTED,
                         url,
@@ -10153,9 +10317,7 @@ fn verify_multi_asset(
                     );
                     return;
                 }
-                let Some(algorithm) = resolved_hash_algorithm(part_hash, &ma)
-                    .or_else(|| claim.get("alg").and_then(Value::as_text))
-                else {
+                let Some(algorithm) = resolved_hash_algorithm(&[part_hash, &ma, claim]) else {
                     results.push_failure(
                         ALGORITHM_UNSUPPORTED,
                         url,
@@ -11247,24 +11409,7 @@ fn container_failure_output(code: &str, explanation: &str, profile: EngineProfil
 
 /// Serialize a slice of status codes for the reader report.
 fn status_array(codes: &[StatusCode]) -> Json {
-    Json::Array(
-        codes
-            .iter()
-            .map(|status| {
-                let mut value = json!({
-                    "code": status.code,
-                    "explanation": status.explanation,
-                    "url": status.url,
-                });
-                if let (Some(object), Some(details)) =
-                    (value.as_object_mut(), status.details.as_ref())
-                {
-                    object.insert("details".into(), details.clone());
-                }
-                value
-            })
-            .collect(),
-    )
+    Json::Array(codes.iter().map(|status| json!(status)).collect())
 }
 
 /// Build the `validation_results.activeManifest` object.
@@ -11676,7 +11821,10 @@ mod tests {
             child_label.to_string(),
             ManifestDigests::expanded(sha(actual_manifest)),
         );
-        let claim_refs = ClaimAssertionRefs::build(&parent, &claim, generation);
+        let mut claim_refs = ClaimAssertionRefs::build(&parent, &claim, generation);
+        let mut redactions = redaction::Index::default();
+        redactions.add_claim("urn:c2pa:parent", &claim, &manifests);
+        claim_refs.redactions = Some(std::sync::Arc::new(redactions));
         let mut results = ValidationResults::default();
         let mut digest_cache = IngredientManifestDigestCache::new(
             StoreContext {
@@ -11929,6 +12077,7 @@ mod tests {
         let status = |code: &str, details: Option<Json>| StatusCode {
             code: code.into(),
             url: String::new(),
+            resource_url: None,
             explanation: String::new(),
             details,
         };

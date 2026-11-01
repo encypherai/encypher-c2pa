@@ -29,14 +29,9 @@
 //!   bytes, the claim shall be rejected with a failure code of
 //!   `assertion.notRedacted`".
 //!
-//! The same legality test gates the ingredient side. A redaction changes the
-//! ingredient manifest's bytes, so its `activeManifest` hash legitimately no
-//! longer matches and the validator must fall back to the claim-signature hash
-//! validation method (Validation, "Validate the Ingredients": "If one or more
-//! matching redacted assertions are found ... validate the ingredient using
-//! the claim signature hash validation method"). Only a LAWFUL redaction earns
-//! that fallback: otherwise a claim could excuse any ingredient-manifest
-//! mismatch by declaring a redaction the spec forbids.
+//! The lineage index selects the claim-signature method independently of the
+//! ingredient manifest hash. Declaration legality and signature validation
+//! remain separate checks; neither filters the index.
 //!
 //! A target manifest that is absent from the store is not a defect. When the
 //! last reference to an ingredient manifest is redacted, Architecture requires
@@ -50,10 +45,120 @@ use super::{
 use crate::c2pa_cbor::Value;
 use crate::c2pa_core::jumbf::ParsedManifest;
 
+/// One lineage-wide list, shared by every validation phase. Each target keeps
+/// its declarants so an action cannot borrow another claim's declaration.
+#[derive(Default)]
+pub(super) struct Index {
+    targets: std::collections::HashMap<
+        String,
+        std::collections::BTreeMap<String, std::collections::HashSet<String>>,
+    >,
+    nonzero: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl Index {
+    pub(super) fn add_claim(
+        &mut self,
+        label: &str,
+        claim: &Value,
+        manifests: &[ParsedManifest<'_>],
+    ) {
+        let Some(Value::Array(entries)) = claim.get("redacted_assertions") else {
+            return;
+        };
+        for target in entries
+            .iter()
+            .take(MAX_REDACTED_ASSERTIONS)
+            .filter_map(entry_url)
+            .filter_map(|url| match read_entry(url, label) {
+                Entry::Absolute(target) => Some(target),
+                _ => None,
+            })
+        {
+            self.targets
+                .entry(target.manifest.to_string())
+                .or_default()
+                .entry(target.assertion.to_string())
+                .or_default()
+                .insert(label.to_string());
+            if manifests
+                .iter()
+                .find(|manifest| manifest.label == target.manifest)
+                .and_then(|manifest| manifest.assertion_content_is_zeroed(target.assertion))
+                == Some(false)
+            {
+                self.nonzero
+                    .entry(target.manifest.to_string())
+                    .or_default()
+                    .insert(target.assertion.to_string());
+            }
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    pub(super) fn names_manifest(&self, manifest: &str) -> bool {
+        self.targets.contains_key(manifest)
+    }
+
+    pub(super) fn contains(&self, manifest: &str, assertion: &str) -> bool {
+        self.targets
+            .get(manifest)
+            .is_some_and(|targets| targets.contains_key(assertion))
+    }
+
+    pub(super) fn declared_by(&self, declarant: &str, url: &str) -> bool {
+        let Entry::Absolute(target) = read_entry(url, declarant) else {
+            return false;
+        };
+        self.targets
+            .get(target.manifest)
+            .and_then(|targets| targets.get(target.assertion))
+            .is_some_and(|declarants| declarants.contains(declarant))
+    }
+
+    pub(super) fn verify_target(
+        &self,
+        manifest: &str,
+        assertion: &str,
+        url: &str,
+        results: &mut ValidationResults,
+    ) {
+        if let Some(code) = non_redactable(assertion) {
+            results.push_failure(
+                code,
+                url.to_string(),
+                format!("assertion '{assertion}' may not be redacted"),
+            );
+        }
+        if self
+            .nonzero
+            .get(manifest)
+            .is_some_and(|targets| targets.contains(assertion))
+        {
+            results.push_failure(
+                ASSERTION_NOT_REDACTED,
+                url.to_string(),
+                "assertion declared redacted still contains non-zero content".into(),
+            );
+        }
+    }
+
+    pub(super) fn verify_manifest(&self, manifest: &str, results: &mut ValidationResults) {
+        if let Some(targets) = self.targets.get(manifest) {
+            for assertion in targets.keys() {
+                let url = format!("self#jumbf=/c2pa/{manifest}/c2pa.assertions/{assertion}");
+                self.verify_target(manifest, assertion, &url, results);
+            }
+        }
+    }
+}
 /// Ceiling on `redacted_assertions` entries examined for one claim. A claim may
 /// not declare more assertions than [`super::MAX_CLAIM_ASSERTION_REFERENCES`],
 /// and it cannot lawfully redact more assertions than a store can hold.
-const MAX_REDACTED_ASSERTIONS: usize = 4_096;
+pub(super) const MAX_REDACTED_ASSERTIONS: usize = 4_096;
 
 /// A parsed `redacted_assertions` entry.
 struct Target<'a> {
@@ -179,63 +284,19 @@ pub(super) fn verify_claim_redactions(
                 continue;
             }
         };
-        if let Some(code) = non_redactable(target.assertion) {
-            results.push_failure(
-                code,
-                url.to_string(),
-                format!(
-                    "assertion '{}' in manifest '{}' may not be redacted",
-                    target.assertion, target.manifest
-                ),
-            );
-            continue;
-        }
-        // A target manifest the store no longer carries is the lawful outcome
-        // of redacting the last reference to it, not a defect.
-        let Some(manifest) = manifests
+        if manifests
             .iter()
             .find(|manifest| manifest.label == target.manifest)
-        else {
-            continue;
-        };
-        if manifest.assertion_content_is_zeroed(target.assertion) == Some(false) {
+            .and_then(|manifest| manifest.assertion_content_is_zeroed(target.assertion))
+            == Some(false)
+        {
             results.push_failure(
                 ASSERTION_NOT_REDACTED,
                 url.to_string(),
-                format!(
-                    "assertion '{}' is declared redacted but is still present in manifest '{}'",
-                    target.assertion, target.manifest
-                ),
+                "assertion declared redacted still contains non-zero content".into(),
             );
         }
     }
-}
-
-/// Whether `claim` lawfully redacts at least one assertion of `manifest_label`.
-///
-/// This is the switch C2PA 2.4 Validation, Validate the Ingredients, uses to
-/// select the claim-signature hash validation method for an ingredient whose
-/// manifest bytes a redaction has changed. An unlawful declaration
-/// (self-redaction, an actions assertion, a hard binding) is not a redaction
-/// and never excuses an ingredient-manifest hash mismatch.
-pub(super) fn redacts_manifest(claim: &Value, manifest_label: &str) -> bool {
-    let Some(Value::Array(entries)) = claim.get("redacted_assertions") else {
-        return false;
-    };
-    entries
-        .iter()
-        .take(MAX_REDACTED_ASSERTIONS)
-        .filter_map(entry_url)
-        // The declaring label is unknown here, and it does not matter: a
-        // self-scoped entry can never name a DIFFERENT manifest, so passing
-        // `manifest_label` as the declaring label rejects exactly the entries
-        // that would have named it while redacting their own store.
-        .any(|url| match read_entry(url, "") {
-            Entry::Absolute(target) => {
-                target.manifest == manifest_label && non_redactable(target.assertion).is_none()
-            }
-            _ => false,
-        })
 }
 
 #[cfg(test)]
@@ -322,6 +383,13 @@ mod tests {
         let manifests = [store.child()];
         let mut results = ValidationResults::default();
         verify_claim_redactions(PARENT, claim, &manifests, &mut results);
+        let mut index = Index::default();
+        index.add_claim(PARENT, claim, &manifests);
+        if let Some(targets) = index.targets.get(CHILD) {
+            for label in targets.keys() {
+                index.verify_target(CHILD, label, &uri(CHILD, label), &mut results);
+            }
+        }
         results
     }
 
@@ -397,35 +465,18 @@ mod tests {
         }
     }
 
-    /// Only a lawful redaction lets an ingredient fall back to the
-    /// claim-signature hash validation method.
+    /// Method selection uses the lineage list, including prohibited targets.
     #[test]
-    fn only_lawful_redactions_switch_the_ingredient_method() {
-        assert!(redacts_manifest(
-            &claim_redacting(&[uri(CHILD, "c2pa.metadata")]),
-            CHILD
-        ));
-        assert!(!redacts_manifest(
-            &claim_redacting(&[uri(CHILD, "c2pa.actions")]),
-            CHILD
-        ));
-        assert!(!redacts_manifest(
-            &claim_redacting(&[uri(CHILD, "c2pa.hash.data")]),
-            CHILD
-        ));
-        assert!(!redacts_manifest(
-            &claim_redacting(&[uri("urn:c2pa:other", "c2pa.metadata")]),
-            CHILD
-        ));
-        // A hashed-URI map in the entry position still identifies the box.
-        let mapped = vmap(vec![(
-            "redacted_assertions",
-            Value::Array(vec![vmap(vec![(
-                "url",
-                Value::Text(uri(CHILD, "c2pa.metadata")),
-            )])]),
-        )]);
-        assert!(redacts_manifest(&mapped, CHILD));
+    fn indexed_redactions_select_the_ingredient_method() {
+        for label in ["c2pa.metadata", "c2pa.actions", "c2pa.hash.data"] {
+            let mut index = Index::default();
+            index.add_claim(PARENT, &claim_redacting(&[uri(CHILD, label)]), &[]);
+            assert!(index.names_manifest(CHILD));
+            assert!(index.declared_by(PARENT, &uri(CHILD, label)));
+        }
+        let mut index = Index::default();
+        index.add_claim(CHILD, &claim_redacting(&[uri(CHILD, "c2pa.metadata")]), &[]);
+        assert!(!index.names_manifest(CHILD));
     }
 
     /// A self-redaction must reach a consumer's report from the verification
