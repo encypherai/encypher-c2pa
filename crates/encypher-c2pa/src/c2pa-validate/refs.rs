@@ -206,6 +206,10 @@ enum Step {
 enum Kind {
     /// `$hashed-uri-map`: a `self#jumbf=` URI.
     Internal,
+    /// Action ingredient references have a versioned redaction exception.
+    Ingredient,
+    /// Action and ingredient relatedAssertions have a 2.5 exception.
+    Related,
     /// `$hashed-uri-map / $hashed-ext-uri-map`: the URL's own scheme decides.
     /// An external URL is left to the external-data procedure.
     Either,
@@ -234,6 +238,10 @@ const INGREDIENT_V2: &[RefField] = &[
 const INGREDIENT_V3: &[RefField] = &[
     field(&[Step::Field("thumbnail")], Kind::Internal),
     field(&[Step::Field("data")], Kind::Either),
+    field(
+        &[Step::Field("relatedAssertions"), Step::Each],
+        Kind::Related,
+    ),
 ];
 
 /// `c2pa.actions` / `c2pa.actions.v2`: `actions-map`, `actions-map-v2`,
@@ -248,7 +256,7 @@ const ACTIONS: &[RefField] = &[
             Step::Field("parameters"),
             Step::Field("ingredient"),
         ],
-        Kind::Internal,
+        Kind::Ingredient,
     ),
     field(
         &[
@@ -259,7 +267,7 @@ const ACTIONS: &[RefField] = &[
             Step::Field("ingredients"),
             Step::Each,
         ],
-        Kind::Internal,
+        Kind::Ingredient,
     ),
     field(
         &[
@@ -270,7 +278,7 @@ const ACTIONS: &[RefField] = &[
             Step::Field("relatedAssertions"),
             Step::Each,
         ],
-        Kind::Internal,
+        Kind::Related,
     ),
     field(
         &[
@@ -328,6 +336,7 @@ struct Located<'v> {
     kind: Kind,
     value: &'v Value,
     path: String,
+    action_kind: Option<&'v str>,
 }
 
 /// Walk `steps` through `value`, collecting references until `limit` is hit.
@@ -352,6 +361,7 @@ fn locate<'v>(
                 kind,
                 value,
                 path: path.clone(),
+                action_kind: None,
             });
             false
         }
@@ -386,7 +396,12 @@ fn locate<'v>(
             false
         }
         Some((Step::EachRelated, rest)) => {
-            if locate(value, kind, rest, depth, path, out, limit) {
+            let start = out.len();
+            let capped = locate(value, kind, rest, depth, path, out, limit);
+            for located in &mut out[start..] {
+                located.action_kind = value.get("action").and_then(Value::as_text);
+            }
+            if capped {
                 return true;
             }
             if depth >= MAX_RELATED_DEPTH {
@@ -448,10 +463,16 @@ pub(super) fn verify_assertion_references(
     // could not follow: they wrote an action's `parameters.ingredient` hash
     // before the assertion it names was final, so the digest in that position
     // routinely disagrees with the assertion the claim itself binds correctly.
-    // A v1 claim is therefore held to this rule only under strict conformance,
-    // exactly as it is held to the `c2pa.actions` ingredient-resolution rules
-    // in [`super::verify_action_assertions`].
-    if generation == ClaimGeneration::V1 && is_generous(profile) {
+    // The legacy digest tolerance never permits a reference to a redacted
+    // target. Walk those references under both policies, while leaving other
+    // v1 reference digests to the existing compatibility procedure.
+    let legacy = generation == ClaimGeneration::V1 && is_generous(profile);
+    if legacy
+        && claim_refs
+            .redactions
+            .as_deref()
+            .is_none_or(super::redaction::Index::is_empty)
+    {
         return ReferenceWalk {
             examined: 0,
             truncated: false,
@@ -484,6 +505,14 @@ pub(super) fn verify_assertion_references(
         let mut capped = false;
         let capacity = budget.saturating_sub(examined);
         for field in fields {
+            // Ingredient relatedAssertions was introduced in 2.5. Earlier
+            // policies still walk action relatedAssertions.
+            if field.kind == Kind::Related
+                && base_label(alabel) == "c2pa.ingredient.v3"
+                && !super::spec25::applies(profile)
+            {
+                continue;
+            }
             let mut path = String::new();
             if locate(
                 assertion,
@@ -500,6 +529,51 @@ pub(super) fn verify_assertion_references(
         }
         examined += located.len();
         for located in &located {
+            let redacted = super::spec25::redacted_reference_target(
+                located.value,
+                manifest_label,
+                claim_refs.redactions.as_deref(),
+            );
+            if let Some(target) = redacted {
+                let exempt = super::spec25::applies(profile)
+                    && match located.kind {
+                        Kind::Related => target.same_manifest,
+                        Kind::Ingredient => {
+                            matches!(
+                                base_label(target.label),
+                                "c2pa.ingredient" | "c2pa.ingredient.v2" | "c2pa.ingredient.v3"
+                            ) && match located.action_kind {
+                                Some(
+                                    "c2pa.opened" | "c2pa.placed" | "c2pa.transcoded"
+                                    | "c2pa.repackaged",
+                                ) => target.same_manifest,
+                                Some("c2pa.deleted" | "c2pa.removed") => !target.same_manifest,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                if exempt {
+                    results.push_informational(
+                        super::spec25::ASSERTION_REDACTED,
+                        target.url.to_string(),
+                        "reference resolves to a redacted assertion".into(),
+                    );
+                    continue;
+                }
+                results.push_failure(
+                    HASHED_URI_MISSING,
+                    target.url.to_string(),
+                    format!(
+                        "{alabel} field '{}' references a redacted assertion",
+                        located.path
+                    ),
+                );
+                continue;
+            }
+            if legacy {
+                continue;
+            }
             validate_reference(
                 located,
                 alabel,
@@ -568,6 +642,12 @@ pub(super) fn locate_external_references(
         let mut located = Vec::new();
         let mut capped = false;
         for field in fields {
+            if field.kind == Kind::Related
+                && base_label(label) == "c2pa.ingredient.v3"
+                && !super::spec25::applies(profile)
+            {
+                continue;
+            }
             let mut path = String::new();
             if locate(
                 assertion,
