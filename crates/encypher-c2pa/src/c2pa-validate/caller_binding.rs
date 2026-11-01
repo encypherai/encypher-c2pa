@@ -228,7 +228,7 @@ fn schema_defect(
             let Some(Value::Array(entries)) = assertion.get("boxes") else {
                 return Some((malformed, "no boxes field".into()));
             };
-            let default_alg = resolved_hash_algorithm(assertion, claim);
+            let default_alg = resolved_hash_algorithm(&[assertion, claim]);
             for entry in entries {
                 let names_ok = matches!(entry.get("names"), Some(Value::Array(names))
                     if !names.is_empty() && names.iter().all(|name| name.as_text().is_some()));
@@ -250,7 +250,7 @@ fn schema_defect(
             if profile.version == SpecVersion::V2_5 && uris.is_empty() {
                 return Some((malformed, "collection must contain at least one URI".into()));
             }
-            if let Some(defect) = algorithm_defect(resolved_hash_algorithm(assertion, claim)) {
+            if let Some(defect) = algorithm_defect(resolved_hash_algorithm(&[assertion, claim])) {
                 return Some(defect);
             }
             for entry in uris {
@@ -289,7 +289,7 @@ fn schema_defect(
             None
         }
         b if is_supported_bmff_hash_label(b) => {
-            if let Some(defect) = algorithm_defect(resolved_hash_algorithm(assertion, claim)) {
+            if let Some(defect) = algorithm_defect(resolved_hash_algorithm(&[assertion, claim])) {
                 return Some(defect);
             }
             let exclusion_maps = match bmff_exclusion_maps(assertion) {
@@ -314,7 +314,7 @@ fn schema_defect(
             None
         }
         _ => {
-            if let Some(defect) = algorithm_defect(resolved_hash_algorithm(assertion, claim)) {
+            if let Some(defect) = algorithm_defect(resolved_hash_algorithm(&[assertion, claim])) {
                 return Some(defect);
             }
             if assertion.get("hash").and_then(Value::as_bytes).is_none() {

@@ -140,6 +140,7 @@ pub(super) struct Budget {
     bytes: usize,
     exhausted: [Option<usize>; 4],
     reported: [bool; 4],
+    pub(super) redactions: Option<std::sync::Arc<super::redaction::Index>>,
 }
 
 impl Budget {
@@ -156,6 +157,7 @@ impl Budget {
             bytes: 0,
             exhausted: [None; 4],
             reported: [false; 4],
+            redactions: None,
         }
     }
 
@@ -256,6 +258,7 @@ impl Budget {
             results.informational.push(StatusCode {
                 code: GRAPH_LIMIT_EXCEEDED.into(),
                 url: format!("self#jumbf=/c2pa/{active_label}"),
+                resource_url: None,
                 explanation: format!(
                     "verification graph {name} ceiling reached ({limit}); traversal stopped. \
                      This is a resource outcome and does not affect manifest validity."
@@ -306,6 +309,70 @@ struct Edge {
     target: String,
     /// The verdict the signer recorded for that manifest, if any.
     recorded: Option<Value>,
+}
+
+/// Discover the complete bounded lineage before validating any target. Sorting
+/// edges makes resource-limited discovery independent of ingredient order.
+pub(super) fn redaction_index(
+    active_label: &str,
+    store: StoreContext<'_>,
+    profile: EngineProfile,
+    limits: GraphLimits,
+    results: &mut ValidationResults,
+) -> std::sync::Arc<super::redaction::Index> {
+    let mut index = super::redaction::Index::default();
+    let mut budget = Budget::new(limits);
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([(active_label.to_string(), 0)]);
+    while let Some((label, depth)) = queue.pop_front() {
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        let Some(manifest) = store
+            .manifests
+            .iter()
+            .find(|manifest| manifest.label == label)
+        else {
+            continue;
+        };
+        if !budget.depth(depth) || !budget.node() || !budget.bytes(manifest.manifest_jumbf.len()) {
+            break;
+        }
+        let Some(claim) = manifest.claim_cbor.and_then(|bytes| decode(bytes).ok()) else {
+            continue;
+        };
+        let generation = versions::claim_generation(manifest, &claim);
+        let mut refs = ClaimAssertionRefs::build(manifest, &claim, generation);
+        if label != active_label && is_time_stamp_manifest(&refs) {
+            continue;
+        }
+        let declarations = match claim.get("redacted_assertions") {
+            Some(Value::Array(entries)) => {
+                entries.len().min(super::redaction::MAX_REDACTED_ASSERTIONS)
+            }
+            _ => 0,
+        };
+        if !budget.references(declarations) {
+            break;
+        }
+        index.add_claim(&label, &claim, store.manifests);
+        let mut ignored = ValidationResults::default();
+        let mut next = edges(
+            manifest,
+            &claim,
+            &mut refs,
+            generation,
+            profile,
+            &mut ignored,
+        );
+        next.sort_by(|left, right| left.target.cmp(&right.target));
+        if !budget.references(next.len()) {
+            break;
+        }
+        queue.extend(next.into_iter().map(|edge| (edge.target, depth + 1)));
+    }
+    budget.report(active_label, results);
+    std::sync::Arc::new(index)
 }
 
 /// Walk the active manifest's ingredient graph.
@@ -366,6 +433,7 @@ pub(super) fn build<'a>(
         };
         let generation = versions::claim_generation(manifest, claim);
         let mut claim_refs = ClaimAssertionRefs::build(manifest, claim, generation);
+        claim_refs.redactions = budget.redactions.clone();
         // A time-stamp manifest reached through an ingredient "shall be
         // ignored" (C2PA 2.4, Time-Stamp Manifests in an ingredient).
         if !is_active && is_time_stamp_manifest(&claim_refs) {
@@ -404,7 +472,8 @@ pub(super) fn build<'a>(
         }
         let graph_edges = edges(
             manifest,
-            &claim_refs,
+            claim,
+            &mut claim_refs,
             generation,
             profile,
             &mut results[index],
@@ -550,6 +619,13 @@ fn validate_reached_manifest<'a>(
     results: &mut ValidationResults,
 ) {
     let sig_url = format!("self#jumbf=/c2pa/{}/c2pa.signature", manifest.label);
+    super::redaction::verify_claim_redactions(
+        &manifest.label,
+        claim,
+        cache.store.manifests,
+        results,
+    );
+    super::verify_redacted_identity_references(claim_refs, results);
     verify_assertion_bindings(
         claim,
         claim_refs,
@@ -611,14 +687,57 @@ fn validate_reached_manifest<'a>(
     }
 }
 
+/// An ingredient assertion grants discovery authority only when its claim
+/// declaration resolves to non-zero content with a matching digest. Signature
+/// validity of the declaring manifest is deliberately not a prerequisite.
+fn ingredient_edge_is_eligible(
+    manifest: &ParsedManifest<'_>,
+    claim: &Value,
+    generation: ClaimGeneration,
+    reference: &super::ClaimAssertionReference<'_>,
+    assertion: &mut super::IndexedAssertion<'_>,
+) -> bool {
+    if !matches!(
+        reference.field,
+        "assertions" | "created_assertions" | "gathered_assertions"
+    ) || reference
+        .label
+        .and_then(|label| manifest.assertion_content_is_zeroed(label))
+        != Some(false)
+    {
+        return false;
+    }
+    let Some(expected) = reference.value.get("hash").and_then(Value::as_bytes) else {
+        return false;
+    };
+    let Some(algorithm) = super::resolved_hash_algorithm(&[reference.value, claim]) else {
+        return false;
+    };
+    let Some(index) = super::bmff_algorithm_index(algorithm) else {
+        return false;
+    };
+    if assertion.jumbf_digests[index].is_none() {
+        assertion.jumbf_digests[index] = assertion
+            .jumbf
+            .and_then(|bytes| super::hash_bytes(algorithm, bytes));
+    }
+    assertion.jumbf_digests[index].as_deref() == Some(expected)
+        || (generation == ClaimGeneration::V1
+            && assertion
+                .payload
+                .and_then(|bytes| super::hash_bytes(algorithm, bytes))
+                .as_deref()
+                == Some(expected))
+}
+
 /// The ingredient edges one manifest's claim declares.
 ///
-/// Only a claim-declared ingredient assertion is an edge: reading a link out of
-/// an assertion box the claim never referenced would let an injected box extend
-/// the graph with the claim signature untouched.
+/// Only a digest-checked claim declaration is an edge: an injected or altered
+/// assertion box cannot extend the graph with the claim signature untouched.
 fn edges(
     manifest: &ParsedManifest<'_>,
-    claim_refs: &ClaimAssertionRefs<'_>,
+    claim: &Value,
+    claim_refs: &mut ClaimAssertionRefs<'_>,
     generation: ClaimGeneration,
     profile: EngineProfile,
     results: &mut ValidationResults,
@@ -628,26 +747,37 @@ fn edges(
         let Some(label) = reference.label else {
             continue;
         };
-        if !label.starts_with("c2pa.ingredient") {
+        if !matches!(
+            super::refs::base_label(label),
+            "c2pa.ingredient" | "c2pa.ingredient.v2" | "c2pa.ingredient.v3"
+        ) {
             continue;
         }
-        let Some(ingredient) = claim_refs
-            .indexed(label)
-            .and_then(|assertion| assertion.decoded.as_ref())
-        else {
+        if claim_refs.is_redacted(label) {
+            continue;
+        }
+        let Some(assertion) = claim_refs.assertions.get_mut(label) else {
+            continue;
+        };
+        if !ingredient_edge_is_eligible(manifest, claim, generation, reference, assertion) {
+            continue;
+        }
+        let Some(ingredient) = assertion.decoded.as_ref() else {
             continue;
         };
         let assertion_uri = format!(
             "self#jumbf=/c2pa/{}/c2pa.assertions/{label}",
             manifest.label
         );
-        let link = ingredient
+        // The ingredient assertion's own binding gates recursion. Preserve its
+        // target even when a manifest/signature link hash is missing or wrong:
+        // the method-selection phase validates those links after discovery.
+        let Some(target) = ingredient
             .get("activeManifest")
-            .or_else(|| ingredient.get("c2pa_manifest"));
-        let Some(target) = link
+            .or_else(|| ingredient.get("c2pa_manifest"))
             .and_then(|link| link.get("url"))
             .and_then(Value::as_text)
-            .and_then(super::extract_manifest_label)
+            .and_then(|url| super::ingredient_manifest_label(url, None))
         else {
             continue;
         };
@@ -770,6 +900,10 @@ fn collect_recorded(codes: Option<&Value>, into: &mut Vec<(&'static str, StatusC
                         .and_then(Value::as_text)
                         .unwrap_or_default()
                         .to_string(),
+                    resource_url: entry
+                        .get("resourceUrl")
+                        .and_then(Value::as_text)
+                        .map(str::to_string),
                     explanation: entry
                         .get("explanation")
                         .and_then(Value::as_text)
@@ -1460,9 +1594,9 @@ mod tests {
         );
     }
 
-    /// Two manifests naming each other. Neither link hash can be valid (each
-    /// claim would have to commit to the other's digest), but the walk must
-    /// terminate and validate each manifest once.
+    /// Two manifests naming each other. The entry link is valid; the return
+    /// link cannot also commit to the completed cycle. Validate the reached
+    /// manifest once and report its broken return link without re-entering the active manifest.
     #[test]
     fn a_label_cycle_terminates_and_validates_each_manifest_once() {
         let signer = Signer::conformant();
@@ -1481,14 +1615,17 @@ mod tests {
         };
         let first_binding = Assertion::new("c2pa.hash.data", &data_hash());
         let first_ingredient = Assertion::new("c2pa.ingredient.v3", &link(ACTIVE));
-        let (first, _) = manifest_box(
+        let (first, first_sig) = manifest_box(
             &signer,
             INGREDIENT,
             &[first_binding.clone(), first_ingredient.clone()],
             vec![first_binding.reference(), first_ingredient.reference()],
         );
         let second_binding = Assertion::new("c2pa.hash.data", &data_hash());
-        let second_ingredient = Assertion::new("c2pa.ingredient.v3", &link(INGREDIENT));
+        let second_ingredient = Assertion::new(
+            "c2pa.ingredient.v3",
+            &ingredient(INGREDIENT, &first, &first_sig, "componentOf", None),
+        );
         let (second, _) = manifest_box(
             &signer,
             ACTIVE,
@@ -1871,4 +2008,9 @@ mod tests {
             limited.report.validation_results.informational
         );
     }
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/redaction_lineage/mod.rs"
+    ));
 }

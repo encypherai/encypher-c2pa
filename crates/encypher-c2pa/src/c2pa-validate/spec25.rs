@@ -24,7 +24,6 @@ use super::{
     ClaimAssertionRefs, EngineProfile, OnlineEvidence, SpecVersion, ValidationResults, Value,
     ALGORITHM_UNSUPPORTED,
 };
-use crate::c2pa_core::jumbf::ParsedManifest;
 use crate::c2pa_crypto::ClaimAlgorithmList;
 use crate::c2pa_formats::{AppendOnlyFlavor, AssetFormat, TextLocatorRules};
 
@@ -387,12 +386,11 @@ pub(super) fn verify_linked_resource_integrity(
                     continue;
                 };
                 if alg.is_none() || expected.is_none() {
-                    results.push_failure_with_details(
+                    results.failure.push(linked_resource_status(
                         LINKED_RESOURCE_MALFORMED,
-                        assertion_url.clone(),
-                        "externalResources entry lacks alg or hash".into(),
-                        serde_json::json!({ "resourceUrl": resource_url }),
-                    );
+                        resource_url,
+                        "externalResources entry lacks alg or hash",
+                    ));
                     continue;
                 }
                 if !is_allowed_hash_algorithm(alg.unwrap_or_default()) {
@@ -412,7 +410,6 @@ pub(super) fn verify_linked_resource_integrity(
                     expected.unwrap_or_default(),
                     entry,
                     label,
-                    &assertion_url,
                     true,
                     evidence,
                     resources,
@@ -452,23 +449,21 @@ pub(super) fn verify_linked_resource_integrity(
                     continue;
                 };
                 if expected.is_none() {
-                    results.push_failure_with_details(
+                    results.failure.push(linked_resource_status(
                         LINKED_RESOURCE_MALFORMED,
-                        assertion_url.clone(),
-                        "relativeResources entry lacks hash".into(),
-                        serde_json::json!({ "resourceUrl": resource_url }),
-                    );
+                        resource_url,
+                        "relativeResources entry lacks hash",
+                    ));
                     continue;
                 }
                 let traverses = percent_decode(resource_url)
                     .is_none_or(|decoded| decoded.split('/').any(|segment| segment == ".."));
                 if traverses {
-                    results.push_failure_with_details(
+                    results.failure.push(linked_resource_status(
                         LINKED_RESOURCE_INVALID_URI,
-                        assertion_url.clone(),
-                        "relative linked resource URI contains a '..' path segment or an invalid escape".into(),
-                        serde_json::json!({ "resourceUrl": resource_url }),
-                    );
+                        resource_url,
+                        "relative linked resource URI contains a '..' path segment or an invalid escape",
+                    ));
                     continue;
                 }
                 terminal_linked_resource(
@@ -477,7 +472,6 @@ pub(super) fn verify_linked_resource_integrity(
                     expected.unwrap_or_default(),
                     entry,
                     label,
-                    &assertion_url,
                     false,
                     evidence,
                     resources,
@@ -581,6 +575,16 @@ fn unique_map_field<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Val
     values.next().is_none().then_some(value)
 }
 
+fn linked_resource_status(code: &str, resource_url: &str, explanation: &str) -> super::StatusCode {
+    super::StatusCode {
+        code: code.into(),
+        url: String::new(),
+        resource_url: Some(resource_url.into()),
+        explanation: explanation.into(),
+        details: Some(serde_json::json!({ "resourceUrl": resource_url })),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn terminal_linked_resource(
     resource_url: &str,
@@ -588,13 +592,11 @@ fn terminal_linked_resource(
     expected_hash: &[u8],
     entry: &Value,
     assertion_label: &str,
-    assertion_url: &str,
     network_resolvable: bool,
     evidence: OnlineEvidence<'_>,
     resources: &mut super::refs::ResourceCache<'_>,
     results: &mut ValidationResults,
 ) {
-    let details = || serde_json::json!({ "resourceUrl": resource_url });
     let supplied = evidence
         .external_data
         .and_then(|resources| resources.get(resource_url))
@@ -604,21 +606,19 @@ fn terminal_linked_resource(
         None if network_resolvable => match resources.resolve(resource_url) {
             super::refs::ResolvedResource::Retrieved { bytes, media_type } => (bytes, media_type),
             super::refs::ResolvedResource::Unavailable => {
-                results.push_informational_with_details(
+                results.informational.push(linked_resource_status(
                     LINKED_RESOURCE_INACCESSIBLE,
-                    assertion_url.to_string(),
-                    "linked resource retrieval produced no usable body".into(),
-                    details(),
-                );
+                    resource_url,
+                    "linked resource retrieval produced no usable body",
+                ));
                 return;
             }
             super::refs::ResolvedResource::NotAttempted => {
-                results.push_informational_with_details(
+                results.informational.push(linked_resource_status(
                     LINKED_RESOURCE_SKIPPED,
-                    assertion_url.to_string(),
-                    "linked resource was not retrieved".into(),
-                    details(),
-                );
+                    resource_url,
+                    "linked resource was not retrieved",
+                ));
                 push_unique(
                     &mut results.network_needs,
                     NetworkNeed::ExternalData {
@@ -631,19 +631,17 @@ fn terminal_linked_resource(
         },
         None => {
             if evidence.external_is_unreachable(resource_url) {
-                results.push_informational_with_details(
+                results.informational.push(linked_resource_status(
                     LINKED_RESOURCE_INACCESSIBLE,
-                    assertion_url.to_string(),
-                    "linked resource retrieval produced no usable body".into(),
-                    details(),
-                );
+                    resource_url,
+                    "linked resource retrieval produced no usable body",
+                ));
             } else {
-                results.push_informational_with_details(
+                results.informational.push(linked_resource_status(
                     LINKED_RESOURCE_SKIPPED,
-                    assertion_url.to_string(),
-                    "linked resource was not retrieved".into(),
-                    details(),
-                );
+                    resource_url,
+                    "linked resource was not retrieved",
+                ));
             }
             return;
         }
@@ -654,12 +652,11 @@ fn terminal_linked_resource(
         _ => None,
     }) {
         if size != bytes.len() {
-            results.push_informational_with_details(
+            results.informational.push(linked_resource_status(
                 LINKED_RESOURCE_SIZE_MISMATCH,
-                assertion_url.to_string(),
-                "retrieved linked resource size differs from the assertion".into(),
-                details(),
-            );
+                resource_url,
+                "retrieved linked resource size differs from the assertion",
+            ));
             return;
         }
     }
@@ -669,66 +666,35 @@ fn terminal_linked_resource(
             crate::c2pa_core::spec::canonicalize_mime(observed)
                 != crate::c2pa_core::spec::canonicalize_mime(expected_format)
         }) {
-            results.push_informational_with_details(
+            results.informational.push(linked_resource_status(
                 LINKED_RESOURCE_FORMAT_MISMATCH,
-                assertion_url.to_string(),
-                "retrieved linked resource media type differs from the assertion".into(),
-                details(),
-            );
+                resource_url,
+                "retrieved linked resource media type differs from the assertion",
+            ));
             return;
         }
     }
     if hash_bytes(alg, bytes).as_deref() != Some(expected_hash) {
-        results.push_informational_with_details(
+        results.informational.push(linked_resource_status(
             LINKED_RESOURCE_HASH_MISMATCH,
-            assertion_url.to_string(),
-            "retrieved linked resource hash differs from the assertion".into(),
-            details(),
-        );
+            resource_url,
+            "retrieved linked resource hash differs from the assertion",
+        ));
         return;
     }
-    results.push_success_with_details(
+    results.success.push(linked_resource_status(
         LINKED_RESOURCE_MATCH,
-        assertion_url.to_string(),
-        "linked resource integrity matched".into(),
-        details(),
-    );
-}
-/// Every assertion named in any claim's `redacted_assertions` across the
-/// store, as `(manifest label, assertion label)` (2.5 Preparing the list of
-/// redacted assertions: the list spans the asset's whole lineage).
-pub(super) fn store_redactions(manifests: &[ParsedManifest<'_>]) -> HashSet<(String, String)> {
-    let mut redacted = HashSet::new();
-    for manifest in manifests {
-        let Some(claim) = manifest
-            .claim_cbor
-            .and_then(|bytes| crate::c2pa_cbor::decode(bytes).ok())
-        else {
-            continue;
-        };
-        let Some(Value::Array(entries)) = claim.get("redacted_assertions") else {
-            continue;
-        };
-        for entry in entries {
-            let url = match entry {
-                Value::Text(url) => Some(url.as_str()),
-                other => other.get("url").and_then(Value::as_text),
-            };
-            if let Some(target) = url.and_then(absolute_assertion_target) {
-                redacted.insert(target);
-            }
-        }
-    }
-    redacted
+        resource_url,
+        "linked resource integrity matched",
+    ));
 }
 
 /// `(manifest, assertion)` named by an absolute assertion JUMBF URI.
-fn absolute_assertion_target(url: &str) -> Option<(String, String)> {
+fn absolute_assertion_target(url: &str) -> Option<(&str, &str)> {
     let (manifest, label) = url
         .strip_prefix("self#jumbf=/c2pa/")?
         .split_once("/c2pa.assertions/")?;
-    (!manifest.is_empty() && !label.is_empty() && !label.contains('/'))
-        .then(|| (manifest.to_string(), label.to_string()))
+    (!manifest.is_empty() && !label.is_empty() && !label.contains('/')).then_some((manifest, label))
 }
 
 /// An assertion reference whose target appears in the list of redacted
@@ -737,7 +703,7 @@ pub(super) struct RedactedTarget<'v> {
     /// Whether the target lives in the manifest being validated.
     pub(super) same_manifest: bool,
     /// The target assertion's label.
-    pub(super) label: String,
+    pub(super) label: &'v str,
     /// The reference's JUMBF URL, for the status record.
     pub(super) url: &'v str,
 }
@@ -751,19 +717,20 @@ pub(super) struct RedactedTarget<'v> {
 pub(super) fn redacted_reference_target<'v>(
     reference: &'v Value,
     manifest_label: &str,
-    redactions: &HashSet<(String, String)>,
+    redactions: Option<&super::redaction::Index>,
 ) -> Option<RedactedTarget<'v>> {
+    let redactions = redactions?;
     let url = reference.get("url").and_then(Value::as_text)?;
     let (manifest, label) = match absolute_assertion_target(url) {
         Some(target) => target,
         None => (
-            manifest_label.to_string(),
-            url.strip_prefix("self#jumbf=c2pa.assertions/")?.to_string(),
+            manifest_label,
+            url.strip_prefix("self#jumbf=c2pa.assertions/")?,
         ),
     };
     let same_manifest = manifest == manifest_label;
     redactions
-        .contains(&(manifest, label.clone()))
+        .contains(manifest, label)
         .then_some(RedactedTarget {
             same_manifest,
             label,
@@ -971,7 +938,6 @@ mod tests {
                 entry.get("hash").and_then(Value::as_bytes).unwrap(),
                 &entry,
                 "c2pa.linked-resource-integrity",
-                "self#jumbf=/c2pa/test/c2pa.assertions/c2pa.linked-resource-integrity",
                 true,
                 OnlineEvidence::default(),
                 &mut resources,
@@ -987,5 +953,12 @@ mod tests {
                 .count(),
             2
         );
+        for status in &results.success {
+            assert!(status.url.is_empty());
+            assert_eq!(status.resource_url.as_deref(), Some(URL));
+            let status = serde_json::to_value(status).expect("status serializes");
+            assert_eq!(status["resourceUrl"], URL);
+            assert!(status.get("url").is_none());
+        }
     }
 }

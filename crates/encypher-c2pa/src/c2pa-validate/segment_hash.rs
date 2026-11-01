@@ -138,7 +138,7 @@ fn parse(assertion: &Value, enclosing: &Value) -> Result<SegmentHash, ParseError
             })
         }
     };
-    let alg = resolved_hash_algorithm(assertion, enclosing)
+    let alg = resolved_hash_algorithm(&[assertion, enclosing])
         .ok_or_else(|| ParseError::Algorithm("segment hash names no hash algorithm".into()))?;
     if !is_allowed_hash_algorithm(alg) {
         return Err(ParseError::Algorithm(format!(
