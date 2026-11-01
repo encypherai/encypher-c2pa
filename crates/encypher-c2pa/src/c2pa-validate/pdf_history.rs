@@ -108,6 +108,7 @@ fn object_failure(owner: &PdfObjectManifestStore, explanation: &str) -> StatusCo
             "self#pdf-object={}:{}",
             owner.owner_number, owner.owner_generation
         ),
+        resource_url: None,
         explanation: explanation.into(),
         details: None,
     }
@@ -127,6 +128,7 @@ fn attach_object_manifests(
             let status = StatusCode {
                 code: MANIFEST_INACCESSIBLE.into(),
                 url: "self#pdf-objects".into(),
+                resource_url: None,
                 explanation: error.to_string(),
                 details: None,
             };

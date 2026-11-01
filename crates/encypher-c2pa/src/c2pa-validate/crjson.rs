@@ -575,9 +575,8 @@ fn status_codes(value: &Json) -> StatusCodes {
     }
 }
 
-/// Project reader-report status entries onto the `{code, url, explanation}`
-/// triple the schema allows. The report's `details` payload is dropped: the
-/// schema forbids additional properties on a status entry.
+/// Project reader-report entries onto the schema's status properties.
+/// Extension `details` are omitted; 2.5 linked-resource locations are retained.
 fn status_entries(value: Option<&Json>) -> Vec<Json> {
     let Some(entries) = value.and_then(Json::as_array) else {
         return Vec::new();
@@ -589,7 +588,12 @@ fn status_entries(value: Option<&Json>) -> Vec<Json> {
             let code = object.get("code")?.as_str()?;
             let mut status = Map::new();
             status.insert("code".into(), Json::String(code.to_string()));
-            for name in ["url", "explanation"] {
+            let location = if object.get("resourceUrl").and_then(Json::as_str).is_some() {
+                "resourceUrl"
+            } else {
+                "url"
+            };
+            for name in [location, "explanation"] {
                 if let Some(text) = object.get(name).and_then(Json::as_str) {
                     status.insert(name.to_string(), Json::String(text.to_string()));
                 }
@@ -1108,6 +1112,213 @@ mod tests {
             "the ingredient manifest reports the delta as its own result"
         );
         assert!(cr["manifests"][1].get("ingredientDeltas").is_none());
+    }
+
+    #[test]
+    fn signed_lri_report_validates_against_the_published_2_5_schema() {
+        use super::super::signature_conformance_tests::Signer;
+        use sha2::{Digest, Sha256};
+
+        const MATCH: &str = "https://example.test/match";
+        const SKIPPED: &str = "https://example.test/skipped";
+        const INACCESSIBLE: &str = "https://example.test/inaccessible";
+        let encode = |value: &Value| {
+            crate::c2pa_cbor::encode(value, Profile::LegacyPipelineBDefinite).unwrap()
+        };
+        let asset = b"linked";
+        let lri = encode(&map_from_pairs([(
+            "resources".into(),
+            map_from_pairs([(
+                "externalResources".into(),
+                Value::Array(
+                    [MATCH, SKIPPED, INACCESSIBLE]
+                        .into_iter()
+                        .map(|url| {
+                            map_from_pairs([
+                                ("url".into(), Value::Text(url.into())),
+                                ("alg".into(), Value::Text("sha256".into())),
+                                ("hash".into(), Value::Bytes(Sha256::digest(asset).to_vec())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            )]),
+        )]));
+        let binding = encode(&map_from_pairs([
+            ("alg".into(), Value::Text("sha256".into())),
+            ("hash".into(), Value::Bytes(Sha256::digest(asset).to_vec())),
+            ("pad".into(), Value::Bytes(Vec::new())),
+        ]));
+        let actions = encode(&map_from_pairs([
+            ("allActionsIncluded".into(), Value::Bool(true)),
+            (
+                "actions".into(),
+                Value::Array(vec![map_from_pairs([
+                    ("action".into(), Value::Text("c2pa.created".into())),
+                    (
+                        "digitalSourceType".into(),
+                        Value::Text(
+                            "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".into(),
+                        ),
+                    ),
+                ])]),
+            ),
+        ]));
+        let assertions = [
+            ("c2pa.actions.v2", actions),
+            ("c2pa.hash.data", binding),
+            ("c2pa.linked-resource-integrity", lri),
+        ];
+        let boxes: Vec<_> = assertions
+            .iter()
+            .map(|(label, payload)| assertion_box(label, payload, None))
+            .collect();
+        let references = assertions
+            .iter()
+            .zip(&boxes)
+            .map(|((label, _), boxed)| {
+                map_from_pairs([
+                    (
+                        "url".into(),
+                        Value::Text(format!("self#jumbf=c2pa.assertions/{label}")),
+                    ),
+                    ("alg".into(), Value::Text("sha256".into())),
+                    (
+                        "hash".into(),
+                        Value::Bytes(Sha256::digest(&boxed[8..]).to_vec()),
+                    ),
+                ])
+            })
+            .collect();
+        let claim = encode(&map_from_pairs([
+            (
+                "instanceID".into(),
+                Value::Text("xmp:iid:lri-fixture".into()),
+            ),
+            (
+                "claim_generator_info".into(),
+                map_from_pairs([
+                    ("name".into(), Value::Text("Encypher Fixture".into())),
+                    ("specVersion".into(), Value::Text("2.5.0".into())),
+                ]),
+            ),
+            ("created_assertions".into(), Value::Array(references)),
+            (
+                "signature".into(),
+                Value::Text("self#jumbf=c2pa.signature".into()),
+            ),
+        ]));
+        let signer = Signer::conformant();
+        let store = build_manifest_store(&[build_manifest_with_claim_label(
+            "urn:c2pa:00000000-0000-4000-8000-000000000001",
+            &boxes,
+            &claim,
+            &signer.sign(&claim),
+            "c2pa.claim.v2",
+        )]);
+        let options = crate::VerifyOptions {
+            spec_version: Some("2.5".into()),
+            strict_conformance: true,
+            validation_time: Some("2026-06-01T00:00:00Z".into()),
+            external_data: Some([(MATCH.into(), "bGlua2Vk".into())].into_iter().collect()),
+            external_data_unreachable: Some(vec![INACCESSIBLE.into()]),
+            ..crate::VerifyOptions::default()
+        };
+        let report =
+            crate::verify_with_manifest_store(asset, &store, "application/octet-stream", &options)
+                .expect("signed LRI store verifies");
+        assert!(
+            report
+                .validation_results
+                .success
+                .iter()
+                .any(|s| s.code == "claimSignature.validated"),
+            "signed LRI store statuses:\nsuccess: {:#?}\ninformational: {:#?}\nfailure: {:#?}",
+            report.validation_results.success,
+            report.validation_results.informational,
+            report.validation_results.failure,
+        );
+        assert!(
+            report
+                .validation_results
+                .failure
+                .iter()
+                .all(|s| s.code == "signingCredential.untrusted"),
+            "unexpected failures in signed LRI store: {:#?}",
+            report.validation_results.failure,
+        );
+        for (bucket, code, url) in [
+            (
+                &report.validation_results.success,
+                "assertion.linkedResourceIntegrity.match",
+                MATCH,
+            ),
+            (
+                &report.validation_results.informational,
+                "assertion.linkedResourceIntegrity.skipped",
+                SKIPPED,
+            ),
+            (
+                &report.validation_results.informational,
+                "assertion.linkedResourceIntegrity.inaccessible",
+                INACCESSIBLE,
+            ),
+        ] {
+            let status = bucket
+                .iter()
+                .find(|s| s.code == code)
+                .expect("LRI status emitted");
+            assert!(status.url.is_empty());
+            assert_eq!(status.resource_url.as_deref(), Some(url));
+            let reader_bucket = if code.ends_with(".match") {
+                "success"
+            } else {
+                "informational"
+            };
+            let reader_status = report.manifest_report["validation_results"]["activeManifest"]
+                [reader_bucket]
+                .as_array()
+                .expect("reader status bucket")
+                .iter()
+                .find(|s| s["code"] == code)
+                .expect("reader LRI status");
+            assert_eq!(reader_status["resourceUrl"], url);
+            assert!(reader_status.get("url").is_none());
+        }
+        let document = report.content_credentials.expect("strict 2.5 emits crJSON");
+        let results = &document["manifests"][0]["validationResults"];
+        assert_eq!(results["specVersion"], "2.5.0");
+        let statuses: Vec<_> = ["success", "informational", "failure"]
+            .into_iter()
+            .flat_map(|bucket| results[bucket].as_array().unwrap())
+            .filter(|s| {
+                s["code"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("assertion.linkedResourceIntegrity.")
+            })
+            .collect();
+        assert_eq!(statuses.len(), 3);
+        for status in statuses {
+            assert!(status["resourceUrl"].as_str().is_some());
+            assert!(status.get("url").is_none());
+            assert!(status.get("details").is_none());
+        }
+        let schema: Json = serde_json::from_str(include_str!(
+            "../../tests/fixtures/crjson/crJSON-2.5.schema.json"
+        ))
+        .expect("published 2.5 schema is JSON");
+        let mut schemas = boon::Schemas::new();
+        let mut compiler = boon::Compiler::new();
+        compiler
+            .add_resource("crJSON.schema.json", schema)
+            .expect("schema registers");
+        let index = compiler
+            .compile("crJSON.schema.json", &mut schemas)
+            .expect("schema compiles");
+        if let Err(error) = schemas.validate(&document, index) {
+            panic!("LRI crJSON violates the published 2.5 schema:\n{error:#}");
+        }
     }
 
     #[test]
