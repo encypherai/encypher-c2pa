@@ -63,8 +63,8 @@ x509-tsp = { workspace = true }
 # verifies, and parses SPKI with the existing `spki` stack.
 ml-dsa = { workspace = true, features = ["alloc"] }
 unicode-normalization = "0.1"
-miniz_oxide = "0.8"
-brotli = { version = "8", default-features = false, features = ["std"] }
+miniz_oxide = "0.9"
+brotli = { version = "9", default-features = false, features = ["std"] }
 # Zstandard decoding for WARC records (`std` reader, `hash` frame checksums);
 # pure Rust, MSRV 1.87.
 ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
@@ -73,7 +73,7 @@ url = "2.5"
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 # JSON Schema draft 2020-12 validator (MIT OR Apache-2.0), used only by the
 # crJSON schema-conformance test. Never linked into the published library.
 boon = "0.6"
